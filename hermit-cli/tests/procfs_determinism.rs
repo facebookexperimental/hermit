@@ -1487,8 +1487,8 @@ fn a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot() {
 }
 
 /// A bind recorded where the kernel put it when the container's setup
-/// installed it stays the plan's, through the real setup path (`--mount`, as
-/// `--bind` takes only targets below /tmp): the second of three binds names
+/// installed it stays the plan's, through the real setup path (`--mount`
+/// here; `--bind` is its general shorthand): the second of three binds names
 /// opt/x, which crosses the symbolic link x -> foo in the
 /// first bind at opt, so the kernel mounts it at foo; the third bind replaces
 /// opt with a directory whose x links to bar. The row at foo is still shown,
@@ -2209,30 +2209,46 @@ fn user_bind_under_private_tmp_has_a_stable_guest_mountpoint() {
     );
 }
 
+/// A general `--bind` at `/etc/group` replaces Hermit's identity mount
+/// there, exactly as the same `--mount` does
+/// (`proc_self_mountinfo_shows_a_user_mount_at_its_target_not_as_hermit_owned`):
+/// the row is the user's bind, at its target, not Hermit-owned and not
+/// the private provenance. (Before general binds, a bind outside /tmp
+/// was ignored and this test asserted the private provenance survived.)
 #[test]
-fn ignored_bind_outside_tmp_does_not_discard_private_mount_provenance() {
+fn a_general_bind_outside_tmp_replaces_private_mount_provenance() {
     let _guard = hermit_run_lock();
-    let ignored_source = tempfile::NamedTempFile::new().expect("ignored bind source");
+    let user_source = tempfile::NamedTempFile::new().expect("general bind source");
     let read = || {
         read_procfs_with("/proc/self/mountinfo", None, |command| {
             command.arg(format!(
                 "--bind={}:{}",
-                ignored_source.path().display(),
+                user_source.path().display(),
                 "/etc/group"
             ));
         })
     };
     let first = assert_runs_equal_while_host_mountinfo_stable(
         read,
-        "ignored outside-/tmp bind destabilized private provenance",
+        "general outside-/tmp bind destabilized mount provenance",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    let group_rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/etc/group"))
+        .collect::<Vec<_>>();
+    assert!(!group_rows.is_empty(), "mountinfo must contain /etc/group");
     assert!(
-        text.lines().any(|line| {
-            line.split(' ').nth(4) == Some("/etc/group")
-                && line.contains("/tmpvol/.hermit/etc/group")
-        }),
-        "ignored bind incorrectly removed the active private /etc/group provenance"
+        group_rows
+            .iter()
+            .all(|row| !row.contains("/tmpvol/.hermit/etc/group")),
+        "a user bind at /etc/group must replace the private provenance: {group_rows:?}"
+    );
+    let top = group_rows.last().unwrap();
+    assert_eq!(
+        top.split(' ').nth(3),
+        Some("/etc/group"),
+        "the user bind's root is not its target: {top}"
     );
 }
 

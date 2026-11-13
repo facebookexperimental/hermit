@@ -32182,13 +32182,16 @@ fn max_log_bytes_exits_promptly_with_allow_unsupported_syscalls_and_stderr_a_ful
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
-/// A `--bind` whose target is outside guest `/tmp` is ignored with a warning
-/// on stderr while the outer process prepares the container's mounts.
+/// A `--bind` whose target is outside guest `/tmp` is a general bind
+/// mount now, applied silently (it used to warn that it had no effect);
+/// paired here with a warning the run still prints, so the premise —
+/// the outer process writes diagnostics while preparing the mounts —
+/// is still proven on the read-stderr run.
 #[test]
-fn max_log_bytes_exits_promptly_with_a_bind_outside_tmp_and_stderr_a_full_pipe() {
+fn max_log_bytes_exits_promptly_with_a_general_bind_and_stderr_a_full_pipe() {
     CappedRun {
-        run_options: &["--bind=/usr"],
-        prints: Some("WARNING: --bind target /usr is outside guest /tmp"),
+        run_options: &["--bind=/usr", "--allow-unsupported-syscalls"],
+        prints: Some("WARNING: --allow-unsupported-syscalls permits unmodeled syscalls"),
         ..CappedRun::default()
     }
     .assert_exits_promptly_with_full_unread_stderr(|_| {});

@@ -90,11 +90,80 @@ static const char *find_env(char **envp, const char *name) {
     return "(unset)";
 }
 static char cwd_buf[4096];
+static char io_buf[4096];
+/* Mount-test operations, one per guest argument after argv[0]:
+ * "read:<path>" prints FILE <path>=<contents> (or =ERR<errno>),
+ * "write:<path>:<text>" writes and prints WROTE <path> (or ERR<errno>).
+ * With no such arguments the guest's output is exactly as before. */
+static void write_errno(long r) {
+    long e = -r;
+    char digits[24];
+    int n = 0;
+    if (e == 0) digits[n++] = '0';
+    while (e > 0) { digits[n++] = (char)('0' + (e % 10)); e /= 10; }
+    write_str("ERR");
+    while (n > 0) { char c[2] = {digits[--n], '\0'}; write_str(c); }
+}
+static int has_prefix(const char *s, const char *prefix) {
+    while (*prefix != '\0') {
+        if (*s++ != *prefix++) return 0;
+    }
+    return 1;
+}
+static void guest_ops(char **argv, long argc) {
+    for (long i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (has_prefix(arg, "read:")) {
+            const char *path = arg + 5;
+            long fd = sys3(2, (long)path, 0, 0);
+            write_str("FILE ");
+            write_str(path);
+            write_str("=");
+            if (fd < 0) {
+                write_errno(fd);
+            } else {
+                long n;
+                while ((n = sys3(0, fd, (long)io_buf, (long)sizeof(io_buf) - 1)) > 0) {
+                    io_buf[n] = '\0';
+                    write_str(io_buf);
+                }
+                if (n < 0) write_errno(n);
+                sys3(3, fd, 0, 0);
+            }
+            write_str("\n");
+        } else if (has_prefix(arg, "write:")) {
+            const char *rest = arg + 6;
+            const char *colon = rest;
+            while (*colon != '\0' && *colon != ':') colon++;
+            if (*colon != ':') continue;
+            /* The path is rest[..colon-rest]; copy it out NUL-terminated. */
+            char path[512];
+            u64 plen = (u64)(colon - rest);
+            if (plen >= sizeof(path)) continue;
+            for (u64 j = 0; j < plen; j++) path[j] = rest[j];
+            path[plen] = '\0';
+            long fd = sys3(2, (long)path, 0x241, 0644);
+            write_str("WROTE ");
+            write_str(path);
+            write_str("=");
+            if (fd < 0) {
+                write_errno(fd);
+            } else {
+                const char *text = colon + 1;
+                long w = sys3(1, fd, (long)text, (long)slen(text));
+                if (w < 0) write_errno(w); else write_str(text);
+                sys3(3, fd, 0, 0);
+            }
+            write_str("\n");
+        }
+    }
+}
 void guest_main(long *stack) {
     long argc = stack[0];
     char **argv = (char **)(stack + 1);
     char **envp = argv + argc + 1;
     write_str("GUEST_MARKER=hello-from-image\n");
+    guest_ops(argv, argc);
     write_str("TEST_ENV=");
     write_str(find_env(envp, "TEST_ENV"));
     write_str("\n");
@@ -734,6 +803,219 @@ fn oci_dir_materializes_runs_and_reuses_cache() {
         "second run must reuse the cached tree, not re-apply layers"
     );
     assert_eq!(find_rootfs(&cache), rootfs, "same cache dir reused");
+}
+
+/// `--mount` and `--bind` compose with `--image`: a bind mount, a tmpfs,
+/// and a `--bind` work directory land inside the rootfs at their guest
+/// targets, a `readonly` bind refuses guest writes, and mounts Hermit
+/// cannot install in a rootfs are refused by name before the guest runs.
+#[test]
+fn oci_dir_composes_with_mount_and_bind() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache = tmp.path().join("cache");
+    let image_dir = tmp.path().join("oci-image");
+    write_valid_oci_dir(&image_dir);
+    let image = format!("oci-dir:{}", image_dir.display());
+
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("input.txt"), b"from-bind-mount\n").unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("work.txt"), b"from-bind-flag\n").unwrap();
+
+    // /data is not in the fixture image (created as a mountpoint),
+    // /opt/appdir is (an existing directory target), /scratch is a
+    // fresh tmpfs, and /work comes through --bind.
+    let output = run_hermit(
+        &cache,
+        &[
+            "run".to_string(),
+            format!("--image={image}"),
+            "--strict".to_string(),
+            format!(
+                "--mount=type=bind,source={},target=/data,readonly",
+                data.display()
+            ),
+            "--mount=type=tmpfs,target=/scratch".to_string(),
+            format!("--bind={}:/work", work.display()),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+            "read:/data/input.txt".to_string(),
+            "write:/data/input.txt:nope".to_string(),
+            "write:/scratch/scratch.txt:from-tmpfs".to_string(),
+            "read:/scratch/scratch.txt".to_string(),
+            "read:/work/work.txt".to_string(),
+            "write:/work/out.txt:guest-output".to_string(),
+            "read:/proc/self/mountinfo".to_string(),
+        ],
+    );
+    assert_guest_ran(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("FILE /data/input.txt=from-bind-mount"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("WROTE /data/input.txt=ERR30"),
+        "a readonly bind refuses the guest write with EROFS: {stdout}"
+    );
+    assert!(
+        stdout.contains("WROTE /scratch/scratch.txt=from-tmpfs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /scratch/scratch.txt=from-tmpfs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /work/work.txt=from-bind-flag"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(work.join("out.txt")).unwrap(),
+        b"guest-output",
+        "a writable --bind into the rootfs writes through to the host"
+    );
+    assert_eq!(
+        std::fs::read(data.join("input.txt")).unwrap(),
+        b"from-bind-mount\n",
+        "the readonly bind's host source is unchanged"
+    );
+    // The guest's mount table shows each bind at its guest target as
+    // its root, never the host source subpath (measured before the
+    // rewrite: the /data row's root was the host tempdir subpath, and
+    // the tmpfs row carried the host uid/gid).
+    let mountinfo_row = |mountpoint: &str| {
+        stdout
+            .lines()
+            .find(|line| line.split(' ').nth(4) == Some(mountpoint))
+            .unwrap_or_else(|| panic!("no mountinfo row at {mountpoint}:\n{stdout}"))
+            .to_string()
+    };
+    let data_row = mountinfo_row("/data");
+    assert_eq!(
+        data_row.split(' ').nth(3),
+        Some("/data"),
+        "the bind row's root is its guest target: {data_row}"
+    );
+    assert!(
+        !stdout.contains(&data.display().to_string()),
+        "the host bind source path leaked into the guest mount table:\n{stdout}"
+    );
+    let scratch_row = mountinfo_row("/scratch");
+    assert!(
+        !scratch_row.contains("uid=") && !scratch_row.contains("gid="),
+        "the tmpfs row carries host ids in its superblock options: {scratch_row}"
+    );
+
+    // Determinism: the read-only composition under --verify --verify-strict
+    // runs the guest twice and compares the runs; a writable bind would
+    // let run one change run two's inputs, so this uses the readonly bind
+    // and the (always empty at start) tmpfs only.
+    let verified = run_hermit(
+        &cache,
+        &[
+            "run".to_string(),
+            format!("--image={image}"),
+            "--strict".to_string(),
+            "--verify".to_string(),
+            "--verify-strict".to_string(),
+            format!(
+                "--mount=type=bind,source={},target=/data,readonly",
+                data.display()
+            ),
+            "--mount=type=tmpfs,target=/scratch".to_string(),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+            "read:/data/input.txt".to_string(),
+            "write:/scratch/scratch.txt:from-tmpfs".to_string(),
+            "read:/scratch/scratch.txt".to_string(),
+        ],
+    );
+    assert_eq!(
+        verified.status.code(),
+        Some(0),
+        "verified image+mount run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout_of(&verified),
+        stderr_of(&verified)
+    );
+    assert!(
+        stdout_of(&verified).contains("FILE /data/input.txt=from-bind-mount"),
+        "{}",
+        stdout_of(&verified)
+    );
+
+    // Targets under /tmp, both spellings: prepared in the private /tmp
+    // staging the guest's /tmp is bound from, not in the cached rootfs
+    // (where the staging bind would hide the mountpoint).
+    let under_tmp = run_hermit(
+        &cache,
+        &[
+            "run".to_string(),
+            format!("--image={image}"),
+            "--strict".to_string(),
+            format!(
+                "--mount=type=bind,source={},target=/tmp/data,readonly",
+                data.display()
+            ),
+            format!("--bind={}:/tmp/work", work.display()),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+            "read:/tmp/data/input.txt".to_string(),
+            "read:/tmp/work/work.txt".to_string(),
+            "write:/tmp/work/tmp-out.txt:from-tmp-bind".to_string(),
+        ],
+    );
+    assert_guest_ran(&under_tmp);
+    let stdout = stdout_of(&under_tmp);
+    assert!(
+        stdout.contains("FILE /tmp/data/input.txt=from-bind-mount"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /tmp/work/work.txt=from-bind-flag"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(work.join("tmp-out.txt")).unwrap(),
+        b"from-tmp-bind",
+        "a --bind below /tmp in an image writes through to the host"
+    );
+
+    // Refusals, by name, before any guest runs.
+    for (mount, named) in [
+        (
+            "--mount=type=volume,target=/data",
+            "type=volume is not supported",
+        ),
+        ("--mount=type=tmpfs,target=/proc", "inside /proc"),
+        (
+            "--mount=type=tmpfs,target=relative",
+            "must be an absolute path",
+        ),
+        ("--mount=target=/data", "bind mount with no source"),
+        ("--bind=/srv:/proc", "inside /proc"),
+        ("--bind=/srv:/", "would replace the whole OCI rootfs"),
+    ] {
+        let output = run_hermit(
+            &cache,
+            &[
+                "run".to_string(),
+                format!("--image={image}"),
+                mount.to_string(),
+                "--".to_string(),
+                "/bin/guest".to_string(),
+            ],
+        );
+        assert_ne!(output.status.code(), Some(0), "{mount} must refuse");
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains(named), "{mount}: {stderr}");
+        assert!(
+            !stdout_of(&output).contains("GUEST_MARKER"),
+            "{mount}: the guest must not run"
+        );
+    }
 }
 
 #[test]
@@ -1448,5 +1730,13 @@ fn run_help_documents_local_image_forms_without_buildah() {
     assert!(
         !help.contains("buildah"),
         "help must not claim buildah materialization:\n{help}"
+    );
+    assert!(
+        !help.contains("PROTOTYPE"),
+        "image mode is supported, not a prototype:\n{help}"
+    );
+    assert!(
+        flat.contains("compose with it"),
+        "help must state that --mount/--bind compose with --image:\n{help}"
     );
 }

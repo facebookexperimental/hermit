@@ -1687,10 +1687,18 @@ outside `/tmp`, or expose only the required path:
 hermit run --bind=/host/path:/guest-name -- /tmp/guest-name
 ```
 
-`--bind=SOURCE` exposes a host path under guest `/tmp` with its name preserved;
-`--bind=SOURCE:TARGET` selects the target under guest `/tmp` or the guest's
-private `/dev/shm` (below). For general mount targets, use Docker-style
-`--mount` syntax. Mount sources must exist before Hermit starts.
+`--bind` is Docker's `-v` spelling, shorthand for `--mount type=bind` at any
+guest target: `--bind=SOURCE` preserves the path, `--bind=SOURCE:TARGET`
+selects the target, and a trailing `:ro` makes the bind read-only (`:rw`
+spells the default). Mount sources must exist before Hermit starts. In host
+mode a target must exist too, except one under guest `/tmp` (created in the
+private `/tmp`), one under an earlier `--mount` or `--bind` of the same run,
+and — for `--bind` only — `/dev/shm` itself or, when the guest's `/dev/shm`
+is Hermit's private one, a target below it. With `--image`, targets are
+paths inside the image rootfs instead. An invalid bind is an
+error; Hermit never warns and silently skips a mount it was asked for. For
+input binds under `--verify`, prefer `:ro`: a writable bind is shared by the
+two runs, so the first run's writes are the second run's inputs.
 
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
@@ -1713,7 +1721,7 @@ one from host `/tmp` when `TMPDIR` or `--tmp` keeps the private `/tmp` in the
 host's `/dev/shm` (it is then bound first). `--bind
 /dev/shm` keeps the host's `/dev/shm` for a guest that talks to host processes
 through it, `--bind DIR:/dev/shm` uses host directory `DIR` instead, and a
-`--mount` at `/dev/shm` (or at `/dev`) replaces it. A `--no-namespace` run uses
+`--mount` or `--bind` at `/dev/shm`, `/dev` or `/` replaces it. A `--no-namespace` run uses
 the host's `/dev/shm`, an `--image` run has none, and `hermit replay` does not
 make one, as it answers the guest's calls from the recording.
 
@@ -1727,7 +1735,7 @@ still list, create, open and remove POSIX message queues as files in
 likewise gets keys and names that no other run or host process holds; it no
 longer reaches the host's System V objects or message queues, which only a
 `--no-namespace` run, sharing the host's IPC namespace, still does. A
-`--mount` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
+`--mount` or `--bind` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
 and `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue` shows the
 host's queues there; a mount below `/dev/mqueue` is refused. `hermit replay`
 gets the IPC namespace but no private `/dev/mqueue`, and an `--image` run's
@@ -1858,6 +1866,69 @@ under its home directory a writable one, for example `-e HOME=/tmp`.
 `-e NAME=VALUE` replaces any of these values, and `--base-env=empty` sets none
 of them. `LANG`, `TERM`, `TZ` and `SHELL` are not set; pass them with `-e` when
 a program needs them.
+
+#### OCI Image Mode (`--image`)
+
+`hermit run --image <ref> -- <program>` runs the guest against the root
+filesystem of an OCI image instead of the host filesystem, so the guest's
+file inputs come deterministically from the pinned image. Three forms are
+accepted: a reference into the local podman store (pin it by digest,
+`docker.io/library/busybox@sha256:...`; fetch it first with `hermit oci pull`
+or `podman pull`, as `hermit run` never pulls), `--image=oci-dir:/path` (an
+OCI layout directory), and `--image=docker-archive:/file.tar` (a
+`podman save`/`docker save` archive holding exactly one image). Only
+linux/amd64 images with uncompressed or gzip layers are supported (where
+the image declares an os/architecture it must be linux/amd64; an
+unspecified one is accepted), on the ptrace and KVM backends, and image
+mode requires namespaces (it refuses `--no-namespace`). Coverage today:
+ptrace has automated end-to-end image tests including `--strict` and a
+`--verify --verify-strict` repeat; KVM is admitted and has been
+smoke-tested manually, with no automated image test yet. The
+materialized rootfs is cached read-only under
+`~/.cache/hermit/oci-rootfs/`; the guest gets an isolated writable `/tmp`,
+the image's declared environment over the minimal base environment
+(`--base-env` is not applied with `--image`), a fresh `/proc`, and a
+minimal `/dev` (`null`, `zero`, `full`, `random`, `urandom`, `pts`). The
+image's `Entrypoint` always wraps the program, as in Docker: an explicit
+program (and its arguments) replace only the image's `Cmd`, which is the
+default when no program is given.
+
+`--mount` and `--bind` compose with `--image` much as with
+`docker run`: their targets are paths inside the image rootfs, created
+there if missing (a target under an earlier caller mount must exist in
+that mount's content; it is not created, and symlinks in that content are
+followed as it installs, not refused), while the image itself stays
+read-only. Bind mounts
+(`--mount type=bind,...,readonly`, `--bind SRC:DST[:ro]`) and tmpfs
+(`--mount type=tmpfs,target=/scratch`) are supported: `--bind` work
+directories install first, then `--mount`s in the order given, after
+`/tmp`. Mounts and binds at `/`, inside `/proc` or `/dev`, of other types
+(`volume`, `proc`, ...), without a source, or through a symlinked path
+inside the image are refused by name, in either spelling. The symlink
+refusal covers paths through the image itself; inside an earlier caller
+mount, symlinks are followed. Bind sources
+are declared host inputs, like host-mode binds: a writable bind shared by
+`--verify`'s two runs can carry the first run's writes into the second, so
+prefer `readonly` binds for inputs. In the guest's mount table a bind
+shows its guest target as its root, never the host source path.
+
+Remaining gaps, honestly: there is no writable container layer (writes
+outside `/tmp` and your mounts fail read-only, where Docker would copy
+up); of the image config only `Env`, `WorkingDir`, `Cmd` and
+`Entrypoint` are applied — `User`, `Volumes`, `ExposedPorts`,
+`StopSignal`, `Healthcheck` and the rest are ignored, as are named
+volumes; layer uid/gid are flattened to the invoking user during
+materialization, so image files present as root-owned in the guest and
+non-root images run with root ownership semantics; there is no
+`/dev/shm` and `/sys` is the image's empty directory (no sysfs); tmpfs
+size/mode mount options are not accepted; the image's `WorkingDir` is
+used but never created, so if it is absent from the rootfs the run
+fails at startup (pass `--workdir=/`, or another directory the image
+has); and the guest is entered with `chroot`, not `pivot_root`.
+Mountpoints Hermit creates for `--mount` and `--bind` targets persist
+as empty directories or files in the shared rootfs cache, visible to
+later runs of the same image (a persisted file mountpoint makes a
+later directory bind at that path refuse until the cache is cleared).
 
 ## Logs And Run Summaries
 

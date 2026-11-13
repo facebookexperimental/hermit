@@ -172,17 +172,33 @@ fn missing_mount_target(mounts: &[MountArg], exists: impl Fn(&Path) -> bool) -> 
     })
 }
 
-/// Refuse a `--mount` target before setup, by the host's paths (`exists`,
-/// `is_dir`): first one the guest's own `/dev/mqueue` would cover
-/// ([`refuse_mount_below_private_mqueue`]), which would otherwise be named as
-/// missing, since a host's `/dev/mqueue` holds only its queues; then the
-/// first [`missing_mount_target`].
+/// Refuse a caller target the guest's own `/dev/mqueue` would cover,
+/// over the combined `--mount` and `--bind` targets: a cover can come
+/// from either flag (`--mount target=/dev/mqueue` or
+/// `--bind DIR:/dev/mqueue`), and so can the target below it, so
+/// neither flag's list alone decides this. Checked ahead of the
+/// existence checks: a host's `/dev/mqueue` holds only its queues, so a
+/// target below it would otherwise be named as merely missing.
+fn refuse_below_private_mqueue(
+    mounts: &[MountArg],
+    binds: &[Bind],
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    refuse_mount_below_private_mqueue(
+        mounts
+            .iter()
+            .map(|mount| mount.get_target())
+            .chain(binds.iter().map(|bind| bind_paths(bind).1)),
+        is_dir,
+    )
+}
+
+/// Refuse a `--mount` target before setup, by the host's paths
+/// (`exists`): the first [`missing_mount_target`].
 fn validate_mount_targets(
     mounts: &[MountArg],
     exists: impl Fn(&Path) -> bool,
-    is_dir: impl Fn(&Path) -> bool,
 ) -> Result<(), Error> {
-    refuse_mount_below_private_mqueue(mounts.iter().map(|mount| mount.get_target()), is_dir)?;
     if let Some(target) = missing_mount_target(mounts, exists) {
         anyhow::bail!(
             "--mount target {} does not exist on this host. Hermit mounts onto an existing \
@@ -192,6 +208,247 @@ fn validate_mount_targets(
         );
     }
     Ok(())
+}
+
+/// The first `--bind` target that `exists` reports missing, of those
+/// Hermit mounts onto as they are: the bind twin of
+/// [`missing_mount_target`]. A target inside /tmp goes to the private
+/// /tmp staging the container creates; one at /dev/shm replaces it, and
+/// one below it is created there only when the guest's /dev/shm is the
+/// private one (`private_dev_shm`). A target under a caller's earlier
+/// `--mount` or `--bind` can be provided by that mount. Those are left
+/// to container setup, as there; below a non-private /dev/shm a missing
+/// target is named here, like a `--mount`'s.
+fn missing_bind_target<'a>(
+    binds: &'a [Bind],
+    mounts: &[MountArg],
+    private_dev_shm: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<&'a Path> {
+    binds.iter().enumerate().find_map(|(index, bind)| {
+        let target = bind_paths(bind).1;
+        let under_an_earlier_mount = mounts
+            .iter()
+            .map(|mount| mount.get_target())
+            .chain(binds[..index].iter().map(|earlier| bind_paths(earlier).1))
+            .any(|earlier| target.starts_with(earlier));
+        let staged = target.starts_with(TMP_DIR)
+            || is_dev_shm(target)
+            || (private_dev_shm && is_in_dev_shm(target));
+        (!staged && !under_an_earlier_mount && !exists(target)).then_some(target)
+    })
+}
+
+/// Refuse a `--bind` target before setup, as [`validate_mount_targets`]
+/// refuses a `--mount` target: the first [`missing_bind_target`].
+fn validate_bind_targets(
+    binds: &[Bind],
+    mounts: &[MountArg],
+    private_dev_shm: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    if let Some(target) = missing_bind_target(binds, mounts, private_dev_shm, exists) {
+        anyhow::bail!(
+            "--bind target {} does not exist on this host. Hermit mounts onto an existing \
+             path outside {TMP_DIR} and /dev/shm: create it first, or choose a target under \
+             {TMP_DIR}, which Hermit creates in the guest's private {TMP_DIR}.",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+/// What a `--mount` mounts, for `--image` composition: only bind mounts
+/// (the parser's default and `type=bind`) and tmpfs are installed inside
+/// an OCI rootfs. Reverie's `Mount` does not give its filesystem type
+/// back, so this reads `type=` from the spec `MountArg` retains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageMountKind {
+    Bind,
+    Tmpfs,
+}
+
+fn image_mount_kind(mount: &MountArg) -> Result<ImageMountKind, Error> {
+    let fstype = mount
+        .spec
+        .split(',')
+        .filter_map(|item| item.trim().strip_prefix("type="))
+        .next_back();
+    match fstype {
+        None | Some("bind") => Ok(ImageMountKind::Bind),
+        Some("tmpfs") => Ok(ImageMountKind::Tmpfs),
+        Some(other) => anyhow::bail!(
+            "--mount type={other} is not supported with --image; inside an OCI rootfs Hermit \
+             installs bind mounts (--mount type=bind,source=<HOST>,target=<GUEST>) and tmpfs \
+             (--mount type=tmpfs,target=<GUEST>)"
+        ),
+    }
+}
+
+/// Refuse a caller target that cannot be installed inside an OCI
+/// rootfs, by its shape alone (existence is checked against the
+/// materialized rootfs when the container is built): a non-absolute or
+/// `..`-carrying target, the root itself, or a target in a tree the
+/// image container manages (`/proc`, `/dev`, Hermit's own
+/// `/.hermit-oci-*` files), where the guest's filesystem is Hermit's
+/// deterministic rendering, not the caller's. `spelling` is the flag
+/// that named the target (`--mount` or `--bind`); both spellings of a
+/// bind get exactly these rules.
+fn validate_image_target(target: &Path, spelling: &str) -> Result<(), Error> {
+    anyhow::ensure!(
+        target.is_absolute()
+            && target
+                .components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir)),
+        "{spelling} target {} with --image must be an absolute path inside the image \
+         without '..' components",
+        target.display()
+    );
+    anyhow::ensure!(
+        target != Path::new("/"),
+        "{spelling} target / with --image would replace the whole OCI rootfs; mount at a \
+         path below the root instead"
+    );
+    for managed in ["/proc", "/dev"] {
+        anyhow::ensure!(
+            !target.starts_with(managed),
+            "{spelling} target {} is inside {managed}, which the image container provides \
+             itself (a deterministic /proc and a minimal /dev); mount at a path the \
+             image owns instead",
+            target.display()
+        );
+    }
+    let first_component = target.components().nth(1);
+    anyhow::ensure!(
+        !matches!(
+            first_component,
+            Some(std::path::Component::Normal(name))
+                if name.as_bytes().starts_with(b".hermit-oci-")
+        ),
+        "{spelling} target {} names one of Hermit's own image files",
+        target.display()
+    );
+    Ok(())
+}
+
+/// Refuse the `--mount`s and `--bind`s that cannot be installed inside
+/// an OCI rootfs: an unsupported mount type, a bind mount with no
+/// source, and every target [`validate_image_target`] refuses.
+fn validate_image_mounts(mounts: &[MountArg], binds: &[Bind]) -> Result<(), Error> {
+    for mount in mounts {
+        if image_mount_kind(mount)? == ImageMountKind::Bind {
+            anyhow::ensure!(
+                mount.get_source().is_some(),
+                "--mount {} with --image is a bind mount with no source; give one as \
+                 --mount type=bind,source=<HOST>,target={}",
+                mount.spec,
+                mount.get_target().display()
+            );
+        }
+        validate_image_target(mount.get_target(), "--mount")?;
+    }
+    for bind in binds {
+        validate_image_target(bind_paths(bind).1, "--bind")?;
+    }
+    Ok(())
+}
+
+/// Make `base/rel` a mountable target of the wanted kind inside a
+/// materialized image rootfs (or the private /tmp staging, which is
+/// bound at the rootfs's /tmp): the mountpoint a bind of a directory
+/// (or a tmpfs) needs is a directory, a file bind's is a file. An
+/// existing target of the wrong kind, a symlinked component (which
+/// pre-chroot resolution would follow out of the rootfs on host
+/// semantics), or a creation failure refuses the run by name, before
+/// spawn. Returns the host path to mount onto.
+///
+/// Confinement is an lstat walk, not fd-grade: paths are re-resolved
+/// by name when the container's child mounts them, so a same-uid host
+/// process that can mutate the shared rootfs cache between this check
+/// and that mount could swap in a symlink. In that window the guest
+/// is not running and the image is already materialized; the residual
+/// is accepted and stated here rather than implied away.
+fn prepare_image_mount_target(
+    base: &Path,
+    rel: &Path,
+    want_dir: bool,
+    guest_target: &Path,
+    spelling: &str,
+    tree: &str,
+) -> Result<PathBuf, Error> {
+    // Every existing component must stay inside the root: refuse a
+    // symlink rather than follow it pre-chroot.
+    let mut walked = base.to_path_buf();
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!(
+                "{spelling} target {} has a non-normal path component",
+                guest_target.display()
+            );
+        };
+        walked.push(name);
+        match std::fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+                "{spelling} target {} passes through the symlink {} inside the image, which \
+                 Hermit will not follow while setting up the rootfs; mount at a path whose \
+                 components are the image's own directories",
+                guest_target.display(),
+                Path::new("/")
+                    .join(walked.strip_prefix(base).unwrap_or(&walked))
+                    .display()
+            ),
+            Ok(_) => {}
+            // Missing from here down: created below. Any other lstat
+            // failure refuses by name here rather than being read as
+            // missing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => anyhow::bail!(
+                "cannot inspect {spelling} target {} in {tree}: {e}",
+                guest_target.display()
+            ),
+        }
+    }
+    let path = base.join(rel);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                meta.is_dir() == want_dir,
+                "{spelling} target {} exists in the image as a {}, but the mount needs a {} \
+                 there; choose a target the image has as a {}, or bind a matching source",
+                guest_target.display(),
+                if meta.is_dir() { "directory" } else { "file" },
+                if want_dir { "directory" } else { "file" },
+                if want_dir { "directory" } else { "file" },
+            );
+        }
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot create the parent directories of {spelling} target {} in \
+                         {tree}: {e}",
+                        guest_target.display()
+                    )
+                })?;
+            }
+            let created = if want_dir {
+                std::fs::create_dir_all(&path)
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map(|_| ())
+            };
+            created.map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot create {spelling} target {} in {tree}: {e}",
+                    guest_target.display()
+                )
+            })?;
+        }
+    }
+    Ok(path)
 }
 
 /// Refuse a run on a host without `/tmp` (Android) when `TMPDIR` is unset:
@@ -290,40 +547,36 @@ fn bind_paths(bind: &Bind) -> (&Path, &Path) {
     )
 }
 
-/// Whether the container applies `bind`: one at or below guest `/tmp`, one
-/// below the private `/dev/shm` (where the guest gets one,
-/// `private_dev_shm`), or one at `/dev/shm` from another host directory,
-/// which replaces it. `--bind /dev/shm` mounts nothing: it keeps the host's
-/// `/dev/shm`.
-fn bind_is_applied(bind: &Bind, private_dev_shm: bool) -> bool {
-    let (source, target) = bind_paths(bind);
-    target.starts_with(TMP_DIR)
-        || (is_dev_shm(target) && !is_dev_shm(source))
-        || (is_below_dev_shm(target) && private_dev_shm)
-}
-
 /// Whether `bind` is `--bind /dev/shm`, which keeps the host's `/dev/shm`
-/// for the guest and mounts nothing.
+/// for the guest and mounts nothing: the private `/dev/shm` is not mounted
+/// (the bind covers it, `dev_shm_covering_targets`), so the host's stays.
 fn keeps_host_dev_shm(bind: &Bind) -> bool {
     let (source, target) = bind_paths(bind);
     is_dev_shm(source) && is_dev_shm(target)
 }
 
-fn warn_unapplied_bind(bind: &Bind) {
-    let target = bind.target.to_string_lossy();
-    if is_below_dev_shm(bind_paths(bind).1) {
-        crate::app::tracing::diagnostic_eprintln!(
-            "WARNING: --bind target {target} is below a guest /dev/shm that is not Hermit's \
-             private one (a --mount or --bind at /dev/shm replaced it, or --bind /dev/shm kept \
-             the host's), so this option has no effect; use --mount to mount into it"
-        );
-    } else {
-        crate::app::tracing::diagnostic_eprintln!(
-            "WARNING: --bind target {target} is outside guest /tmp and the guest's private \
-             /dev/shm, so this option has no effect; files outside them are already visible \
-             unless another mount hides them"
-        );
-    }
+/// A `--bind` target ending in a further `:option` segment: the parser
+/// split at the first `:` and took a trailing `:ro`/`:rw` as an option,
+/// so a colon in the target's final component with no `/` after it is a
+/// further docker-style option Hermit's `--bind` spelling does not take
+/// (propagation, relabeling, caching). Refuse it by name, with the
+/// `--mount` spelling that does express those. A colon in an earlier
+/// component (`/tmp/a:b/c`) is an ordinary path and stays allowed.
+fn refuse_bind_target_with_option(target: &Path) -> Result<(), Error> {
+    let bytes = target.as_os_str().as_bytes();
+    let trailing_option = bytes
+        .iter()
+        .rposition(|byte| *byte == b':')
+        .is_some_and(|colon| !bytes[colon..].contains(&b'/'));
+    anyhow::ensure!(
+        !trailing_option,
+        "--bind target {} carries a further ':' option, which the --bind spelling does not \
+         take (only a trailing :ro or :rw); use \
+         --mount type=bind,source=<SRC>,target=<DST> with bind-propagation= for propagation \
+         options",
+        target.display()
+    );
+    Ok(())
 }
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_FORWARDED_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
@@ -1866,15 +2119,21 @@ pub struct RunOpts {
     skid_margin: Option<u64>,
 
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
-    /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
+    /// source must exist on the host. For a simple bind mount, `--bind` is the shorthand.
+    /// With `--image`, only the bind and tmpfs types install, at targets inside the rootfs.
     #[clap(long, value_name = "path")]
-    mount: Vec<MountArg>,
+    pub(crate) mount: Vec<MountArg>,
 
-    /// Bind-mount a host file or directory into guest `/tmp` or the guest's private `/dev/shm`.
-    /// Use `SOURCE` to preserve its path or `SOURCE:TARGET` to choose a target under `/tmp` or
-    /// `/dev/shm`; the source must already exist, and one bound below `/dev/shm` must not be in
-    /// the host's `/dev/shm`. `--bind /dev/shm` keeps the host's `/dev/shm` in place of the
-    /// guest's private one; `--bind DIR:/dev/shm` uses host directory `DIR` instead.
+    /// Bind-mount a host file or directory into the guest, Docker's `-v` spelling: `SOURCE` to
+    /// preserve its path, `SOURCE:TARGET` to choose the guest target, with a trailing `:ro` for
+    /// a read-only bind (`:rw` spells the writable default). This is shorthand for
+    /// `--mount type=bind,source=SOURCE,target=TARGET[,readonly]` at any guest target; the
+    /// source must already exist, as must a target outside guest `/tmp` and `/dev/shm` (those
+    /// two are created in the guest's private `/tmp` and `/dev/shm`), and a source bound below
+    /// `/dev/shm` must not be in the host's `/dev/shm`. `--bind /dev/shm` keeps the host's
+    /// `/dev/shm` in place of the guest's private one; `--bind DIR:/dev/shm` uses host
+    /// directory `DIR` instead. With `--image`, the target is a path inside the image rootfs,
+    /// created there if missing.
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
@@ -2104,7 +2363,7 @@ pub struct RunOpts {
     #[clap(long, value_name = "dirpath")]
     tmp: Option<PathBuf>,
 
-    /// PROTOTYPE: run the guest against the root filesystem of an OCI image
+    /// Run the guest against the root filesystem of an OCI image
     /// instead of the host filesystem. The image is materialized into a
     /// read-only cached root and the guest is `chroot`ed into it with an
     /// isolated writable `/tmp`, so its FILE INPUTS come deterministically
@@ -2135,9 +2394,14 @@ pub struct RunOpts {
     /// `/bin/sh`) or a relative path containing a `/` (e.g. `./bin/sh`),
     /// which is resolved against the image working directory; a bare
     /// command name is searched on the image's PATH. Requires namespaces
-    /// (incompatible with `--no-namespace`). The prototype supports the
-    /// ptrace and kvm backends and does not yet compose with custom
-    /// `--mount`/`--bind` options.
+    /// (incompatible with `--no-namespace`). Supports the
+    /// ptrace and kvm backends. `--mount` (bind and tmpfs types, with
+    /// `readonly` and bind propagation as in host mode) and `--bind`
+    /// compose with it: their targets are paths inside the image rootfs,
+    /// created there if missing (a target Hermit cannot install there
+    /// refuses by name; a target under an earlier caller mount must
+    /// exist in that mount's content, and symlinks there are followed),
+    /// while the image itself stays read-only.
     #[clap(long, value_name = "OCI-REFERENCE")]
     image: Option<String>,
 
@@ -3013,12 +3277,16 @@ impl fmt::Display for RunOpts {
         for bind in &self.bind {
             let src = bind.source.to_str().expect("valid unicode bind source");
             let tar = bind.target.to_str().expect("valid unicode target");
-            if bind.source == bind.target {
+            let ro = if bind.readonly { ":ro" } else { "" };
+            // The one-path spelling cannot carry `:ro` (the parser takes
+            // an option suffix only after a source:target split), so a
+            // read-only identity bind renders both paths.
+            if bind.source == bind.target && !bind.readonly {
                 write!(f, " --bind={}", shell_words::quote(src))?;
             } else {
                 write!(
                     f,
-                    " --bind={}:{}",
+                    " --bind={}:{}{ro}",
                     shell_words::quote(src),
                     shell_words::quote(tar)
                 )?;
@@ -4918,6 +5186,178 @@ fn a_mount_target_an_earlier_mount_provides_is_not_refused() {
     );
 }
 
+/// A `--bind` target is checked like a `--mount` target: one only an
+/// earlier `--mount` or `--bind` provides is left to container setup,
+/// one in /tmp or at-or-below /dev/shm is created by the container, and
+/// any other missing target is named rather than silently unmounted.
+#[test]
+fn a_bind_target_an_earlier_mount_provides_is_not_refused() {
+    let host = |path: &Path| path == Path::new("/srv/data");
+    let opts = |args: &[&str]| {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend(args);
+        argv.push("/bin/true");
+        run_opts_for(&argv)
+    };
+    let nested = opts(&[
+        "--mount=type=bind,source=/srv/source,target=/srv/data",
+        "--bind=/srv/source:/srv/data/sub",
+    ]);
+    assert_eq!(
+        missing_bind_target(&nested.bind, &nested.mount, true, host),
+        None,
+        "a bind under an earlier --mount is left to container setup"
+    );
+    let alone = opts(&["--bind=/srv/source:/srv/data/sub"]);
+    assert_eq!(
+        missing_bind_target(&alone.bind, &alone.mount, true, host),
+        Some(Path::new("/srv/data/sub")),
+        "a missing general bind target is named, not dropped"
+    );
+    for staged in ["--bind=/srv/source:/tmp/x", "--bind=/srv/source:/dev/shm/x"] {
+        let staged = opts(&[staged]);
+        assert_eq!(
+            missing_bind_target(&staged.bind, &staged.mount, true, host),
+            None,
+            "a bind into the private /tmp or /dev/shm is created there"
+        );
+    }
+    // Below a non-private /dev/shm nothing creates the target, so a
+    // missing one is named, like a --mount's.
+    let below_host_shm = opts(&["--bind=/srv/source:/dev/shm/x"]);
+    assert_eq!(
+        missing_bind_target(&below_host_shm.bind, &below_host_shm.mount, false, host),
+        Some(Path::new("/dev/shm/x")), // patternlint-disable-line no-dev-shm-usage | guest mount-target string in tests of a container runtime; nothing is placed in the host's /dev/shm
+        "below a non-private /dev/shm a missing bind target is named"
+    );
+    let refused = validate_bind_targets(&alone.bind, &alone.mount, true, host)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("--bind target /srv/data/sub does not exist on this host"),
+        "{refused}"
+    );
+}
+
+/// A further docker-style option in a `--bind` target (`:shared`, `:z`)
+/// is refused by name with the `--mount` spelling, while the taken
+/// `:ro`/`:rw` suffixes leave no colon to refuse.
+#[test]
+fn a_bind_target_with_a_further_option_is_refused_by_name() {
+    let refused = refuse_bind_target_with_option(Path::new("/data:shared"))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("--mount type=bind"), "{refused}");
+    let bind: Bind = "source:/data:ro".parse().expect("bind parses");
+    assert!(
+        refuse_bind_target_with_option(bind_paths(&bind).1).is_ok(),
+        "the :ro suffix is an option, not part of the target"
+    );
+    assert!(
+        refuse_bind_target_with_option(Path::new("/tmp/a:b/c")).is_ok(),
+        "a colon in an earlier path component is an ordinary path"
+    );
+}
+
+/// With `--image`, only bind and tmpfs mounts install in the rootfs,
+/// at image-owned absolute targets: other types, the root itself, and
+/// Hermit-managed trees refuse by name.
+#[test]
+fn an_image_mount_is_refused_by_shape() {
+    let mounts = |spec: &str| {
+        run_opts_for(&["hermit", "run", &format!("--mount={spec}"), "/bin/true"]).mount
+    };
+    assert!(validate_image_mounts(&mounts("type=bind,source=/srv,target=/data"), &[]).is_ok());
+    assert!(validate_image_mounts(&mounts("type=tmpfs,target=/scratch"), &[]).is_ok());
+    for (spec, named) in [
+        ("type=volume,target=/data", "type=volume is not supported"),
+        ("type=tmpfs,target=/", "replace the whole OCI rootfs"),
+        ("type=tmpfs,target=/proc/x", "inside /proc"),
+        ("type=tmpfs,target=/dev/shm", "inside /dev"),
+        ("type=tmpfs,target=rel/path", "must be an absolute path"),
+        ("type=tmpfs,target=/a/../b", "must be an absolute path"),
+        ("target=/data", "bind mount with no source"),
+        (
+            "type=tmpfs,target=/.hermit-oci-x/sub",
+            "Hermit's own image files",
+        ),
+    ] {
+        let refused = validate_image_mounts(&mounts(spec), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(named), "{spec}: {refused}");
+    }
+    // The same shape rules cover --bind, the other spelling of a bind.
+    let binds =
+        |spec: &str| run_opts_for(&["hermit", "run", &format!("--bind={spec}"), "/bin/true"]).bind;
+    assert!(validate_image_mounts(&[], &binds("/srv:/data")).is_ok());
+    for (spec, named) in [
+        ("/srv:/", "--bind target / with --image would replace"),
+        ("/srv:/proc", "inside /proc"),
+        ("/srv:/dev/shm", "inside /dev"),
+        ("rel/path", "must be an absolute path"),
+    ] {
+        let refused = validate_image_mounts(&[], &binds(spec))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(named), "{spec}: {refused}");
+        assert!(refused.contains("--bind target"), "{spec}: {refused}");
+    }
+}
+
+/// Preparing a mount target inside a rootfs creates the mountpoint of
+/// the wanted kind, refuses a wrong-kind existing target, and refuses
+/// to follow a symlink out of the root.
+#[test]
+fn an_image_mount_target_is_prepared_inside_the_rootfs() {
+    let rootfs = tempfile::tempdir().expect("rootfs tempdir");
+    let base = rootfs.path();
+    let created = prepare_image_mount_target(
+        base,
+        Path::new("data/sub"),
+        true,
+        Path::new("/data/sub"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing directory target is created");
+    assert!(created.is_dir());
+    let file = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        false,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing file target is created");
+    assert!(file.is_file());
+    let wrong = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        true,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(wrong.contains("exists in the image as a file"), "{wrong}");
+    std::os::unix::fs::symlink("/etc", base.join("link")).expect("symlink in rootfs");
+    let escaped = prepare_image_mount_target(
+        base,
+        Path::new("link/x"),
+        true,
+        Path::new("/link/x"),
+        "--bind",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(escaped.contains("passes through the symlink"), "{escaped}");
+    assert!(escaped.contains("--bind target"), "{escaped}");
+}
+
 /// A `--mount` below `/dev/mqueue`, which the guest's own mqueue filesystem
 /// would cover, is refused as that before its target is looked for on the
 /// host, whose `/dev/mqueue` holds only the host's queues. On a host without
@@ -4932,7 +5372,7 @@ fn a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_lo
     ])
     .mount;
     let dev_mqueue = |path: &Path| path == Path::new("/dev/mqueue");
-    let refused = validate_mount_targets(&mounts, dev_mqueue, dev_mqueue)
+    let refused = refuse_below_private_mqueue(&mounts, &[], dev_mqueue)
         .unwrap_err()
         .to_string();
     assert!(
@@ -4942,13 +5382,133 @@ fn a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_lo
         "{refused}"
     );
     let no_dev_mqueue = |_: &Path| false;
-    let refused = validate_mount_targets(&mounts, no_dev_mqueue, no_dev_mqueue)
+    assert!(refuse_below_private_mqueue(&mounts, &[], no_dev_mqueue).is_ok());
+    let refused = validate_mount_targets(&mounts, no_dev_mqueue)
         .unwrap_err()
         .to_string();
     assert!(
         refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
         "{refused}"
     );
+}
+
+/// The below-mqueue refusal sees both flags together: a cover from
+/// either spelling suppresses the private mqueue for a target below it
+/// from the other, and with no cover a bind below it refuses as a
+/// mount does.
+#[test]
+fn a_bind_below_dev_mqueue_is_decided_with_the_mounts() {
+    let dev_mqueue = |path: &Path| path == Path::new("/dev/mqueue");
+    let opts = |args: &[&str]| {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend(args);
+        argv.push("/bin/true");
+        run_opts_for(&argv)
+    };
+    let mount_covers = opts(&[
+        "--mount=type=bind,source=/srv,target=/dev/mqueue",
+        "--bind=/srv:/dev/mqueue/x",
+    ]);
+    assert!(
+        refuse_below_private_mqueue(&mount_covers.mount, &mount_covers.bind, dev_mqueue).is_ok(),
+        "a --mount at /dev/mqueue covers it for a --bind below"
+    );
+    let bind_covers = opts(&["--bind=/srv:/dev/mqueue", "--bind=/srv:/dev/mqueue/x"]);
+    assert!(
+        refuse_below_private_mqueue(&bind_covers.mount, &bind_covers.bind, dev_mqueue).is_ok(),
+        "a --bind at /dev/mqueue covers it for a --bind below"
+    );
+    let uncovered = opts(&["--bind=/srv:/dev/mqueue/x"]);
+    let refused = refuse_below_private_mqueue(&uncovered.mount, &uncovered.bind, dev_mqueue)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("cannot mount at /dev/mqueue/x"),
+        "{refused}"
+    );
+}
+
+/// A general `--bind` suppresses Hermit's private `/dev/shm` and
+/// `/dev/mqueue` like a `--mount` at the same target (at, or above, via
+/// `/dev` or `/`), instead of being mounted and then covered; and a
+/// bind below a replacement `/dev/shm` installs after the bind that
+/// replaces it.
+#[test]
+fn a_general_bind_suppresses_the_private_dev_shm_and_mqueue() {
+    let tmpfs = tempfile::tempdir().unwrap();
+    let plan_targets = |args: &[&str]| -> Vec<PathBuf> {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend(args);
+        argv.push("/bin/true");
+        run_opts_for(&argv)
+            .mounts(tmpfs.path())
+            .expect("mount plan")
+            .mounts
+            .iter()
+            .map(|planned| planned.mount.get_target().to_path_buf())
+            .collect()
+    };
+    // Baseline: with no covering user mount the private /dev/shm is in
+    // the plan (the host of every supported run has a /dev/shm dir).
+    assert!(
+        plan_targets(&[]).contains(&PathBuf::from("/dev/shm")),
+        "baseline plan mounts the private /dev/shm"
+    );
+    for cover in [
+        "--bind=/srv:/dev/shm",
+        "--bind=/srv:/dev",
+        "--bind=/srv:/",
+        "--mount=type=bind,source=/srv,target=/dev",
+    ] {
+        let targets = plan_targets(&[cover]);
+        // Exactly the caller's own mount names the covered path; the
+        // private tmpfs at /dev/shm is not also planned after it.
+        let shm_at = targets.iter().position(|t| t == Path::new("/dev/shm"));
+        let cover_target = cover.rsplit('=').next().unwrap_or_default();
+        let cover_target = cover_target
+            .rsplit(':')
+            .next()
+            .unwrap_or(cover_target)
+            .trim_start_matches("target=");
+        if cover_target == "/dev/shm" {
+            assert_eq!(
+                targets
+                    .iter()
+                    .filter(|t| *t == Path::new("/dev/shm"))
+                    .count(),
+                1,
+                "{cover}: only the caller's bind mounts /dev/shm: {targets:?}"
+            );
+        } else {
+            assert!(
+                shm_at.is_none(),
+                "{cover}: the private /dev/shm must be suppressed: {targets:?}"
+            );
+        }
+    }
+    for cover in ["--bind=/srv:/dev/mqueue", "--bind=/srv:/dev"] {
+        let targets = plan_targets(&[cover]);
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|t| *t == Path::new("/dev/mqueue"))
+                .count(),
+            usize::from(cover.ends_with("/dev/mqueue")),
+            "{cover}: the private /dev/mqueue must be suppressed: {targets:?}"
+        );
+    }
+    // Ordering: the replacement /dev/shm bind installs before a bind
+    // below it, so the descendant lands in the caller's directory.
+    let targets = plan_targets(&["--bind=/srv:/dev/shm", "--bind=/srv:/dev/shm/x"]);
+    let shm = targets
+        .iter()
+        .position(|t| t == Path::new("/dev/shm"))
+        .expect("replacement shm bind planned");
+    let below = targets
+        .iter()
+        .position(|t| t == Path::new("/dev/shm/x")) // patternlint-disable-line no-dev-shm-usage | guest mount-target string in tests of a container runtime; nothing is placed in the host's /dev/shm
+        .expect("below-shm bind planned");
+    assert!(shm < below, "replacement precedes descendant: {targets:?}");
 }
 
 #[test]
@@ -10932,7 +11492,7 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Resolve a guest program path to an absolute path *inside the image rootfs*,
-/// mirroring execve(2) pathname resolution for the `--image` prototype:
+/// mirroring execve(2) pathname resolution for `--image`:
 ///
 ///   * an absolute path is used as-is;
 ///   * a relative path that contains a `/` (e.g. `./bin/sh`, `bin/busybox`) is
@@ -13911,11 +14471,8 @@ impl RunOpts {
         if self.image.is_some() && self.namespace_only {
             anyhow::bail!("--image cannot be combined with --namespace-only");
         }
-        if self.image.is_some() && !self.mount.is_empty() {
-            anyhow::bail!(
-                "--image does not yet compose with custom --mount targets inside the OCI rootfs; \
-                 use --bind <HOST-DIR>:<GUEST-DIR> for a work directory"
-            );
+        if self.image.is_some() {
+            validate_image_mounts(&self.mount, &self.bind)?;
         }
 
         // What the command line asked for, before the modes below that force
@@ -14129,7 +14686,7 @@ impl RunOpts {
             if self.image.is_some() {
                 anyhow::bail!(
                     "--work-span-report={report} is written from inside the run container, and \
-                     --image (a prototype) replaces its root, so the report would be lost"
+                     --image replaces its root, so the report would be lost"
                 );
             }
             if !matches!(backend, Backend::Ptrace) {
@@ -14244,7 +14801,7 @@ impl RunOpts {
             if self.image.is_some() {
                 anyhow::bail!(
                     "--record-access-trace-to={trace} is written from inside the run container, \
-                     and --image (a prototype) replaces its root, so the trace would be lost; drop \
+                     and --image replaces its root, so the trace would be lost; drop \
                      --image, or drop --record-access-trace-to"
                 );
             }
@@ -14901,7 +15458,31 @@ impl RunOpts {
                 );
             }
         }
-        validate_mount_targets(&self.mount, Path::exists, Path::is_dir)
+        // With `--image`, `--mount` targets name paths inside the OCI
+        // rootfs: their shape is checked by `validate_image_mounts` and
+        // their existence against the materialized rootfs when the
+        // container is built, not against the host here.
+        if self.image.is_none() {
+            refuse_below_private_mqueue(&self.mount, &self.bind, Path::is_dir)?;
+            validate_mount_targets(&self.mount, Path::exists)?;
+        }
+        // `--bind` targets are guest paths on the same footing as
+        // `--mount` targets. With `--image` they name paths inside the
+        // OCI rootfs, not the host, so the host-rooted checks below do
+        // not apply (the image container creates the target in the
+        // rootfs, and refuses what it cannot).
+        for bind in &self.bind {
+            refuse_bind_target_with_option(bind_paths(bind).1)?;
+        }
+        if self.image.is_none() {
+            validate_bind_targets(
+                &self.bind,
+                &self.mount,
+                self.has_private_dev_shm(),
+                Path::exists,
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_executable_overlay_mount_targets(&self) -> Result<(), Error> {
@@ -14982,7 +15563,8 @@ impl RunOpts {
     fn mapped_host_program(&self, program: &Path) -> GuestPathMapping {
         let private_dev_shm = self.has_private_dev_shm();
         for bind in self.bind.iter().rev() {
-            if !bind_is_applied(bind, private_dev_shm) {
+            // `--bind /dev/shm` mounts nothing, so it maps no program.
+            if keeps_host_dev_shm(bind) {
                 continue;
             }
             let (source, target) = bind_paths(bind);
@@ -15421,8 +16003,8 @@ impl RunOpts {
     /// not its name, so a relative summary reaches the host directory even
     /// when that directory is under `/tmp`. Modes that never write the summary
     /// are not refused: DBT, `--namespace-only` and `--hb-list-events` (checked
-    /// earlier). `--no-namespace` has no private mounts, and `--image` (a
-    /// prototype) replaces the whole root, which this mapping does not model.
+    /// earlier). `--no-namespace` has no private mounts, and `--image`
+    /// replaces the whole root, which this mapping does not model.
     fn validate_summary_json_visibility(&self) -> Result<(), Error> {
         if self.namespace_only || self.image.is_some() {
             return Ok(());
@@ -15556,7 +16138,7 @@ impl RunOpts {
     /// checks it: its host path, the path as the command names it, and the
     /// image rootfs it resolves in, if any.
     fn guest_program_on_host(&self) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
-        // PROTOTYPE (--image): the guest program is interpreted inside the
+        // With --image, the guest program is interpreted inside the
         // materialized OCI rootfs, not on the host filesystem. Resolve and
         // validate it against the rootfs so that image-only binaries (e.g.
         // busybox's `/bin/busybox`, absent from the host) are accepted, and so
@@ -17864,14 +18446,13 @@ impl RunOpts {
         Ok(status)
     }
 
-    /// The `--bind`s the DBT adapter checks, as (source, target) pairs: those
-    /// [`Self::mounts`] applies for every backend ([`bind_is_applied`]).
-    /// It warns about any other bind, which has no effect.
+    /// The `--bind`s the DBT adapter checks, as (source, target) pairs:
+    /// every bind [`Self::mounts`] applies, which is all of them except
+    /// `--bind /dev/shm` (it mounts nothing; it keeps the host's shm).
     pub(super) fn adapter_binds(&self) -> Vec<(PathBuf, PathBuf)> {
-        let private_dev_shm = self.has_private_dev_shm();
         self.bind
             .iter()
-            .filter(|bind| bind_is_applied(bind, private_dev_shm))
+            .filter(|bind| !keeps_host_dev_shm(bind))
             .map(|bind| {
                 let (source, target) = bind_paths(bind);
                 (source.to_path_buf(), target.to_path_buf())
@@ -17970,12 +18551,20 @@ impl RunOpts {
     /// The guest paths at which the caller's mounts can cover `/dev/shm`:
     /// every `--mount` target, and a `--bind` at `/dev/shm` itself.
     fn dev_shm_covering_targets(&self) -> impl Iterator<Item = &Path> {
-        self.mount.iter().map(|arg| arg.mount.get_target()).chain(
-            self.bind
-                .iter()
-                .map(|bind| bind_paths(bind).1)
-                .filter(|target| is_dev_shm(target)),
-        )
+        // Every caller target, mount or bind: a bind at /dev or / covers
+        // /dev/shm just as a mount there does, and must suppress the
+        // private one rather than be mounted under it.
+        self.mount
+            .iter()
+            .map(|arg| arg.mount.get_target())
+            .chain(self.bind.iter().map(|bind| bind_paths(bind).1))
+    }
+
+    /// Every caller mount and bind target, for the private-mqueue
+    /// suppression and below-mqueue refusal, which must see both flags'
+    /// targets or a bind can be mounted and then silently covered.
+    fn user_mount_targets(&self) -> Vec<&Path> {
+        self.dev_shm_covering_targets().collect()
     }
 
     /// Whether the guest's `/dev/shm` is the container's private one
@@ -18139,33 +18728,44 @@ impl RunOpts {
 
         for (index, bind) in self.bind.iter().enumerate() {
             let backend = index >= backend_binds_from;
-            let mount = Mount::from(bind.clone()).rshared();
+            // `--bind /dev/shm` mounts nothing: it keeps the host's
+            // `/dev/shm` by suppressing the private one.
+            if keeps_host_dev_shm(bind) {
+                continue;
+            }
+            let mount = Mount::from(bind.clone());
 
-            // Bind mounts only make sense in the directories the container
-            // replaces: `/tmp`, staged in the private tmp directory, and
-            // `/dev/shm`, whose private tmpfs they go into.
-            if !bind_is_applied(bind, dev_shm.is_some()) {
-                if !keeps_host_dev_shm(bind) {
-                    warn_unapplied_bind(bind);
-                }
-            } else if let Ok(relative_path) = mount.get_target().strip_prefix(TMP_DIR) {
-                // Discard provenance only for a bind we actually retain. An
-                // ignored outside-/tmp bind must not suppress the real
-                // identity-hardening mount at that target.
+            // A `--bind` is a general bind mount (the `--mount type=bind`
+            // shorthand). Two targets are staged through directories the
+            // container replaces -- `/tmp` through the private tmp
+            // directory, and below the private `/dev/shm` into it -- with
+            // those internal mounts keeping the shared propagation the
+            // staging needs. Every other target is mounted as a
+            // `--mount` bind is: recursive, private propagation.
+            if let Ok(relative_path) = mount.get_target().strip_prefix(TMP_DIR) {
                 explicit_tmp_mount |= relative_path.as_os_str().is_empty();
                 identity_sources
                     .discard_mounts_shadowed_by(&mut identity_mounts, mount.get_target());
                 let target = tmpfs.join(relative_path);
                 identity_sources.add_user_bind(mount.get_target(), Some(&target));
-                user_mounts.push(planned(mount.target(target).touch_target(), backend));
+                user_mounts.push(planned(
+                    mount.rshared().target(target).touch_target(),
+                    backend,
+                ));
             } else if is_dev_shm(mount.get_target()) {
                 // Another host directory as the guest's `/dev/shm`.
                 identity_sources.add_user_bind(mount.get_target(), None);
-                user_mounts.push(planned(mount, backend));
-            } else {
+                user_mounts.push(planned(mount.rshared(), backend));
+            } else if is_below_dev_shm(mount.get_target()) && dev_shm.is_some() {
+                let mount = mount.rshared();
                 refuse_into_dev_shm(&mount)?;
                 identity_sources.add_user_bind(mount.get_target(), None);
                 into_dev_shm.push(planned(mount.touch_target(), backend));
+            } else {
+                identity_sources
+                    .discard_mounts_shadowed_by(&mut identity_mounts, mount.get_target());
+                identity_sources.add_user_bind(mount.get_target(), None);
+                user_mounts.push(planned(mount.rprivate(), backend));
             }
         }
 
@@ -18233,8 +18833,7 @@ impl RunOpts {
         mounts.extend(into_dev_shm);
         mounts.extend(private_tmp);
         mounts.extend(
-            private_mqueue(self.mount.iter().map(|arg| arg.mount.get_target()))?
-                .map(PlannedMount::hermit),
+            private_mqueue(self.user_mount_targets().into_iter())?.map(PlannedMount::hermit),
         );
 
         Ok(PreparedMounts {
@@ -18287,7 +18886,7 @@ impl RunOpts {
     /// table (`IdentityGuard::record_plan`). A native exec domain's container
     /// follows the plan with its declared-input mounts, and has no table.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
-        // PROTOTYPE: when an OCI image is requested, the guest runs against the
+        // When an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
         // with a chroot into the pinned image root.
@@ -18298,7 +18897,7 @@ impl RunOpts {
         let mounts_placeholder = self.mounts_directory_placeholder();
         if let Some(image) = &self.image {
             let rootfs = crate::app::image::materialize_rootfs(image)?;
-            let workdir_binds: Vec<(PathBuf, PathBuf)> = self
+            let workdir_binds: Vec<(PathBuf, PathBuf, bool)> = self
                 .bind
                 .iter()
                 .map(|bind| {
@@ -18310,14 +18909,82 @@ impl RunOpts {
                         PathBuf::from(std::ffi::OsString::from_vec(
                             bind.target.as_bytes().to_vec(),
                         )),
+                        bind.readonly,
                     )
                 })
                 .collect();
-            for (_, target) in &workdir_binds {
+            for (source, target, _) in &workdir_binds {
                 let rel = target.strip_prefix("/").unwrap_or(target);
-                let _ = std::fs::create_dir_all(rootfs.join(rel));
+                let want_dir = source.is_dir();
+                // A target under /tmp is prepared in the private /tmp
+                // staging, bound at the rootfs's /tmp before the binds:
+                // a mountpoint created in the cache's tmp would be
+                // hidden under that bind.
+                if let Ok(under_tmp) = target.strip_prefix(TMP_DIR) {
+                    prepare_image_mount_target(
+                        tmpfs,
+                        under_tmp,
+                        want_dir,
+                        target,
+                        "--bind",
+                        "the guest's private /tmp",
+                    )?;
+                } else {
+                    prepare_image_mount_target(
+                        &rootfs,
+                        rel,
+                        want_dir,
+                        target,
+                        "--bind",
+                        "the image rootfs",
+                    )?;
+                }
             }
-            let (mut container, identity_sources) = image_container(
+            // The caller's `--mount`s, retargeted into the rootfs. A
+            // target under /tmp is prepared in the private /tmp staging
+            // (bound at the rootfs's /tmp before these mounts, so the
+            // pre-chroot path resolves there); one under an earlier
+            // user mount is left to container setup, as in host mode.
+            let mut image_mounts: Vec<Mount> = Vec::with_capacity(self.mount.len());
+            for (index, mount) in self.mount.iter().enumerate() {
+                let target = mount.get_target().to_path_buf();
+                let rel = target.strip_prefix("/").unwrap_or(&target).to_path_buf();
+                let under_earlier = self.mount[..index]
+                    .iter()
+                    .any(|earlier| target.starts_with(earlier.get_target()))
+                    || workdir_binds
+                        .iter()
+                        .any(|(_, bind_target, _)| target.starts_with(bind_target));
+                if !under_earlier {
+                    let want_dir = match image_mount_kind(mount)? {
+                        ImageMountKind::Tmpfs => true,
+                        ImageMountKind::Bind => {
+                            mount.get_source().is_some_and(|source| source.is_dir())
+                        }
+                    };
+                    if let Ok(under_tmp) = target.strip_prefix(TMP_DIR) {
+                        prepare_image_mount_target(
+                            tmpfs,
+                            under_tmp,
+                            want_dir,
+                            &target,
+                            "--mount",
+                            "the guest's private /tmp",
+                        )?;
+                    } else {
+                        prepare_image_mount_target(
+                            &rootfs,
+                            &rel,
+                            want_dir,
+                            &target,
+                            "--mount",
+                            "the image rootfs",
+                        )?;
+                    }
+                }
+                image_mounts.push(mount.mount.clone().target(rootfs.join(&rel)));
+            }
+            let (mut container, mut identity_sources) = image_container(
                 &rootfs,
                 tmpfs,
                 self.pin_threads,
@@ -18327,8 +18994,26 @@ impl RunOpts {
                 crate::app::container::ImageContainerOpts {
                     bind_kvm: self.runtime_backend() == Backend::Kvm,
                     workdir_binds: &workdir_binds,
+                    mounts: &image_mounts,
                 },
             )?;
+            // Deterministic mountinfo roots for the caller's binds, as
+            // in host mode: without these the guest's mount table shows
+            // each bind source's host subpath as its root, and a user
+            // tmpfs row shows the host uid/gid in its superblock
+            // options (measured; both vary by host for one command
+            // line).
+            for (_, target, _) in &workdir_binds {
+                identity_sources.add_user_bind(target, None);
+            }
+            for mount in &self.mount {
+                match image_mount_kind(mount)? {
+                    ImageMountKind::Bind => {
+                        identity_sources.add_user_bind(mount.get_target(), None)
+                    }
+                    ImageMountKind::Tmpfs => identity_sources.add_user_tmpfs(mount.get_target()),
+                }
+            }
             self.network
                 .configure(&mut container, self.analyze_networking);
             return Ok((container, identity_sources));
@@ -18556,7 +19241,7 @@ impl RunOpts {
         if self.prepared_program.is_some() {
             command.arg0(self.program_path());
         }
-        // PROTOTYPE (--image): the guest lives inside the OCI rootfs, so the
+        // With --image, the guest lives inside the OCI rootfs, so the
         // guest working directory must be one that exists under the image root.
         // Default it to the image's declared `WorkingDir`, else `/` (a bare
         // chroot leaves cwd pointing at the — now unreachable — host cwd, which
@@ -18568,7 +19253,7 @@ impl RunOpts {
             command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
         }
 
-        // PROTOTYPE (--image): an OCI rootfs is a self-contained filesystem, so
+        // With --image, an OCI rootfs is a self-contained filesystem, so
         // leaking the host environment (a host `PATH` full of paths absent from
         // the image) both breaks usability and undermines determinism. Instead
         // start from the `--base-env=minimal` defaults, apply the image's *own*

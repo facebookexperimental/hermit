@@ -638,6 +638,10 @@ pub(super) struct IdentityGuard {
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
     user_binds: Vec<UserBind>,
+    /// Guest targets of the caller's fresh tmpfs mounts in an image
+    /// root, whose superblock options are shown as root's (no host
+    /// uid/gid), like a recorded plan's fresh mounts.
+    user_tmpfs_targets: Vec<PathBuf>,
     /// The host's mount table before setup, as (mountpoint, root, device):
     /// the guest's copies of these rows are not any user bind's.
     host_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
@@ -731,6 +735,7 @@ impl IdentityGuard {
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
+            user_tmpfs_targets: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
             directory_placeholder: None,
@@ -991,13 +996,21 @@ impl IdentityGuard {
                     .map(|row| row.raw_mount_id)
                     .filter(|id| !placeholder.contains(id))
                     .collect();
-                // No fresh mount of the plan here: an image root records none.
-                (
-                    current,
-                    installed,
-                    placeholder,
-                    std::collections::BTreeSet::new(),
-                )
+                // The caller's fresh tmpfs mounts, by guest target:
+                // their superblock options lose the host uid/gid below,
+                // like a recorded plan's fresh mounts.
+                let fresh = current
+                    .iter()
+                    .filter(|row| {
+                        row.fstype.as_slice() == b"tmpfs"
+                            && self
+                                .user_tmpfs_targets
+                                .iter()
+                                .any(|target| row.mountpoint == mountinfo_escape_path(target))
+                    })
+                    .map(|row| row.raw_mount_id)
+                    .collect();
+                (current, installed, placeholder, fresh)
             }
         };
         for row in &mut rows {
@@ -1028,6 +1041,12 @@ impl IdentityGuard {
     /// Show a user's bind at guest path `target` (staged at `staging` for a
     /// bind under `/tmp`) with the target as its mountinfo root
     /// ([`UserBind`]).
+    /// Record a caller tmpfs at guest `target` in an image root, so its
+    /// row's superblock options are stripped of the host uid/gid.
+    pub(super) fn add_user_tmpfs(&mut self, target: &Path) {
+        self.user_tmpfs_targets.push(target.to_path_buf());
+    }
+
     pub(super) fn add_user_bind(&mut self, target: &Path, staging: Option<&Path>) {
         if self.user_binds.is_empty() {
             match mount_rows() {
@@ -1494,6 +1513,7 @@ pub(super) fn identity_hardening_mounts_on(
             mountinfo_roots,
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
+            user_tmpfs_targets: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
             directory_placeholder: None,
@@ -1756,7 +1776,7 @@ fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
         .join(&b',')
 }
 
-/// PROTOTYPE: a container whose root filesystem is a materialized OCI image
+/// A container whose root filesystem is a materialized OCI image
 /// rootfs. This is the *filesystem half* of hermit-as-container-runtime: the
 /// guest's file inputs come deterministically from the pinned image rather than
 /// from the host filesystem.
@@ -1778,7 +1798,11 @@ fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
 /// Backend/device and caller-bind choices for [`image_container`].
 pub(super) struct ImageContainerOpts<'a> {
     pub bind_kvm: bool,
-    pub workdir_binds: &'a [(PathBuf, PathBuf)],
+    /// Caller binds as (source, guest target, read-only).
+    pub workdir_binds: &'a [(PathBuf, PathBuf, bool)],
+    /// Caller `--mount`s, already retargeted to their pre-chroot paths
+    /// inside the rootfs.
+    pub mounts: &'a [Mount],
 }
 
 pub(super) fn image_container(
@@ -1816,9 +1840,17 @@ pub(super) fn image_container(
     // Caller work directories (--bind HOST:GUEST with --image): bound after
     // the read-only root so the guest can read/write its test workdir while
     // the image itself stays immutable. Targets are guest-absolute paths.
-    for (source, target) in opts.workdir_binds {
+    for (source, target, readonly) in opts.workdir_binds {
         let rel = target.strip_prefix("/").unwrap_or(target);
-        container.mount(Mount::bind(source, rootfs.join(rel)));
+        let mount = Mount::bind(source, rootfs.join(rel));
+        container.mount(if *readonly { mount.readonly() } else { mount });
+    }
+    // Caller --mounts (bind and tmpfs, targets already inside the
+    // rootfs), in the caller's order so a later mount can layer over an
+    // earlier one, after the read-only root, the private /tmp, and the
+    // --bind work directories, and before Hermit's own /proc and /dev.
+    for mount in opts.mounts {
+        container.mount(mount.clone());
     }
 
     // Mount the deterministic /proc into the target root. The materializer
@@ -6564,6 +6596,7 @@ mod tests {
                     ImageContainerOpts {
                         bind_kvm: false,
                         workdir_binds: &[],
+                        mounts: &[],
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -6634,6 +6667,7 @@ mod tests {
                     ImageContainerOpts {
                         bind_kvm: false,
                         workdir_binds: &[],
+                        mounts: &[],
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -7124,6 +7158,7 @@ mod tests {
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
+            user_tmpfs_targets: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
             directory_placeholder: None,
@@ -7166,6 +7201,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with generated tmp");
@@ -7181,6 +7217,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with user tmp");
@@ -7223,6 +7260,7 @@ mod tests {
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
+            user_tmpfs_targets: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
             directory_placeholder: None,
