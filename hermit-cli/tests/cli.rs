@@ -547,6 +547,43 @@ fn hermit(args: &[&str]) -> Output {
     hermit_test::hermit_output(&format!("hermit {args:?}"), &mut hermit_command(args))
 }
 
+/// Whether the hermit binary under test was built with the `liteinst`
+/// feature, asked of the binary itself. The probe run carries no
+/// explicit maximum — an explicit one is refused by policy in every
+/// build, before the backend check — so with an inherited maximum a
+/// build with the backend refuses by policy for the in-guest
+/// preemption timer (exit [`HERMIT_POLICY_REFUSAL_EXIT`], reason
+/// "pass --max-timeslice=disabled"), and a build without it refuses as
+/// backend-unavailable (exit [`HERMIT_INTERNAL_FAILURE_EXIT`],
+/// "compiled without the liteinst backend"), which is checked first.
+/// Any other outcome — a run that starts, a different refusal, a spawn
+/// failure — panics: the test binary's own `cfg!(feature = "liteinst")`
+/// says nothing about the hermit binary, whose features its build
+/// chooses independently, so the cases that assert a build's refusal
+/// ask here and accept no third answer.
+fn hermit_has_liteinst() -> bool {
+    static HAS_LITEINST: OnceLock<bool> = OnceLock::new();
+    *HAS_LITEINST.get_or_init(|| {
+        let output = hermit(&["--backend", "liteinst", "run", "--", "/bin/true"]);
+        let stderr = stderr(&output);
+        if output.status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT)
+            && stderr.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable")
+            && stderr.contains("compiled without the liteinst backend")
+        {
+            false
+        } else if output.status.code() == Some(HERMIT_POLICY_REFUSAL_EXIT)
+            && stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && stderr.contains("pass --max-timeslice=disabled")
+        {
+            true
+        } else {
+            panic!(
+                "the liteinst probe run gave no recognised refusal: {output:?}"
+            )
+        }
+    })
+}
+
 fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
     hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
@@ -19400,11 +19437,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     );
 }
 
-/// A build without the `liteinst` feature has no LiteInst backend, so
-/// `--backend liteinst` must refuse before any guest runs and say which build
-/// flag is missing -- not fall back to another backend, and not blame the host.
+/// `--backend liteinst` must refuse before any guest runs, for the
+/// reason that matches the hermit binary's own build (asked of the
+/// binary, [`hermit_has_liteinst`]): a build without the `liteinst`
+/// feature has no LiteInst backend and must say which build flag is
+/// missing -- not fall back to another backend, and not blame the host;
+/// a build with it refuses for the in-guest preemption timer, by policy.
 #[test]
-#[cfg(not(feature = "liteinst"))]
 fn run_liteinst_without_the_feature_refuses_and_names_the_flag() {
     let args = [
         "--backend",
@@ -19418,14 +19457,39 @@ fn run_liteinst_without_the_feature_refuses_and_names_the_flag() {
     let output = hermit(&args);
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("this build was compiled without the liteinst backend"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("--features liteinst"), "{stderr}");
+    if hermit_has_liteinst() {
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{output:?}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("pass --max-timeslice=disabled"),
+            "{stderr}"
+        );
+    } else {
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "{output:?}"
+        );
+        assert!(
+            stderr.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("this build was compiled without the liteinst backend"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--features liteinst"), "{stderr}");
+    }
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("liteinst-guest-ran"),
-        "the guest must not run under a backend this build does not have: {output:?}"
+        "the guest must not run when the run is refused: {output:?}"
     );
 }
 
@@ -45968,7 +46032,7 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
             .read_to_string(&mut stderr)
             .expect("cannot read hermit's stderr");
 
-        let (exit, class, reason) = if maximum.is_some() || cfg!(feature = "liteinst") {
+        let (exit, class, reason) = if maximum.is_some() || hermit_has_liteinst() {
             (
                 HERMIT_POLICY_REFUSAL_EXIT,
                 "HERMIT_POLICY_REFUSAL class=policy-refusal",
