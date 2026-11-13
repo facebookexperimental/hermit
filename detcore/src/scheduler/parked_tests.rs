@@ -69,6 +69,8 @@ struct Backend {
     permits: Mutex<Vec<SignalDeliveryPermit>>,
     /// Whether the Tool opted in to orphan placement.
     orphan_placement_enabled: std::sync::atomic::AtomicBool,
+    /// Whether the Tool opted in to guest signals to other processes.
+    cross_process_signals_enabled: std::sync::atomic::AtomicBool,
     /// Every `place_orphans` call, in order.
     placements: Mutex<Vec<(SignalProcessId, Vec<OrphanPlacement>)>>,
     /// Reapers that reap their children automatically in the backend's
@@ -232,6 +234,11 @@ impl ProcessSignalControl for Backend {
     }
     fn enable_orphan_placement(&self) -> Result<(), reverie::Errno> {
         self.orphan_placement_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn enable_cross_process_signals(&self) -> Result<(), reverie::Errno> {
+        self.cross_process_signals_enabled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
@@ -8619,7 +8626,8 @@ fn a_fresh_timer_publication_replaces_a_stale_identical_entry() {
 /// A scheduler for a backend that also places orphans where Detcore names
 /// and publishes the parent-death signals Detcore decides (KVM's
 /// `places_orphans` and `publishable_parent_death_signals`), with its control
-/// installed. Installing it opts in to the placement.
+/// installed. Installing it opts in to the placement, and to guest signals to
+/// other processes, which Detcore admits (`Scheduler::guest_send_admission`).
 fn placing_fixture() -> (Scheduler, Arc<Backend>) {
     let mut s = Scheduler::new(&Config {
         sequentialize_threads: true,
@@ -8646,6 +8654,11 @@ fn placing_fixture() -> (Scheduler, Arc<Backend>) {
     assert!(
         backend
             .orphan_placement_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(
+        backend
+            .cross_process_signals_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     );
     (s, backend)

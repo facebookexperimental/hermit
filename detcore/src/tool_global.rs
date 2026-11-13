@@ -117,6 +117,8 @@ use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
+use crate::scheduler::guest_send_admission::SendAdmission;
+use crate::scheduler::guest_send_admission::SendScope;
 use crate::scheduler::parked::*;
 use crate::scheduler::process_signal_receiver::ProcessSignalReceiver;
 use crate::scheduler::real_timer::DequeueAck;
@@ -5486,6 +5488,19 @@ impl GlobalState {
                     .process_signal_sent(dtid, process);
                 R::ProcessSignalSent(())
             }
+            GlobalRequest::GuestSendAdmission(process, named, scope, signo) => {
+                R::GuestSendAdmission(
+                    self.lock_rpc_scheduler(false)
+                        .await
+                        .guest_send_admission(dtid, process, named, scope, signo),
+                )
+            }
+            GlobalRequest::GuestSendCommitted(receiver, scope, signo) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .guest_send_committed(receiver, scope, signo);
+                R::GuestSendCommitted(())
+            }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -8599,8 +8614,12 @@ pub enum SignalScope {
 /// the append rule above does not cover them (finding 1 of rev5338-cx's
 /// review of 29b3e6a8, finding 2 of coord7's; 56 on its first rebase, 57 at
 /// its rebase onto main's 56, where https://github.com/rrnewton/hermit/pull/5259
-/// had taken 56); it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 57;
+/// had taken 56). 58 adds `GuestSendAdmission` and `GuestSendCommitted`, the
+/// admission of a guest's signal to another process where the backend keeps
+/// the guest's signal queues (stage X1 slice C of the KVM cross-process
+/// signal design, https://github.com/rrnewton/hermit/issues/4485); it is
+/// current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 58;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8876,6 +8895,16 @@ pub enum GlobalRequest {
     /// whose receiver the scheduler chose, succeeded
     /// (`Scheduler::process_signal_sent`).
     ProcessSignalSent(DetPid),
+
+    /// Whether the calling thread's send of this signal, naming this task of
+    /// this process (or of its own process when `None`) in this scope, may
+    /// go to a backend that keeps its own signal queues
+    /// (`Scheduler::guest_send_admission`).
+    GuestSendAdmission(Option<DetPid>, DetTid, SendScope, i32),
+
+    /// The calling thread's admitted send of this signal in this scope, which
+    /// this thread is to take, succeeded (`Scheduler::guest_send_committed`).
+    GuestSendCommitted(DetTid, SendScope, i32),
 
     /// The calling thread is about to forward a send of this signal to its own
     /// process, naming this task, that Linux gives to it
@@ -9714,6 +9743,8 @@ pub enum GlobalResponse {
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     ProcessSignalReceiver(ProcessSignalReceiver),
     ProcessSignalSent(()),
+    GuestSendAdmission(SendAdmission),
+    GuestSendCommitted(()),
     OwnProcessSignalChoice(()),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
@@ -11004,6 +11035,56 @@ where
     {
         GlobalResponse::ProcessSignalSent(()) => {}
         response => unreachable!("unexpected response to ProcessSignalSent: {response:?}"),
+    }
+}
+
+/// Whether the calling thread's send of `signo`, naming `named` of
+/// `process` (`None`: `named`'s own) in `scope`, may go to a backend that
+/// keeps its own signal queues, decided in its turn before any effect
+/// (`Scheduler::guest_send_admission`).
+pub(crate) async fn guest_send_admission<G, T>(
+    guest: &mut G,
+    process: Option<DetPid>,
+    named: DetTid,
+    scope: SendScope,
+    signo: i32,
+) -> SendAdmission
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::GuestSendAdmission(process, named, scope, signo),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::GuestSendAdmission(admission) => admission,
+        response => unreachable!("unexpected response to GuestSendAdmission: {response:?}"),
+    }
+}
+
+/// The calling thread's admitted send of `signo` in `scope`, which
+/// `receiver` is to take, succeeded (`Scheduler::guest_send_committed`).
+pub(crate) async fn guest_send_committed<G, T>(
+    guest: &mut G,
+    receiver: DetTid,
+    scope: SendScope,
+    signo: i32,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::GuestSendCommitted(receiver, scope, signo),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::GuestSendCommitted(()) => {}
+        response => unreachable!("unexpected response to GuestSendCommitted: {response:?}"),
     }
 }
 

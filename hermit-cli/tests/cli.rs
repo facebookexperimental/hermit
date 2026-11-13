@@ -1423,6 +1423,34 @@ fn signal_targets_not_live_guest() -> &'static Path {
     })
 }
 
+static CROSS_PROCESS_SIGNAL_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn cross_process_signal_admission_guest() -> &'static Path {
+    CROSS_PROCESS_SIGNAL_ADMISSION_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("cross-process-signal-admission");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create cross-process-signal-admission guest directory");
+        let guest = build_root.join("cross_process_signal_admission");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/cross_process_signal_admission.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile cross-process-signal-admission guest");
+        assert!(
+            output.status.success(),
+            "cross-process-signal-admission guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 static ROBUST_FUTEX_UNEXCHANGEABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn robust_futex_unexchangeable_word_guest() -> &'static Path {
@@ -25513,13 +25541,521 @@ fn signals_to_targets_that_are_not_live_answer_as_on_linux() {
     }
 }
 
+/// The sends of tests/c/cross_process_signal_admission.c to a runnable
+/// child, by each of the seven sending calls, in three groups by kind of
+/// call (see `assert_admitted_sends_match_linux`). The calls that name a
+/// signal number only.
+const SENDS_BY_KILL_TGKILL_OR_TKILL: [(&str, &str); 3] = [
+    ("runnable", "kill"),
+    ("runnable", "tgkill"),
+    ("runnable", "tkill"),
+];
+
+/// The calls that also queue a `siginfo` (see `SENDS_BY_KILL_TGKILL_OR_TKILL`).
+const SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE: [(&str, &str); 2] =
+    [("runnable", "sigqueue"), ("runnable", "tgsigqueue")];
+
+/// The calls through a pidfd (see `SENDS_BY_KILL_TGKILL_OR_TKILL`).
+const SENDS_BY_PIDFD: [(&str, &str); 2] = [("runnable", "pidfd"), ("runnable", "pidfd-thread")];
+
+/// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
+/// `tgkill`, to a child that ignores the signal or waits for it, by `kill`
+/// to a child whose two threads both wait in `sigsuspend`, and by `kill` to
+/// a child alone in the raw `select` system call.
+const SENDS_KVM_ADMITS: [(&str, &str); 12] = [
+    ("ignored", "kill"),
+    ("ignored", "tgkill"),
+    ("select", "kill"),
+    ("select", "tgkill"),
+    ("pselect", "kill"),
+    ("pselect", "tgkill"),
+    ("sigsuspend", "kill"),
+    ("sigsuspend", "tgkill"),
+    ("sigtimedwait", "kill"),
+    ("sigtimedwait", "tgkill"),
+    ("sigsuspend-two", "kill"),
+    ("select-raw", "kill"),
+];
+
+/// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
+/// `tgkill`, across a wait, a new thread or an exec.
+const SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC: [(&str, &str); 8] = [
+    ("waitfatal", "kill"),
+    ("waitfatal", "tgkill"),
+    ("recv", "kill"),
+    ("recv", "tgkill"),
+    ("newthread", "kill"),
+    ("newthread", "tgkill"),
+    ("exec", "kill"),
+    ("exec", "tgkill"),
+];
+
+/// tests/c/cross_process_signal_admission.c: a caught SIGUSR1 from a parent
+/// to its runnable child reaches the child once, with the sender's tgid and
+/// the `si_code` of the sending call, here `kill`, `tgkill` and `tkill`
+/// (`SENDS_BY_KILL_TGKILL_OR_TKILL`). On ptrace the kernel delivers it,
+/// matching the native run. The KVM twin is
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
+#[test]
+fn guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_KILL_TGKILL_OR_TKILL,
+    );
+}
+
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux` on
+/// KVM, where Detcore admits each send in the sender's turn, as stage X1
+/// slice C of the KVM cross-process signal design has it
+/// (https://github.com/rrnewton/hermit/issues/4485), and orders its delivery,
+/// with no refusal, matching the native run, and each run verified bitwise.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_KILL_TGKILL_OR_TKILL,
+    );
+}
+
+/// As `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`,
+/// by `rt_sigqueueinfo` and `rt_tgsigqueueinfo` (`SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE`).
+#[test]
+fn guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE,
+    );
+}
+
+/// `guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux`
+/// on KVM, as in
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_SIGQUEUE_OR_TGSIGQUEUE,
+    );
+}
+
+/// As `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`,
+/// by `pidfd_send_signal` to the process and to its thread (`SENDS_BY_PIDFD`).
+#[test]
+fn guest_signals_to_another_process_by_pidfd_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_by_pidfd_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_BY_PIDFD,
+    );
+}
+
+/// `guest_signals_to_another_process_by_pidfd_match_linux` on KVM, as in
+/// `run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`.
+#[test]
+fn run_kvm_guest_signals_to_another_process_by_pidfd_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_by_pidfd_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_BY_PIDFD,
+    );
+}
+
+/// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
+/// (`SENDS_KVM_ADMITS`), on ptrace:
+/// - ignored, blocked and default-ignored copies, and SIGCONT, leave the
+///   child's `pause()` running until its own alarm;
+/// - `select`, `pselect6` under a temporary mask that admits the signal,
+///   `sigsuspend` and `sigtimedwait` end as on Linux;
+/// - with both of the child's threads in `sigsuspend` under such a mask,
+///   `kill` is refused by name (`PTRACE_REFUSED_ADMITTED_MODES`);
+/// - the raw `select` system call ends with EINTR and the handler, as on
+///   Linux (KVM refuses it by name: `KVM_REFUSED_ADMITTED_MODES`).
+#[test]
+fn guest_signals_to_another_process_that_kvm_admits_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_that_kvm_admits_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_KVM_ADMITS,
+    );
+}
+
+/// `guest_signals_to_another_process_that_kvm_admits_match_linux` on KVM,
+/// the `select`, `pselect6`, `sigtimedwait` and two-thread `sigsuspend` rows
+/// also verified bitwise. With both of the child's threads in `sigsuspend`
+/// under a mask that admits the signal, `kill` wakes the first thread alone,
+/// which runs the handler, while the other is still in `sigsuspend`
+/// afterwards, as on Linux. The two-thread row shows by the guest's output
+/// which thread took the copy; that its sibling is not woken at all leaves
+/// no trace in the output, and two runs of one build compare equal either
+/// way, so it is shown by the scheduler's unit tests instead
+/// (`the_unchosen_suspend_sibling_stays_asleep_and_has_no_turn`).
+#[test]
+fn run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_KVM_ADMITS,
+    );
+}
+
+/// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
+/// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
+/// (`SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC`), on ptrace:
+/// - a default-fatal SIGTERM the child blocks and waits for in
+///   `sigtimedwait` is taken by the wait, and the child lives;
+/// - `recv` on a socket pair ends as on Linux;
+/// - a send right after the child created a thread that leaves the signal
+///   unblocked reaches that thread (the design's "Sender reads");
+/// - a blocked, caught copy queued before the child execs itself takes its
+///   default action once the new image unblocks it (its "Exec").
+#[test]
+fn guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC,
+    );
+}
+
+/// `guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux`
+/// on KVM, the `waitfatal` rows also verified bitwise.
+#[test]
+fn run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC,
+    );
+}
+
+/// The modes of tests/c/cross_process_signal_admission.c whose admitted
+/// delivery on KVM is also run under `--verify --verify-strict`: the runnable
+/// receiver, which takes its copy at a boundary of its own
+/// (`CatchReach::Boundary`), and the receivers whose next probe takes it
+/// (`CatchReach::Probe`: `select`, `pselect6`, `rt_sigtimedwait`, including
+/// the wait for a blocked default-fatal SIGTERM), and the first of two
+/// threads in a backend-served `sigsuspend` (`CatchReach::BackendSuspend`),
+/// whose sibling must not take the copy. Native equality alone does
+/// not show that two runs commit the same schedule, so these rows need the
+/// bitwise comparison too (condition C1 of the deterministic-scheduling
+/// review of https://github.com/rrnewton/hermit/pull/5415).
+const STRICT_VERIFY_ADMITTED_MODES: [&str; 6] = [
+    "runnable",
+    "select",
+    "pselect",
+    "sigtimedwait",
+    "waitfatal",
+    "sigsuspend-two",
+];
+
+/// The modes of `SENDS_KVM_ADMITS` that ptrace refuses by name. With both of
+/// the child's threads asleep in `rt_sigsuspend`, which ptrace leaves to the
+/// kernel, Detcore cannot choose the receiving thread as Linux's
+/// `complete_signal` does, since the kernel would wake one at a moment host
+/// timing sets (https://github.com/rrnewton/hermit/issues/4034).
+const PTRACE_REFUSED_ADMITTED_MODES: [&str; 1] = ["sigsuspend-two"];
+
+/// The modes of `SENDS_KVM_ADMITS` that KVM refuses by name, as
+/// `run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals` checks
+/// with its other cases (`RAW_SELECT_MODES`): a receiver in the raw `select`
+/// system call, which ptrace runs as on Linux.
+const KVM_REFUSED_ADMITTED_MODES: [&str; 1] = ["select-raw"];
+
+/// The backend an admitted-send test runs its cases on
+/// (`assert_admitted_sends_match_linux`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmittedOn {
+    /// ptrace, where the kernel performs the send: the portable lane.
+    Ptrace,
+    /// KVM, where Detcore admits the send, and its `--verify` leg: a
+    /// `run_kvm_` test, which the KVM lane requires and the portable lane
+    /// skips.
+    Kvm,
+}
+
+/// Runs each `(mode, call)` case of tests/c/cross_process_signal_admission.c
+/// natively, then on `on`'s backend, which must print the native run's lines
+/// with no call refused by name. On KVM, a case whose mode is in
+/// `STRICT_VERIFY_ADMITTED_MODES` runs once more under
+/// `--verify --verify-strict`, which must print the same lines, compare the
+/// two runs bitwise with no relaxation, and find them identical, its
+/// `--verify-json` report saying bitwise parity over the same nonzero number
+/// of INFO records on each side.
+///
+/// On ptrace, a mode in `PTRACE_REFUSED_ADMITTED_MODES` must instead be
+/// refused by name, with the policy status; on KVM, a mode in
+/// `KVM_REFUSED_ADMITTED_MODES` is left to the refusal test that names it.
+///
+/// The cases are split across tests so that each stays inside nextest's
+/// 22-second CPU cap. Measured in the validate Cargo profile, each test alone:
+/// a runnable case, whose receiver runs system calls until the signal lands,
+/// costs about 3.9 CPU seconds on ptrace (one Hermit run) and about 4.3 on
+/// KVM (one run and the two of `--verify`), so its seven sending calls are
+/// split by kind of call into groups of three, two and two. The other modes
+/// cost about 1.3 CPU seconds a case or less: the eleven cases of
+/// `SENDS_KVM_ADMITS` took 1.4 CPU seconds on ptrace and 1.5 on KVM, and the
+/// eight of `SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC` 10.3 and 2.9.
+fn assert_admitted_sends_match_linux(test: &str, on: AdmittedOn, cases: &[(&str, &str)]) {
+    if on == AdmittedOn::Kvm && kvm_unavailable(test) {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = cross_process_signal_admission_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let backend = match on {
+        AdmittedOn::Ptrace => "--backend=ptrace",
+        AdmittedOn::Kvm => "--backend=kvm",
+    };
+    for &(mode, call) in cases {
+        if on == AdmittedOn::Kvm && KVM_REFUSED_ADMITTED_MODES.contains(&mode) {
+            continue;
+        }
+        let native = Command::new(guest)
+            .args([mode, call])
+            .output()
+            .expect("run the cross-process-signal-admission guest natively");
+        assert!(native.status.success(), "native, {mode} {call}: {native:?}");
+        let native = stdout(&native);
+        assert!(
+            native.contains(&format!("{call} of ")) && !native.contains("child exited 4"),
+            "the native run is the oracle, {mode} {call}:\n{native}"
+        );
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            call,
+        ];
+        let output = hermit(&args);
+        if on == AdmittedOn::Ptrace && PTRACE_REFUSED_ADMITTED_MODES.contains(&mode) {
+            assert_hermit_refusal_contains(
+                &output,
+                Refusal::Policy,
+                &[
+                    "cannot choose the receiving thread",
+                    "https://github.com/rrnewton/hermit/issues/4034",
+                ],
+            );
+            continue;
+        }
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend}, {mode} {call}");
+        let run_log = stderr(&output);
+        assert!(
+            !run_log
+                .lines()
+                .any(|line| line.contains(" refused: ") || line.contains(" refused by the backend")),
+            "{backend}, {mode} {call}: a call was refused by name\nstderr:\n{run_log}"
+        );
+        if on == AdmittedOn::Ptrace || !STRICT_VERIFY_ADMITTED_MODES.contains(&mode) {
+            continue;
+        }
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report = report.to_str().expect("report path should be UTF-8");
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report,
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            call,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            native,
+            "--verify on kvm, {mode} {call}: stderr:\n{log}"
+        );
+        assert!(
+            !log.lines().any(|line| line.contains(" refused: ")
+                || line.contains(" refused by the backend")),
+            "--verify on kvm, {mode} {call}: a call was refused by name\nstderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "--verify on kvm, {mode} {call}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "--verify on kvm, {mode} {call}: verification failed:\n{log}"
+        );
+        // A match of two empty logs is no parity
+        // (`empty_log_comparison_matches_but_is_never_parity`).
+        assert_bitwise_parity(report, &format!("--verify on kvm, {mode} {call}"));
+    }
+}
+
+/// The modes of tests/c/cross_process_signal_admission.c whose receiver
+/// waits in the raw `select` system call: alone or beside a runnable
+/// sibling that leaves the signal unblocked, with no timeout or with one.
+/// The timed ones come first, so a run that returns late fails before one
+/// that would hang.
+const RAW_SELECT_MODES: [&str; 4] = [
+    "select-raw-timed",
+    "select-raw-two-timed",
+    "select-raw",
+    "select-raw-two",
+];
+
+/// tests/c/cross_process_signal_admission.c on KVM: the sends to another
+/// process that stage X1 slice C refuses by name, before any effect
+/// (https://github.com/rrnewton/hermit/issues/4485): a caught signal to a
+/// child parked in `pause` or in a polled `read` of a pipe (slice D), to one
+/// in a `poll` whose probe never takes a pending signal (slice D), and to one
+/// waiting on a futex (N8a); a default-fatal SIGTERM (slice F); SIGKILL
+/// (slice G); and a default stop (stage X2). A fail-closed run ends with the policy-refusal status naming
+/// the refusal, and the sender prints nothing after its call. With
+/// `--allow-unsupported-syscalls` the call returns ENOSYS and the child sees
+/// nothing: it reports as if no signal had been sent.
+///
+/// A receiver in the raw `select` system call (`RAW_SELECT_MODES`) is refused
+/// the same way: raw `select` has no signal mask the backend can check, and
+/// its probes never took the copy, so such a send hung the run with no
+/// timeout or ended the call with 0 at its timeout instead of EINTR. Only
+/// the fail-closed run is checked there: allowed, a wait with no timeout
+/// that no probe ends has no transcript to compare.
+#[test]
+fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
+    if kvm_unavailable("run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = cross_process_signal_admission_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let parked = "is parked in an emulated pause, nanosleep, polled read or child wait, which \
+                  KVM does not yet end for a signal another process sends (stage X1 slice D)";
+    let cases: [(&str, &str, &str); 7] = [
+        (
+            "pause",
+            parked,
+            "kill of USR1: -1 ENOSYS\nchild: pause returned -1 EINTR\nchild: alarm 1\n\
+             child: handler ran 0 time(s)\nchild exited 0\n",
+        ),
+        // Its own alarm ends the read, which reports the timeout (exit 41).
+        (
+            "read",
+            parked,
+            "kill of USR1: -1 ENOSYS\nchild: read returned -1 EINTR\n\
+             child: handler ran 0 time(s)\nchild exited 41\n",
+        ),
+        (
+            "poll",
+            "polls in a call whose probe never takes a pending signal (poll, epoll_wait, an \
+             unmasked ppoll), which KVM does not yet end for a signal another process sends \
+             (stage X1 slice D)",
+            "kill of USR1: -1 ENOSYS\nchild: poll returned 0\nchild: handler ran 0 time(s)\n\
+             child exited 0\n",
+        ),
+        (
+            "futex",
+            "waits on a futex, and KVM cannot interrupt a futex wait for a signal (N8a)",
+            "kill of USR1: -1 ENOSYS\nchild: futex wait returned -1 ETIMEDOUT\n\
+             child: handler ran 0 time(s)\nchild exited 0\n",
+        ),
+        (
+            "fatal",
+            "its default action ends the process, which KVM cannot yet carry out for a signal \
+             another process sends (stage X1 slice F)",
+            "kill of TERM: -1 ENOSYS\nchild: handler ran 0 time(s)\nchild exited 0\n",
+        ),
+        (
+            "sigkill",
+            "KVM cannot yet end another process for a SIGKILL (stage X1 slice G)",
+            "kill of KILL: -1 ENOSYS\nchild: handler ran 0 time(s)\nchild exited 0\n",
+        ),
+        (
+            "stop",
+            "its default action stops the process, which KVM does not support (stage X2)",
+            "kill of TSTP: -1 ENOSYS\nkill of CONT: 0\nchild: handler ran 0 time(s)\n\
+             child exited 0\n",
+        ),
+    ];
+    let assert_refused = |mode: &str, reason: &str| {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            "kill",
+        ];
+        let output = hermit(&args);
+        let (out, err) = (stdout(&output), stderr(&output));
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: a fail-closed run must stop with the policy-refusal status\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        assert!(
+            err.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && err.contains("kill refused: KVM cannot deliver signal ")
+                && err.contains(reason),
+            "{mode}: the run did not name the refusal on stderr\nstderr:\n{err}"
+        );
+        assert!(
+            !out.contains("kill of "),
+            "{mode}: the sender went on past the refused call\nstdout:\n{out}"
+        );
+    };
+    for mode in RAW_SELECT_MODES {
+        assert_refused(
+            mode,
+            "waits in select, and select has no signal mask the backend can check; use pselect6",
+        );
+    }
+    for (mode, reason, allowed) in cases {
+        assert_refused(mode, reason);
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--allow-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            "kill",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            allowed,
+            "{mode} with unsupported operations allowed; stderr:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
 /// tests/c/kill_child_and_wait.c: a parent kills its own pausing child with
 /// SIGKILL and waits for it. On ptrace the kill succeeds and the wait reports
-/// the child killed by signal 9. KVM cannot deliver a signal to another
-/// process; it used to answer the kill with a bare ENOSYS, after which the
+/// the child killed by signal 9. KVM cannot yet end another process for a
+/// SIGKILL; it used to answer the kill with a bare ENOSYS, after which the
 /// parent waited forever and the run ended in "Deadlock detected" (exit 125).
-/// The backend now records the typed refusal UnsupportedOperation::Signal and
-/// Detcore stops the run as a policy refusal naming it
+/// Detcore now refuses the kill by name in the sender's turn, before it
+/// reaches the backend, and stops the run as a policy refusal; stage X1 slice
+/// G of the KVM cross-process signal design lifts it
 /// (https://github.com/rrnewton/hermit/issues/4485).
 #[test]
 fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
@@ -25573,9 +26109,9 @@ fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
         );
         assert!(
             stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && stderr.contains("kill refused: KVM cannot deliver signal 9 to process ")
                 && stderr.contains(
-                    "kill refused by the backend: KVM signal delivery refused: KVM cannot \
-                     deliver a signal to another process"
+                    "KVM cannot yet end another process for a SIGKILL (stage X1 slice G)"
                 ),
             "{log:?}: the KVM run did not name the signal refusal on stderr\nstderr:\n{stderr}"
         );
@@ -68933,10 +69469,148 @@ fn a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take() {
     ]);
 }
 
+/// The KVM twins of the three discarded-at-send tests above, each row under
+/// the same `--strict --verify --verify-strict`, now that Detcore admits the
+/// guest's sends to another process on KVM (stage X1 slice C of the KVM
+/// cross-process signal design, https://github.com/rrnewton/hermit/issues/4485).
+/// Twelve rows are not here, each with the same KVM answer before that
+/// change:
+/// - `kept-after-discard`: the futex wait ends ETIMEDOUT, and the handler
+///   runs after it, as KVM cannot end a futex wait for a signal (N8a);
+/// - `kept-timer-after-discard`: refused by name (`sigchld-decision-mismatch`),
+///   as the timer's expiry is a signal the scheduler sends, which KVM takes
+///   only as a published SIGCHLD;
+/// - `timer-unchanged`, `timer-rearm-near`: the wait ends EAGAIN, where Linux
+///   takes the expiry that came while SIGUSR1 was ignored once a handler is
+///   installed;
+/// - `init-dfl`, `init-caught`, `init-own`: KVM refuses the `CLONE_NEWPID`
+///   clone by name;
+/// - `fault-partial-16`, `fault-partial-64`: the faulting take writes none of
+///   the siginfo, where Linux writes the bytes before the fault;
+/// - `signalfd-inread`, `signalfd-eintr`, `signalfd-eintr-8k`: the worker's
+///   blocking signalfd read returns the SIGUSR1 main sent while it was
+///   ignored.
+#[test]
+fn run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
+    if kvm_unavailable("run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take")
+    {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("futex-dfl", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-ign", "futex -1 ETIMEDOUT, handled 0", None),
+            ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0", None),
+            ("sleep-dfl", "nanosleep 0 0, handled 0", None),
+            ("sleep-ign", "nanosleep 0 0, handled 0", None),
+            ("wait4-dfl", "wait4 child 0, status 7, handled 0", None),
+            ("blocked-keeps", "handled 1", None),
+            ("self-take", "sigtimedwait 10 0, handled 0", None),
+            (
+                "sigtimedwait-ign",
+                "sigtimedwait -1 EAGAIN, handled 0",
+                None,
+            ),
+            (
+                "sigtimedwait-ign-inwait",
+                "sigtimedwait -1 EAGAIN, handled 0",
+                None,
+            ),
+            ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0", None),
+            (
+                "sigpipe-take",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+            (
+                "sigpipe-signalfd",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+        ],
+    );
+}
+
+/// The KVM twin of
+/// `a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results`;
+/// `run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`
+/// names the rows KVM does not yet answer as Linux does.
+#[test]
+fn run_kvm_a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results() {
+    if kvm_unavailable(
+        "run_kvm_a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results",
+    ) {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("timer-rearm-far", "sigtimedwait -1 EAGAIN", None),
+            ("timer-disarm", "sigtimedwait -1 EAGAIN", None),
+            ("timer-delete", "sigtimedwait -1 EAGAIN", None),
+            ("wait4-timer", "wait4 child 0, status 7, handled 0", None),
+            ("itimer-leader", "sigtimedwait 14 0", None),
+            ("xproc", "futex -1 ETIMEDOUT, handled 0", None),
+            ("fault-empty", "sigtimedwait -1 EAGAIN", None),
+            ("fault-discarded", "sigtimedwait -1 EAGAIN", None),
+            ("fault-kept", "sigtimedwait -1 EFAULT", None),
+            ("signalfd-two", "read 128 0", None),
+            ("signalfd-partial", "read 128 0", None),
+            (
+                "sigpipe-inwait",
+                "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+                None,
+            ),
+            ("take-info", "sigtimedwait 10 0, info signal 10", None),
+        ],
+    );
+}
+
+/// The KVM twin of
+/// `a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take`;
+/// `run_kvm_a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`
+/// names the rows KVM does not yet answer as Linux does.
+#[test]
+fn run_kvm_a_signal_discarded_by_its_named_task_reaches_no_take() {
+    if kvm_unavailable("run_kvm_a_signal_discarded_by_its_named_task_reaches_no_take") {
+        return;
+    }
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows_on(
+        Some("--backend=kvm"),
+        &[
+            ("sole-nonleader", "sigtimedwait -1 EAGAIN", None),
+            ("exited-leader", "sigtimedwait 10 0", None),
+            ("tight-stack-null", "sigtimedwait 10, info signal -1", None),
+            ("tight-stack-info", "sigtimedwait 10, info signal 10", None),
+            (
+                "fault-partial-discarded",
+                "sigtimedwait -1 EAGAIN, changed 0",
+                None,
+            ),
+            (
+                "fault-partial-hole",
+                "sigtimedwait -1 EAGAIN, changed 0",
+                None,
+            ),
+        ],
+    );
+}
+
 /// Runs each row of the discarded-at-send tests: the guest's line under
 /// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), or
 /// under `--strict` alone for the `HOST_TIMED_REJOIN` rows.
 fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
+    assert_discard_at_send_rows_on(None, rows);
+}
+
+/// `assert_discard_at_send_rows` on the backend `backend` selects (`None`:
+/// the default, ptrace).
+fn assert_discard_at_send_rows_on(backend: Option<&str>, rows: &[(&str, &str, Option<&str>)]) {
     let _guard = hermit_run_guard();
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     // KNOWN NONDETERMINISTIC, https://github.com/rrnewton/hermit/issues/4359:
@@ -68957,7 +69631,8 @@ fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
     const HOST_TIMED_REJOIN: [&str; 3] = ["signalfd-inread", "signalfd-eintr", "signalfd-eintr-8k"];
     for &(mode, line, native) in rows {
         let verify = !HOST_TIMED_REJOIN.contains(&mode);
-        let mut args = vec!["run", "--strict"];
+        let mut args: Vec<&str> = backend.into_iter().collect();
+        args.extend(["run", "--strict"]);
         if verify {
             args.extend(["--verify", "--verify-strict"]);
         }
@@ -68968,7 +69643,8 @@ fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
         assert_eq!(
             stdout(&output),
             format!("{mode}: {line}\n"),
-            "{mode} (native: {}): stderr:\n{log}",
+            "{mode} on {} (native: {}): stderr:\n{log}",
+            backend.unwrap_or("ptrace"),
             native.unwrap_or(line)
         );
         if !verify {
@@ -74703,10 +75379,10 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 stderr(&output)
             );
             assert!(
-                stderr(&output).contains(
-                    "kill refused by the backend: KVM signal delivery refused: KVM cannot \
-                     deliver a signal to another process"
-                ),
+                stderr(&output).contains("kill refused: KVM cannot deliver signal 9 to process ")
+                    && stderr(&output).contains(
+                        "KVM cannot yet end another process for a SIGKILL (stage X1 slice G)"
+                    ),
                 "{test}: KVM refuses the parent's SIGKILL by name, {case}\nstderr:\n{}",
                 stderr(&output)
             );

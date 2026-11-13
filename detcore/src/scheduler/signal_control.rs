@@ -302,6 +302,18 @@ impl Scheduler {
         if self.backend.places_orphans {
             control.process.enable_orphan_placement()?;
         }
+        // A backend that keeps its own signal queues (KVM) refuses a guest's
+        // signal to another process, or to its own process while that has
+        // another thread, until the Tool says that it selects the receiving
+        // thread: Detcore admits each such send in the sender's turn, before
+        // any effect, or refuses it by name (`Scheduler::guest_send_admission`,
+        // section 2 of the KVM cross-process signal design), and orders its
+        // delivery. A backend that keeps no queues of its own answers ENOSYS,
+        // and its sends stay as they were.
+        match control.process.enable_cross_process_signals() {
+            Ok(()) | Err(reverie::syscalls::Errno::ENOSYS) => {}
+            Err(errno) => return Err(errno.into()),
+        }
         self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
     }

@@ -418,6 +418,13 @@ mod tests {
         // its rebase onto main's 55, and 57 at its rebase onto main's 56
         // (https://github.com/rrnewton/hermit/pull/5259). Digest measured at this head.
         (57, "42fff6542bd35935", "f8b1309588141fd0"),
+        // Adds `GuestSendAdmission` and `GuestSendCommitted` and their
+        // responses: the admission of a guest's signal to another process
+        // where the backend keeps the guest's signal queues (stage X1 slice C
+        // of the KVM cross-process signal design,
+        // https://github.com/rrnewton/hermit/issues/4485). Digest measured at
+        // this head.
+        (58, "d3f1e0f6c6021396", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

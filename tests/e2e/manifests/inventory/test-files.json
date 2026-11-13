@@ -398,6 +398,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/cross_process_signal_admission.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cross_process_signal_admission.c is owned by hermit-cli/tests/cli.rs: guest_signals_to_another_process_that_kvm_admits_match_linux and run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals compile this guest, in which a parent signals its child in the states stage X1 slice C of the KVM cross-process signal design admits or refuses, and require the native output on ptrace and KVM for each admitted send, and on KVM the policy-refusal status naming each refused one and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4485); it remains a guest fixture because a generic manifest cannot assert a refusal status."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/cwd_dotdot_lookups.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/cwd_dotdot_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests dotdot_names_are_decided_by_where_they_lead (ptrace) and run_kvm_dotdot_names_are_decided_by_where_they_lead (KVM) compile this guest, which looks names up through their leading `..` from a removed working directory, whose getcwd fails with ENOENT, and from one whose path is longer than PATH_MAX (ENAMETOOLONG), as Linux still walks `..` out of both, and other names below the long one, and require the same exact lines on both backends from Hermit started in / and elsewhere (https://github.com/rrnewton/hermit/issues/4541); it remains a guest fixture because a generic manifest cannot start Hermit from two working directories and compare."
@@ -1282,7 +1288,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/kill_child_and_wait.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kill_child_and_wait.c is owned by hermit-cli/tests/cli.rs: run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills compiles this guest, in which a parent kills its own pausing child with SIGKILL and waits for it, and requires ptrace's kill=0 and a child signaled by 9, and on KVM the policy-refusal status naming the backend's signal refusal instead of a bare ENOSYS and a deadlock (https://github.com/rrnewton/hermit/issues/4485); it remains a guest fixture because a generic manifest cannot assert a refusal status."
+      "why": "tests/c/kill_child_and_wait.c is owned by hermit-cli/tests/cli.rs: run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills compiles this guest, in which a parent kills its own pausing child with SIGKILL and waits for it, and requires ptrace's kill=0 and a child signaled by 9, and on KVM the policy-refusal status naming Detcore's refusal of a SIGKILL to another process (stage X1 slice G) instead of a bare ENOSYS and a deadlock (https://github.com/rrnewton/hermit/issues/4485); it remains a guest fixture because a generic manifest cannot assert a refusal status."
     },
     {
       "disposition": "guest-fixture",
