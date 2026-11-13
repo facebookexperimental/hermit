@@ -113,6 +113,13 @@ pub enum Refusal {
     /// sequence's bytes, so they may be a literal pool, which is data
     /// however its words decode.
     LiteralInsideSequence,
+    /// A reader in executable segment bytes no executable section
+    /// covers reaches the sequence's bytes. Kept apart from
+    /// [`Self::LiteralInsideSequence`] so a census can tell a
+    /// refusal only gap words cause from one proven code causes:
+    /// gap bytes are not proved code, and data there can decode
+    /// as a reader it is not.
+    GapReaderInsideSequence,
     /// Only the unwind table says the sequence is code, and it lies in a
     /// range the code addresses as data, between the address an `LDR`
     /// (literal), `ADR` or `ADRP` gives and the next instruction a branch

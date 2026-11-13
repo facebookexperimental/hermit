@@ -53,7 +53,11 @@ pub mod rewrite;
 /// the image. 9: nor does a word of the SVE encodings, which hold no branch.
 /// 10: flag-setting read-modify-write loops retain the original ALU
 /// instruction after the LSE atomic so their outgoing flags are preserved.
-pub const REWRITE_FORMAT_VERSION: u32 = 10;
+/// 11: literal and base readers in executable segment bytes no
+/// executable section covers protect the bytes they read, under
+/// their own refusal name, and direct branches out of those bytes
+/// count as branch targets.
+pub const REWRITE_FORMAT_VERSION: u32 = 11;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

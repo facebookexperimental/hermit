@@ -15,7 +15,15 @@
 //! exactly as it mapped the original.
 //!
 //! Only sections marked executable (`SHF_EXECINSTR`, so `.text`, `.plt`,
-//! `.init` and the like) are scanned. An executable `PT_LOAD` segment also
+//! `.init` and the like) are scanned for rewrites. Bytes an executable
+//! segment carries that no such section covers are never rewritten, but
+//! their literal and base readers are collected for protection, under
+//! their own refusal name (`gap-reader-inside-the-sequence`): gap
+//! bytes are not proved code, so data there (ordinary `.rodata` in a
+//! single R+X load, the GNU ld default) can decode as a reader it is
+//! not and refuse sequences only it would refuse. Unaligned gap ends
+//! are rounded outward and decoded; only a gap whose bytes run past
+//! the end of the file is refused by name. An executable `PT_LOAD` segment also
 //! carries the ELF header, the dynamic symbol and relocation tables and
 //! read-only data, and those bytes decode as instructions as readily as code
 //! does: measured on one Android test binary, scanning whole segments found
@@ -49,6 +57,10 @@
 //! without mapping symbols after one with them inherits the earlier `$x`
 //! range. The branch analysis still reads every word of every executable
 //! section, so a word that might branch into a sequence still refuses it.
+//! Gap words contribute decoded direct-branch targets the same way, but
+//! they are exempt from the unknown-direct-branch rule section words
+//! trip: data in a gap can look like an unallocated branch, and applying
+//! that rule to it would refuse nearly every image with R+X data.
 //!
 //! A section in a segment that is both writable and executable is refused
 //! too: writable text is either a loader quirk or a runtime that rewrites
@@ -156,6 +168,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::BranchOutOfRange => "branch-out-of-range",
         Refusal::Relocated => "relocation-inside-the-sequence",
         Refusal::LiteralInsideSequence => "literal-inside-the-sequence",
+        Refusal::GapReaderInsideSequence => "gap-reader-inside-the-sequence",
         Refusal::AddressedData => "addressed-data-inside-the-sequence",
         Refusal::NoMappingSymbols => "no-mapping-symbols",
         Refusal::UnsupportedMappingSymbol(_) => "unsupported-mapping-symbol",
@@ -237,7 +250,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
     // Addresses control is known to start at without executing what precedes
     // them: the loader entry, defined function symbols and FDE entries.
     let mut known_entries: std::collections::HashSet<u64>;
-    let (sections, functions) = {
+    let (sections, functions, gap_spans, gap_unreadable) = {
         let elf = Elf::parse(bytes)?;
         if elf.header.e_machine != header::EM_AARCH64 {
             return Ok(None);
@@ -372,8 +385,223 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 }
             })
             .collect::<Vec<_>>();
+        // Bytes an executable segment carries that no executable
+        // section covers (segment gaps, or bytes in sections
+        // without SHF_EXECINSTR) are never rewritten, but a reader
+        // there can still read rewritten bytes, so collect its
+        // words for protection only. Only a gap whose nominal
+        // bytes run past the end of the file is refused.
+        let mut gap_spans: Vec<(Vec<u32>, u64)> = Vec::new();
+        let mut gap_unreadable = false;
+        // A scan domain: a VA interval, the translation that maps
+        // its addresses to file offsets (`base_off + (va -
+        // base_va)`, signed, never saturated), and the nominal
+        // load ranges whose file backing must be complete.
+        type Domain = (u64, u64, u64, u64, Vec<(u64, u64)>);
+        let translate = |base_va: u64, base_off: u64, va: u64| -> Option<u64> {
+            if va >= base_va {
+                base_off.checked_add(va - base_va)
+            } else {
+                base_off.checked_sub(base_va - va)
+            }
+        };
+        let load_domain = |ph: &goblin::elf::program_header::ProgramHeader| -> Domain {
+            // The largest aarch64 page, 64 KiB: the kernel's page
+            // size is not in the ELF, so every load is scanned
+            // over its 64 KiB-rounded filesz domain, extended
+            // through the file-backed part of its memsz (a musl
+            // loader leaves a non-writable load's memsz tail as
+            // the file bytes it mapped).
+            let extent = ph.p_filesz.max(ph.p_memsz);
+            (
+                ph.p_vaddr & !0xffff,
+                ph.p_vaddr.saturating_add(extent).saturating_add(0xffff) & !0xffff,
+                ph.p_vaddr,
+                ph.p_offset,
+                vec![(ph.p_vaddr, ph.p_vaddr.saturating_add(ph.p_filesz))],
+            )
+        };
+        let loads: Vec<&goblin::elf::program_header::ProgramHeader> = elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == program_header::PT_LOAD)
+            .collect();
+        let mut domains: Vec<Domain> = loads
+            .iter()
+            .filter(|ph| ph.is_executable())
+            .map(|ph| load_domain(ph))
+            .collect();
+        // Loader-created executable domains, for dynamic images
+        // only (a static image's holes are mapped by nobody).
+        let is_dynamic = elf.header.e_type == 3
+            || elf
+                .program_headers
+                .iter()
+                .any(|ph| ph.p_type == 2 || ph.p_type == 3);
+        if is_dynamic && !loads.is_empty() {
+            // DT_TEXTREL, read from the dynamic segment's entries.
+            let mut textrel = false;
+            for ph in elf.program_headers.iter().filter(|ph| ph.p_type == 2) {
+                let start = ph.p_offset as usize;
+                let count = (ph.p_filesz as usize) / 16;
+                for i in 0..count {
+                    let Some(entry) = bytes.get(start + 16 * i..start + 16 * i + 16) else {
+                        break;
+                    };
+                    let tag = i64::from_le_bytes(entry[..8].try_into().unwrap());
+                    let val = u64::from_le_bytes(entry[8..].try_into().unwrap());
+                    if tag == 22 || (tag == 30 && val & 0x4 != 0) {
+                        textrel = true;
+                    }
+                    if tag == 0 {
+                        break;
+                    }
+                }
+            }
+            let lowest = loads
+                .iter()
+                .min_by_key(|ph| ph.p_vaddr)
+                .expect("loads is non-empty");
+            if textrel {
+                // Every load is remapped through its own
+                // translation before the image becomes executable
+                // everywhere, so every load has a domain.
+                for ph in loads.iter().filter(|ph| !ph.is_executable()) {
+                    domains.push(load_domain(ph));
+                }
+            }
+            if lowest.is_executable() || textrel {
+                // The musl-style initial map: the whole image span
+                // with the lowest load's permissions, holes left
+                // executable. Its span is exact only at the host
+                // page size, which is not monotone in that size,
+                // so take the union at 4, 16 and 64 KiB, each span
+                // decoded through its own translation and kept
+                // distinct from the others.
+                let min_vaddr = lowest.p_vaddr;
+                let max_mem_end = loads
+                    .iter()
+                    .map(|ph| ph.p_vaddr.saturating_add(ph.p_memsz))
+                    .max()
+                    .expect("loads is non-empty");
+                // (initial spans carry no nominal range: they are
+                // hypothetical mappings, clipped to the file, and
+                // only a real load's domain refuses as truncated)
+                for page in [0x1000u64, 0x4000, 0x10000] {
+                    let a = min_vaddr & !(page - 1);
+                    let o = lowest.p_offset & !(page - 1);
+                    let c = max_mem_end.saturating_add(page - 1) & !(page - 1);
+                    let span_end = c.saturating_add(o);
+                    domains.push((a, span_end, a, o, Vec::new()));
+                }
+            }
+        }
+        for (seg_start, seg_end, base_va, base_off, nominal) in &domains {
+            let (seg_start, seg_end) = (*seg_start, *seg_end);
+            let file_offset = |va: u64| translate(*base_va, *base_off, va);
+            // A section interval covers domain bytes only where
+            // the section scanner reads the same file bytes at the
+            // same addresses under this translation: its interval
+            // must intersect the domain, and its file offset for
+            // the intersection must agree. Sections in other
+            // domains, and sections whose backing disagrees, cover
+            // nothing here.
+            let mut covered: Vec<(u64, u64)> = sections
+                .iter()
+                .filter_map(|section| {
+                    // An unreadable section covers nothing: its
+                    // bytes join the gap scan instead.
+                    section.words.as_ref()?;
+                    let start = section.vaddr.max(seg_start);
+                    let end = section.vaddr.saturating_add(section.size).min(seg_end);
+                    if start >= end {
+                        return None;
+                    }
+                    let via_section = section.offset.checked_add(start - section.vaddr)?;
+                    (file_offset(start) == Some(via_section)).then_some((start, end))
+                })
+                .collect();
+            covered.sort_unstable();
+            let mut cursor = seg_start;
+            let mut gaps: Vec<(u64, u64)> = Vec::new();
+            for &(start, end) in &covered {
+                if start > cursor {
+                    gaps.push((cursor, start));
+                }
+                cursor = cursor.max(end);
+            }
+            if cursor < seg_end {
+                gaps.push((cursor, seg_end));
+            }
+            for (start, end) in gaps {
+                if start >= end {
+                    continue;
+                }
+                let first = start & !3;
+                let last = end.saturating_add(3) & !3;
+                // Clip a partly file-backed prefix, preserving
+                // PCs: the first VA whose file offset is 0
+                // (`base_va - base_off` in signed arithmetic)
+                // advances the span by exactly that displacement.
+                let file_start_va = *base_va as i128 - *base_off as i128;
+                let first = if (first as i128) < file_start_va {
+                    u64::try_from(file_start_va).unwrap_or(u64::MAX)
+                } else {
+                    first
+                };
+                if first >= last {
+                    continue;
+                }
+                // Clip to actual file backing, preserving PCs: a
+                // hypothetical interval wholly outside the file is
+                // empty, and a rounded tail past the file holds no
+                // bytes. Only a gap whose NOMINAL load bytes run
+                // past the file is truncated, refused below.
+                let nominal_ok =
+                    nominal
+                        .iter()
+                        .filter(|(s, e)| *s < last && first < *e)
+                        .all(|(_, e)| {
+                            file_offset(*e).is_some_and(|limit| (limit as usize) <= bytes.len())
+                        });
+                let Some(offset) = file_offset(first)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .zip(usize::try_from(last - first).ok())
+                    .and_then(|(offset, size)| {
+                        let end = offset.checked_add(size)?;
+                        if end <= bytes.len() {
+                            bytes.get(offset..end)
+                        } else if nominal_ok {
+                            bytes.get(offset..bytes.len())
+                        } else {
+                            None
+                        }
+                    })
+                else {
+                    // No file byte at all under this translation:
+                    // empty unless a nominal range is truncated.
+                    let intersects = nominal.iter().any(|(s, e)| *s < last && first < *e);
+                    if intersects && !nominal_ok {
+                        gap_unreadable = true;
+                    }
+                    continue;
+                };
+                if offset.is_empty() {
+                    continue;
+                }
+                gap_spans.push((
+                    offset
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .collect(),
+                    first,
+                ));
+            }
+        }
         let unwind = evidence.unwind.unwrap_or_default();
-        (sections, unwind)
+        (sections, unwind, gap_spans, gap_unreadable)
     };
     // Every FDE start is likewise an entry control can begin at.
     known_entries.extend(functions.iter().map(|(entry, _)| *entry));
@@ -420,14 +648,31 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 })
         })
         .collect();
-    let mut literals: Vec<(u64, u64)> = spans
+    // Gap words are protection-only readers: they are scanned for
+    // literal and base references like section code, never rewritten,
+    // and their refusals are named apart from proven code's.
+    let gap_span_refs: Vec<(&[u32], u64)> = gap_spans
         .iter()
-        .flat_map(|(words, pc)| mapping::literal_references(words, *pc))
-        .filter(|reference| {
-            reference.kind != mapping::LiteralKind::Address || !entry_of(reference.range.0)
-        })
-        .map(|reference| reference.range)
+        .map(|(words, pc)| (words.as_slice(), *pc))
         .collect();
+    // Direct branches out of gap bytes target sequences as surely
+    // as branches out of sections do.
+    let gap_targets: std::collections::HashSet<u64> = gap_span_refs
+        .iter()
+        .flat_map(|(words, pc)| rewrite::direct_branch_targets(words, *pc))
+        .collect();
+    let literals_of = |spans: &[(&[u32], u64)]| -> Vec<(u64, u64)> {
+        spans
+            .iter()
+            .flat_map(|(words, pc)| mapping::literal_references(words, *pc))
+            .filter(|reference| {
+                reference.kind != mapping::LiteralKind::Address || !entry_of(reference.range.0)
+            })
+            .map(|reference| reference.range)
+            .collect()
+    };
+    let mut literals: Vec<(u64, u64)> = literals_of(&spans);
+    let mut gap_literals: Vec<(u64, u64)> = literals_of(&gap_span_refs);
     // What the code reads through an `ADRP`'s page or an `ADR`'s address
     // ([`mapping::base_references`]): an access of known address and width
     // reads those bytes, and an `ADD` from it takes an address, as `ADR`
@@ -441,22 +686,33 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         .map(|section| (section.vaddr, section.vaddr.saturating_add(section.size)))
         .collect();
     let mut unbounded: Vec<(u64, u64)> = Vec::new();
-    for reference in spans
-        .iter()
-        .flat_map(|(words, pc)| mapping::base_references(words, *pc))
-    {
-        match reference {
-            mapping::BaseReference::Access(start, end) => unbounded.push((start, end)),
-            mapping::BaseReference::Address(at) if !entry_of(at) => {
-                literals.push((at, at.wrapping_add(4)))
+    let mut gap_unbounded: Vec<(u64, u64)> = Vec::new();
+    for (span_set, is_gap) in [(&spans, false), (&gap_span_refs, true)] {
+        for reference in span_set
+            .iter()
+            .flat_map(|(words, pc)| mapping::base_references(words, *pc))
+        {
+            let (ranges, targets) = if is_gap {
+                (&mut gap_unbounded, &mut gap_literals)
+            } else {
+                (&mut unbounded, &mut literals)
+            };
+            match reference {
+                mapping::BaseReference::Access(start, end) => ranges.push((start, end)),
+                mapping::BaseReference::Address(at) if !entry_of(at) => {
+                    targets.push((at, at.wrapping_add(4)))
+                }
+                mapping::BaseReference::Address(_) => {}
+                mapping::BaseReference::Unknown { .. } => ranges.extend(&executable),
             }
-            mapping::BaseReference::Address(_) => {}
-            mapping::BaseReference::Unknown { .. } => unbounded.extend(&executable),
         }
     }
     literals.sort_unstable();
+    gap_literals.sort_unstable();
     unbounded.sort_unstable();
     unbounded.dedup();
+    gap_unbounded.sort_unstable();
+    gap_unbounded.dedup();
     // No addressed-data extents are computed: without mapping symbols a
     // section is unproven and left alone, so no data exclusion is needed.
     let extents: Vec<(u64, u64)> = Vec::new();
@@ -482,6 +738,14 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
     });
     let mut report = FileReport::default();
     let mut patches = Vec::new();
+    if gap_unreadable {
+        report.skipped_segments.push(
+            "executable segment bytes not covered by an executable section are truncated, \
+             so their readers cannot be checked"
+                .into(),
+        );
+        return Ok(Some(FilePlan { report, patches }));
+    }
     if relr_unreadable {
         report
             .skipped_segments
@@ -500,12 +764,13 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             code,
             unknown,
         } = section;
-        let external_targets: std::collections::HashSet<u64> = section_targets
+        let mut external_targets: std::collections::HashSet<u64> = section_targets
             .iter()
             .enumerate()
             .filter(|(other, _)| *other != index)
             .flat_map(|(_, targets)| targets.iter().copied())
             .collect();
+        external_targets.extend(&gap_targets);
         let Some(words) = words else {
             report.skipped_segments.push(format!(
                 "executable section at file offset {offset:#x} is truncated or unaligned"
@@ -556,8 +821,12 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         }
         let mut plan = rewrite::plan_section(&words, vaddr, &external_targets, &known_entries);
         restrict_to_code(&mut plan, &words, vaddr, &code);
-        refuse_literals(&mut plan, &literals);
+        // Section readers before gap readers, so a refusal is
+        // named for gap words only when no proven reader causes it.
+        refuse_literals(&mut plan, &literals, Refusal::LiteralInsideSequence);
         refuse_overlapping(&mut plan, &unbounded, Refusal::LiteralInsideSequence);
+        refuse_literals(&mut plan, &gap_literals, Refusal::GapReaderInsideSequence);
+        refuse_overlapping(&mut plan, &gap_unbounded, Refusal::GapReaderInsideSequence);
         refuse_overlapping(&mut plan, &extents, Refusal::AddressedData);
         if unknown_direct_branch {
             rewrite::refuse_patched(&mut plan, Refusal::UnknownDirectBranch);
@@ -682,7 +951,7 @@ fn file_code_evidence(bytes: &[u8], elf: &Elf<'_>) -> mapping::CodeEvidence {
 /// literal pool. Whatever the evidence: an object linked without mapping
 /// symbols after one with them inherits the earlier `$x` range, and a real
 /// loop is never a literal's target.
-fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)]) {
+fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)], reason: Refusal) {
     // No target is longer than 16 bytes (`LDR Qt`).
     const LONGEST: u64 = 16;
     let patched = std::mem::take(&mut plan.patched);
@@ -696,7 +965,7 @@ fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)]) {
         if reached {
             plan.refused.push(rewrite::RefusedSite {
                 addr: site.addr,
-                reason: Refusal::LiteralInsideSequence,
+                reason: reason.clone(),
             });
         } else {
             plan.patched.push(site);
@@ -1704,6 +1973,939 @@ pub(crate) mod tests {
         assert_eq!(report.patched_total(), 1, "{report:?}");
         assert!(report.refused.is_empty(), "{report:?}");
         assert_ne!(changed, nearby);
+    }
+
+    /// A literal reader in bytes an executable segment carries but no
+    /// executable section covers (here the second section keeps its
+    /// segment place with only `SHF_ALLOC`) still protects the loop it
+    /// reads; with no reader there, or a reader in a covered section,
+    /// the loop is rewritten or refused as the covered cases are.
+    #[test]
+    fn literal_readers_in_segment_gaps_protect_other_sections() {
+        let loop_words = [
+            0x885f_fc08, // 0x400100: ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, 0x400100
+            0xd65f_03c0, // ret
+        ];
+        const LDR: u32 = 0x18ff_f801; // 0x400200: ldr w1, 0x400100
+        const NOP: u32 = 0xd503_201f;
+
+        // The two-section image with the second section's flags
+        // reduced to ALLOC, so its bytes are in the RX segment but
+        // in no executable section.
+        let gap_image = |reader: u32| {
+            let mut image = two_sections_with_marks(&loop_words, &[reader, 0xd65f_03c0], &[(1, 0)]);
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            let second = shoff + 64 * 2;
+            image[second + 8..second + 16].copy_from_slice(&2u64.to_le_bytes());
+            image
+        };
+
+        // Control: the reader in a covered executable section refuses.
+        let covered = two_sections_with_marks(&loop_words, &[LDR, 0xd65f_03c0], &[(1, 0)]);
+        let plan = plan_bytes(&covered).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+
+        // Gap reader: an LDR literal in uncovered segment bytes
+        // refuses the loop it reads, and nothing is rewritten.
+        let image = gap_image(LDR);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        let (unchanged, report) = rewritten(&image);
+        assert_eq!(unchanged, image, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("gap-reader-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+
+        // Reader-free gap: NOPs in uncovered segment bytes leave
+        // the loop rewritten.
+        let image = gap_image(NOP);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        let (changed, report) = rewritten(&image);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_ne!(changed, image);
+    }
+
+    /// `LDR w1, <loop>` at `pc`, reading the loop at 0x400100.
+    fn gap_ldr(pc: u64) -> u32 {
+        let imm19 = ((0x400100i64 - pc as i64) / 4) as u32 & 0x7_ffff;
+        0x1800_0001 | (imm19 << 5)
+    }
+
+    /// Patch the only program header's fields of a two-section image:
+    /// file size and mem size, virtual address and file offset at
+    /// their ELF offsets (the alignment is left as it was), and
+    /// return the image.
+    fn with_program_header(mut image: Vec<u8>, filesz: u64, vaddr: u64, offset: u64) -> Vec<u8> {
+        image[72..80].copy_from_slice(&offset.to_le_bytes());
+        image[80..88].copy_from_slice(&vaddr.to_le_bytes());
+        image[96..104].copy_from_slice(&filesz.to_le_bytes());
+        image[104..112].copy_from_slice(&filesz.to_le_bytes());
+        image
+    }
+
+    /// A later executable section past the segment end must not
+    /// erase this segment's tail gap, and a segment before every
+    /// section is itself a gap.
+    #[test]
+    fn gap_walk_keeps_each_segments_tail() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        const NOP: u32 = 0xd503_201f;
+        let image = |reader_pc: u64, reader: u32, filesz: u64| {
+            let mut image = two_sections_with_marks(&loop_words, &[NOP, 0xd65f_03c0], &[(1, 0)]);
+            // Move the second section's address past the segment end;
+            // its bytes stay where they were, so the walk must not
+            // let it consume the first segment's tail.
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            let second = shoff + 64 * 2;
+            image[second + 16..second + 24].copy_from_slice(&0x401000u64.to_le_bytes());
+            let at = (reader_pc - 0x400000) as usize;
+            image[at..at + 4].copy_from_slice(&reader.to_le_bytes());
+            with_program_header(image, filesz, 0x400000, 0)
+        };
+        // Reader in the tail gap (0x400180) of a segment ending at
+        // 0x400300: refused, nothing rewritten.
+        let plan = plan_bytes(&image(0x400180, gap_ldr(0x400180), 0x300))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        // Reader-free tail: still rewritten.
+        let plan = plan_bytes(&image(0x400180, NOP, 0x300)).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        // A segment entirely before the first section (it ends at
+        // 0x4000c4, before the loop at 0x400100) with a reader at
+        // 0x4000c0: refused as well.
+        let plan = plan_bytes(&image(0x4000c0, gap_ldr(0x4000c0), 0xc4))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+    }
+
+    /// A legal non-word-aligned, page-congruent segment start
+    /// decodes the gap bytes at their real PCs and offsets.
+    #[test]
+    fn gap_walk_maps_an_unaligned_segment_start() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        let at = 0x80usize;
+        image[at..at + 4].copy_from_slice(&gap_ldr(0x400080).to_le_bytes());
+        // vaddr 0x400001 at file offset 1: congruent mod 0x1000.
+        let filesz = (image.len() - 1) as u64;
+        let image = with_program_header(image, filesz, 0x400001, 1);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    /// A reader past nominal `p_filesz` but inside the segment's
+    /// last mapped page is still a reader.
+    #[test]
+    fn gap_walk_covers_the_mapped_page_tail() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        let at = 0x180usize;
+        image[at..at + 4].copy_from_slice(&gap_ldr(0x400180).to_le_bytes());
+        // The segment's file size ends just after the loop.
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    /// A section whose file offset disagrees with the load does
+    /// not cover the load's actual reader bytes.
+    #[test]
+    fn gap_walk_distrusts_a_disagreeing_section_offset() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let second = [gap_ldr(0x400200), 0xd65f_03c0];
+        let mut image = two_sections_with_marks(&loop_words, &second, &[(1, 0)]);
+        // The second section now claims its bytes live at file
+        // offset 0x800 (zeros) instead of 0x200 (the reader).
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let header = shoff + 64 * 2;
+        let total = 0x808usize;
+        image.resize(total.max(image.len()), 0);
+        for (i, word) in [0xd503_201fu32, 0xd65f_03c0].iter().enumerate() {
+            image[0x800 + 4 * i..0x804 + 4 * i].copy_from_slice(&word.to_le_bytes());
+        }
+        image[header + 24..header + 32].copy_from_slice(&0x800u64.to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    /// Two executable segments: a reader in the first segment's
+    /// trailing gap is collected even though a second segment and
+    /// its section follow it.
+    #[test]
+    fn gap_readers_survive_a_second_executable_segment() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        // Reader at 0x400180, in the first segment's tail gap.
+        image[0x180..0x184].copy_from_slice(&gap_ldr(0x400180).to_le_bytes());
+        // Move the second section to 0x500100, backed at file
+        // offset 0x2100, and give the image a second, valid
+        // PT_LOAD for it at offset 0x2000 (page-congruent, and its
+        // filesz 0x108 covers the relocated section).
+        let second_bytes: Vec<u8> = image[0x200..0x208].to_vec();
+        image.resize(0x2200.max(image.len()), 0);
+        image[0x2100..0x2108].copy_from_slice(&second_bytes);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let second = shoff + 64 * 2;
+        image[second + 16..second + 24].copy_from_slice(&0x500100u64.to_le_bytes());
+        image[second + 24..second + 32].copy_from_slice(&0x2100u64.to_le_bytes());
+        image[56..58].copy_from_slice(&2u16.to_le_bytes());
+        image[120..124].copy_from_slice(&1u32.to_le_bytes());
+        image[124..128].copy_from_slice(&5u32.to_le_bytes());
+        image[128..136].copy_from_slice(&0x2000u64.to_le_bytes());
+        image[136..144].copy_from_slice(&0x500000u64.to_le_bytes());
+        image[144..152].copy_from_slice(&0x500000u64.to_le_bytes());
+        image[152..160].copy_from_slice(&0x108u64.to_le_bytes());
+        image[160..168].copy_from_slice(&0x108u64.to_le_bytes());
+        image[168..176].copy_from_slice(&0x1000u64.to_le_bytes());
+        let image = with_program_header(image, 0x300, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        // Matched control: same geometry, only the gap reader at
+        // 0x180 is left zero, so the loop is rewritten.
+        let mut control =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        control.resize(0x2200.max(control.len()), 0);
+        let bytes2: Vec<u8> = control[0x200..0x208].to_vec();
+        control[0x2100..0x2108].copy_from_slice(&bytes2);
+        let shoff2 = u64::from_le_bytes(control[40..48].try_into().unwrap()) as usize;
+        let second2 = shoff2 + 64 * 2;
+        control[second2 + 16..second2 + 24].copy_from_slice(&0x500100u64.to_le_bytes());
+        control[second2 + 24..second2 + 32].copy_from_slice(&0x2100u64.to_le_bytes());
+        control[56..58].copy_from_slice(&2u16.to_le_bytes());
+        control[120..124].copy_from_slice(&1u32.to_le_bytes());
+        control[124..128].copy_from_slice(&5u32.to_le_bytes());
+        control[128..136].copy_from_slice(&0x2000u64.to_le_bytes());
+        control[136..144].copy_from_slice(&0x500000u64.to_le_bytes());
+        control[144..152].copy_from_slice(&0x500000u64.to_le_bytes());
+        control[152..160].copy_from_slice(&0x108u64.to_le_bytes());
+        control[160..168].copy_from_slice(&0x108u64.to_le_bytes());
+        control[168..176].copy_from_slice(&0x1000u64.to_le_bytes());
+        let control = with_program_header(control, 0x300, 0x400000, 0);
+        let plan = plan_bytes(&control).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    /// A direct branch out of gap bytes into a sequence refuses it,
+    /// like a branch out of a covered section.
+    #[test]
+    fn gap_branches_into_a_sequence_refuse_it() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        // `b 0x400104` (into the loop's second word) at 0x400180.
+        let imm26 = ((0x400104i64 - 0x400180) / 4) as u32 & 0x3ff_ffff;
+        let branch = 0x1400_0000 | imm26;
+        image[0x180..0x184].copy_from_slice(&branch.to_le_bytes());
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let second = shoff + 64 * 2;
+        image[second + 8..second + 16].copy_from_slice(&2u64.to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("branch-into-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    /// A segment whose gap bytes run past the end of the file is
+    /// refused by name, with no patches.
+    #[test]
+    fn a_truncated_gap_is_refused_by_name() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let image = two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        // The segment claims far more file than the image holds,
+        // while every section stays inside it.
+        let image = with_program_header(image, 0x1_0000, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.skipped_segments,
+            vec![
+                "executable segment bytes not covered by an executable section are truncated, \
+                 so their readers cannot be checked"
+                    .to_string()
+            ],
+            "{plan:?}"
+        );
+    }
+
+    /// Ordinary read-only data in a single R+X segment (the GNU ld
+    /// default layout) can decode as an ADR a branch then reads
+    /// through, which refuses every sequence under the gap-reader
+    /// name, not the proven-code literal name. This pins that
+    /// cost deliberately: the refusal is safe, and the name says
+    /// only gap words caused it.
+    #[test]
+    fn rodata_words_in_a_gap_refuse_under_the_gap_reader_name() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        // ASCII "P_SE" / "ER_T" bytes at 0x400180, in the gap.
+        image[0x180..0x184].copy_from_slice(&0x505f_534eu32.to_le_bytes());
+        image[0x184..0x188].copy_from_slice(&0x545f_5245u32.to_le_bytes());
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let second = shoff + 64 * 2;
+        image[second + 8..second + 16].copy_from_slice(&2u64.to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    /// Write a program header at `index` (56 bytes at 64 + 56*index).
+    fn put_ph(
+        image: &mut [u8],
+        index: usize,
+        kind: u32,
+        flags: u32,
+        offset: u64,
+        vaddr: u64,
+        filesz: u64,
+    ) {
+        let at = 64 + 56 * index;
+        image[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        image[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+        image[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+        image[at + 16..at + 24].copy_from_slice(&vaddr.to_le_bytes());
+        image[at + 24..at + 32].copy_from_slice(&vaddr.to_le_bytes());
+        image[at + 32..at + 40].copy_from_slice(&filesz.to_le_bytes());
+        image[at + 40..at + 48].copy_from_slice(&filesz.to_le_bytes());
+        image[at + 48..at + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    }
+
+    /// The image of the domain tests: the two-section loop image
+    /// grown to `total` bytes, with a reader word at file offset
+    /// `reader_at` (VA `reader_pc`) reading the loop. Callers add
+    /// the extra program headers (and any dynamic entries) their
+    /// case needs.
+    fn domain_image(total: usize, reader_at: usize, reader_pc: u64) -> Vec<u8> {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        image.resize(total.max(image.len()), 0);
+        image[reader_at..reader_at + 4]
+            .copy_from_slice(&gap_ldr_at(reader_pc, 0x400100).to_le_bytes());
+        image
+    }
+
+    /// `LDR w1, target` at `pc`.
+    fn gap_ldr_at(pc: u64, target: u64) -> u32 {
+        let displacement = target as i64 - pc as i64;
+        assert!(
+            (-(1 << 20)..(1 << 20)).contains(&displacement),
+            "LDR literal displacement out of range"
+        );
+        let imm19 = (displacement / 4) as u32 & 0x7_ffff;
+        0x1800_0001 | (imm19 << 5)
+    }
+
+    #[test]
+    fn readers_past_the_4k_page_in_a_load_are_collected() {
+        // Filesz ends at 0x114; the reader is in the 64 KiB
+        // mapped tail at 0x402000.
+        let image = domain_image(0x10000, 0x2000, 0x402000);
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn holes_between_loads_of_a_dynamic_image_are_collected() {
+        // An RW load far away; a reader at 0x420000 in the hole.
+        let mut image = domain_image(0x30100, 0x20000, 0x420000);
+        put_ph(&mut image, 1, 1, 6, 0x30000, 0x430000, 0x100);
+        // A PT_DYNAMIC so the image is dynamic even read strictly.
+        put_ph(&mut image, 2, 2, 4, 0x30040, 0x430040, 16);
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn readers_in_loads_and_holes_are_collected() {
+        // TEXTREL is set in this fixture, but the lowest load is
+        // executable, so the initial spans reach both readers even
+        // without it; the TEXTREL-caused cases are the two named
+        // textrel_ tests below.
+        // A reader in the RW load's own bytes.
+        let mut image = domain_image(0x30100, 0x30000, 0x430000);
+        put_ph(&mut image, 1, 1, 6, 0x30000, 0x430000, 0x100);
+        put_ph(&mut image, 2, 2, 4, 0x30040, 0x430040, 32);
+        image[0x30040..0x30048].copy_from_slice(&22i64.to_le_bytes());
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        // The hole shape is the same image with the reader in the hole
+        // at 0x420000 instead: covered by the initial-map span.
+        let mut image = domain_image(0x30100, 0x20000, 0x420000);
+        put_ph(&mut image, 1, 1, 6, 0x30000, 0x430000, 0x100);
+        put_ph(&mut image, 2, 2, 4, 0x30040, 0x430040, 32);
+        image[0x30040..0x30048].copy_from_slice(&22i64.to_le_bytes());
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn textrel_covers_holes_even_when_the_lowest_load_is_read_only() {
+        // An R load below the RX load, DT_TEXTREL present, and
+        // the reader in the hole between them.
+        let mut image = domain_image(0x47000, 0x46000, 0x3f8000);
+        // A read-only load below the loop's load (0x3e0000, backed
+        // at file 0x2e000), so the lowest load is not executable,
+        // and a dynamic segment carrying DT_TEXTREL.
+        put_ph(&mut image, 1, 1, 4, 0x2e000, 0x3e0000, 0x100);
+        put_ph(&mut image, 2, 2, 4, 0x2e040, 0x3e0040, 32);
+        image[0x2e040..0x2e048].copy_from_slice(&22i64.to_le_bytes());
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        // Matched control: identical layout, only the reader at
+        // file 0x46000 is a NOP; the loop is rewritten.
+        let mut control = domain_image(0x47000, 0x46000, 0x3f8000);
+        control[0x46000..0x46004].copy_from_slice(&0xd503_201fu32.to_le_bytes());
+        put_ph(&mut control, 1, 1, 4, 0x2e000, 0x3e0000, 0x100);
+        put_ph(&mut control, 2, 2, 4, 0x2e040, 0x3e0040, 32);
+        control[0x2e040..0x2e048].copy_from_slice(&22i64.to_le_bytes());
+        control[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let control = with_program_header(control, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&control).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    #[test]
+    fn textrel_readers_decode_through_their_own_load() {
+        // An RX load at VA 0x430000 / offset 0x10000 holding bytes
+        // the planner must not touch here (they are not the loop's
+        // section), and an RW load VA 0x450000 / offset 0x20000
+        // whose reader at VA 0x450080 reads the loop in the first
+        // load. Only the RW load's own translation (VA 0x450080 is
+        // file 0x20080) decodes it correctly.
+        let mut image = domain_image(0x51000, 0x20080, 0x450080);
+        // Retarget that reader at the loop (0x400100).
+        image[0x20080..0x20084].copy_from_slice(&gap_ldr_at(0x450080, 0x400100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 6, 0x20000, 0x450000, 0x100);
+        put_ph(&mut image, 2, 2, 4, 0x20040, 0x450040, 32);
+        image[0x20040..0x20048].copy_from_slice(&22i64.to_le_bytes());
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn memsz_tails_of_an_executable_load_are_collected() {
+        // As a static ET_EXEC, so no hole domain applies.
+        let mut image = domain_image(0x30100, 0x20000, 0x420000);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[96..104].copy_from_slice(&0x114u64.to_le_bytes());
+        image[104..112].copy_from_slice(&0x30000u64.to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        // Matched control: same memsz (0x30000), only the reader
+        // at file 0x20000 is a NOP; the loop is rewritten.
+        let mut control = domain_image(0x30100, 0x20000, 0x420000);
+        control[0x20000..0x20004].copy_from_slice(&0xd503_201fu32.to_le_bytes());
+        control[16..18].copy_from_slice(&2u16.to_le_bytes());
+        control[96..104].copy_from_slice(&0x114u64.to_le_bytes());
+        control[104..112].copy_from_slice(&0x30000u64.to_le_bytes());
+        let plan = plan_bytes(&control).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        // The same reader in a static image whose segment ends
+        // at 0x114 with no memsz tail: not collected, still patched.
+        let mut image = domain_image(0x30100, 0x20000, 0x420000);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    #[test]
+    fn a_section_reader_names_a_combined_refusal_before_a_gap_reader() {
+        // A section ADRP of unknown extent and a gap LDR both reach
+        // the loop: the refusal is the proven reader's name, not
+        // the gap's, because section guards run first.
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let reader = [0x9000_0001u32, 0xd503_201f, 0xd65f_03c0];
+        let mut image = two_sections_with_marks(&loop_words, &reader, &[(1, 0)]);
+        image[0x180..0x184].copy_from_slice(&gap_ldr_at(0x400180, 0x400100).to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("literal-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            None,
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn bytes_mapped_by_no_load_are_not_scanned() {
+        // Precision: a reader-shaped word in file bytes no load
+        // maps, in a static two-load layout, so it is rewritten.
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image.resize(0x20100, 0);
+        image[0x18000..0x18004].copy_from_slice(&gap_ldr_at(0x418000, 0x400100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 5, 0x20000, 0x500000, 0x100);
+        image[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let image = with_program_header(image, 0x300, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        assert!(plan.report.refused.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn each_initial_span_decodes_through_its_own_translation() {
+        // Lowest offset 0x1000, so the word at file 0x21000 decodes
+        // at PC 0x420000 in the 4 KiB initial span and at 0x421000 in
+        // the 16/64 KiB spans. Two images pin each direction: in one
+        // the word is a loop reader only at the 4 KiB PC, in the
+        // other only at the larger-page PC.
+        let build = |reader: u32| {
+            let mut image = domain_image(0x30100, 0x21000, 0x420000);
+            image[0x21000..0x21004].copy_from_slice(&reader.to_le_bytes());
+            // Back the loop section at file 0x1100, where this
+            // image's first load (offset 0x1000) maps VA 0x400100,
+            // and the second section at file 0x1200, where that
+            // translation maps VA 0x400200.
+            let text: Vec<u8> = image[0x100..0x208].to_vec();
+            image[0x1100..0x1100 + text.len()].copy_from_slice(&text);
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            for (index, off) in [(1usize, 0x1100u64), (2, 0x1200)] {
+                let header = shoff + 64 * index;
+                image[header + 24..header + 32].copy_from_slice(&off.to_le_bytes());
+            }
+            put_ph(&mut image, 1, 1, 6, 0x30000, 0x430000, 0x100);
+            put_ph(&mut image, 2, 2, 4, 0x30040, 0x430040, 16);
+            image[56..58].copy_from_slice(&3u16.to_le_bytes());
+            with_program_header(image, 0x114, 0x400000, 0x1000)
+        };
+        // Reader only at the 4 KiB PC (0x420000 -> loop 0x400100).
+        let plan = plan_bytes(&build(gap_ldr_at(0x420000, 0x400100)))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        // Reader only at the larger-page PC (0x421000 -> loop).
+        let plan = plan_bytes(&build(gap_ldr_at(0x421000, 0x400100)))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+    }
+
+    /// Shift every recorded address of a two-section image by
+    /// `delta`: section header addresses and symbol values naming
+    /// the old section starts move with them (file bytes stay).
+    fn shift_section_addresses(image: &mut [u8], delta: u64) {
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        for index in [1usize, 2] {
+            let header = shoff + 64 * index;
+            let addr = u64::from_le_bytes(image[header + 16..header + 24].try_into().unwrap());
+            image[header + 16..header + 24].copy_from_slice(&(addr + delta).to_le_bytes());
+        }
+        // Symbol values naming the old section starts, in the
+        // symtab the helper appended (section header index 4).
+        let sym_header = shoff + 64 * 4;
+        let sym_at = u64::from_le_bytes(image[sym_header + 24..sym_header + 32].try_into().unwrap())
+            as usize;
+        let sym_len =
+            u64::from_le_bytes(image[sym_header + 32..sym_header + 40].try_into().unwrap())
+                as usize;
+        for entry in (sym_at..sym_at + sym_len).step_by(24) {
+            let value = u64::from_le_bytes(image[entry + 8..entry + 16].try_into().unwrap());
+            if value == 0x400100 || value == 0x400200 {
+                image[entry + 8..entry + 16].copy_from_slice(&(value + delta).to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn a_partly_file_backed_prefix_gap_is_clipped_not_skipped() {
+        // Static RX at VA 0x401000, offset 0, filesz 0x300; the loop
+        // section is at 0x401100 (file 0x100), the reader at VA
+        // 0x401080 / file 0x80, in the part of the 64 KiB scan
+        // domain before the segment.
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let build = |reader: u32| {
+            let mut image =
+                two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+            shift_section_addresses(&mut image, 0x1000);
+            image[16..18].copy_from_slice(&2u16.to_le_bytes());
+            image[0x80..0x84].copy_from_slice(&reader.to_le_bytes());
+            with_program_header(image, 0x300, 0x401000, 0)
+        };
+        let plan = plan_bytes(&build(gap_ldr_at(0x401080, 0x401100)))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        let plan = plan_bytes(&build(0xd503_201f)).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    /// A reader in the first mapped page before `p_vaddr` (the
+    /// lld-style shape: RX at VA 0x2a30 / offset 0x1a30 under a
+    /// lower read-only load, so the executable bytes VA
+    /// [0x2000, 0x2a30) sit before the segment's own start). The
+    /// reader at VA 0x2100 / file 0x1100 reads the loop at
+    /// 0x2b30.
+    #[test]
+    fn a_reader_before_p_vaddr_is_scanned() {
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let build = |reader: u32| {
+            let mut image =
+                two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+            image.resize(0x4000, 0);
+            // Move the sections into the RX load: the loop to VA
+            // 0x2b30 / file 0x1b30, the second section to VA
+            // 0x2c30 / file 0x1c30.
+            let text: Vec<u8> = image[0x100..0x208].to_vec();
+            image[0x1b30..0x1b30 + text.len()].copy_from_slice(&text);
+            for (from, to) in [(0x400100u64, 0x2b30u64), (0x400200, 0x2c30)] {
+                let from = from.to_le_bytes();
+                let mut at = 0;
+                while let Some(found) = image[at..].windows(8).position(|w| w == from) {
+                    at += found;
+                    image[at..at + 8].copy_from_slice(&to.to_le_bytes());
+                    at += 8;
+                }
+            }
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            for (index, off) in [(1usize, 0x1b30u64), (2, 0x1c30)] {
+                let header = shoff + 64 * index;
+                image[header + 24..header + 32].copy_from_slice(&off.to_le_bytes());
+            }
+            image[0x1100..0x1104].copy_from_slice(&reader.to_le_bytes());
+            let filesz = (image.len() - 0x1a30) as u64;
+            put_ph(&mut image, 0, 1, 5, 0x1a30, 0x2a30, filesz);
+            put_ph(&mut image, 1, 1, 4, 0, 0, 0x1000);
+            put_ph(&mut image, 2, 2, 4, 0x3000, 0x3000, 16);
+            image[56..58].copy_from_slice(&3u16.to_le_bytes());
+            image
+        };
+        let plan = plan_bytes(&build(gap_ldr_at(0x2100, 0x2b30)))
+            .unwrap()
+            .unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        // Matched control: the word at VA 0x2100 is a NOP.
+        let plan = plan_bytes(&build(0xd503_201f)).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    /// A dynamic image whose lowest load is read-only and which
+    /// has no TEXTREL: no initial span exists, so a reader in the
+    /// hole between the loads is never collected and the loop is
+    /// rewritten. This pins the boundary of the hole domain (it
+    /// also kills an "always add spans" mutant).
+    #[test]
+    fn a_dynamic_hole_without_textrel_or_an_executable_lowest_load_is_not_scanned() {
+        let mut image = domain_image(0x3f1000, 0x3f0000, 0x3f0000);
+        image[0x3f0000..0x3f0004].copy_from_slice(&gap_ldr_at(0x3f0000, 0x400100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 4, 0, 0, 0x1000);
+        put_ph(&mut image, 2, 2, 4, 0x3000, 0x3000, 16);
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        assert!(plan.report.refused.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn only_a_smaller_page_initial_span_reaches_a_low_offset_reader() {
+        // The lowest load's VA/offset shifted by 0xf000, the later
+        // load at +0x2f000, and the reader at +0x38000, which lies
+        // in the 4 KiB initial span but past the 64 KiB formula's
+        // end (its O floors to 0 at 64 KiB).
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        image.resize(0x39000, 0);
+        // Move the section bytes and addresses up by 0xf000.
+        let text: Vec<u8> = image[0x100..0x208].to_vec();
+        image[0xf100..0xf100 + text.len()].copy_from_slice(&text);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        for index in [1usize, 2] {
+            let header = shoff + 64 * index;
+            let off = u64::from_le_bytes(image[header + 24..header + 32].try_into().unwrap());
+            image[header + 24..header + 32].copy_from_slice(&(off + 0xf000).to_le_bytes());
+        }
+        shift_section_addresses(&mut image, 0xf000);
+        image[0x38000..0x38004].copy_from_slice(&gap_ldr_at(0x438000, 0x40f100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 6, 0x2f000, 0x42f000, 0x1000);
+        put_ph(&mut image, 2, 2, 4, 0x2f040, 0x42f040, 16);
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x1000, 0x40f000, 0xf000);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.refused.get("gap-reader-inside-the-sequence"),
+            Some(&1),
+            "{plan:?}"
+        );
+        // Matched control: identical geometry, only the reader at
+        // file 0x38000 is a NOP; the loop is rewritten.
+        let mut control =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        control.resize(0x39000, 0);
+        let text: Vec<u8> = control[0x100..0x208].to_vec();
+        control[0xf100..0xf100 + text.len()].copy_from_slice(&text);
+        let shoff = u64::from_le_bytes(control[40..48].try_into().unwrap()) as usize;
+        for index in [1usize, 2] {
+            let header = shoff + 64 * index;
+            let off = u64::from_le_bytes(control[header + 24..header + 32].try_into().unwrap());
+            control[header + 24..header + 32].copy_from_slice(&(off + 0xf000).to_le_bytes());
+        }
+        shift_section_addresses(&mut control, 0xf000);
+        control[0x38000..0x38004].copy_from_slice(&0xd503_201fu32.to_le_bytes());
+        put_ph(&mut control, 1, 1, 6, 0x2f000, 0x42f000, 0x1000);
+        put_ph(&mut control, 2, 2, 4, 0x2f040, 0x42f040, 16);
+        control[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let control = with_program_header(control, 0x1000, 0x40f000, 0xf000);
+        let plan = plan_bytes(&control).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    #[test]
+    fn readers_at_a_64k_location_and_their_reader_free_control() {
+        let image = domain_image(0x10000, 0x8000, 0x408000);
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        let mut image = domain_image(0x10000, 0x8000, 0x408000);
+        image[0x8000..0x8004].copy_from_slice(&0xd503_201fu32.to_le_bytes());
+        let image = with_program_header(image, 0x114, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    #[test]
+    fn widening_covered_intervals_scans_bytes_no_domain_maps() {
+        // Precision for the widening mutant: both sections sit
+        // outside the first load's 64 KiB domain in their own far
+        // load, and the reader-shaped word at VA 0x418000 (under
+        // the first load's translation) is mapped by no domain.
+        // Correct clipping rewrites it; widening the covered intervals
+        // without clipping lets that word refuse.
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image.resize(0x20200, 0);
+        // The second section goes to VA 0x420100 / file 0x20100 in
+        // its own load; its bytes move with it.
+        let second_bytes: Vec<u8> = image[0x200..0x208].to_vec();
+        image[0x20100..0x20108].copy_from_slice(&second_bytes);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let second = shoff + 64 * 2;
+        image[second + 16..second + 24].copy_from_slice(&0x420100u64.to_le_bytes());
+        image[second + 24..second + 32].copy_from_slice(&0x20100u64.to_le_bytes());
+        image[0x18000..0x18004].copy_from_slice(&gap_ldr_at(0x418000, 0x400100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 5, 0x20000, 0x420000, 0x200);
+        image[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let image = with_program_header(image, 0x300, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        assert!(plan.report.refused.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn bytes_past_a_dynamic_images_span_are_not_scanned() {
+        // The same precision shape in a dynamic image: the word at
+        // VA 0x440000 is past every load domain and past the
+        // initial map's span too, so the loop is still rewritten.
+        let loop_words = [
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+        let mut image =
+            two_sections_with_marks(&loop_words, &[0xd503_201f, 0xd65f_03c0], &[(1, 0)]);
+        image.resize(0x20200, 0);
+        let second_bytes: Vec<u8> = image[0x200..0x208].to_vec();
+        image[0x20100..0x20108].copy_from_slice(&second_bytes);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let second = shoff + 64 * 2;
+        image[second + 16..second + 24].copy_from_slice(&0x420100u64.to_le_bytes());
+        image[second + 24..second + 32].copy_from_slice(&0x20100u64.to_le_bytes());
+        image.resize(0x40100, 0);
+        image[0x40000..0x40004].copy_from_slice(&gap_ldr_at(0x440000, 0x400100).to_le_bytes());
+        put_ph(&mut image, 1, 1, 5, 0x20000, 0x420000, 0x200);
+        put_ph(&mut image, 2, 2, 4, 0x20040, 0x420040, 16);
+        image[56..58].copy_from_slice(&3u16.to_le_bytes());
+        let image = with_program_header(image, 0x300, 0x400000, 0);
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
     }
 
     /// What an `ADRP` lets the code read is protected like a literal load's
