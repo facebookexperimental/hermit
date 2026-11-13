@@ -54,6 +54,13 @@
 //! - A test that leaves the required set needs approval too. Moving into the ledger is an
 //!   addition. Leaving the suite, or being `#[ignore]`d, needs `KVM-Required-Removal: <URL> <id>`.
 //!   A rename leaves under the old id.
+//! - One closed exception: [`SQUASHED_APPROVALS`] names, one by one, the rows whose approval line
+//!   an import dropped before the GitHub export received them. Such a row needs no line while it
+//!   has had exactly its listed text in every version from the listed commit, where it entered, to
+//!   the one judged. A row added later, one entering anywhere else, and one that differed in any
+//!   version since it entered, even if it returned to the listed text, need their line like any
+//!   other. hermit_import's prepare.rs prints the approval lines of an imported range for the
+//!   import commit's message, so later imports keep theirs.
 //!
 //! The required set comes from the suite's source ([`suite_tests`]), whose parser refuses every
 //! attribute form it does not understand on the lines it reads. The node also compares that set
@@ -107,6 +114,70 @@ pub const NO_SIGNATURE: &str = "-";
 
 /// The commit-message key that binds an approval URL to the ledger rows it approves.
 pub const GAP_APPROVAL_KEY: &str = "KVM-Gap-Approval:";
+
+/// One approved row whose approval line an import dropped: its ledger, the row exactly as it
+/// entered, the commit where it entered (in full), and the approving record its approval field
+/// names.
+#[derive(Clone, Copy, Debug)]
+pub struct SquashedApproval {
+    pub ledger: &'static str,
+    pub row: &'static str,
+    pub entered: &'static str,
+    pub approval: &'static str,
+}
+
+/// The rows the history gate accepts without an approval line, because an import dropped it
+/// ([`SquashedApproval`]). The list is closed and holds no patterns: each entry is one row, held
+/// to its exact text in every version from the commit where it entered. So any row added later,
+/// entering at another commit, or differing in any version since it entered still needs its line.
+///
+/// The 0.5.5 import squashed the public history into one fbsource commit and copied none of its
+/// `KVM-Gap-Approval:` lines. On the GitHub export that commit is
+/// 1c24fe3aa964d51c246de92d022d30cc3ddf6dba, which introduced the deadline_slice_cap ledger, so
+/// its two approved rows entered there with no line binding their approval: the coordinator's
+/// commit that filed dev-hermit minibeads dh-j7ocf. In rrnewton/hermit's own history the rows
+/// entered with their lines, so this list is never consulted there.
+pub const SQUASHED_APPROVALS: [SquashedApproval; 2] = [
+    SquashedApproval {
+        ledger: "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
+        row: "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms\tD\thttps://github.com/rrnewton/hermit/issues/4485\tskipped\t-\thttps://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+        entered: "1c24fe3aa964d51c246de92d022d30cc3ddf6dba",
+        approval: "https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+    },
+    SquashedApproval {
+        ledger: "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
+        row: "hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask\tE+F'\thttps://github.com/rrnewton/hermit/issues/4995\tskipped\t-\thttps://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+        entered: "1c24fe3aa964d51c246de92d022d30cc3ddf6dba",
+        approval: "https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+    },
+];
+
+/// Whether `row` of `ledger` is one of [`SQUASHED_APPROVALS`] exactly, in every version from the
+/// one where it entered to the one judged (`since_entered`, oldest first): the same ledger, the
+/// listed commit as the one where it entered, every field the same in each of those versions,
+/// and the named approval. A row that entered with other text, or had other text in any version
+/// since, is not exempt, even if it returned to the listed text.
+fn squashed_approval(ledger: &str, row: &Row, since_entered: &[Version]) -> bool {
+    let Some(entered) = since_entered.first() else {
+        return false;
+    };
+    let scope = row.scope();
+    SQUASHED_APPROVALS.iter().any(|exempt| {
+        exempt.ledger == ledger
+            && exempt.entered == entered.commit
+            && row.approval == Approval::Url(exempt.approval.to_string())
+            && parse(&format!("{HEADER}\n{}\n", exempt.row))
+                .is_ok_and(|rows| rows.as_slice() == std::slice::from_ref(row))
+            && since_entered.iter().all(|version| {
+                let same_scope = version
+                    .rows
+                    .iter()
+                    .filter(|other| other.scope() == scope)
+                    .collect::<Vec<_>>();
+                !same_scope.is_empty() && same_scope.iter().all(|other| *other == row)
+            })
+    })
+}
 
 /// The commit-message key that approves a test leaving the required set other than into the
 /// ledger: deleted from the suite, renamed, or `#[ignore]`d.
@@ -948,6 +1019,9 @@ pub struct HistoryVerdict {
     pub baseline_rows: usize,
     /// Rows added or changed later, each with a bound approval.
     pub approved_rows: usize,
+    /// Rows accepted without an approval line because an import dropped it
+    /// ([`SQUASHED_APPROVALS`]).
+    pub squashed_rows: usize,
     /// Required tests at the last version.
     pub required: usize,
 }
@@ -1020,6 +1094,8 @@ pub fn judge_history(
             Approval::Url(url) => {
                 if bound(TrailerKind::GapApproval, Some(url), &row.id, entered.position) {
                     verdict.approved_rows += 1;
+                } else if squashed_approval(declaration.ledger, row, &versions[start..]) {
+                    verdict.squashed_rows += 1;
                 } else {
                     verdict.violations.push(format!(
                         "{}: its approval {url} is bound to it by no commit message from {}, where the row entered the ledger, onward. Add the line `{GAP_APPROVAL_KEY} {url} {}` to the commit message that adds the row (or to a later one)",
@@ -1788,6 +1864,178 @@ mod tests {
             g_failure.replace("878:5:\npositive=3 samples=20 progress=19882\n\nnote:", "163:5:\nguest failed: \"x\"\nstatus: exit status: 1\nstdout:\npositive=3 samples=20 progress=19882\n\nstderr:\n\nnote:"),
         ] {
             assert!(!signature_matches(g, &different), "{different}");
+        }
+    }
+
+    /// The GitHub export's commit for the 0.5.5 import, which introduced deadline_slice_cap's
+    /// ledger.
+    const IMPORT: &str = "1c24fe3aa964d51c246de92d022d30cc3ddf6dba";
+
+    fn slice_cap() -> &'static Declaration {
+        declaration_for_node("privileged-test.deadline_slice_cap_kvm").unwrap()
+    }
+
+    fn at(position: usize, commit: &str, rows: &[&str]) -> Version {
+        Version {
+            position,
+            commit: commit.to_string(),
+            rows: parse(&ledger(rows)).unwrap(),
+            tests: tests(&[
+                "itimer_a_private_descriptor_table_consumer_re_arms",
+                "itimer_generation_discard_follows_the_wait_mask",
+                "other",
+            ]),
+        }
+    }
+
+    fn squashed_rows() -> Vec<&'static str> {
+        SQUASHED_APPROVALS.iter().map(|exempt| exempt.row).collect()
+    }
+
+    #[test]
+    fn the_squashed_import_rows_need_no_line_while_they_are_as_they_entered() {
+        for exempt in &SQUASHED_APPROVALS {
+            assert_eq!(exempt.ledger, slice_cap().ledger);
+            assert!(
+                exempt.row.ends_with(&format!("\t{}", exempt.approval)),
+                "{}",
+                exempt.row
+            );
+        }
+        let rows = squashed_rows();
+        let later = format!("{:040x}", 3);
+        let versions = [at(0, IMPORT, &rows), at(3, &later, &rows)];
+        let verdict = judge_history(slice_cap(), &versions, &[]);
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        assert_eq!(
+            (
+                verdict.squashed_rows,
+                verdict.approved_rows,
+                verdict.baseline_rows
+            ),
+            (2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_new_unapproved_row_in_the_import_commit_is_refused() {
+        let new = format!(
+            "hermit-run::deadline_slice_cap$other\tD\thttps://github.com/rrnewton/hermit/issues/4485\tskipped\t-\t{APPROVAL}"
+        );
+        let mut rows = squashed_rows();
+        rows.push(&new);
+        let verdict = judge_history(slice_cap(), &[at(0, IMPORT, &rows)], &[]);
+        assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
+        assert!(
+            verdict.violations[0].starts_with("hermit-run::deadline_slice_cap$other: its approval"),
+            "{:?}",
+            verdict.violations
+        );
+        assert_eq!(verdict.squashed_rows, 2);
+        // Its own line still admits it.
+        let bound = [CommitTrailers {
+            position: 0,
+            commit: IMPORT.to_string(),
+            trailers: parse_trailers(&format!(
+                "{GAP_APPROVAL_KEY} {APPROVAL} hermit-run::deadline_slice_cap$other"
+            )),
+        }];
+        let verdict = judge_history(slice_cap(), &[at(0, IMPORT, &rows)], &bound);
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        assert_eq!((verdict.squashed_rows, verdict.approved_rows), (2, 1));
+    }
+
+    #[test]
+    fn an_exempted_row_that_changes_or_enters_elsewhere_is_refused() {
+        let rows = squashed_rows();
+        let refused = |declaration: &Declaration, versions: &[Version]| {
+            let verdict = judge_history(declaration, versions, &[]);
+            assert_eq!(verdict.squashed_rows, 1, "{:?}", verdict.violations);
+            assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
+            assert!(
+                verdict.violations[0].starts_with(
+                    "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms: its approval"
+                ),
+                "{:?}",
+                verdict.violations
+            );
+        };
+        // A field outside the row's scope changes in the import commit itself: the gap code, the
+        // issue, or the approving record.
+        for changed in [
+            rows[0].replacen("\tD\t", "\tD2\t", 1),
+            rows[0].replace("/issues/4485", "/issues/4486"),
+            rows[0].replace(
+                "81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+                "1111111111111111111111111111111111111111",
+            ),
+        ] {
+            refused(slice_cap(), &[at(0, IMPORT, &[changed.as_str(), rows[1]])]);
+        }
+        // The row changes later, turning a known failure instead of a skip: it enters again there.
+        let failing = rows[0].replace("\tskipped\t-\t", "\tfailed\trefuses the clone\t");
+        let later = format!("{:040x}", 5);
+        refused(
+            slice_cap(),
+            &[
+                at(0, IMPORT, &rows),
+                at(5, &later, &[failing.as_str(), rows[1]]),
+            ],
+        );
+        // The same row entering at any other commit, or in another ledger, is not the one exempted.
+        let elsewhere = format!("{:040x}", 7);
+        let verdict = judge_history(slice_cap(), &[at(0, &elsewhere, &rows)], &[]);
+        assert_eq!(
+            (verdict.squashed_rows, verdict.violations.len()),
+            (0, 2),
+            "{:?}",
+            verdict.violations
+        );
+        let verdict = judge_history(&DECLARATION, &[at(0, IMPORT, &rows)], &[]);
+        assert_eq!(
+            (verdict.squashed_rows, verdict.violations.len()),
+            (0, 2),
+            "{:?}",
+            verdict.violations
+        );
+    }
+
+    #[test]
+    fn an_exempted_row_that_entered_or_stood_with_other_text_is_refused() {
+        let rows = squashed_rows();
+        let refused = |versions: &[Version]| {
+            let verdict = judge_history(slice_cap(), versions, &[]);
+            assert_eq!(verdict.squashed_rows, 1, "{:?}", verdict.violations);
+            assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
+            assert!(
+                verdict.violations[0].starts_with(
+                    "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms: its approval"
+                ),
+                "{:?}",
+                verdict.violations
+            );
+        };
+        let middle = format!("{:040x}", 3);
+        let later = format!("{:040x}", 6);
+        // A field outside the row's scope differs, so the row still entered at the import
+        // commit: the gap code, the issue, or the approving record.
+        for changed in [
+            rows[0].replacen("\tD\t", "\tD2\t", 1),
+            rows[0].replace("/issues/4485", "/issues/4486"),
+            rows[0].replace(
+                "81d9a9e92e752b9ad45be0799cec1557ebdeb3b8",
+                "1111111111111111111111111111111111111111",
+            ),
+        ] {
+            let differing = [changed.as_str(), rows[1]];
+            // Converging: other text where it entered, the listed text from a later commit on.
+            refused(&[at(0, IMPORT, &differing), at(6, &later, &rows)]);
+            // Transient: the listed text where it entered and at the end, other text between.
+            refused(&[
+                at(0, IMPORT, &rows),
+                at(3, &middle, &differing),
+                at(6, &later, &rows),
+            ]);
         }
     }
 }
