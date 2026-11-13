@@ -1502,6 +1502,8 @@ fn write_fake_podman(tmp: &Path) -> FakePodman {
     let layer = tmp.join("store-layer");
     std::fs::create_dir_all(bin_dir.clone()).unwrap();
     std::fs::create_dir_all(layer.join("bin")).unwrap();
+    // The image's working directory, as the OCI fixture's layer has it.
+    std::fs::create_dir_all(layer.join("opt/appdir")).unwrap();
     let guest = layer.join("bin/guest");
     std::fs::copy(guest_binary(), &guest).unwrap();
     std::fs::set_permissions(&guest, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1575,7 +1577,7 @@ impl FakePodman {
             .env("FAKE_PODMAN_LAYER", &self.layer)
             .env(
                 "FAKE_PODMAN_CONFIG",
-                r#"{"Env":["STORE_ENV=from-store","PATH=/bin"],"WorkingDir":"","Cmd":["/bin/guest"],"Entrypoint":null}"#,
+                r#"{"Env":["TEST_ENV=from-image","STORE_ENV=from-store","PATH=/bin"],"WorkingDir":"/opt/appdir","Cmd":["/bin/guest"],"Entrypoint":null}"#,
             )
             .stdin(std::process::Stdio::null());
         hermit_test::hermit_output("hermit fake-podman run", &mut command)
@@ -1628,7 +1630,11 @@ fn find_manifest(cache: &Path) -> serde_json::Value {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // Do not follow symlinks: a materialized rootfs contains
+            // dev/fd -> /proc/self/fd, so following it recurses into the
+            // walker's own fd directory forever (mirrors the guard in
+            // tree_snapshot above).
+            if path.is_dir() && !path.is_symlink() {
                 walk(&path, out);
             } else if path.file_name().is_some_and(|name| name == "manifest.json") {
                 out.push(path);
@@ -1639,6 +1645,20 @@ fn find_manifest(cache: &Path) -> serde_json::Value {
     walk(&cache.join("hermit"), &mut found);
     assert_eq!(found.len(), 1, "manifests under {}: {found:?}", cache.display());
     serde_json::from_slice(&std::fs::read(&found[0]).unwrap()).unwrap()
+}
+
+#[test]
+fn find_manifest_does_not_follow_symlinked_directories() {
+    // A materialized rootfs links dev/fd at /proc/self/fd; a walk that
+    // follows directory symlinks recurses into its own fd table forever.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cache = tmp.path().join("cache");
+    let recording = cache.join("hermit").join("recording");
+    std::fs::create_dir_all(&recording).unwrap();
+    std::fs::write(recording.join("manifest.json"), b"{}").unwrap();
+    std::os::unix::fs::symlink(cache.join("hermit"), recording.join("loop")).unwrap();
+    let manifest = find_manifest(&cache);
+    assert!(manifest.is_object(), "{manifest}");
 }
 
 #[test]
