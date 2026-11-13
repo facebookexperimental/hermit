@@ -484,12 +484,12 @@ fn append_hermit_args_with_execution_root_mode(
     // A case that already chooses its own workdir keeps it: the execution
     // root's tmpfs mount exists only to provide that workdir, and a second
     // --workdir (any target) would make clap refuse the command.
-    let case_has_workdir = command_args.iter().any(|arg| {
-        arg.to_str()
-            .is_some_and(|arg| arg.starts_with("--workdir"))
-    }) || command_args
-        .windows(2)
-        .any(|pair| pair[0] == OsStr::new("--workdir"));
+    let case_has_workdir = command_args
+        .iter()
+        .any(|arg| arg.to_str().is_some_and(|arg| arg.starts_with("--workdir")))
+        || command_args
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new("--workdir"));
     if !private_mount
         || case_has_workdir
         || command_args.contains(&OsStr::new("--mount=type=tmpfs,target=/test"))
@@ -590,9 +590,7 @@ fn hermit_has_liteinst() -> bool {
         {
             true
         } else {
-            panic!(
-                "the liteinst probe run gave no recognised refusal: {output:?}"
-            )
+            panic!("the liteinst probe run gave no recognised refusal: {output:?}")
         }
     })
 }
@@ -19528,10 +19526,7 @@ fn run_liteinst_without_the_feature_refuses_and_names_the_flag() {
             stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
             "{stderr}"
         );
-        assert!(
-            stderr.contains("pass --max-timeslice=disabled"),
-            "{stderr}"
-        );
+        assert!(stderr.contains("pass --max-timeslice=disabled"), "{stderr}");
     } else {
         assert_eq!(
             output.status.code(),

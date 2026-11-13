@@ -166,7 +166,10 @@ fn private_workdir(backend: &str) -> &'static [&'static str] {
             "--workdir=/tmp/timerfd-workdir",
             "--max-timeslice=disabled",
         ],
-        _ => &["--mount=type=tmpfs,target=/tmp/timerfd-workdir", "--workdir=/tmp/timerfd-workdir"],
+        _ => &[
+            "--mount=type=tmpfs,target=/tmp/timerfd-workdir",
+            "--workdir=/tmp/timerfd-workdir",
+        ],
     }
 }
 
