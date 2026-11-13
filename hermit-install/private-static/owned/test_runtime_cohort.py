@@ -46,6 +46,50 @@ HISTORICAL_SOURCE_COMMITS = {
 }
 
 
+# The GitHub export ShipIt publishes. Its history holds none of the
+# rrnewton/hermit commits above, so where a reviewed commit is absent the tests
+# that read its cohort skip, saying so, and only there (export_history_skip).
+# Checking the fixture blobs in (dev-hermit minibeads dh-dme9zg) deletes the skip.
+EXPORT_REPOSITORY = 'facebookexperimental/hermit'
+HISTORY_SKIP_PREFIX = ('test_runtime_cohort.py: SKIPPED on ' + EXPORT_REPOSITORY
+                       + ': historical object ')
+# The reviewed commits, as loaded: a commit a test substitutes is never skipped.
+REVIEWED_HISTORICAL_COMMITS = {name: dict(heads) for name, heads in HISTORICAL_SOURCE_COMMITS.items()}
+_reported_history_skips = set()
+
+
+def _historical_commit_present(owner, commit):
+    """Whether `commit` is in `owner`'s repository. A Git failure raises."""
+    source = D.parents[2] / ('reverie' if owner == 'R' else '')
+    environment = dict(os.environ, GIT_NO_LAZY_FETCH='1', GIT_NO_REPLACE_OBJECTS='1')
+    answer = subprocess.run(['git', '--no-replace-objects', '-C', str(source), 'cat-file', '--batch-check'],
+                            input=(commit + '\n').encode('ascii'), capture_output=True,
+                            env=environment, timeout=10, check=True).stdout.decode('ascii', 'replace').split()
+    if answer == [commit, 'missing']:
+        return False
+    if answer[:2] == [commit, 'commit']:
+        return True
+    raise RuntimeError('historical commit probe: unexpected answer for ' + owner + ' ' + commit
+                       + ': ' + ' '.join(answer))
+
+
+def export_history_skip(name, repository):
+    """The SKIPPED line for cohort `name`, or None to read it. It skips only
+    on the export (`repository` exactly EXPORT_REPOSITORY), and only when one
+    of the cohort's reviewed commits is absent from its repository. Anywhere
+    else, or for a commit a test substitutes, a missing object still fails."""
+    if repository != EXPORT_REPOSITORY:
+        return None
+    for owner in ('H', 'R'):
+        commit = HISTORICAL_SOURCE_COMMITS[name][owner]
+        if commit == REVIEWED_HISTORICAL_COMMITS[name][owner] and not _historical_commit_present(owner, commit):
+            return (HISTORY_SKIP_PREFIX + owner + ' ' + commit + ' (cohort ' + name + ') is absent: '
+                    "this export's history does not hold it; the tests that read this cohort are "
+                    'skipped until dev-hermit minibeads dh-dme9zg checks in the fixture blobs and '
+                    'deletes this skip')
+    return None
+
+
 def _git_cat_file(owner, specs, limit):
     """Read only named local objects, with bounded output and elapsed time."""
     source = D.parents[2] / ('reverie' if owner == 'R' else '')
@@ -256,6 +300,12 @@ class ContentCohort(unittest.TestCase):
                     self.apply(root,bad)
 
     def historical_fixture(self, root, name):
+        reason = export_history_skip(name, os.environ.get('GITHUB_REPOSITORY'))
+        if reason is not None:
+            if reason not in _reported_history_skips:
+                _reported_history_skips.add(reason)
+                print(reason, file=sys.stderr, flush=True)
+            raise unittest.SkipTest(reason)
         rows = dict(cohort.COHORTS)[name]
         self.assertEqual(len(rows), 31)
         heads = HISTORICAL_SOURCE_COMMITS[name]
@@ -1487,8 +1537,37 @@ class HistoricalFixtureControls(unittest.TestCase):
                          patch.object(publisher, 'fixed_gate_data', side_effect=observe(publisher.fixed_gate_data)):
                         cls(method).run(result)
                     self.assertEqual(result.errors + result.failures, [])
+                    # A control whose historical cohort skipped on the export
+                    # (export_history_skip), and that ran nothing else, skips too.
+                    ours = [reason for _, reason in result.skipped if reason.startswith(HISTORY_SKIP_PREFIX)]
+                    if ours and not events:
+                        self.skipTest(ours[0])
                     self.assertTrue(events)
                     self.assertEqual(events, ['accepted', 'refused'] * (len(events) // 2))
+
+
+class ExportHistorySkip(unittest.TestCase):
+    def test_only_an_absent_reviewed_commit_on_the_export_is_skipped(self):
+        name = 'function-sections-054-content-v1'
+        missing = '0' * 40
+        absent = dict(HISTORICAL_SOURCE_COMMITS[name], H=missing)
+        with patch.dict(HISTORICAL_SOURCE_COMMITS, {name: absent}), \
+             patch.dict(REVIEWED_HISTORICAL_COMMITS, {name: dict(absent)}):
+            reason = export_history_skip(name, EXPORT_REPOSITORY)
+            self.assertTrue(reason.startswith(HISTORY_SKIP_PREFIX + 'H ' + missing), reason)
+            self.assertIn('dh-dme9zg', reason)
+            for other in (None, '', 'rrnewton/hermit', 'facebookexperimental/hermit-fork',
+                          'FacebookExperimental/hermit', 'facebookexperimental/hermit '):
+                self.assertIsNone(export_history_skip(name, other), other)
+        # A commit a test substitutes is not a reviewed one, so it is never skipped.
+        with patch.dict(HISTORICAL_SOURCE_COMMITS, {name: absent}):
+            self.assertIsNone(export_history_skip(name, EXPORT_REPOSITORY))
+        # Present commits are read even on the export; the live heads stand in for reviewed ones.
+        present = {'H': fixture_git(LIVE, 'rev-parse', 'HEAD'),
+                   'R': fixture_git(LIVE / 'reverie', 'rev-parse', 'HEAD')}
+        with patch.dict(HISTORICAL_SOURCE_COMMITS, {name: present}), \
+             patch.dict(REVIEWED_HISTORICAL_COMMITS, {name: dict(present)}):
+            self.assertIsNone(export_history_skip(name, EXPORT_REPOSITORY))
 
 
 if __name__ == '__main__':
