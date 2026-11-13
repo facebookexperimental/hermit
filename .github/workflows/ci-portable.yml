@@ -418,6 +418,18 @@ jobs:
           packages: liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # The Reverie preparation-identity test in check.script_unit_tests_on_host
+      # runs cargo in the reverie submodule, whose rust-toolchain.toml pins its
+      # own toolchain. Without this step rustup would install that toolchain during
+      # the test, inside its 30 s producer deadline; hosted runs 43357952618,
+      # 43369776313 and 43434101176 all timed out in that first cargo call.
+      # The version comes from reverie/rust-toolchain.toml, and the list line
+      # records in the job log what is installed.
+      - name: Install Reverie's pinned Rust toolchain
+        working-directory: reverie
+        run: |
+          rustup toolchain install --profile minimal
+          rustup toolchain list
       # check.script_unit_tests runs the real structured-Nextest fixture.  Installing
       # rust-script alone made that fixture fail with "no such command:
       # nextest" on run 35335623037; the fixture is a test of the production
