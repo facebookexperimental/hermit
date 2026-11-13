@@ -874,13 +874,13 @@ impl IdentityGuard {
         let namespace = hermit::current_mount_namespace()?;
         let contents = fs::read("/proc/thread-self/mountinfo")
             .context("Failed to read the guest mount table for its identity order")?;
+        let rows = detcore_model::container_mounts::parse_container_mounts(&contents)
+            .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))?;
+        let autofs_roots = detcore_model::container_mounts::autofs_mountpoints(&rows)
+            .ok_or_else(|| anyhow!("an autofs mountpoint in the guest mount table is malformed"))?;
         let table = match &self.plan {
             MountPlan::Unrecorded => None,
-            _ => {
-                let rows = detcore_model::container_mounts::parse_container_mounts(&contents)
-                    .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))?;
-                self.container_mount_table_of(rows)?
-            }
+            _ => self.container_mount_table_of(rows)?,
         };
         let order = hermit::mountinfo_identity_order_keeping_from_raw(
             &contents,
@@ -899,6 +899,7 @@ impl IdentityGuard {
             order,
             namespace,
             root_rewrites,
+            autofs_roots,
         })
     }
 
@@ -1155,6 +1156,9 @@ pub(super) struct ContainerMountView {
     /// The proven roots of Hermit's mounts ([`IdentityGuard::mountinfo_root_rewrites`])
     /// that name a mount of `order` (`rewrites_of_snapshot`).
     pub(super) root_rewrites: Vec<MountInfoRootRewrite>,
+    /// The namespace's `autofs` mountpoints (`DetConfig::autofs_roots`),
+    /// from the same read.
+    pub(super) autofs_roots: Vec<PathBuf>,
 }
 
 /// `rewrites` less any that names a mount `order` does not have. The rewrites
@@ -1515,6 +1519,22 @@ pub(super) fn apply_affinity(
     Ok(())
 }
 
+/// The mountpoints of this process's `autofs` mounts
+/// ([`detcore_model::container_mounts::autofs_mountpoints`] over one read
+/// of `/proc/thread-self/mountinfo`). Read host-side before the clone, it
+/// names the autofs mounts the container's copied tree will contain.
+/// Fails closed: an unreadable or malformed mount table is an error, not
+/// an empty list, so a host whose autofs mounts Hermit cannot identify
+/// refuses the launch instead of silently keeping their EPERM behavior.
+pub(super) fn host_autofs_mountpoints() -> Result<Vec<PathBuf>, Error> {
+    let contents = fs::read("/proc/thread-self/mountinfo")
+        .context("Failed to read the host mount table to find its autofs mounts")?;
+    let rows = detcore_model::container_mounts::parse_container_mounts(&contents)
+        .ok_or_else(|| anyhow!("the host mount table has a malformed row"))?;
+    detcore_model::container_mounts::autofs_mountpoints(&rows)
+        .ok_or_else(|| anyhow!("an autofs mountpoint in the host mount table is malformed"))
+}
+
 pub fn default_container(pin_threads: bool) -> Result<Container, Error> {
     let mut container = namespace_container(pin_threads, None)?;
     container.mount(container_proc_mount());
@@ -1538,6 +1558,20 @@ pub(super) fn namespace_container(
         // of the host's, so host mounts and unmounts would keep changing the
         // guest's mount table during a run. Cut that propagation first.
         .mount(Mount::new("/").rprivate());
+    // Since Linux 6.19 (commit 922a6f34c175), autofs refuses a lookup from
+    // a mount namespace that does not own the autofs mount when the mount
+    // is strictly private, returning EPERM where native returns ENOENT or
+    // automounts (fs/autofs/root.c, autofs_d_automount). Making just the
+    // autofs mounts unbindable after the recursive-private remount keeps
+    // the propagation cut (unbindable mounts receive nothing) while
+    // letting lookups reach the daemon, so missing names answer ENOENT.
+    // Keys the launcher pre-triggered are already mounted in the copied
+    // tree; other real keys mount only in the host's namespace and the
+    // lookup loops to ELOOP, which Detcore explains once
+    // (DetConfig::notice_autofs_eloop).
+    for mountpoint in host_autofs_mountpoints()? {
+        container.mount(Mount::new(mountpoint).flags(MountFlags::MS_UNBINDABLE));
+    }
 
     apply_affinity(&mut container, pin_threads, cpu_profile_source)?;
     Ok(container)
@@ -7154,7 +7188,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
-                        mounts: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with generated tmp");
@@ -7170,7 +7204,7 @@ mod tests {
             ImageContainerOpts {
                 bind_kvm: false,
                 workdir_binds: &[],
-                        mounts: &[],
+                mounts: &[],
             },
         )
         .expect("construct image container with user tmp");

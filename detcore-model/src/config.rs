@@ -746,6 +746,19 @@ pub struct Config {
     #[clap(skip)]
     pub container_mount_table: Option<crate::container_mounts::ContainerMountTable>,
 
+    /// The guest-visible mountpoints of the host `autofs` mounts hermit-cli
+    /// copied into the container and made unbindable (see
+    /// [`crate::container_mounts::autofs_mountpoints`]), in that function's
+    /// parents-first order. Detcore uses them only to explain an `ELOOP`
+    /// lookup under one of them (see [`Self::notice_autofs_eloop`]); nothing
+    /// the guest observes about its files depends on the list. Empty where
+    /// the host has no autofs mounts, in every older configuration, and in
+    /// the DBT backend's frozen legacy form, which leaves this field out.
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub autofs_roots: Vec<PathBuf>,
+
     /// The guest path of the empty, read-only directory hermit-cli mounted in
     /// the guest's container for Detcore's placeholder directories where the
     /// guest's procfs is not the kernel's (KVM: the backend provides process
@@ -1275,6 +1288,18 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub notice_host_network_abstract_binds: bool,
+
+    /// **Internal:** Print a one-time notice on Hermit's standard error when a guest path
+    /// lookup under one of [`Self::autofs_roots`] fails with `ELOOP`: hermit-cli made those
+    /// autofs mounts unbindable in the container, so a key it did not pre-trigger consults
+    /// the host daemon, mounts only in the host's namespace, and the lookup loops to
+    /// `ELOOP` in the guest's. `hermit run` sets it where Detcore runs in Hermit's own
+    /// process (the ptrace backend), so the notice reaches Hermit's stderr and never the
+    /// guest's. Nothing the guest observes depends on it. The DBT backend's runtime reads
+    /// the frozen legacy form ([`to_legacy_backend_json`]), which leaves this field out.
+    #[serde(default)]
+    #[clap(skip)]
+    pub notice_autofs_eloop: bool,
 
     /// How the guest's process and thread IDs are numbered
     /// ([`GuestIds`](crate::pid::GuestIds)). The host sets it, not a flag:
@@ -3702,7 +3727,9 @@ impl Default for Config {
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
 /// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
 /// froze, which reads back as false: DBT's runtime then prints no notice for
-/// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added after this form froze,
+/// an abstract `AF_UNIX` bind. So are [`Config::autofs_roots`] and
+/// [`Config::notice_autofs_eloop`], added after this form froze, which read
+/// back as empty and false: DBT's runtime then prints no autofs notice. So is [`Config::eager_lone_preemptions`], added after this form froze,
 /// which has no effect without a PMU timer and reads back as false. So is
 /// [`Config::standard_stream_aliases`], added after this form froze, set only for KVM, which
 /// reads back as unset. So is [`Config::stacktrace_at_schedule_positions`], also added later,
@@ -4317,6 +4344,10 @@ mod legacy_backend_json {
     /// `notice_host_network_abstract_binds` came after it too. It is never written and
     /// reads as false, so the DBT runtime prints no notice for an abstract
     /// `AF_UNIX` bind under host networking.
+    /// `autofs_roots` and `notice_autofs_eloop` came after it too. They are
+    /// never written and read as empty and false, so the DBT runtime prints
+    /// no autofs notice; the coordinated startup's typed configuration
+    /// carries them.
     /// `replay_edited_preemptions` came after it too. It is never written and
     /// reads as false; it cannot matter there, since a timerless backend
     /// such as DBT refuses `--replay-preemptions-from`, which it requires.
@@ -4375,7 +4406,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 62] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 64] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4401,6 +4432,7 @@ mod legacy_backend_json {
         "cpu_profile_source",
         "signal_state_copy",
         "container_mount_table",
+        "autofs_roots",
         "mountinfo_mount_namespace",
         "directory_placeholder",
         "container_procfs",
@@ -4413,6 +4445,7 @@ mod legacy_backend_json {
         "annotated_priority_replay",
         "virtual_cpus",
         "notice_host_network_abstract_binds",
+        "notice_autofs_eloop",
         "replay_edited_preemptions",
         "lenient_replay",
         "eager_lone_preemptions",
@@ -4583,6 +4616,7 @@ mod legacy_backend_json {
                     | "signal_delivery_check_fatal"
                     | "container_procfs"
                     | "notice_host_network_abstract_binds"
+                    | "notice_autofs_eloop"
                     | "replay_edited_preemptions"
                     | "lenient_replay"
                     | "eager_lone_preemptions"
@@ -4595,7 +4629,9 @@ mod legacy_backend_json {
                     | "untrap_passthrough_syscalls",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
-                Some("rewrite_exclusives_overlay" | "rewrite_exclusives_unmarked") => seed
+                Some(
+                    "rewrite_exclusives_overlay" | "rewrite_exclusives_unmarked" | "autofs_roots",
+                ) => seed
                     .deserialize(serde_json::Value::Array(Vec::new()))
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -4943,6 +4979,7 @@ mod legacy_backend_json {
                 | "cpu_profile_source"
                 | "signal_state_copy"
                 | "container_mount_table"
+                | "autofs_roots"
                 | "mountinfo_mount_namespace"
                 | "directory_placeholder"
                 | "container_procfs"
@@ -4955,6 +4992,7 @@ mod legacy_backend_json {
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
+                | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
                 | "lenient_replay"
                 | "eager_lone_preemptions"
@@ -6022,6 +6060,7 @@ mod tests {
                 | "cpu_profile_source"
                 | "signal_state_copy"
                 | "container_mount_table"
+                | "autofs_roots"
                 | "mountinfo_mount_namespace"
                 | "directory_placeholder"
                 | "container_procfs"
@@ -6034,6 +6073,7 @@ mod tests {
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
+                | "notice_autofs_eloop"
                 | "replay_edited_preemptions"
                 | "lenient_replay"
                 | "eager_lone_preemptions"
@@ -6101,10 +6141,12 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty-one fewer (lenient_replay joined them in dh-mvz7y,
-        // chaos_timed_wait_spread later), so forty-seven keys fewer than fields.
+        // sixty-three fewer (lenient_replay joined them in dh-mvz7y,
+        // chaos_timed_wait_spread later, `autofs_roots` and
+        // `notice_autofs_eloop` later still), so forty-nine keys fewer
+        // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 47);
+        assert_eq!(fields.len(), keys.len() + 49);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7509,6 +7551,58 @@ mod tests {
                 decoded.notice_host_network_abstract_binds,
                 notice_host_network_abstract_binds
             );
+        }
+    }
+
+    /// `autofs_roots` and `notice_autofs_eloop` came after the legacy form froze, so they
+    /// never enter it, and both the object and the array form read them back
+    /// as empty and false.
+    #[test]
+    fn autofs_notice_fields_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            autofs_roots: vec![PathBuf::from("/home"), PathBuf::from("/mnt/vol")],
+            notice_autofs_eloop: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("autofs_roots"), "{json}");
+        assert!(!json.contains("notice_autofs_eloop"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(back.autofs_roots.is_empty());
+        assert!(!back.notice_autofs_eloop);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(back.autofs_roots.is_empty());
+        assert!(!back.notice_autofs_eloop);
+    }
+
+    /// `Config` crosses Reverie RPC as positional legacy bincode, so the
+    /// autofs fields are encoded whether set or not.
+    #[test]
+    fn autofs_notice_fields_round_trip_through_reverie_bincode() {
+        for (autofs_roots, notice_autofs_eloop) in
+            [(Vec::new(), false), (vec![PathBuf::from("/home")], true)]
+        {
+            let config = Config {
+                autofs_roots: autofs_roots.clone(),
+                notice_autofs_eloop,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.autofs_roots, autofs_roots);
+            assert_eq!(decoded.notice_autofs_eloop, notice_autofs_eloop);
         }
     }
 

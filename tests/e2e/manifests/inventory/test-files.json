@@ -115,6 +115,18 @@
       "why": "tests/c/arch_prctl_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/autofs_fixture_daemon.c",
+      "runner": "hermit-cli/tests/mount_introspection.rs",
+      "why": "tests/c/autofs_fixture_daemon.c is owned by hermit-cli/tests/mount_introspection.rs: The privileged integration test autofs_privileged_fixture_measures_triggers_and_eloop_notice compiles this stub autofs v5 daemon and runs it under sudo in a private mount namespace, where it mounts a synthetic indirect autofs whose real and ghost keys it answers itself, so the test can measure automount triggers (O_PATH vs O_PATH|O_DIRECTORY, stat vs statx), count daemon requests per guest lookup, and run guests against missing, unlisted, and pre-triggered keys without a host autofs daemon; a generic manifest cannot create the root-owned namespace or the daemon."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/autofs_probe.c",
+      "runner": "hermit-cli/tests/mount_introspection.rs",
+      "why": "tests/c/autofs_probe.c is owned by hermit-cli/tests/mount_introspection.rs: The integration tests autofs_missing_name_is_enoent_under_hermit and autofs_privileged_fixture_measures_triggers_and_eloop_notice compile this stat/lstat/O_PATH/statx/readdir probe and compare its per-path errno output natively, under run --strict, and inside the synthetic autofs fixture (including the pinned ELOOP for an unlisted real key); a generic manifest cannot assert this exact errno output or the fixture's namespace setup."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/bind_getsockname.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

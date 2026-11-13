@@ -5167,7 +5167,7 @@ fn thread_mount_id_of(path: &Path) -> Option<u64> {
 /// a relative path from the calling thread's working directory, whose name is
 /// never asked for. Holding it pins the mount it reaches, and the lookup has
 /// already triggered any automount on the way.
-fn hold_path(path: &Path, directory: bool) -> nix::Result<std::os::fd::OwnedFd> {
+pub fn hold_path(path: &Path, directory: bool) -> nix::Result<std::os::fd::OwnedFd> {
     use nix::fcntl::OFlag;
     let flags = OFlag::O_PATH
         | OFlag::O_CLOEXEC

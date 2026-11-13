@@ -151,6 +151,8 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        autofs_roots: Vec::new(),
+        notice_autofs_eloop: false,
         // As a container's run on ptrace has it, so that Detcore serves
         // `/proc` and the descriptor directories here too, each on procfs's
         // root; no placeholder directory is mounted where the guest's procfs
@@ -303,6 +305,8 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        autofs_roots: Vec::new(),
+        notice_autofs_eloop: false,
         // As a container's run on ptrace has it, so that Detcore serves
         // `/proc` and the descriptor directories here too, each on procfs's
         // root; no placeholder directory is mounted where the guest's procfs
@@ -455,6 +459,8 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        autofs_roots: Vec::new(),
+        notice_autofs_eloop: false,
         // As a container's run on ptrace has it, so that Detcore serves
         // `/proc` and the descriptor directories here too, each on procfs's
         // root; no placeholder directory is mounted where the guest's procfs

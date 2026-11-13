@@ -2194,6 +2194,23 @@ hermit run --base-env=host -- /absolute/path/to/PROGRAM
 If the program is under host `/tmp`, either move it, use `--tmp=/tmp`, or bind
 it into guest `/tmp`. Hermit's startup error names this case explicitly.
 
+### Lookups Under An Autofs Mount (for example `/home`)
+
+Hermit pre-triggers, before the guest starts, the automounts its launch
+needs (the guest's `$HOME`, its working directory, and a
+slash-containing program path) and pins them for the run, so those paths
+behave natively. A name that does not exist under an autofs mount
+answers `ENOENT`, as natively. A *real* automount key outside that set —
+another user's home, a volume the program reaches only mid-run — does
+not automount in the guest: the container holds autofs mounts
+unbindable to keep its mount table fixed, so the host daemon mounts the
+key only in the host's namespace and the guest lookup fails with
+`ELOOP`. On the ptrace backend Hermit prints one notice per run on
+stderr naming the path and the remedy: run with the path as (or under)
+`$HOME` or `--workdir` so Hermit pre-triggers it, or `--mount` the tree
+explicitly. A later run may then see the key already mounted host-side,
+so repeatability claims do not cover such lookups.
+
 ### Namespace Setup Fails With EPERM
 
 Hermit needs unprivileged user, PID, IPC, and mount namespace support. Container

@@ -1375,6 +1375,10 @@ fn record_or_replay_config_with_timer_support(
         mount_id_assignment_order: Vec::new(),
         // The recorder and the replayer set the table from the recording.
         container_mount_table: None,
+        // Record/replay containers get their autofs roots with the table,
+        // from the recording; the notice is a `hermit run` diagnostic.
+        autofs_roots: Vec::new(),
+        notice_autofs_eloop: false,
         // Detcore serves no placeholder directory under record and replay,
         // whose containers mount none, and serves no `/proc` directory there.
         directory_placeholder: None,

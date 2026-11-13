@@ -220,6 +220,63 @@ pub fn parse_container_mounts(contents: &[u8]) -> Option<Vec<ContainerMount>> {
         .collect()
 }
 
+/// Undo the kernel's `mountinfo` path escaping. Linux escapes exactly
+/// space, tab, newline and backslash as `\040`, `\011`, `\012`, `\134`
+/// (`mangle_path` in fs/proc_namespace.c); anything else after a
+/// backslash is malformed and yields `None`, so callers enumerating
+/// mounts to act on can fail closed instead of acting on a wrong path.
+pub fn unescape_mountinfo_path(escaped: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte != b'\\' {
+            out.push(byte);
+            rest = tail;
+            continue;
+        }
+        let (decoded, tail) = match tail {
+            [b'0', b'4', b'0', tail @ ..] => (b' ', tail),
+            [b'0', b'1', b'1', tail @ ..] => (b'\t', tail),
+            [b'0', b'1', b'2', tail @ ..] => (b'\n', tail),
+            [b'1', b'3', b'4', tail @ ..] => (b'\\', tail),
+            _ => return None,
+        };
+        out.push(decoded);
+        rest = tail;
+    }
+    Some(out)
+}
+
+/// The mountpoints of every `autofs` mount in `rows`, unescaped,
+/// deduplicated (stacked mounts at one mountpoint appear once), ordered
+/// parents before children (ascending component count; stable within a
+/// depth). Hermit's container setup makes exactly these mounts
+/// unbindable after its recursive-private remount, so that lookups of
+/// missing names under them consult the automount daemon and return
+/// ENOENT instead of the EPERM Linux 6.19 returns to a non-owner
+/// namespace on a strictly private autofs mount
+/// (fs/autofs/root.c `autofs_d_automount`, commit 922a6f34c175).
+pub fn autofs_mountpoints(rows: &[ContainerMount]) -> Option<Vec<std::path::PathBuf>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut points: Vec<std::path::PathBuf> = Vec::new();
+    for row in rows {
+        if row.fstype == b"autofs" {
+            let point =
+                std::ffi::OsString::from_vec(unescape_mountinfo_path(&row.mountpoint)?).into();
+            if !points.contains(&point) {
+                points.push(point);
+            }
+        }
+    }
+    points.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.as_os_str().cmp(b.as_os_str()))
+    });
+    Some(points)
+}
+
 /// The guest's container mount table (see the module documentation).
 #[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContainerMountTable {
@@ -1253,6 +1310,63 @@ mod tests {
             table.mounts(&[rewrite]),
             b"tmpfs /tmp/x tmpfs rw 0 0\ntmpfs /tmp/tmpAbCdef tmpfs rw 0 0\n"
         );
+    }
+
+    #[test]
+    fn autofs_mountpoints_identifies_only_autofs_rows() {
+        // Indirect and direct (systemd) autofs mounts, a stacked pair at
+        // one mountpoint, a nested autofs below another, an escaped space
+        // in a mountpoint, and non-autofs rows on either side.
+        let rows = parse_container_mounts(
+            b"\
+20 1 259:4 / / rw,relatime shared:1 - btrfs /dev/root rw\n\
+21 20 0:58 / /home rw,relatime shared:218 - autofs /etc/auto.home rw,fd=12,pgrp=5026,timeout=600,indirect\n\
+22 20 0:31 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=43,pgrp=1,direct\n\
+23 21 0:59 / /srv/shared\\040dir rw,relatime shared:30 - autofs /etc/auto.shared rw,fd=7,pgrp=5026,indirect\n\
+24 20 0:58 / /home rw,relatime shared:219 - autofs /etc/auto.home rw,fd=13,pgrp=5026,indirect\n\
+25 20 0:24 / /dev/pts rw,relatime - devpts devpts rw\n",
+        )
+        .unwrap();
+        // Deduplicated; the nested mount sorts after its parent.
+        assert_eq!(
+            autofs_mountpoints(&rows),
+            Some(vec![
+                std::path::PathBuf::from("/home"),
+                std::path::PathBuf::from("/srv/shared dir"),
+                std::path::PathBuf::from("/proc/sys/fs/binfmt_misc"),
+            ])
+        );
+    }
+
+    #[test]
+    fn autofs_mountpoints_is_empty_without_autofs_rows() {
+        let rows =
+            parse_container_mounts(b"20 1 259:4 / / rw,relatime shared:1 - btrfs /dev/root rw\n")
+                .unwrap();
+        assert_eq!(autofs_mountpoints(&rows), Some(Vec::new()));
+        assert_eq!(autofs_mountpoints(&[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn mountinfo_paths_unescape_octal_only() {
+        assert_eq!(unescape_mountinfo_path(b"/a b"), Some(b"/a b".to_vec()));
+        assert_eq!(unescape_mountinfo_path(b"/a\\040b"), Some(b"/a b".to_vec()));
+        assert_eq!(
+            unescape_mountinfo_path(b"/a\\011b"),
+            Some(b"/a\tb".to_vec())
+        );
+        assert_eq!(
+            unescape_mountinfo_path(b"/a\\012b"),
+            Some(b"/a\nb".to_vec())
+        );
+        assert_eq!(
+            unescape_mountinfo_path(b"/a\\134b"),
+            Some(b"/a\\b".to_vec())
+        );
+        // Anything else after a backslash is malformed: fail closed.
+        assert_eq!(unescape_mountinfo_path(b"/a\\99b"), None);
+        assert_eq!(unescape_mountinfo_path(b"/a\\04"), None);
+        assert_eq!(unescape_mountinfo_path(b"/a\\001b"), None);
     }
 
     #[test]

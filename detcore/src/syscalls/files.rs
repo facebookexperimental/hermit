@@ -1097,6 +1097,41 @@ fn notice_host_network_abstract_bind(name: &[u8], result: &Result<i64, Errno>) {
     }
 }
 
+/// The one-time notice for a guest lookup that failed with `ELOOP` at the
+/// guest-absolute `path`, under the recorded autofs root `root`
+/// ([`Config::notice_autofs_eloop`]). The cause is stated as likely: the
+/// trigger is an errno and a lexical prefix, and a genuine symlink loop
+/// under the same root presents identically.
+fn autofs_eloop_notice(path: &Path, root: &Path) -> String {
+    format!(
+        "hermit: NOTICE: the guest's lookup of \"{}\" failed with ELOOP, likely because it \
+         names a key of the autofs mount at \"{}\" that Hermit did not pre-trigger: the \
+         container holds that mount unbindable, so the host daemon mounted the key only in \
+         the host's namespace and the lookup looped without reaching it. It will not \
+         automount in this run. Declare the input instead: run with the path as (or under) \
+         $HOME or --workdir so Hermit pre-triggers it, or --mount the tree explicitly. \
+         (Shown once per run.)",
+        path.display(),
+        root.display(),
+    )
+}
+
+/// Print [`autofs_eloop_notice`], on Hermit's own standard error, the first
+/// time this process is asked. Only called where Detcore runs in Hermit's
+/// process, so the guest never sees the line (as
+/// [`notice_host_network_abstract_bind`]).
+fn notice_autofs_eloop(path: &Path, root: &Path) {
+    static NOTICED: AtomicBool = AtomicBool::new(false);
+    if !NOTICED.swap(true, Ordering::Relaxed) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            crate::util::RetryingStderr,
+            "{}",
+            autofs_eloop_notice(path, root)
+        );
+    }
+}
+
 /// The name, without its leading NUL, of the abstract `AF_UNIX` address
 /// `bytes` holds: the first `addrlen` bytes of a `sockaddr_un`. `None` for a
 /// path name, a bare family (an autobind), or an address too short to hold a
@@ -5796,6 +5831,58 @@ impl<T: RecordOrReplay> Detcore<T> {
             && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
         {
             crate::fifo_peer::note_guest_made((stat.st_dev, stat.st_ino));
+        }
+    }
+
+    /// Note a call that failed with `ELOOP` for the autofs notice: if any
+    /// path it looked up is at or under one of the run's recorded autofs
+    /// roots ([`Config::autofs_roots`]), explain the loop once on Hermit's
+    /// stderr ([`notice_autofs_eloop`]). Called after the call's errno is
+    /// final, only when [`Config::notice_autofs_eloop`] is set; a failed
+    /// lookup changed neither the guest's working directory nor its
+    /// descriptors, so absolutizing after the fact names the same paths.
+    /// The path-resolving syscalls considered are exactly
+    /// [`procfs_levels::path_operands`]' set. Matching is lexical on the
+    /// guest-absolutized spelling, on a component boundary; a spelling
+    /// that symlinks into a root is missed by design (resolving it
+    /// host-side would itself cross mountpoints). Suppressed after the
+    /// guest changes its root: recorded roots name paths in the
+    /// container-root view the guest then no longer has.
+    pub(crate) async fn note_autofs_eloop<G: Guest<Self>>(&self, guest: &mut G, call: &Syscall) {
+        if guest.thread_state().changed_root.load(Ordering::SeqCst) {
+            return;
+        }
+        let (sysno, args) = call.into_parts();
+        let Some(operands) = procfs_levels::path_operands(sysno) else {
+            return;
+        };
+        let values = [
+            args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+        ];
+        for (dirfd_at, path_at) in operands {
+            let dirfd = dirfd_at.map_or(libc::AT_FDCWD, |position| values[position] as i32);
+            let Some(spelling) = PathPtr::from_ptr(values[*path_at] as *const libc::c_char)
+                .and_then(|address| address.read(&guest.memory()).ok())
+            else {
+                continue;
+            };
+            let spelling: PathBuf = spelling;
+            Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+            let Ok(observed) = Self::observed_path(guest, dirfd, &spelling) else {
+                continue;
+            };
+            if !observed.is_absolute() {
+                continue;
+            }
+            if let Some(root) = self
+                .cfg
+                .autofs_roots
+                .iter()
+                .find(|root| observed.starts_with(root))
+            {
+                notice_autofs_eloop(&observed, root);
+                return;
+            }
         }
     }
 

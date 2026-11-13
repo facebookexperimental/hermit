@@ -8524,6 +8524,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 return res;
             }
 
+            // A lookup that looped under an autofs mount the container holds
+            // unbindable: explain it once on Hermit's stderr
+            // (`Detcore::note_autofs_eloop`). Boxed: it reads guest memory
+            // across an await, kept out of every syscall's future
+            // (`hot_path_futures_stay_small`).
+            if matches!(res, Err(Error::Errno(Errno::ELOOP)))
+                && self.cfg.notice_autofs_eloop
+                && !self.cfg.autofs_roots.is_empty()
+            {
+                Box::pin(self.note_autofs_eloop(guest, &call)).await;
+            }
+
             // A `write`, `writev` or `sendto` through a datagram socket whose
             // connected peer has gone purged the socket's receive queue
             // (`Detcore::note_send_refused`; `sendmsg` and `sendmmsg` note it

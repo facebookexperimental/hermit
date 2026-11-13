@@ -5298,7 +5298,10 @@ fn an_image_mount_is_refused_by_shape() {
         ("type=tmpfs,target=rel/path", "must be an absolute path"),
         ("type=tmpfs,target=/a/../b", "must be an absolute path"),
         ("target=/data", "bind mount with no source"),
-        ("type=tmpfs,target=/.hermit-oci-x/sub", "Hermit's own image files"),
+        (
+            "type=tmpfs,target=/.hermit-oci-x/sub",
+            "Hermit's own image files",
+        ),
     ] {
         let refused = validate_image_mounts(&mounts(spec), &[])
             .unwrap_err()
@@ -5306,9 +5309,8 @@ fn an_image_mount_is_refused_by_shape() {
         assert!(refused.contains(named), "{spec}: {refused}");
     }
     // The same shape rules cover --bind, the other spelling of a bind.
-    let binds = |spec: &str| {
-        run_opts_for(&["hermit", "run", &format!("--bind={spec}"), "/bin/true"]).bind
-    };
+    let binds =
+        |spec: &str| run_opts_for(&["hermit", "run", &format!("--bind={spec}"), "/bin/true"]).bind;
     assert!(validate_image_mounts(&[], &binds("/srv:/data")).is_ok());
     for (spec, named) in [
         ("/srv:/", "--bind target / with --image would replace"),
@@ -5331,21 +5333,48 @@ fn an_image_mount_is_refused_by_shape() {
 fn an_image_mount_target_is_prepared_inside_the_rootfs() {
     let rootfs = tempfile::tempdir().expect("rootfs tempdir");
     let base = rootfs.path();
-    let created = prepare_image_mount_target(base, Path::new("data/sub"), true, Path::new("/data/sub"), "--mount", "the image rootfs")
-        .expect("a missing directory target is created");
+    let created = prepare_image_mount_target(
+        base,
+        Path::new("data/sub"),
+        true,
+        Path::new("/data/sub"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing directory target is created");
     assert!(created.is_dir());
-    let file = prepare_image_mount_target(base, Path::new("etc/marker"), false, Path::new("/etc/marker"), "--mount", "the image rootfs")
-        .expect("a missing file target is created");
+    let file = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        false,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .expect("a missing file target is created");
     assert!(file.is_file());
-    let wrong = prepare_image_mount_target(base, Path::new("etc/marker"), true, Path::new("/etc/marker"), "--mount", "the image rootfs")
-        .unwrap_err()
-        .to_string();
+    let wrong = prepare_image_mount_target(
+        base,
+        Path::new("etc/marker"),
+        true,
+        Path::new("/etc/marker"),
+        "--mount",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(wrong.contains("exists in the image as a file"), "{wrong}");
     std::os::unix::fs::symlink("/etc", base.join("link")).expect("symlink in rootfs");
-    let escaped =
-        prepare_image_mount_target(base, Path::new("link/x"), true, Path::new("/link/x"), "--bind", "the image rootfs")
-            .unwrap_err()
-            .to_string();
+    let escaped = prepare_image_mount_target(
+        base,
+        Path::new("link/x"),
+        true,
+        Path::new("/link/x"),
+        "--bind",
+        "the image rootfs",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(escaped.contains("passes through the symlink"), "{escaped}");
     assert!(escaped.contains("--bind target"), "{escaped}");
 }
@@ -5454,7 +5483,10 @@ fn a_bind_below_dev_mqueue_is_decided_with_the_mounts() {
     let refused = refuse_below_private_mqueue(&uncovered.mount, &uncovered.bind, dev_mqueue)
         .unwrap_err()
         .to_string();
-    assert!(refused.contains("cannot mount at /dev/mqueue/x"), "{refused}");
+    assert!(
+        refused.contains("cannot mount at /dev/mqueue/x"),
+        "{refused}"
+    );
 }
 
 /// A general `--bind` suppresses Hermit's private `/dev/shm` and
@@ -5501,7 +5533,10 @@ fn a_general_bind_suppresses_the_private_dev_shm_and_mqueue() {
             .trim_start_matches("target=");
         if cover_target == "/dev/shm" {
             assert_eq!(
-                targets.iter().filter(|t| *t == Path::new("/dev/shm")).count(),
+                targets
+                    .iter()
+                    .filter(|t| *t == Path::new("/dev/shm"))
+                    .count(),
                 1,
                 "{cover}: only the caller's bind mounts /dev/shm: {targets:?}"
             );
@@ -15237,6 +15272,17 @@ impl RunOpts {
             && !self.det_opts.det_config.gdbserver
             && self.application_backend.is_none()
             && matches!(backend, Backend::Ptrace);
+        // Detcore's notice for a guest lookup that loops to ELOOP under an
+        // autofs mount the container made unbindable: same conditions as
+        // the abstract-bind notice (Detcore in Hermit's own process, where
+        // its stderr is Hermit's), on the default container path whose
+        // mounts the notice explains.
+        self.det_opts.det_config.notice_autofs_eloop = !self.no_namespace
+            && !self.namespace_only
+            && self.image.is_none()
+            && !self.det_opts.det_config.gdbserver
+            && self.application_backend.is_none()
+            && matches!(backend, Backend::Ptrace);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
         }
@@ -17072,6 +17118,63 @@ impl RunOpts {
     /// `--no-namespace`. `work` receives the parent-held `guards`, the
     /// container's identity mounts, and any explicitly enrolled native run. An
     /// adapter that cannot consume a native run must refuse it.
+    /// Best-effort `O_PATH` holds that trigger, in this process's namespace
+    /// before the container clone copies it, the automounts the launch is
+    /// about to need: the guest's home, its working directory, and a
+    /// slash-containing program path. The cloned tree then contains those
+    /// mounts already made; holding the descriptors for the whole run
+    /// also keeps the host mounts busy, so the daemon cannot expire them
+    /// (and detach the guest's copies) mid-run. Keys beyond this set are
+    /// not pre-triggered: under the container's unbindable autofs mounts
+    /// their lookups reach the daemon, mount only host-side, and loop to
+    /// `ELOOP` in the guest (Detcore explains that once, see
+    /// `DetConfig::notice_autofs_eloop`). A hold that fails (a home that
+    /// does not exist, say) holds nothing and never fails the launch: the
+    /// guest observes the same absence natively.
+    fn pretrigger_autofs_holds(&self) -> Vec<std::os::fd::OwnedFd> {
+        let mut holds = Vec::new();
+        let mut hold = |path: &Path, directory: bool| {
+            if let Ok(fd) = hermit::hold_path(path, directory) {
+                holds.push(fd);
+            }
+        };
+        // Superset, not a mirror of the guest env resolution: the host's
+        // $HOME and every explicit --env HOME value (a bare --env HOME
+        // resolves to the host's, already first).
+        let mut homes: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            homes.push(home);
+        }
+        for (name, value) in &self.env {
+            if name == "HOME"
+                && let Some(value) = value
+            {
+                homes.push(value.into());
+            }
+        }
+        for home in &homes {
+            if !home.is_empty() {
+                hold(Path::new(home), true);
+            }
+        }
+        if let Some(workdir) = self.launch_workdir() {
+            hold(workdir, true);
+        }
+        let program = self
+            .prepared_program
+            .as_deref()
+            .unwrap_or_else(|| self.program_path());
+        if program.as_os_str().as_encoded_bytes().contains(&b'/') {
+            if let Some(parent) = program.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                hold(parent, true);
+            }
+            hold(program, false);
+        }
+        holds
+    }
+
     pub(super) fn launch_in_container<G, F, T>(
         &self,
         guards: G,
@@ -17093,6 +17196,16 @@ impl RunOpts {
             detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
             <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         }
+        // Trigger the launch's automounts in this namespace before the
+        // clone copies it, and pin them for the whole run. Only the
+        // default container path needs this: --no-namespace looks up
+        // natively, --image's paths are rootfs-internal, and
+        // --namespace-only makes no private tree to strand a lookup in.
+        let _autofs_holds = if !self.no_namespace && !self.namespace_only && self.image.is_none() {
+            self.pretrigger_autofs_holds()
+        } else {
+            Vec::new()
+        };
         let gdbserver_port = self.bind_gdbserver_port()?;
         super::pinned_cpu::set_settings(self.pinned_cpu_settings());
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
@@ -18771,8 +18884,7 @@ impl RunOpts {
         mounts.extend(into_dev_shm);
         mounts.extend(private_tmp);
         mounts.extend(
-            private_mqueue(self.user_mount_targets().into_iter())?
-                .map(PlannedMount::hermit),
+            private_mqueue(self.user_mount_targets().into_iter())?.map(PlannedMount::hermit),
         );
 
         Ok(PreparedMounts {
@@ -18897,9 +19009,9 @@ impl RunOpts {
                 if !under_earlier {
                     let want_dir = match image_mount_kind(mount)? {
                         ImageMountKind::Tmpfs => true,
-                        ImageMountKind::Bind => mount
-                            .get_source()
-                            .is_some_and(|source| source.is_dir()),
+                        ImageMountKind::Bind => {
+                            mount.get_source().is_some_and(|source| source.is_dir())
+                        }
                     };
                     if let Ok(under_tmp) = target.strip_prefix(TMP_DIR) {
                         prepare_image_mount_target(
@@ -18950,9 +19062,7 @@ impl RunOpts {
                     ImageMountKind::Bind => {
                         identity_sources.add_user_bind(mount.get_target(), None)
                     }
-                    ImageMountKind::Tmpfs => {
-                        identity_sources.add_user_tmpfs(mount.get_target())
-                    }
+                    ImageMountKind::Tmpfs => identity_sources.add_user_tmpfs(mount.get_target()),
                 }
             }
             self.network
@@ -19764,12 +19874,13 @@ impl RunOpts {
             document.preemption = Some(self.preemption_summary());
         }
         if let Some(image_ref) = &self.image {
-            let mut image = crate::app::image::resolved_image_identity(image_ref).map_err(|error| {
-                Error::new(PolicyRefusal).context(format!(
-                    "cannot bind a resolved image identity for this manifest-requested \
+            let mut image =
+                crate::app::image::resolved_image_identity(image_ref).map_err(|error| {
+                    Error::new(PolicyRefusal).context(format!(
+                        "cannot bind a resolved image identity for this manifest-requested \
                      --image run: {error:#}"
-                ))
-            })?;
+                    ))
+                })?;
             // `self.image` may already have been canonicalized to a store ID;
             // the captured run options retain the reference as supplied.
             if image.reference.is_some() && supplied_image_reference.is_some() {
@@ -21163,6 +21274,7 @@ pub(super) fn complete_container_config(
             config.mountinfo_mount_ids = view.order;
             config.mountinfo_mount_namespace = Some(view.namespace);
             config.container_mount_table = view.table;
+            config.autofs_roots = view.autofs_roots;
         }
         // No container (`--no-namespace`): the guest runs in this process's
         // own namespace, where Hermit installed no mount, so its table is
@@ -21181,6 +21293,9 @@ pub(super) fn complete_container_config(
             config.mountinfo_mount_ids = order;
             config.mountinfo_mount_namespace = Some(namespace);
             config.container_mount_table = Some(table);
+            // No autofs_roots: the guest runs in this process's own
+            // namespace, where autofs lookups are native and there is
+            // no unbindable-loop outcome to explain.
         }
     }
     Ok(config)
