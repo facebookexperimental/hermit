@@ -1298,6 +1298,39 @@ pub(crate) mod tests {
         assert!(serde_json::from_str::<CellCpuObservationsV1>(&raw).is_err());
     }
 
+    /// A row this head writes must deserialize with the type as it
+    /// was before the clone3 probe existed (the same three fields,
+    /// unknown fields refused): the probe record lives in its own
+    /// run-level output, never in this row.
+    #[test]
+    fn a_written_row_reads_with_the_pre_probe_type() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreProbeRow {
+            version: u64,
+            binding: CellCpuBinding,
+            invocations: Vec<InvocationCpuObservation>,
+        }
+        let row = CellCpuObservationsV1 {
+            version: 1,
+            binding: CellCpuBinding {
+                run_id: "fixture".into(),
+                hermit_sha: "0".repeat(40),
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/native-cpu".into(),
+                mode: "naked".into(),
+                backend: RequiredNullable::Null,
+                outer_attempt: 1,
+                run_index: RequiredNullable::Null,
+            },
+            invocations: Vec::new(),
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert!(serde_json::from_value::<PreProbeRow>(value).is_ok());
+    }
+
     #[test]
     fn branch_charges_preserve_independent_live_and_final_values() {
         let mut row = executed_row();

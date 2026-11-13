@@ -8034,6 +8034,115 @@ impl LiveCpuMeter {
     }
 }
 
+/// The startup clone3 probe, before this run's first cgroup-carrying
+/// start: one dedicated probe cgroup, created exactly as a real
+/// invocation's is (the same parent choice), probed into, reaped and
+/// removed. It runs once per process; later calls return at once.
+/// A probe cgroup that cannot be created is no verdict: the real
+/// invocation's own refusal paths decide, as before.
+/// The order the first budgeted invocation takes: the startup
+/// probe finishes (and drops its cgroup) before the first real
+/// invocation cgroup is allocated, so the probe never competes
+/// with a real cgroup for the parent's last slot.
+fn probe_before_first_real_cgroup<T>(probe: impl FnOnce(), allocate_real: impl FnOnce() -> T) -> T {
+    probe();
+    allocate_real()
+}
+
+fn probe_clone3_for_the_run(plan: &LiveCpuPlan) {
+    let parent = plan.cgroup_parent.clone();
+    probe_clone3_for_the_run_with(plan, &crate::vfork_spawn::CLONE3, move || {
+        let created = match &parent {
+            Some(parent) => InvocationCgroup::create_in(parent),
+            None => InvocationCgroup::create(),
+        };
+        created.ok().map(|cgroup| {
+            (
+                cgroup.directory_fd(),
+                Box::new(cgroup) as Box<dyn std::any::Any + Send>,
+            )
+        })
+    });
+}
+
+/// [`probe_clone3_for_the_run`] with the probe cgroup's creation
+/// given: the probe cgroup is created (and dropped) inside the one
+/// shared initialization, before any real invocation cgroup is
+/// allocated.
+fn probe_clone3_for_the_run_with(
+    plan: &LiveCpuPlan,
+    support: &std::sync::Arc<crate::vfork_spawn::Clone3Support>,
+    create_probe_cgroup: impl FnOnce() -> Option<(RawFd, Box<dyn std::any::Any + Send>)>
+    + Send
+    + 'static,
+) {
+    let _ = plan;
+    support.probe_cgroup_clone_once(create_probe_cgroup);
+}
+
+/// The probe record's own run-level output, written once per
+/// process next to the run's other files
+/// (`<result_root>/runs/<run_id>/clone3-probe.json`). A run whose
+/// probe never ran writes nothing.
+/// Publish the probe record for this run. The record is mandatory
+/// structured output: a write failure fails the cell (through
+/// `record_cell`'s failure path) rather than silently losing the
+/// record, because a run that cannot publish its evidence cannot
+/// be judged from it. Only a success consumes the once: a failed
+/// attempt is retried by the next cell.
+/// Publish `record` (the probe's, when it has run) for this run.
+/// Publish the probe record with its once state given.
+fn publish_probe_record_with(
+    context: &RunContext,
+    record: Option<crate::vfork_spawn::CgroupProbeRecord>,
+    written: &std::sync::Mutex<bool>,
+) -> Result<(), String> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let dir = context.result_root.join("runs").join(&context.run_id);
+    match write_probe_record_once(&dir, &record, written) {
+        Ok(_) => Ok(()),
+        Err(reason) => {
+            eprintln!("manifest-plan: {reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// Write `record` as `clone3-probe.json` in `dir`, at most once per
+/// successful write per `written`: `Ok(true)` only for the caller
+/// that wrote it, and a named error the caller must not drop.
+fn write_probe_record_once(
+    dir: &std::path::Path,
+    record: &crate::vfork_spawn::CgroupProbeRecord,
+    written: &std::sync::Mutex<bool>,
+) -> Result<bool, String> {
+    let mut written = written
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *written {
+        return Ok(false);
+    }
+    let path = dir.join("clone3-probe.json");
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "cannot create {} for the clone3 probe record: {error}",
+            dir.display()
+        )
+    })?;
+    let text = serde_json::to_string_pretty(record)
+        .map_err(|error| format!("cannot encode the clone3 probe record: {error}"))?;
+    std::fs::write(&path, text).map_err(|error| {
+        format!(
+            "cannot write clone3 probe record {}: {error}",
+            path.display()
+        )
+    })?;
+    *written = true;
+    Ok(true)
+}
+
 fn execute_process_with_cpu_poll_interval(
     request: ProcessRequest,
     limits: ProcessLimits,
@@ -8041,8 +8150,12 @@ fn execute_process_with_cpu_poll_interval(
 ) -> Result<ProcessOutput, String> {
     let started = Instant::now();
     let ordinal = observations.len() as u64 + 1;
+    let plan = LiveCpuPlan::current();
     let meter = if limits.cpu_budget_usec.is_some() {
-        LiveCpuMeter::choose(&LiveCpuPlan::current())
+        probe_before_first_real_cgroup(
+            || probe_clone3_for_the_run(&plan),
+            || LiveCpuMeter::choose(&plan),
+        )
     } else {
         Ok(LiveCpuMeter::Disabled)
     };
@@ -9706,10 +9819,60 @@ fn record_cell(
     cell: &SelectedCell,
     run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
 ) -> Result<CellResult, CellRunFailure> {
+    record_cell_with_probe_record(
+        context,
+        cell,
+        || crate::vfork_spawn::CLONE3.cgroup_probe_record(),
+        run,
+    )
+}
+
+/// [`record_cell`], with the probe record to publish given (the
+/// process's own, in production).
+fn record_cell_with_probe_record(
+    context: &RunContext,
+    cell: &SelectedCell,
+    get_probe_record: impl FnOnce() -> Option<crate::vfork_spawn::CgroupProbeRecord>,
+    run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
+) -> Result<CellResult, CellRunFailure> {
+    static WRITTEN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    record_cell_with_probe_record_in_state(context, cell, get_probe_record, &WRITTEN, run)
+}
+
+/// [`record_cell_with_probe_record`] with the publication once
+/// state given (its own, in a test).
+fn record_cell_with_probe_record_in_state(
+    context: &RunContext,
+    cell: &SelectedCell,
+    get_probe_record: impl FnOnce() -> Option<crate::vfork_spawn::CgroupProbeRecord>,
+    written: &std::sync::Mutex<bool>,
+    run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
+) -> Result<CellResult, CellRunFailure> {
     let mut progress = CellRunProgress::default();
     let outcome = run(&mut progress);
+    // The record is read only now: the probe may have run during
+    // this very cell (the first cell of the process), and a record
+    // read before the run would silently publish nothing.
+    let probe_record = get_probe_record();
     let mut observations = empty_cpu_observations(context, cell);
     observations.invocations = progress.observations;
+    if let Err(reason) = publish_probe_record_with(context, probe_record, written) {
+        return Err(match outcome {
+            Ok(mut result) => {
+                result.cpu_observations = Some(observations);
+                CellRunFailure {
+                    reason,
+                    observations: Box::new(result.cpu_observations.take().expect("attached above")),
+                    attempts: result.attempts,
+                }
+            }
+            Err(_) => CellRunFailure {
+                reason,
+                observations: Box::new(observations),
+                attempts: progress.attempts,
+            },
+        });
+    }
     match outcome {
         Ok(mut result) => {
             result.cpu_observations = Some(observations);
@@ -17844,11 +18007,23 @@ fi
         static FORKS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
+    /// How many times this process has called fork(), on any thread:
+    /// the same prepare handler, counted process-wide. Only exact in
+    /// a process running one test (the child
+    /// [`alone_in_a_child_process`] starts).
+    static FORKS_IN_PROCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn forks_in_process() -> u64 {
+        forks_on_this_thread();
+        FORKS_IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The number of fork() calls this thread has made since the counter was
     /// installed in this process.
     fn forks_on_this_thread() -> u64 {
         extern "C" fn count_fork() {
             FORKS_ON_THIS_THREAD.with(|forks| forks.set(forks.get() + 1));
+            FORKS_IN_PROCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
@@ -17916,6 +18091,9 @@ fi
     #[test]
     fn an_invocation_in_a_cgroup_starts_without_forking_this_process() {
         let test = "an_invocation_in_a_cgroup_starts_without_forking_this_process";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
         let Some(mut probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
         else {
             return;
@@ -17951,6 +18129,19 @@ fi
         };
         assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
         assert_eq!(forks, 0, "starting the invocation forked this process");
+        // The startup probe must not fork at all: it starts its
+        // child with clone3, on its setup thread, before this
+        // invocation. This process runs only this test, so the
+        // count is exact.
+        assert_eq!(
+            forks_in_process(),
+            0,
+            "the startup probe must not fork this process"
+        );
+        assert!(
+            crate::vfork_spawn::CLONE3.cgroup_probe_record().is_some(),
+            "the startup probe ran before the first invocation"
+        );
         let cgroup = fs::read_to_string(root.join("cgroup.stdout")).unwrap();
         let invocation = format!("/hermit-e2e-invocation-{}-", std::process::id());
         assert!(
@@ -20203,6 +20394,222 @@ fi
         assert!(json.contains(r#""source":"cgroup_v2_invocation_cpu_stat_v1""#));
         assert_cpu_source_roundtrip(&row);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The production order, driven through the same helper the
+    /// budgeted path calls: with room for exactly one live cgroup
+    /// at a time, the probe is created and dropped before the real
+    /// allocation, and both complete. Reversing the helper's order
+    /// leaves the slot held when the probe asks for it, the probe
+    /// records `unavailable`, and this test fails.
+    #[test]
+    fn the_probe_finishes_before_the_first_real_cgroup_is_allocated() {
+        use std::sync::atomic::AtomicUsize;
+        struct Slot {
+            live: std::sync::Arc<AtomicUsize>,
+            events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push("probe-drop");
+                self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = LiveCpuPlan {
+            allow_process_group_scan: Ok(false),
+            cgroup_parent: None,
+        };
+        let support = std::sync::Arc::new(crate::vfork_spawn::Clone3Support::new());
+        let create =
+            |live: &std::sync::Arc<AtomicUsize>,
+             events: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>| {
+                if live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                events.lock().unwrap().push("probe-create");
+                Some((
+                    -1,
+                    Box::new(Slot {
+                        live: std::sync::Arc::clone(live),
+                        events: std::sync::Arc::clone(events),
+                    }) as Box<dyn std::any::Any + Send>,
+                ))
+            };
+        let real = probe_before_first_real_cgroup(
+            || {
+                let live = std::sync::Arc::clone(&live);
+                let events = std::sync::Arc::clone(&events);
+                probe_clone3_for_the_run_with(&plan, &support, move || create(&live, &events))
+            },
+            || {
+                if live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err("the probe still holds the only cgroup slot".to_string());
+                }
+                events.lock().unwrap().push("real-create");
+                Ok(())
+            },
+        );
+        assert_eq!(real, Ok(()));
+        let record = support.cgroup_probe_record().expect("probe ran");
+        assert_eq!(record.outcome, "no_verdict");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["probe-create", "probe-drop", "real-create"]
+        );
+    }
+
+    /// The run-level probe record is written exactly once, even
+    /// when cells finish concurrently: one writer wins, and the file
+    /// holds that record.
+    #[test]
+    fn the_probe_record_file_is_written_once() {
+        let root = cpu_reader_test_root("probe-record-once");
+        let dir = root.join("runs").join("fixture-run");
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let written = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                let record = record.clone();
+                let written = std::sync::Arc::clone(&written);
+                let wins = std::sync::Arc::clone(&wins);
+                std::thread::spawn(move || {
+                    if write_probe_record_once(&dir, &record, &written).unwrap() {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(wins.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let text = std::fs::read_to_string(dir.join("clone3-probe.json")).unwrap();
+        let back: crate::vfork_spawn::CgroupProbeRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, record);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A failed probe-record write is a named error, and it does not
+    /// consume the once: with the obstacle gone, the next attempt
+    /// writes the record.
+    /// The record_cell failed-write path at cell level: the write
+    /// is refused (the run directory's parent is a file), the cell
+    /// fails by that name, and the failure still carries the
+    /// completed attempt's invocations.
+    #[test]
+    fn a_failed_probe_record_write_fails_the_cell_with_its_invocations() {
+        let root = cpu_reader_test_root("probe-record-cell");
+        let mut context = run_context(&root);
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        context.result_root = blocker;
+        let cell = native_cpu_cell("/bin/true", 1);
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let failure = record_cell_with_probe_record_in_state(
+            &context,
+            &cell,
+            || Some(record.clone()),
+            &std::sync::Mutex::new(false),
+            |progress| {
+                progress
+                    .observations
+                    .push(InvocationCpuObservation::pending(
+                        1,
+                        InvocationRole::Preparation,
+                        CommandIdentity {
+                            argv: vec!["/bin/true".to_string()],
+                            cwd: "/".to_string(),
+                            env_overrides: BTreeMap::new(),
+                        },
+                        None,
+                    ));
+                Err("cell failed".to_string())
+            },
+        )
+        .expect_err("the record write must fail this cell");
+        assert!(
+            failure.reason.contains("clone3 probe record"),
+            "{}",
+            failure.reason
+        );
+        assert_eq!(failure.observations.invocations.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The first cell of a process publishes the probe record
+    /// that only came into existence during that cell: the record
+    /// is read after the run, not snapshotted before it. With the
+    /// old order (read before the run) the getter sees nothing and
+    /// no file is written, and this test fails.
+    #[test]
+    fn the_first_cell_publishes_the_probe_record_it_ran_with() {
+        let root = cpu_reader_test_root("probe-record-first-cell");
+        let context = run_context(&root);
+        let cell = native_cpu_cell("/bin/true", 1);
+        let during_run = std::cell::RefCell::new(None);
+        let result = record_cell_with_probe_record_in_state(
+            &context,
+            &cell,
+            || during_run.borrow().clone(),
+            &std::sync::Mutex::new(false),
+            |_progress| {
+                *during_run.borrow_mut() = Some(crate::vfork_spawn::CgroupProbeRecord {
+                    outcome: "usable".to_string(),
+                    kernel: "test-kernel".to_string(),
+                    reason: None,
+                    child_wait: "pidfd".to_string(),
+                });
+                Err("cell failed".to_string())
+            },
+        );
+        assert!(result.is_err());
+        let file = root
+            .join("results")
+            .join("runs")
+            .join("fixture")
+            .join("clone3-probe.json");
+        let text =
+            std::fs::read_to_string(&file).expect("the first cell must publish its probe record");
+        let back: crate::vfork_spawn::CgroupProbeRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.outcome, "usable");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_probe_record_write_is_named_and_retried() {
+        let root = cpu_reader_test_root("probe-record-retry");
+        let dir = root.join("runs").join("fixture-run");
+        std::fs::create_dir_all(dir.join("clone3-probe.json")).unwrap();
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let written = std::sync::Mutex::new(false);
+        let error = write_probe_record_once(&dir, &record, &written)
+            .expect_err("a directory in the record's place refuses the write");
+        assert!(error.contains("clone3-probe.json"), "{error}");
+        std::fs::remove_dir_all(dir.join("clone3-probe.json")).unwrap();
+        assert!(write_probe_record_once(&dir, &record, &written).unwrap());
+        assert!(!write_probe_record_once(&dir, &record, &written).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
