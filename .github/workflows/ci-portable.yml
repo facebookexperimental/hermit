@@ -450,6 +450,16 @@ jobs:
       # then refused because addr2line was not yet present in Cargo's cache.
       - name: Fetch locked workspace dependencies for offline checks
         run: cargo fetch --locked
+      # The Reverie preparation-identity test in check.script_unit_tests_on_host
+      # asks Cargo for the Reverie workspace's locked metadata offline
+      # (`cargo metadata --locked --offline` in reverie/). The fetch above covers
+      # only Hermit's lockfile, and reverie/Cargo.lock names crates it does not
+      # (74 at Reverie 8143cbd8), so run 43512793059 failed that call with exit
+      # 101 ("no matching package named `darling`"). It runs with Reverie's
+      # toolchain, from the "Install Reverie's pinned Rust toolchain" step.
+      - name: Fetch Reverie's locked dependencies for offline checks
+        working-directory: reverie
+        run: cargo fetch --locked
       - name: Download rust-script binaries
         uses: actions/download-artifact@v4
         with:
