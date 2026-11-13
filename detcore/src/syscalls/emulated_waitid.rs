@@ -33,6 +33,9 @@ enum Selector {
     Exact(DetPid),
     Any,
     Group(libc::pid_t),
+    /// `P_PIDFD`: the process the pidfd at this descriptor names, read from
+    /// Detcore's descriptor model under the turn ([`pidfd_target`]).
+    Pidfd(libc::c_int),
 }
 
 fn classify(call: syscalls::Waitid) -> Result<Selector, Errno> {
@@ -53,21 +56,70 @@ fn classify(call: syscalls::Waitid) -> Result<Selector, Errno> {
         }
         which if which == libc::P_ALL as i32 => Selector::Any,
         which if which == libc::P_PGID as i32 && call.pid() >= 0 => Selector::Group(call.pid()),
-        which if which == libc::P_PIDFD as i32 && call.pid() >= 0 => {
-            // No emulating backend has a pidfd wait implementation. Do not inspect a same-number
-            // host fd through /proc. This is an unsupported form, not Linux
-            // pidfd parity (including the O_NONBLOCK descriptor case).
-            return Err(if options & libc::WNOHANG == 0 {
-                Errno::EOPNOTSUPP
-            } else {
-                Errno::EINVAL
-            });
-        }
+        // Linux checks the options before the descriptor, and a negative
+        // descriptor is EINVAL (`kernel_waitid_prepare`, kernel/exit.c).
+        which if which == libc::P_PIDFD as i32 && call.pid() >= 0 => Selector::Pidfd(call.pid()),
         _ => return Err(Errno::EINVAL),
     };
     // Preserve the backend's terminal SIGCHLD-only boundary. The scheduler
     // handles __WNOTHREAD; that bit must not reach the exact backend syscall.
     Ok(selector)
+}
+
+/// What Detcore's descriptor model holds about the descriptor a
+/// `waitid(P_PIDFD)` names (`ThreadState::with_detfd`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PidfdFacts {
+    ty: crate::fd::FdType,
+    target: Option<DetPid>,
+    status_flags: libc::c_int,
+    blocking_mode_unknown: bool,
+}
+
+/// What a `waitid(P_PIDFD)` waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PidfdTarget {
+    /// The process the pidfd names, and whether its open file description is
+    /// nonblocking.
+    Process { target: DetPid, nonblocking: bool },
+    /// Linux answers EBADF.
+    NotAPidfd,
+    /// Detcore cannot tell what the descriptor names; the reason says why.
+    Unknown(&'static str),
+}
+
+/// The target of a `waitid(P_PIDFD)` whose descriptor Detcore models as
+/// `facts` (`None`: no open descriptor), as Linux resolves it at entry.
+/// `pidfd_get_pid` (kernel/pid.c) answers EBADF for a descriptor that is not
+/// open, and `pidfd_pid` (fs/pidfs.c) for a file that is not a pidfd; an
+/// `O_PATH` descriptor is not open for `fdget`. Otherwise the wait names the
+/// pidfd's process, whatever later happens to the descriptor, and the
+/// description's `O_NONBLOCK` makes the wait `WNOHANG`
+/// (`kernel_waitid_prepare`, kernel/exit.c). Detcore records the process of
+/// every pidfd it opens (`handle_pidfd_open`, `CLONE_PIDFD`); a pidfd it
+/// did not open, or a descriptor it models only as a regular file (which a
+/// pidfd received from outside the run may be), names nothing Detcore knows.
+fn pidfd_target(facts: Option<PidfdFacts>) -> PidfdTarget {
+    use crate::fd::FdType;
+    let Some(facts) = facts else {
+        return PidfdTarget::NotAPidfd;
+    };
+    match facts.ty {
+        FdType::Pidfd => match facts.target {
+            None => PidfdTarget::Unknown("it is a pidfd whose process Detcore did not record"),
+            Some(_) if facts.blocking_mode_unknown => {
+                PidfdTarget::Unknown("Detcore does not know whether the pidfd is nonblocking")
+            }
+            Some(target) => PidfdTarget::Process {
+                target,
+                nonblocking: facts.status_flags & libc::O_NONBLOCK != 0,
+            },
+        },
+        FdType::Regular if facts.status_flags & libc::O_PATH == 0 => PidfdTarget::Unknown(
+            "Detcore did not open it as a pidfd and cannot tell whether it is one",
+        ),
+        _ => PidfdTarget::NotAPidfd,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,17 +223,21 @@ where
     complete_child(guest, call, child).await
 }
 
+/// `pidfd_nonblocking`: the wait names a nonblocking pidfd and the caller did
+/// not pass `WNOHANG`, so Linux waits as with `WNOHANG` and answers `EAGAIN`
+/// where that wait would answer 0 (`kernel_waitid`, kernel/exit.c).
 async fn wait_terminal<G, T>(
     guest: &mut G,
     call: syscalls::Waitid,
     spec: ChildWaitSpec,
     rsrc: Resources,
+    pidfd_nonblocking: bool,
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let nonblocking = call.options() & libc::WNOHANG != 0;
+    let nonblocking = call.options() & libc::WNOHANG != 0 || pidfd_nonblocking;
     let mut request_turn = true;
     let mut pending_signal = None;
     loop {
@@ -206,6 +262,9 @@ where
         }
         let (ready, has_child) = ready_child_wait(guest, spec).await;
         let child = match decide(ready, has_child, nonblocking, pending_signal.is_some()) {
+            Decision::Complete(Ok(0)) if pidfd_nonblocking => {
+                return finish_without_event(guest, call, Err(Errno::EAGAIN)).await;
+            }
             Decision::Complete(result) => return finish_without_event(guest, call, result).await,
             Decision::Wait => {
                 request_turn = true;
@@ -330,7 +389,56 @@ where
             return finish_without_event(guest, call, Err(errno)).await;
         }
     };
+    let mut pidfd_nonblocking = false;
     let selector = match selector {
+        Selector::Pidfd(fd) => {
+            // Linux resolves the descriptor once, at entry; the wait then
+            // names the process, whatever happens to the descriptor. This
+            // task holds the run until its first resource request, so no
+            // other task changes the descriptor table while it is read.
+            let facts = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| PidfdFacts {
+                    ty: detfd.ty(),
+                    target: detfd.pidfd_target(),
+                    status_flags: detfd.status_flags(),
+                    blocking_mode_unknown: detfd.blocking_mode_unknown(),
+                })
+                .ok();
+            match pidfd_target(facts) {
+                PidfdTarget::Process {
+                    target,
+                    nonblocking,
+                } => {
+                    pidfd_nonblocking = nonblocking && call.options() & libc::WNOHANG == 0;
+                    ChildWaitSelector::Exact(target)
+                }
+                PidfdTarget::NotAPidfd => {
+                    resource_request(guest, rsrc).await;
+                    return finish_without_event(guest, call, Err(Errno::EBADF)).await;
+                }
+                PidfdTarget::Unknown(reason) => {
+                    let reason = format!("a wait on descriptor {fd}: {reason}");
+                    tracing::error!("[dtid {dettid}] Detcore refuses waitid: {reason}");
+                    let panic_on_unsupported = guest.config().panic_on_unsupported_syscalls;
+                    let refused = crate::syscalls::helpers::refuse_unserviceable_operation_with(
+                        guest,
+                        panic_on_unsupported,
+                        reverie::syscalls::Sysno::waitid,
+                        Errno::EOPNOTSUPP,
+                        Some(&reason),
+                    )
+                    .await;
+                    return match refused {
+                        Err(Error::Errno(errno)) => {
+                            resource_request(guest, rsrc).await;
+                            finish_without_event(guest, call, Err(errno)).await
+                        }
+                        other => other,
+                    };
+                }
+            }
+        }
         Selector::Exact(child) => ChildWaitSelector::Exact(child),
         Selector::Any => ChildWaitSelector::Any,
         Selector::Group(0) => {
@@ -345,7 +453,7 @@ where
     let spec = terminal_child_wait_spec(selector, dettid, call.options());
     // The backend's exact callback boundary supplies disposition exclusion. Preserve
     // the application's mask so a process alarm can interrupt a parked wait.
-    wait_terminal(guest, call, spec, rsrc).await
+    wait_terminal(guest, call, spec, rsrc, pidfd_nonblocking).await
 }
 
 #[cfg(test)]
@@ -399,7 +507,12 @@ mod tests {
             assert_eq!(classify(exact.with_options(bad)), Err(Errno::EINVAL));
         }
         let pidfd = call.with_which(libc::P_PIDFD as i32).with_pid(7);
-        assert_eq!(classify(pidfd), Err(Errno::EOPNOTSUPP));
+        assert_eq!(classify(pidfd), Ok(Selector::Pidfd(7)));
+        assert_eq!(classify(pidfd.with_pid(0)), Ok(Selector::Pidfd(0)));
+        assert_eq!(
+            classify(pidfd.with_options(libc::WEXITED | libc::WNOHANG)),
+            Ok(Selector::Pidfd(7))
+        );
         assert_eq!(classify(pidfd.with_pid(-1)), Err(Errno::EINVAL));
         assert_eq!(classify(pidfd.with_options(0)), Err(Errno::EINVAL));
         for unsupported in [libc::WSTOPPED, libc::WEXITED | libc::__WCLONE] {
@@ -408,10 +521,73 @@ mod tests {
                 Err(Errno::EINVAL)
             );
         }
+    }
+
+    #[test]
+    fn a_pidfd_wait_names_the_recorded_process_and_its_blocking_mode() {
+        use crate::fd::FdType;
+        let target = DetPid::from_raw(7);
+        let facts = |ty, target, status_flags, blocking_mode_unknown| {
+            Some(PidfdFacts {
+                ty,
+                target,
+                status_flags,
+                blocking_mode_unknown,
+            })
+        };
+        assert_eq!(pidfd_target(None), PidfdTarget::NotAPidfd);
         assert_eq!(
-            classify(pidfd.with_options(libc::WEXITED | libc::WNOHANG)),
-            Err(Errno::EINVAL)
+            pidfd_target(facts(FdType::Pidfd, Some(target), libc::O_RDWR, false)),
+            PidfdTarget::Process {
+                target,
+                nonblocking: false
+            }
         );
+        assert_eq!(
+            pidfd_target(facts(
+                FdType::Pidfd,
+                Some(target),
+                libc::O_RDWR | libc::O_NONBLOCK,
+                false
+            )),
+            PidfdTarget::Process {
+                target,
+                nonblocking: true
+            }
+        );
+        assert!(matches!(
+            pidfd_target(facts(FdType::Pidfd, None, libc::O_RDWR, false)),
+            PidfdTarget::Unknown(_)
+        ));
+        assert!(matches!(
+            pidfd_target(facts(FdType::Pidfd, Some(target), libc::O_RDWR, true)),
+            PidfdTarget::Unknown(_)
+        ));
+        // A regular file Detcore did not open as a pidfd may be one received
+        // from outside the run; an O_PATH descriptor is not open for fdget.
+        assert!(matches!(
+            pidfd_target(facts(FdType::Regular, None, libc::O_RDONLY, false)),
+            PidfdTarget::Unknown(_)
+        ));
+        assert_eq!(
+            pidfd_target(facts(FdType::Regular, None, libc::O_PATH, false)),
+            PidfdTarget::NotAPidfd
+        );
+        for ty in [
+            FdType::Pipe,
+            FdType::Socket,
+            FdType::Eventfd,
+            FdType::Signalfd,
+            FdType::Timerfd,
+            FdType::Memfd,
+            FdType::Epoll,
+        ] {
+            assert_eq!(
+                pidfd_target(facts(ty, None, libc::O_RDWR, false)),
+                PidfdTarget::NotAPidfd,
+                "{ty:?}"
+            );
+        }
     }
 
     #[test]

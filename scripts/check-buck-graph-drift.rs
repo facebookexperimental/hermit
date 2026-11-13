@@ -74,9 +74,20 @@
 //! test-parameter parity between `rust_library` and `rust_binary`
 //! that B1 broke.
 //!
+//! On the GitHub export, facebookexperimental/hermit, this check has
+//! nothing to read: `shim/shims.bzl` belongs to the open-source Buck
+//! layer (shim/), which that export does not carry. ShipIt strips it,
+//! and dh-2y5z03 V4 keeps shim/ stripped. There it prints one line
+//! beginning `SKIPPED` and exits 0. It skips only when
+//! `GITHUB_REPOSITORY` names the export AND `shim/shims.bzl` is absent:
+//! any other checkout missing the file still fails (exit 2), and an
+//! export that has the file is checked in full. The skip comes out when
+//! dh-8zi9o4 (where that layer lives after the branch flip) is resolved.
+//!
 //! Run with no argument inside the checkout; `--help` or `-h` prints
-//! the usage. Exit status: 0 when no drift is found, 1 on drift or a
-//! file this check refuses to read, 2 on a usage or load error, 75
+//! the usage. Exit status: 0 when no drift is found, or on the GitHub
+//! export without `shim/shims.bzl` (the `SKIPPED` line), 1 on drift or
+//! a file this check refuses to read, 2 on a usage or load error, 75
 //! when the Reverie submodule is not initialized.
 //!
 //! ```cargo
@@ -100,7 +111,8 @@ const NAME: &str = "check-buck-graph-drift.rs";
 const USAGE: &str = "usage: check-buck-graph-drift.rs [-h | --help]";
 const HELP: &str = "Refuse Buck graph drift (shim test-parameter gap, stale or missing \
      shared-cell alias, missing generic-array buildscript cfg) in this checkout. Run it \
-     with no argument from inside a Hermit checkout. Exit status: 0 clean, 1 drift, \
+     with no argument from inside a Hermit checkout. Exit status: 0 clean (or SKIPPED \
+     on the facebookexperimental/hermit export, which has no shim/shims.bzl), 1 drift, \
      2 usage or load error, 75 when the Reverie submodule is not initialized.";
 /// How BUCK files spell an unsuffixed third-party Rust target.
 const REF_PREFIX: &str = "fbsource//third-party/rust:";
@@ -114,6 +126,10 @@ const KNOWN_MISSING: [&str; 4] = ["io-uring", "num_cpus", "quickcheck_macros", "
 const DEAD_REFS: [&str; 3] = ["prost", "tonic", "tonic-prost"];
 const DEAD_REF_FILES: [&str; 1] = ["shim/shims.bzl"];
 const SHIMS: &str = "shim/shims.bzl";
+/// The GitHub export ShipIt publishes, which does not carry the
+/// open-source Buck layer; see `export_skip`.
+const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
+const NOT_A_CHECKOUT: &str = "run this inside a Hermit checkout, outside its submodules";
 /// The shim's label rewrite rules, whose exact entries rename crates.
 const REWRITES: &str = "shim/build_defs/lib/oss.bzl";
 const ALIASES: &str = "shim/third-party/rust/shared-cell-aliases.txt";
@@ -136,8 +152,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match run() {
-        Ok(summary) => {
+        Ok(Pass::Clean(summary)) => {
             println!("{NAME}: {summary}");
+            ExitCode::SUCCESS
+        }
+        Ok(Pass::Skipped(reason)) => {
+            println!("{NAME}: {reason}");
             ExitCode::SUCCESS
         }
         Err(Outcome::Drift(violations)) => {
@@ -155,6 +175,13 @@ fn main() -> ExitCode {
             ExitCode::from(75)
         }
     }
+}
+
+/// A run that found no drift: a clean checkout, or the GitHub export,
+/// which has nothing to check (`export_skip`).
+enum Pass {
+    Clean(String),
+    Skipped(String),
 }
 
 enum Outcome {
@@ -175,8 +202,15 @@ impl From<NoResult> for Outcome {
     }
 }
 
-fn run() -> Result<String, Outcome> {
+fn run() -> Result<Pass, Outcome> {
     let root = repo_root()?;
+    let repository = std::env::var("GITHUB_REPOSITORY").ok();
+    if let Some(reason) = export_skip(&root, repository.as_deref()) {
+        return Ok(Pass::Skipped(reason));
+    }
+    if !root.join(SHIMS).is_file() {
+        return Err(String::from(NOT_A_CHECKOUT).into());
+    }
     let mut violations: Vec<String> = Vec::new();
 
     // B1: both shim entry points swallow the same test parameters.
@@ -347,7 +381,7 @@ fn run() -> Result<String, Outcome> {
     }
 
     if violations.is_empty() {
-        Ok(format!(
+        Ok(Pass::Clean(format!(
             "{} unsuffixed third-party references and {} first-party label(s) the \
              shim renames to a crate ({}) in {files_scanned} build files: \
              {via_shared} via the shared-cell list ({} entries, all locked crates), \
@@ -366,24 +400,47 @@ fn run() -> Result<String, Outcome> {
             KNOWN_MISSING.join(", "),
             DEAD_REFS.len(),
             DEAD_REFS.join(", "),
-        ))
+        )))
     } else {
         Err(Outcome::Drift(violations))
     }
 }
 
-/// The checkout root, refusing anything that is not a Hermit checkout.
+/// The `SKIPPED` line for the GitHub export, or `None` to run the check.
+/// It skips only when `repository` is `EXPORT_REPOSITORY` and nothing at
+/// all is at `SHIMS`, which belongs to the open-source Buck layer that
+/// export does not carry (ShipIt strips it, and dh-2y5z03 V4 keeps shim/
+/// stripped). Any other checkout missing `SHIMS` still fails, and an
+/// export that has it is checked in full. The skip comes out when
+/// dh-8zi9o4 is resolved.
+fn export_skip(root: &Path, repository: Option<&str>) -> Option<String> {
+    let absent = matches!(
+        fs::symlink_metadata(root.join(SHIMS)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    (repository == Some(EXPORT_REPOSITORY) && absent).then(|| {
+        format!(
+            "SKIPPED on {EXPORT_REPOSITORY}: {SHIMS} is absent: it belongs to the \
+             open-source Buck layer, which this export does not carry; this check needs \
+             that layer, and this skip comes out when dh-8zi9o4 (where that layer lives \
+             after the branch flip) is resolved"
+        )
+    })
+}
+
+/// The checkout root, refusing anything without a `Cargo.lock`. `run`
+/// refuses a root without `SHIMS` too, except on the GitHub export.
 fn repo_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|error| format!("git could not run: {error}"))?;
     if !output.status.success() {
-        return Err("run this inside a Hermit checkout, outside its submodules".into());
+        return Err(NOT_A_CHECKOUT.into());
     }
     let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if !root.join(SHIMS).is_file() || !root.join("Cargo.lock").is_file() {
-        return Err("run this inside a Hermit checkout, outside its submodules".into());
+    if !root.join("Cargo.lock").is_file() {
+        return Err(NOT_A_CHECKOUT.into());
     }
     Ok(root)
 }
@@ -753,6 +810,64 @@ fn buildscript_cfg_preserved(fixups: &toml::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh, empty directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "check-buck-graph-drift-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shim")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_the_export_without_the_shims_skips() {
+        let root = scratch("absent");
+        let reason = export_skip(&root, Some(EXPORT_REPOSITORY)).expect("the export skips");
+        assert!(
+            reason.starts_with("SKIPPED on facebookexperimental/hermit: "),
+            "{reason}"
+        );
+        // It names the bead that decides where the open-source Buck layer
+        // lives, and claims no V4 deletion: V4 keeps shim/ stripped.
+        assert!(
+            reason.contains(SHIMS)
+                && reason.contains("open-source Buck layer")
+                && reason.contains("dh-8zi9o4")
+                && !reason.contains("V4"),
+            "{reason}"
+        );
+        // Anywhere else the same tree is not skipped, so `run` refuses it.
+        for other in [
+            None,
+            Some("rrnewton/hermit"),
+            Some(""),
+            Some("FacebookExperimental/hermit"),
+            Some("facebookexperimental/hermit-fork"),
+            Some("facebookexperimental/hermit "),
+        ] {
+            assert_eq!(export_skip(&root, other), None, "{other:?}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_export_with_the_shims_is_checked() {
+        let root = scratch("present");
+        fs::write(root.join(SHIMS), "def rust_library(\n").unwrap();
+        assert_eq!(export_skip(&root, Some(EXPORT_REPOSITORY)), None);
+        // Something at the path that is not a readable file is not absent
+        // either: `run` refuses it rather than skip.
+        fs::remove_file(root.join(SHIMS)).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join(SHIMS)).unwrap();
+        assert_eq!(export_skip(&root, Some(EXPORT_REPOSITORY)), None);
+        fs::remove_file(root.join(SHIMS)).unwrap();
+        fs::create_dir(root.join(SHIMS)).unwrap();
+        assert_eq!(export_skip(&root, Some(EXPORT_REPOSITORY)), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn refs_are_extracted_verbatim() {

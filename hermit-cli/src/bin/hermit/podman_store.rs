@@ -50,6 +50,10 @@ pub(crate) struct ResolvedImage {
     pub id: String,
     /// The image's manifest digest (`sha256:...`), when the store records one.
     pub digest: Option<String>,
+    /// Fully qualified repo digests naming this image, when the store
+    /// records any. A multi-arch reference can pin an index digest while
+    /// [`Self::digest`] names the selected platform manifest.
+    pub repo_digests: Vec<String>,
 }
 
 /// A row of `hermit oci ls`.
@@ -222,10 +226,21 @@ impl PodmanStore {
         let digest = podman_output(&["image", "inspect", &id, "--format", "{{.Digest}}"])
             .ok()
             .filter(|d| d.starts_with("sha256:"));
+        let repo_digests = podman_output(&[
+            "image",
+            "inspect",
+            &id,
+            "--format",
+            "{{json .RepoDigests}}",
+        ])
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
         Ok(ResolvedImage {
             reference: reference.to_string(),
             id,
             digest,
+            repo_digests,
         })
     }
 

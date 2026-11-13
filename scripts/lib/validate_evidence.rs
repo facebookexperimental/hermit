@@ -470,9 +470,10 @@ mod tests {
             "--requalify-cell".into(),
             "c-programs/pid-probe".into(),
             "verify".into(),
-            // SaBRe is archived (ci/manifest-plan/src/archived.rs), so its cells
-            // are no longer selected per commit; use a selected DBT cell.
-            "dbt".into(),
+            // SaBRe is archived (ci/manifest-plan/src/archived.rs) and DBT left the
+            // first-party core, so neither has a selected cell. Use a LiteInst
+            // cell; requalification_plan_bracket below covers a ptrace one.
+            "liteinst".into(),
             "--no-label-pr".into(),
         ])
         .unwrap();
@@ -487,14 +488,17 @@ mod tests {
             category: "c-programs".into(),
             test: Some("c-programs/pid-probe".into()),
             mode: Some("verify".into()),
-            backend: Some("dbt".into()),
+            backend: Some("liteinst".into()),
         };
         let committed = super::super::validate_plan::validation_config(root).unwrap();
         let lane =
             dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&requested.lane))
                 .unwrap();
         let owner = dagrun::result_manifest_owner(&lane.steps, &requested).unwrap();
-        let selected = dagrun::select_steps_by_tags(&lane, &[owner.tag()], false).unwrap();
+        let mut selected = dagrun::select_steps_by_tags(&lane, &[owner.tag()], false).unwrap();
+        // The plan is fail-fast by default (apply_fail_fast); shape the
+        // expectation the same way, as requalification_plan_bracket does.
+        super::super::collapse_fail_fast_families(&mut selected);
         // Exact bytes cover resource bounds, command argv and dependency order.
         assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&selected));
         let prepared = SelectedEvidence::capture(root, &plan)

@@ -8300,10 +8300,58 @@ esac
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The GitHub export ShipIt publishes, which carries no BUCK or .bzl file
+    /// until dh-2y5z03 V4 exports the shared ones, release_alias.bzl among them.
+    const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
+
+    /// Whether nothing at all is at `relative` below `root` and `repository` is
+    /// exactly `EXPORT_REPOSITORY`. Anywhere else, or with the file present, it
+    /// is false, so a checkout missing the file still fails. dh-2y5z03 V4
+    /// deletes this.
+    fn export_strip_applies(root: &Path, relative: &str, repository: Option<&str>) -> bool {
+        matches!(
+            fs::symlink_metadata(root.join(relative)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) && repository == Some(EXPORT_REPOSITORY)
+    }
+
+    #[test]
+    fn only_an_absent_file_on_the_export_is_skipped() {
+        let root =
+            std::env::temp_dir().join(format!("build-buck-release-export-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("hermit-cli")).unwrap();
+        let alias = "hermit-cli/release_alias.bzl";
+        assert!(export_strip_applies(&root, alias, Some(EXPORT_REPOSITORY)));
+        for other in [
+            None,
+            Some("rrnewton/hermit"),
+            Some("facebookexperimental/hermit-fork"),
+        ] {
+            assert!(!export_strip_applies(&root, alias, other), "{other:?}");
+        }
+        fs::write(root.join(alias), "").unwrap();
+        assert!(!export_strip_applies(&root, alias, Some(EXPORT_REPOSITORY)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
-        // hermit-cli/BUCK defines the release targets through this macro.
-        let buck = fs::read_to_string(source_root().join("hermit-cli/release_alias.bzl")).unwrap();
+        // hermit-cli/BUCK defines the release targets through this macro. ShipIt
+        // strips it from the GitHub export, where this test is skipped, saying so.
+        let alias = "hermit-cli/release_alias.bzl";
+        let repository = std::env::var("GITHUB_REPOSITORY").ok();
+        if export_strip_applies(&source_root(), alias, repository.as_deref()) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "build-buck-release.rs: SKIPPED on {EXPORT_REPOSITORY}: {alias} is absent, \
+                 because ShipIt strips it from this export; \
+                 release_buck_target_uses_declared_library_dependencies_and_exact_rpath is \
+                 skipped until dh-2y5z03 V4 exports it and deletes this skip"
+            );
+            return;
+        }
+        let buck = fs::read_to_string(source_root().join(alias)).unwrap();
         assert!(buck.contains("\"fbsource//third-party/xz:lzma\""));
         assert!(
             buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\"")

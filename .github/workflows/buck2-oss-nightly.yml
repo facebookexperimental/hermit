@@ -3,6 +3,13 @@ name: OSS Buck2 nightly
 # This workflow exercises the documented public Buck2 reproduction path. It is
 # deliberately separate from landing evidence and never runs for a pull request
 # or a push to main.
+#
+# TEMPORARY (dh-2y5z03): the Buck graph is not exported to the
+# facebookexperimental/hermit mirror until dh-2y5z03 V4, so there both build
+# jobs are skipped by their job-level `if:`, and the mirror-skip job runs and
+# says why. The skip stays out of the steps, whose text
+# scripts/check-github-actions-triggers.rs binds by hash. The V4 diff removes
+# the mirror-skip job, the two job-level `if:` lines and this note.
 on:
   schedule:
     - cron: "17 10 * * *"
@@ -19,10 +26,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  mirror-skip:
+    name: Buck build skipped on the facebookexperimental mirror
+    if: github.repository == 'facebookexperimental/hermit'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Say why the Buck build is skipped
+        run: |
+          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
+
   buck-release-evidence:
     name: Supplemental feature-complete Buck release evidence
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    if: github.repository != 'facebookexperimental/hermit'
 
     steps:
       - name: Check out Hermit and its pinned sources
@@ -322,6 +341,7 @@ jobs:
     name: Regenerate and build the OSS Buck2 graph
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    if: github.repository != 'facebookexperimental/hermit'
 
     steps:
       - name: Check out Hermit and its pinned sources

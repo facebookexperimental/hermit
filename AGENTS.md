@@ -586,7 +586,9 @@ The portable workflow is the one exception, by owner decision on 2026-10-27:
 "invoke CI automatically only for external PRs not by our hermit-bot account".
 `ci-portable.yml` runs on `pull_request` (opened, synchronize, reopened,
 ready_for_review) unless the author is `hermit-bot3` or the pull request is a
-draft, as well as after a push to `integration` and on manual dispatch. It
+draft, as well as after a push to `integration` or `main` and on manual
+dispatch (`main` since owner Slack 6324, 2026-11-12, for automated GitHub CI
+on the facebookexperimental/hermit mirror). It
 uses no secrets and a `contents: read` token (its `cleanup` job alone asks for
 `actions: write` to delete the run's own artifacts, and skips fork pull
 requests, whose token cannot have it), so it behaves the same for a branch of

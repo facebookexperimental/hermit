@@ -210,6 +210,23 @@ fn validate_mount_targets(
     Ok(())
 }
 
+/// Refuse a non-image run's `--mount` and `--bind` targets by the host's
+/// paths, in this order: first a target the guest's own `/dev/mqueue`
+/// would cover ([`refuse_below_private_mqueue`], by `is_dir`), then a
+/// missing `--mount` target ([`validate_mount_targets`], by `exists`).
+/// The mqueue rule goes first because existence on the host says nothing
+/// about it: a target below the private `/dev/mqueue` is refused whether
+/// or not the host has that path.
+fn refuse_host_mount_targets(
+    mounts: &[MountArg],
+    binds: &[Bind],
+    exists: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    refuse_below_private_mqueue(mounts, binds, is_dir)?;
+    validate_mount_targets(mounts, exists)
+}
+
 /// The first `--bind` target that `exists` reports missing, of those
 /// Hermit mounts onto as they are: the bind twin of
 /// [`missing_mount_target`]. A target inside /tmp goes to the private
@@ -2725,6 +2742,11 @@ pub struct RunOpts {
     /// run has written its trace (`finish_manifest`).
     #[clap(skip)]
     pending_network_manifest: Option<crate::app::manifest::Manifest>,
+
+    /// Runtime-only: the resolved image identity recorded in this run's
+    /// manifest, checked against every materialized rootfs before use.
+    #[clap(skip)]
+    manifest_image: Option<crate::app::manifest::Image>,
 
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
@@ -5390,6 +5412,46 @@ fn a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_lo
         refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
         "{refused}"
     );
+}
+
+/// A non-image run checks its mount targets against the private
+/// `/dev/mqueue` before their existence on the host, and the mqueue rule
+/// refuses a target below it whether or not that path exists on the host:
+/// an existing host path would not make mounting there safe, since the
+/// guest's own mqueue filesystem covers it. On a host without
+/// `/dev/mqueue`, a missing target is named as missing and an existing one
+/// passes.
+#[test]
+fn a_target_below_the_private_dev_mqueue_is_refused_whether_or_not_it_exists() {
+    let mounts = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/dev/mqueue/below",
+        "/bin/true",
+    ])
+    .mount;
+    let dev_mqueue = |path: &Path| path == Path::new("/dev/mqueue");
+    for target_exists in [true, false] {
+        let refused =
+            refuse_host_mount_targets(&mounts, &[], move |_: &Path| target_exists, dev_mqueue)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            refused.contains(
+                "cannot mount at /dev/mqueue/below: the guest's /dev/mqueue is its own mqueue filesystem"
+            ),
+            "target exists on the host: {target_exists}: {refused}"
+        );
+    }
+    let no_dev_mqueue = |_: &Path| false;
+    let refused = refuse_host_mount_targets(&mounts, &[], |_: &Path| false, no_dev_mqueue)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
+        "{refused}"
+    );
+    assert!(refuse_host_mount_targets(&mounts, &[], |_: &Path| true, no_dev_mqueue).is_ok());
 }
 
 /// The below-mqueue refusal sees both flags together: a cover from
@@ -14043,12 +14105,16 @@ impl RunOpts {
         // For the same reason, the run manifest too. It is a convenience
         // beside the warning that already prints the inputs, so a data
         // directory that cannot be written does not stop the run.
-        let recording = self.begin_manifest(global).unwrap_or_else(|error| {
-            crate::app::tracing::diagnostic_eprintln!(
-                "hermit: WARNING: this run's manifest was not written: {error:#}"
-            );
-            None
-        });
+        let recording = match self.begin_manifest(global) {
+            Ok(recording) => recording,
+            Err(error) if error.downcast_ref::<PolicyRefusal>().is_some() => return Err(error),
+            Err(error) => {
+                crate::app::tracing::diagnostic_eprintln!(
+                    "hermit: WARNING: this run's manifest was not written: {error:#}"
+                );
+                None
+            }
+        };
         self.warn_of_host_drawn_inputs(global, recording)?;
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
@@ -15463,8 +15529,7 @@ impl RunOpts {
         // their existence against the materialized rootfs when the
         // container is built, not against the host here.
         if self.image.is_none() {
-            refuse_below_private_mqueue(&self.mount, &self.bind, Path::is_dir)?;
-            validate_mount_targets(&self.mount, Path::exists)?;
+            refuse_host_mount_targets(&self.mount, &self.bind, Path::exists, Path::is_dir)?;
         }
         // `--bind` targets are guest paths on the same footing as
         // `--mount` targets. With `--image` they name paths inside the
@@ -16134,6 +16199,22 @@ impl RunOpts {
         validate_executable(&host, &requested, rootfs.as_deref())
     }
 
+    /// Materialize an image rootfs and, when this run recorded an image
+    /// identity in its manifest, refuse to use a tree materialized from any
+    /// other content. The comparison intentionally ignores the supplied
+    /// reference: tags and IDs can name the same content through different
+    /// spellings.
+    fn materialize_image_rootfs(&self, image_ref: &str) -> Result<PathBuf, Error> {
+        let materialized = crate::app::image::materialize_rootfs(image_ref)?;
+        crate::app::image::ensure_materialized_identity_matches(
+            image_ref,
+            self.manifest_image.as_ref(),
+            materialized.identity.as_ref(),
+        )
+        .map_err(|error| Error::new(PolicyRefusal).context(format!("{error:#}")))?;
+        Ok(materialized.path)
+    }
+
     /// Where the guest program is on the host, as [`Self::validate_program`]
     /// checks it: its host path, the path as the command names it, and the
     /// image rootfs it resolves in, if any.
@@ -16149,7 +16230,7 @@ impl RunOpts {
             // Materialize before building the command: on a cold cache this is
             // what makes the image's Env/WorkingDir available for relative-path
             // resolution during first-run validation.
-            let rootfs = crate::app::image::materialize_rootfs(image)?;
+            let rootfs = self.materialize_image_rootfs(image)?;
             let command = self.guest_command()?;
             let requested = Path::new(command.get_program());
             // `guest_command()` sets the image working directory (WorkingDir, or
@@ -18896,7 +18977,7 @@ impl RunOpts {
         // and no tmpfs of Hermit's is there for a guest to reach.
         let mounts_placeholder = self.mounts_directory_placeholder();
         if let Some(image) = &self.image {
-            let rootfs = crate::app::image::materialize_rootfs(image)?;
+            let rootfs = self.materialize_image_rootfs(image)?;
             let workdir_binds: Vec<(PathBuf, PathBuf, bool)> = self
                 .bind
                 .iter()
@@ -19849,6 +19930,10 @@ impl RunOpts {
         let (mut global_inputs, mut run_inputs) =
             crate::app::run_config::to_manifest_parts(&config)?;
         manifest::drop_outputs(&mut global_inputs, &mut run_inputs);
+        let supplied_image_reference = run_inputs
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         if self.timer_downgrade.is_some() {
             run_inputs.insert(
                 manifest::MAX_TIMESLICE_KEY.to_owned(),
@@ -19874,6 +19959,21 @@ impl RunOpts {
         );
         if !self.namespace_only {
             document.preemption = Some(self.preemption_summary());
+        }
+        if let Some(image_ref) = &self.image {
+            let mut image = crate::app::image::resolved_image_identity(image_ref).map_err(|error| {
+                Error::new(PolicyRefusal).context(format!(
+                    "cannot bind a resolved image identity for this manifest-requested \
+                     --image run: {error:#}"
+                ))
+            })?;
+            // `self.image` may already have been canonicalized to a store ID;
+            // the captured run options retain the reference as supplied.
+            if image.reference.is_some() && supplied_image_reference.is_some() {
+                image.reference = supplied_image_reference;
+            }
+            self.manifest_image = Some(image.clone());
+            document = document.with_image(image);
         }
         let path = match &network_trace {
             // The trace stays where its user named it, with its manifest

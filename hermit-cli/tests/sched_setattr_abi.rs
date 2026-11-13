@@ -30,6 +30,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use nix::errno::Errno;
+use nix::sys::resource::Resource;
+use nix::sys::resource::getrlimit;
+
 /// Compile the probe fixture and return its path. The build root is
 /// `CARGO_TARGET_TMPDIR`, which lives under `target/` rather than `/tmp`:
 /// Hermit isolates `/tmp`, so a guest binary placed there would be invisible
@@ -73,6 +77,11 @@ fn transcript(mut command: Command, label: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.starts_with("sched-setattr-context ") {
+            eprintln!("{label}: {line}");
+        }
+    }
     String::from_utf8(output.stdout).expect("the probe prints ASCII")
 }
 
@@ -80,11 +89,25 @@ fn transcript(mut command: Command, label: &str) -> String {
 fn sched_setattr_argument_handling_matches_the_host_kernel() {
     let guest = build_fixture();
 
+    // Raising priority can require RLIMIT_NICE headroom on the host. Hermit
+    // exposes nice 0, so choose one request that lowers neither leg's nice.
+    Errno::clear();
+    let current_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let error = Errno::last();
+    assert_eq!(error, Errno::UnknownErrno, "getpriority failed: {error}");
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NICE).expect("getrlimit(RLIMIT_NICE) failed");
+    let requested_nice = current_nice.max(0).to_string();
+    eprintln!(
+        "native caller: nice={current_nice} RLIMIT_NICE={soft}/{hard} requested_nice={requested_nice}"
+    );
+
     let mut native_command = Command::new(&guest);
-    native_command.env_clear();
+    native_command
+        .env_clear()
+        .args(["--sched-nice", &requested_nice]);
     let native = transcript(native_command, "the native sched_setattr probe");
 
-    let sandboxed = run_under_hermit(&guest, "ptrace");
+    let sandboxed = run_under_hermit(&guest, "ptrace", &requested_nice);
     compare(&native, &sandboxed, "ptrace");
 
     // SaBRe is the second backend this handler runs under, and the ABI it
@@ -94,7 +117,7 @@ fn sched_setattr_argument_handling_matches_the_host_kernel() {
     // environment fact, not a product verdict.
     match sabre_artifacts() {
         Some((loader, plugin)) => {
-            let sabre = run_under_hermit_sabre(&guest, &loader, &plugin);
+            let sabre = run_under_hermit_sabre(&guest, &loader, &plugin, &requested_nice);
             compare(&native, &sabre, "sabre");
         }
         None => eprintln!(
@@ -103,7 +126,7 @@ fn sched_setattr_argument_handling_matches_the_host_kernel() {
     }
 }
 
-fn run_under_hermit(guest: &Path, backend: &str) -> String {
+fn run_under_hermit(guest: &Path, backend: &str, requested_nice: &str) -> String {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "120s"])
@@ -115,7 +138,8 @@ fn run_under_hermit(guest: &Path, backend: &str) -> String {
             "--base-env=minimal",
             "--",
         ])
-        .arg(guest);
+        .arg(guest)
+        .args(["--sched-nice", requested_nice]);
     transcript(command, &format!("the {backend} sched_setattr probe"))
 }
 
@@ -130,7 +154,12 @@ fn sabre_artifacts() -> Option<(PathBuf, PathBuf)> {
     (loader.is_file() && plugin.is_file()).then_some((loader, plugin))
 }
 
-fn run_under_hermit_sabre(guest: &Path, loader: &Path, plugin: &Path) -> String {
+fn run_under_hermit_sabre(
+    guest: &Path,
+    loader: &Path,
+    plugin: &Path,
+    requested_nice: &str,
+) -> String {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "120s"])
@@ -141,7 +170,8 @@ fn run_under_hermit_sabre(guest: &Path, loader: &Path, plugin: &Path) -> String 
         .arg("--sabre-plugin")
         .arg(plugin)
         .arg("--")
-        .arg(guest);
+        .arg(guest)
+        .args(["--sched-nice", requested_nice]);
     transcript(command, "the sabre sched_setattr probe")
 }
 

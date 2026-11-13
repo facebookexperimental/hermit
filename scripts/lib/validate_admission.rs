@@ -2226,7 +2226,11 @@ for entry in Path('/proc/self/fd').iterdir():
             ),
             (FLOOR_SENSITIVE_PATHS_FILE, "this list"),
         ] {
-            assert!(root.join(path).is_file(), "{path} ({reader}) is not a file");
+            // On the GitHub export hermit-cli/BUCK is absent: that one file check
+            // is skipped, saying so, and its membership is still checked.
+            if !crate::stripped_from_export(&root, path, "its is-a-file check") {
+                assert!(root.join(path).is_file(), "{path} ({reader}) is not a file");
+            }
             assert!(
                 list.matches(path),
                 "{path} ({reader}) is not floor-sensitive"

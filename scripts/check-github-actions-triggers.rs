@@ -1,17 +1,23 @@
 #!/usr/bin/env -S rust-script --force
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
+//! ```cargo
+//! [dependencies]
+//! serde_yaml = "0.9"
+//! ```
+//!
 //! Enforce the repository's GitHub Actions trigger policy.
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
 //! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`, and for pull requests not opened by the project bot
-//! (owner decision, 2026-10-27): its `pull_request` trigger must use exactly
+//! pushed to `integration` or `main`, and for pull requests not opened by the
+//! project bot (owner decision, 2026-10-27; `main` since owner Slack 6324,
+//! 2026-11-12, which asked for automated GitHub CI on the facebookexperimental
+//! mirror's main, the exported tip): its `pull_request` trigger must use exactly
 //! PORTABLE_PR_TYPES, and every job that can start without a predecessor or
 //! runs under `always()` must carry PORTABLE_PR_GATE, so a bot or draft pull
 //! request runs nothing. Two owner-approved maintenance workflows also run
@@ -19,6 +25,11 @@
 //! dispatchable. This checker deliberately accepts only the small YAML shape
 //! used here. An unfamiliar or ambiguous trigger block is an error, never a
 //! silent pass.
+//!
+//! Every workflow file must also parse as YAML. The checks below read lines,
+//! and only the shapes they police, so a file GitHub cannot load passed them:
+//! GitHub then starts none of its jobs. buck2-oss-nightly.yml was such a file
+//! on 2026-11-12 (a plain scalar containing ": ").
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -35,6 +46,11 @@ const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
 /// The only `pull_request` activity types ci-portable.yml may list.
 const PORTABLE_PR_TYPES: [&str; 4] = ["opened", "synchronize", "reopened", "ready_for_review"];
+/// The branches whose pushes start ci-portable.yml: `integration`, and `main`
+/// since owner Slack 6324 (2026-11-12) asked for automated GitHub CI on the
+/// facebookexperimental/hermit mirror's main. Every other workflow may
+/// push-trigger only on `integration`.
+const PORTABLE_PUSH_BRANCHES: [&str; 2] = ["integration", "main"];
 /// The gate every ci-portable.yml entry job carries: a pull_request run whose
 /// author is hermit-bot3, or whose pull request is a draft, does nothing.
 const PORTABLE_PR_GATE: &str = "github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)";
@@ -296,7 +312,9 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("missing `workflow_dispatch` trigger".to_string());
     }
     if triggers.events.contains("push") {
-        if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
+        if name != PORTABLE
+            && triggers.push_branches.as_deref() != Some(&["integration".to_string()])
+        {
             errors.push("`push.branches` must contain exactly `integration`".to_string());
         }
     } else if triggers.push_branches.is_some() {
@@ -352,8 +370,18 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
                 PORTABLE_PR_TYPES.join(", ")
             ));
         }
-        if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
-            errors.push("ci-portable.yml must push-trigger exactly on `integration`".to_string());
+        if !triggers
+            .push_branches
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .eq(PORTABLE_PUSH_BRANCHES.iter().copied())
+        {
+            errors.push(format!(
+                "ci-portable.yml must push-trigger exactly on [{}]",
+                PORTABLE_PUSH_BRANCHES.join(", ")
+            ));
         }
     }
     errors
@@ -1081,7 +1109,11 @@ fn buck2_nightly_required_markers() -> Vec<(&'static str, &'static str)> {
 // blocks. Semantic validators and mutation tests remain the security boundary.
 const RELEASE_CAPTURE_BLOCK_FNV1A64: u64 = 0xd47269f7822be906;
 const RELEASE_FINALIZE_BLOCK_FNV1A64: u64 = 0x2391b53a25c3213a;
-const RELEASE_UPLOAD_BLOCK_FNV1A64: u64 = 0x729e01b3370e7f6f;
+// The upload step is the last of buck-release-evidence, so its block runs to
+// oss-buck2's first step and includes oss-buck2's job header. That header's
+// one `if:` line, the temporary dh-2y5z03 mirror skip, is the only difference
+// from the reviewed block (hash 0x729e01b3370e7f6f without it).
+const RELEASE_UPLOAD_BLOCK_FNV1A64: u64 = 0xeea2b5ddfeac99ef;
 const LEGACY_REVERIE_BLOCK_FNV1A64: u64 = 0x560c7d2fcc02b62f;
 const LEGACY_DIAGNOSTIC_CAPTURE_BLOCK_FNV1A64: u64 = 0x0ce72a075541cfdf;
 const LEGACY_DIAGNOSTIC_FINALIZE_BLOCK_FNV1A64: u64 = 0x6c037b9cd4dabcaf;
@@ -1365,6 +1397,15 @@ fn validate_buck2_nightly_contract(source: &str) -> Vec<String> {
     errors
 }
 
+/// Why GitHub would refuse to load `source`, if it would. GitHub reads a
+/// workflow only if it is valid YAML; one that is not starts no job, so none of
+/// the line-oriented checks in this file would see anything wrong with it.
+fn yaml_parse_error(source: &str) -> Option<String> {
+    serde_yaml::from_str::<serde_yaml::Value>(source)
+        .err()
+        .map(|error| format!("is not valid YAML, so GitHub would start none of its jobs: {error}"))
+}
+
 fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
@@ -1404,6 +1445,9 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
                 continue;
             }
         };
+        if let Some(error) = yaml_parse_error(&source) {
+            errors.push(format!("{}: {error}", path.display()));
+        }
         match parse_triggers(&source) {
             Ok(triggers) => {
                 errors.extend(
@@ -1450,7 +1494,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration, non-bot pull requests and exact approved schedules"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration (and main for ci-portable.yml), non-bot pull requests and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -1469,17 +1513,98 @@ mod tests {
         parse_triggers(source).expect("fixture should parse")
     }
 
-    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+    /// D131563454's skip step, reduced: `run: echo "...: ..."` is a plain
+    /// scalar, and a plain scalar may not contain ": ". GitHub refused the
+    /// whole file ("You have an error in your yaml syntax on line 35").
+    const UNQUOTED_COLON_STEP: &str = "on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: say\n        run: echo \"SKIPPED on the mirror: not exported\"\n";
 
     #[test]
-    fn portable_policy_accepts_integration_manual_and_gated_pull_requests() {
+    fn a_workflow_that_is_not_yaml_is_refused() {
+        let error = yaml_parse_error(UNQUOTED_COLON_STEP)
+            .expect("a plain scalar containing \": \" must not parse");
+        assert!(error.contains("is not valid YAML"), "{error}");
+        // The same step as a block scalar is valid, so the check is about the
+        // syntax and not about the text.
+        let block = UNQUOTED_COLON_STEP.replace("run: echo", "run: |\n          echo");
+        assert_eq!(yaml_parse_error(&block), None);
+    }
+
+    #[test]
+    fn run_reports_a_workflow_that_is_not_yaml() {
+        let dir = std::env::temp_dir().join(format!(
+            "check-github-actions-triggers-yaml-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(PORTABLE),
+            include_str!("../.github/workflows/ci-portable.yml"),
+        )
+        .unwrap();
+        fs::write(dir.join("broken.yml"), UNQUOTED_COLON_STEP).unwrap();
+        let result = run(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+        let errors = result.expect_err("a workflow that is not YAML must fail the run");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("broken.yml: is not valid YAML")),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn checked_in_workflows_parse_as_yaml() {
+        for (name, source) in [
+            (PORTABLE, include_str!("../.github/workflows/ci-portable.yml")),
+            (
+                VALIDATION_LEVELS,
+                include_str!("../.github/workflows/validation-levels.yml"),
+            ),
+            (
+                BUCK2_OSS_NIGHTLY,
+                include_str!("../.github/workflows/buck2-oss-nightly.yml"),
+            ),
+        ] {
+            assert_eq!(yaml_parse_error(source), None, "{name}");
+        }
+    }
+
+    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+
+    #[test]
+    fn portable_policy_accepts_integration_and_main_pushes_manual_and_gated_pull_requests() {
         assert!(validate(PORTABLE, &parsed(PORTABLE_ON)).is_empty());
+    }
+
+    #[test]
+    fn portable_push_branches_must_be_exactly_integration_and_main() {
+        for branches in [
+            "[integration]",
+            "[main]",
+            "[main, integration]",
+            "[integration, main, release]",
+        ] {
+            let source = PORTABLE_ON.replace("[integration, main]", branches);
+            assert!(
+                !validate(PORTABLE, &parsed(&source)).is_empty(),
+                "{branches}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_portable_workflow_may_push_trigger_on_main() {
+        let triggers = parsed(
+            "on:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\njobs:\n",
+        );
+        assert!(!validate("other.yml", &triggers).is_empty());
     }
 
     #[test]
     fn portable_now_requires_its_pull_request_trigger() {
         let triggers = parsed(
-            "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
+            "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\njobs:\n",
         );
         assert!(!validate(PORTABLE, &triggers).is_empty());
     }

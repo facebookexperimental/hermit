@@ -1556,6 +1556,9 @@ case "$1" in
     ;;
   image)
     case "$*" in
+      *RepoDigests*)
+        printf '%s\n' '["docker.io/library/store-test@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]'
+        ;;
       *Digest*)
         printf 'sha256:%s\n' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ;;
@@ -1652,6 +1655,111 @@ fn store_reference_still_materializes_via_podman_store() {
             "fake podman must record {needle:?}\nrecorded:\n{recorded}"
         );
     }
+}
+
+fn find_manifest(cache: &Path) -> serde_json::Value {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.file_name().is_some_and(|name| name == "manifest.json") {
+                out.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&cache.join("hermit"), &mut found);
+    assert_eq!(found.len(), 1, "manifests under {}: {found:?}", cache.display());
+    serde_json::from_slice(&std::fs::read(&found[0]).unwrap()).unwrap()
+}
+
+#[test]
+fn image_runs_record_resolved_identity_in_v2_manifest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Store path: the supplied tag is preserved while IDs come from the
+    // store resolution that also selected the layer to materialize.
+    let fake = write_fake_podman(tmp.path());
+    let store_cache = tmp.path().join("cache-store");
+    let output = fake.command(
+        &store_cache,
+        &[
+            "run".to_string(),
+            "--image=store-test:latest".to_string(),
+            "--strict".to_string(),
+            "--manifest=always".to_string(),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+        ],
+    );
+    assert_guest_ran(&output);
+    let manifest = find_manifest(&store_cache);
+    assert_eq!(manifest["schema"], "hermit-recording-manifest/v2");
+    assert_eq!(manifest["image"]["source"], "podman-store");
+    assert_eq!(
+        manifest["image"]["reference"],
+        "store-test:latest",
+        "supplied reference must survive canonicalization: {manifest}"
+    );
+    assert_eq!(manifest["image"]["identity"], "a".repeat(64));
+    assert_eq!(manifest["image"]["image_id"], "a".repeat(64));
+    assert_eq!(
+        manifest["image"]["manifest_digest"],
+        format!("sha256:{}", "b".repeat(64))
+    );
+
+    // Local OCI path: the manifest identity is the verified OCI manifest
+    // digest named by the fixture index, with no host path in `reference`.
+    let oci_cache = tmp.path().join("cache-oci");
+    let image_dir = tmp.path().join("oci-image");
+    write_valid_oci_dir(&image_dir);
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(image_dir.join("index.json")).unwrap()).unwrap();
+    let expected_digest = index["manifests"][0]["digest"].as_str().unwrap();
+    let output = run_hermit(
+        &oci_cache,
+        &[
+            "run".to_string(),
+            format!("--image=oci-dir:{}", image_dir.display()),
+            "--strict".to_string(),
+            "--manifest=always".to_string(),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+        ],
+    );
+    assert_guest_ran(&output);
+    let manifest = find_manifest(&oci_cache);
+    assert_eq!(manifest["schema"], "hermit-recording-manifest/v2");
+    assert_eq!(manifest["image"]["source"], "oci-dir");
+    assert!(manifest["image"].get("reference").is_none(), "{manifest}");
+    assert_eq!(manifest["image"]["manifest_digest"], expected_digest);
+    assert_eq!(
+        manifest["image"]["identity"],
+        expected_digest.strip_prefix("sha256:").unwrap()
+    );
+
+    // Docker archive: identity is the verified config digest.
+    let docker_cache = tmp.path().join("cache-docker");
+    let archive = tmp.path().join("image.tar");
+    write_valid_docker_archive(&archive);
+    let output = run_hermit(
+        &docker_cache,
+        &[
+            "run".to_string(),
+            format!("--image=docker-archive:{}", archive.display()),
+            "--strict".to_string(),
+            "--manifest=always".to_string(),
+            "--".to_string(),
+            "/bin/guest".to_string(),
+        ],
+    );
+    assert_guest_ran(&output);
+    let manifest = find_manifest(&docker_cache);
+    assert_eq!(manifest["image"]["source"], "docker-archive");
+    assert!(manifest["image"].get("reference").is_none(), "{manifest}");
+    assert!(manifest["image"].get("manifest_digest").is_none(), "{manifest}");
+    assert_eq!(manifest["image"]["identity"], manifest["image"]["image_id"]);
 }
 
 #[test]

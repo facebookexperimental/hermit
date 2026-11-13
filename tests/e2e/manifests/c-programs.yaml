@@ -5668,20 +5668,26 @@ test:
       artifacts: []
     modes:
       verify:
+        # KVM pidfd-waitid-child: KVM opens a pidfd for another guest process
+        # since Reverie https://github.com/rrnewton/reverie/pull/1410, and
+        # Detcore answers waitid(P_PIDFD) from its pidfd model, EAGAIN for the
+        # nonblocking pidfd of a live child
+        # (https://github.com/rrnewton/hermit/issues/5037).
         ci:
           ptrace: true
           sabre: true
           dbt: true
           liteinst: true
           in-guest-trap: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
           - dbt
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5037): KVM''s pidfd_open serves only the calling process and answers ESRCH for a live child, so the guest exits 1 (`pidfd_open child failed: No such process`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace and native Linux return a pidfd'
+          - kvm
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

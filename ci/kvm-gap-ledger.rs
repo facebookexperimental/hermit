@@ -375,6 +375,16 @@ fn history_of(root: &Path, declaration: &Declaration) -> Result<History, String>
     })
 }
 
+/// The first line of a history refusal. Besides the ledger and its introduction, it counts the
+/// rows the import exception accepted on the way, so a refused run shows them too.
+fn refused_header(ledger: &str, introduction: &str, verdict: &HistoryVerdict) -> String {
+    format!(
+        "KNOWN-GAP-LEDGER-HISTORY-REFUSED {ledger} (introduced at {}; {} row(s) whose approval line an import dropped, known_gaps::SQUASHED_APPROVALS): the ledger may only shrink, and what grows it needs a bound approval:",
+        &introduction[..12],
+        verdict.squashed_rows
+    )
+}
+
 fn history(root: &Path, ledger: Option<&str>) -> Result<bool, String> {
     let mut ok = true;
     for declaration in selected(ledger)? {
@@ -391,20 +401,20 @@ fn history(root: &Path, ledger: Option<&str>) -> Result<bool, String> {
         let verdict = &history.verdict;
         if verdict.violations.is_empty() {
             println!(
-                "kvm-gap-ledger: {}: history holds: introduced at {}, {} committed version(s); {} baseline row(s), {} approved row(s), {} required test(s)",
+                "kvm-gap-ledger: {}: history holds: introduced at {}, {} committed version(s); {} baseline row(s), {} approved row(s), {} row(s) whose approval line an import dropped (known_gaps::SQUASHED_APPROVALS), {} required test(s)",
                 declaration.ledger,
                 &history.introduction[..12],
                 history.versions,
                 verdict.baseline_rows,
                 verdict.approved_rows,
+                verdict.squashed_rows,
                 verdict.required
             );
         } else {
             ok = false;
             eprintln!(
-                "KNOWN-GAP-LEDGER-HISTORY-REFUSED {} (introduced at {}): the ledger may only shrink, and what grows it needs a bound approval:\n{}",
-                declaration.ledger,
-                &history.introduction[..12],
+                "{}\n{}",
+                refused_header(declaration.ledger, &history.introduction, verdict),
                 verdict
                     .violations
                     .iter()
@@ -2265,6 +2275,23 @@ mod tests {
         repository.write(DECLARATION.ledger, &ledger_text(&[]));
         repository.commit("introduce the ledger");
         repository
+    }
+
+    #[test]
+    fn a_refusal_counts_the_rows_the_import_exception_accepted() {
+        let verdict = HistoryVerdict {
+            violations: vec!["refused".to_string()],
+            squashed_rows: 2,
+            ..Default::default()
+        };
+        let header = refused_header(DECLARATION.ledger, &format!("{:040x}", 1), &verdict);
+        assert!(
+            header.starts_with(&format!(
+                "KNOWN-GAP-LEDGER-HISTORY-REFUSED {} (introduced at 000000000000; 2 row(s) whose approval line an import dropped",
+                DECLARATION.ledger
+            )),
+            "{header}"
+        );
     }
 
     #[test]
