@@ -28,7 +28,7 @@ use super::admission_hex;
 /// rewrote it (to `README`, say) could have the proof accept an E..M that edits
 /// the validation DAG. A target that touches the list is validated against the
 /// real current main instead.
-pub const TARGET_PIN_FILE_PATTERNS: &str = "**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\nci/admission/floor-sensitive-paths.txt\n";
+pub const TARGET_PIN_FILE_PATTERNS: &str = "**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\nshim/hermetic_infra/hermit/fb-only/release.bzl\nci/admission/floor-sensitive-paths.txt\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FloorSensitivePattern {
@@ -440,7 +440,7 @@ mod tests {
 
     // A subset of the real ci/admission/floor-sensitive-paths.txt, which lists
     // ci/admission/ (the list itself) as well.
-    const LIST: &str = "ci/dag/\nci/admission/\n**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\n";
+    const LIST: &str = "ci/dag/\nci/admission/\n**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\nshim/hermetic_infra/hermit/fb-only/release.bzl\n";
 
     /// E with the files the cases below edit, M one docs-only commit later,
     /// and a target that changes one source file on E.

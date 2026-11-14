@@ -203,9 +203,11 @@ fn usage() -> &'static str {
        -h, --help                          Show this help\n\
      \n\
      Canonical-pin scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
-     Derived local bindings checked separately: LiteInst cache keys\n\
-     and hermit-cli/BUCK. Excludes other non-Cargo files, untracked/generated files,\n\
-     and nested submodule contents."
+     Derived local bindings checked separately: LiteInst cache keys,\n\
+     hermit-cli/BUCK, and the release values it loads from\n\
+     shim/hermetic_infra/hermit/fb-only/release.bzl (whose HERMIT_VERSION must\n\
+     also equal hermit-cli/Cargo.toml's version). Excludes other non-Cargo files,\n\
+     untracked/generated files, and nested submodule contents."
 }
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -2085,8 +2087,10 @@ fn exact_40_hex_tokens(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// The Buck build bypasses `hermit-cli/build.rs`, so it must restate the
-/// canonical Reverie pin in its explicit compile-time environment.
+/// The Buck build bypasses `hermit-cli/build.rs`, so its explicit compile-time
+/// environment must carry the canonical Reverie pin. This file holds that
+/// environment. Both trees share it, so it binds the pin to a name it loads
+/// from this tree's own [`BUCK_RELEASE_VALUES_SITE`].
 const BUCK_BUILD_PIN_SITE: &str = "hermit-cli/BUCK";
 
 /// The dictionary in [`BUCK_BUILD_PIN_SITE`] that holds that environment.
@@ -2104,62 +2108,189 @@ const BUCK_BUILD_ENV_CONSUMER: &str = "env = LIBHERMIT_ENV,";
 /// libhermit's sources, so each reads the environment.
 const BUCK_BUILD_ENV_CONSUMERS: usize = 3;
 
+/// The release targets' macro (hermit-cli/release_alias.bzl) takes the
+/// environment as its `unstamped_env` argument.
+const UNSTAMPED_RELEASE_ALIAS: &str = "unstamped_env = LIBHERMIT_ENV,";
+
+/// This tree's release values: the open-source stand-in for fbsource's
+/// fb-only/release.bzl, which [`BUCK_BUILD_PIN_SITE`] loads at the same label
+/// through the shim cell ([`BUCK_RELEASE_VALUES_LOAD`]). Each tree keeps its own,
+/// so that a release or a Reverie pin bump edits only that tree's file. It holds
+/// one active `HERMIT_REVERIE_PIN = "<40-hex>"` line, the pin, and one active
+/// `HERMIT_VERSION = "<version>"` line, hermit-cli's package version. A pin bump
+/// carries the pin here like any other derived site ([`carry_derived_pin_sites`]).
+const BUCK_RELEASE_VALUES_SITE: &str = "shim/hermetic_infra/hermit/fb-only/release.bzl";
+
+/// The one active line of [`BUCK_BUILD_PIN_SITE`] that brings the release
+/// values in.
+const BUCK_RELEASE_VALUES_LOAD: &str = r#"load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN", "HERMIT_VERSION")"#;
+
+/// The names [`BUCK_RELEASE_VALUES_SITE`] defines, and the [`BUCK_BUILD_ENV`]
+/// keys that take them.
+const RELEASE_PIN_NAME: &str = "HERMIT_REVERIE_PIN";
+const RELEASE_VERSION_NAME: &str = "HERMIT_VERSION";
+const BUCK_BUILD_PIN_KEY: &str = "HERMIT_REVERIE_PIN";
+const BUCK_BUILD_VERSION_KEY: &str = "CARGO_PKG_VERSION";
+
+/// The manifest whose `[package]` version [`RELEASE_VERSION_NAME`] restates.
+const RELEASE_VERSION_MANIFEST: &str = "hermit-cli/Cargo.toml";
+
+/// One active [`BUCK_BUILD_ENV`] entry for `key`, which must be
+/// `"key": name` with an optional trailing comma and comment: `name` is the
+/// value [`BUCK_BUILD_PIN_SITE`] loads from [`BUCK_RELEASE_VALUES_SITE`].
+///
+/// `Ok(None)` for a line that is not an active entry for `key`. An entry with
+/// any other value is an error, a quoted literal included: a literal would be a
+/// second copy of the value, in the file both trees share.
+fn parse_buck_env_entry(line: &str, key: &str, name: &str) -> Result<Option<()>, String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return Ok(None);
+    }
+    let Some(after_key) = trimmed.strip_prefix(&format!("\"{key}\"")) else {
+        return Ok(None);
+    };
+    let value = after_key
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or_else(|| "key is not followed by ':'".to_string())?
+        .trim_start();
+    let Some(tail) = value.strip_prefix(name) else {
+        return Err(if value.starts_with('"') {
+            format!(
+                "value is a literal; it must be the name {name}, loaded from {BUCK_RELEASE_VALUES_SITE}"
+            )
+        } else {
+            format!("value is not the name {name}: {value:?}")
+        });
+    };
+    let mut tail = tail.trim_start();
+    if let Some(after_comma) = tail.strip_prefix(',') {
+        tail = after_comma.trim_start();
+    }
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return Err(format!("unexpected text after {name}: {tail:?}"));
+    }
+    Ok(Some(()))
+}
+
+/// The value of one active `name = "value"` line of
+/// [`BUCK_RELEASE_VALUES_SITE`]. `Ok(None)` for a line whose active part does
+/// not mention `name`; an error for one that mentions it in any other shape.
+fn parse_release_value(line: &str, name: &str) -> Result<Option<String>, String> {
+    let code = line.split('#').next().unwrap_or("").trim();
+    if !code.contains(name) {
+        return Ok(None);
+    }
+    let quoted = code
+        .strip_prefix(name)
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .and_then(|rest| rest.trim_start().strip_prefix('"'))
+        .ok_or_else(|| format!("not a `{name} = \"...\"` assignment: {code:?}"))?;
+    let value = quoted
+        .strip_suffix('"')
+        .filter(|value| !value.contains('"'))
+        .ok_or_else(|| format!("value is not one double-quoted string: {code:?}"))?;
+    Ok(Some(value.to_string()))
+}
+
+/// The one active value of `name` in [`BUCK_RELEASE_VALUES_SITE`], with its
+/// line number, or every reason there is not exactly one: none, two, or a
+/// line that names it in another shape.
+fn release_value(contents: &str, name: &str) -> Result<(usize, String), Vec<String>> {
+    let mut values = Vec::new();
+    let mut problems = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        match parse_release_value(line, name) {
+            Ok(None) => {}
+            Ok(Some(value)) => values.push((index + 1, value)),
+            Err(reason) => problems.push(format!(
+                "{BUCK_RELEASE_VALUES_SITE}:{}: {reason}",
+                index + 1
+            )),
+        }
+    }
+    if values.len() == 1 && problems.is_empty() {
+        return Ok(values.remove(0));
+    }
+    if values.is_empty() && problems.is_empty() {
+        problems.push(format!(
+            "{BUCK_RELEASE_VALUES_SITE}: no active `{name} = \"...\"` line"
+        ));
+    }
+    if values.len() > 1 {
+        for (line, value) in &values {
+            problems.push(format!(
+                "{BUCK_RELEASE_VALUES_SITE}:{line}: one of {} assignments: {value}",
+                values.len()
+            ));
+        }
+    }
+    Err(problems)
+}
+
+/// [`BUCK_RELEASE_VALUES_SITE`]'s contents. `Ok(None)` after reporting that the
+/// file is missing: [`BUCK_BUILD_PIN_SITE`] loads it, so a tree with that file
+/// must have this one.
+fn read_release_values(root: &Path, header: &str) -> Result<Option<String>, String> {
+    let path = root.join(BUCK_RELEASE_VALUES_SITE);
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            loud_header(header);
+            eprintln!(
+                "{BUCK_BUILD_PIN_SITE} loads its release values from {BUCK_RELEASE_VALUES_SITE}, which this tree lacks."
+            );
+            Ok(None)
+        }
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
+
+/// The literal `version` in a Cargo manifest's `[package]` table, if it has one.
+fn package_version(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if code.starts_with('[') {
+            in_package = code == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(value) = code
+            .strip_prefix("version")
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+        else {
+            continue;
+        };
+        return value
+            .trim()
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_string);
+    }
+    None
+}
+
 /// Bind Buck-built Hermit's reported Reverie provenance to the canonical pin.
 ///
 /// Cargo builds obtain `HERMIT_REVERIE_PIN` from `hermit-cli/build.rs`, which
 /// reads Cargo metadata. Buck does not run that build script: every target that
 /// compiles libhermit's sources consumes [`BUCK_BUILD_ENV`] from
-/// [`BUCK_BUILD_PIN_SITE`]. A stale value therefore produces a working binary
-/// that reports the wrong backend revision, even while every Cargo entry and
-/// the submodule gitlink are uniform. The ordinary pin gate must cover that
-/// active non-Cargo binding.
+/// [`BUCK_BUILD_PIN_SITE`], whose pin entry takes the value
+/// [`BUCK_RELEASE_VALUES_SITE`] defines. A stale value there therefore produces
+/// a working binary that reports the wrong backend revision, even while every
+/// Cargo entry and the submodule gitlink are uniform. The ordinary pin gate must
+/// cover that active non-Cargo binding, through both files: the entry must be
+/// the loaded name, the file must load it exactly once and bind it nowhere
+/// else, and the release values file must assign it exactly once, to the pin.
 ///
-/// The release targets may also consume it, through the one
+/// The release targets may also consume the environment, through the one
 /// [`UNSTAMPED_RELEASE_ALIAS`] line, when CI builds them without the release
 /// provenance stamp. That alias reads the same checked block, so it needs no
 /// pin of its own; any other mention is still refused.
-fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return Ok(None);
-    }
-
-    const KEY: &str = "\"HERMIT_REVERIE_PIN\"";
-    let Some(after_key) = trimmed.strip_prefix(KEY) else {
-        return Ok(None);
-    };
-    let after_colon = after_key
-        .trim_start()
-        .strip_prefix(':')
-        .ok_or_else(|| "key is not followed by ':'".to_string())?
-        .trim_start();
-    let quoted = after_colon
-        .strip_prefix('"')
-        .ok_or_else(|| "value is not double-quoted".to_string())?;
-    let closing_quote = quoted
-        .find('"')
-        .ok_or_else(|| "value has no closing double quote".to_string())?;
-    let value = &quoted[..closing_quote];
-    if !is_full_sha(value) {
-        return Err(format!(
-            "quoted value is not an exact 40-hex revision: {value:?}"
-        ));
-    }
-
-    let mut tail = quoted[closing_quote + 1..].trim_start();
-    if let Some(after_comma) = tail.strip_prefix(',') {
-        tail = after_comma.trim_start();
-    }
-    if !tail.is_empty() && !tail.starts_with('#') {
-        return Err(format!("unexpected text after quoted revision: {tail:?}"));
-    }
-    Ok(Some(value.to_string()))
-}
-
-/// The release targets' macro (hermit-cli/release_alias.bzl) takes the
-/// environment as its `unstamped_env` argument.
-const UNSTAMPED_RELEASE_ALIAS: &str = "unstamped_env = LIBHERMIT_ENV,";
-
 fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let path = root.join(BUCK_BUILD_PIN_SITE);
     let contents = match fs::read_to_string(&path) {
@@ -2227,23 +2358,22 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let mut malformed = Vec::new();
     for (index, line) in lines[build_env_start + 1..build_env_end].iter().enumerate() {
         let source_line = build_env_start + index + 2;
-        match parse_buck_build_pin_binding(line) {
+        match parse_buck_env_entry(line, BUCK_BUILD_PIN_KEY, RELEASE_PIN_NAME) {
             Ok(None) => {}
-            Ok(Some(value)) => bindings.push((source_line, value)),
+            Ok(Some(())) => bindings.push(source_line),
             Err(reason) => malformed.push((source_line, reason)),
         }
     }
-
     if bindings.len() != 1 || !malformed.is_empty() {
         loud_header("BUCK BUILD REVERIE PIN MISSING OR AMBIGUOUS - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "Expected exactly one active \"HERMIT_REVERIE_PIN\": \"<40-hex>\" dictionary entry in {BUCK_BUILD_PIN_SITE}; found {} valid binding(s) and {} malformed candidate(s).",
+            "Expected exactly one active \"{BUCK_BUILD_PIN_KEY}\": {RELEASE_PIN_NAME} dictionary entry in {BUCK_BUILD_PIN_SITE}; found {} valid binding(s) and {} malformed candidate(s).",
             bindings.len(),
             malformed.len()
         );
-        for (line, value) in &bindings {
-            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: duplicate binding {value}");
+        for line in &bindings {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: duplicate binding");
         }
         for (line, reason) in &malformed {
             eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {reason}");
@@ -2251,20 +2381,176 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
         return Ok(1);
     }
 
-    let (line, bound) = &bindings[0];
+    // Outside the block: the one load of the release values, and no other
+    // active mention of either name it loads. Any other could rebind it, and
+    // Buck would then report the rebound value (a version that is not
+    // hermit-cli's, or a pin that is not the gitlink).
+    let mut loads = Vec::new();
+    let mut stray = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if (build_env_start..=build_env_end).contains(&index) {
+            continue;
+        }
+        let code = line.split('#').next().unwrap_or("").trim();
+        if code == BUCK_RELEASE_VALUES_LOAD {
+            loads.push(index + 1);
+        } else if code.contains(RELEASE_PIN_NAME) || code.contains(RELEASE_VERSION_NAME) {
+            stray.push((index + 1, code));
+        }
+    }
+    if loads.len() != 1 || !stray.is_empty() {
+        loud_header("BUCK RELEASE VALUES LOAD MISSING OR AMBIGUOUS - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!(
+            "Expected exactly one active `{BUCK_RELEASE_VALUES_LOAD}` line in {BUCK_BUILD_PIN_SITE}, and no other active mention of {RELEASE_PIN_NAME} or {RELEASE_VERSION_NAME} outside `{BUCK_BUILD_ENV_OPENER}`; found {} load line(s) and {} other mention(s).",
+            loads.len(),
+            stray.len()
+        );
+        for line in &loads {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: load");
+        }
+        for (line, code) in &stray {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {code}");
+        }
+        return Ok(1);
+    }
+
+    let Some(values) = read_release_values(root, "BUCK RELEASE VALUES MISSING - BLOCKED")? else {
+        eprintln!("Canonical Reverie pin: {pin}");
+        return Ok(1);
+    };
+    let (line, bound) = match release_value(&values, RELEASE_PIN_NAME) {
+        Ok(value) => value,
+        Err(problems) => {
+            loud_header("BUCK BUILD REVERIE PIN MISSING OR AMBIGUOUS - BLOCKED");
+            eprintln!("Canonical Reverie pin: {pin}");
+            eprintln!(
+                "Expected exactly one active `{RELEASE_PIN_NAME} = \"<40-hex>\"` line in {BUCK_RELEASE_VALUES_SITE}."
+            );
+            for problem in &problems {
+                eprintln!("  {problem}");
+            }
+            return Ok(1);
+        }
+    };
+    if !is_full_sha(&bound) {
+        loud_header("BUCK BUILD REVERIE PIN MISSING OR AMBIGUOUS - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!(
+            "  {BUCK_RELEASE_VALUES_SITE}:{line}: quoted value is not an exact 40-hex revision: {bound:?}"
+        );
+        return Ok(1);
+    }
     if bound != pin {
         loud_header("BUCK BUILD REVERIE PIN DRIFT - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
-        eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {bound}");
+        eprintln!("  {BUCK_RELEASE_VALUES_SITE}:{line}: {bound}");
         eprintln!(
-            "Buck bypasses hermit-cli/build.rs, so this stale compile-time value makes Buck-built Hermit report the wrong Reverie revision."
+            "Buck bypasses hermit-cli/build.rs and takes this value through {BUCK_BUILD_PIN_SITE}, so a stale one makes Buck-built Hermit report the wrong Reverie revision."
         );
         return Ok(1);
     }
 
     eprintln!(
-        "Buck build pin binding: 1 binding equals the pin ({}).",
+        "Buck build pin binding: {BUCK_BUILD_PIN_SITE} takes {RELEASE_PIN_NAME} from {BUCK_RELEASE_VALUES_SITE}, which equals the pin ({}).",
         &pin[..7.min(pin.len())]
+    );
+    Ok(0)
+}
+
+/// Bind Buck-built Hermit's reported version to hermit-cli's package version.
+///
+/// Not a Reverie pin, but the other value of [`BUCK_RELEASE_VALUES_SITE`], so it
+/// is checked here with the pin: [`BUCK_BUILD_ENV`]'s `CARGO_PKG_VERSION` must
+/// be the loaded [`RELEASE_VERSION_NAME`], and that must equal the version of
+/// [`RELEASE_VERSION_MANIFEST`], which Cargo-built Hermit reports. Run after
+/// [`check_buck_build_pin_binding`] has accepted the block and the load.
+fn check_buck_release_version(root: &Path) -> Result<i32, String> {
+    let path = root.join(BUCK_BUILD_PIN_SITE);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Buck release version: NOT PRESENT in this tree: {BUCK_BUILD_PIN_SITE}.");
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!("could not read {}: {error}", path.display()));
+        }
+    };
+    let lines: Vec<&str> = contents.lines().collect();
+    let block = lines
+        .iter()
+        .position(|line| line.split('#').next().unwrap_or("").trim() == BUCK_BUILD_ENV_OPENER)
+        .and_then(|start| {
+            lines[start + 1..]
+                .iter()
+                .position(|line| line.trim() == "}")
+                .map(|offset| (start, start + 1 + offset))
+        });
+    let Some((start, end)) = block else {
+        loud_header("BUCK BUILD ENV MISSING OR UNTERMINATED - BLOCKED");
+        eprintln!("{BUCK_BUILD_PIN_SITE} has no terminated `{BUCK_BUILD_ENV_OPENER}` block.");
+        return Ok(1);
+    };
+    let mut bindings = 0usize;
+    let mut malformed = Vec::new();
+    for (index, line) in lines[start + 1..end].iter().enumerate() {
+        match parse_buck_env_entry(line, BUCK_BUILD_VERSION_KEY, RELEASE_VERSION_NAME) {
+            Ok(None) => {}
+            Ok(Some(())) => bindings += 1,
+            Err(reason) => malformed.push((start + index + 2, reason)),
+        }
+    }
+    if bindings != 1 || !malformed.is_empty() {
+        loud_header("BUCK BUILD VERSION MISSING OR AMBIGUOUS - BLOCKED");
+        eprintln!(
+            "Expected exactly one active \"{BUCK_BUILD_VERSION_KEY}\": {RELEASE_VERSION_NAME} dictionary entry in {BUCK_BUILD_PIN_SITE}; found {bindings} valid binding(s) and {} malformed candidate(s).",
+            malformed.len()
+        );
+        for (line, reason) in &malformed {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {reason}");
+        }
+        return Ok(1);
+    }
+
+    let Some(values) = read_release_values(root, "BUCK RELEASE VALUES MISSING - BLOCKED")? else {
+        return Ok(1);
+    };
+    let (line, version) = match release_value(&values, RELEASE_VERSION_NAME) {
+        Ok(value) => value,
+        Err(problems) => {
+            loud_header("BUCK RELEASE VERSION MISSING OR AMBIGUOUS - BLOCKED");
+            eprintln!(
+                "Expected exactly one active `{RELEASE_VERSION_NAME} = \"<version>\"` line in {BUCK_RELEASE_VALUES_SITE}."
+            );
+            for problem in &problems {
+                eprintln!("  {problem}");
+            }
+            return Ok(1);
+        }
+    };
+    let manifest_path = root.join(RELEASE_VERSION_MANIFEST);
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("could not read {}: {error}", manifest_path.display()))?;
+    let Some(package) = package_version(&manifest) else {
+        loud_header("BUCK RELEASE VERSION UNCHECKABLE - BLOCKED");
+        eprintln!(
+            "{RELEASE_VERSION_MANIFEST} has no literal `version = \"...\"` in its [package] table."
+        );
+        return Ok(1);
+    };
+    if version != package {
+        loud_header("BUCK RELEASE VERSION DRIFT - BLOCKED");
+        eprintln!("  {BUCK_RELEASE_VALUES_SITE}:{line}: {version}");
+        eprintln!("  {RELEASE_VERSION_MANIFEST}: {package}");
+        eprintln!(
+            "Buck-built Hermit reports {RELEASE_VERSION_NAME} in `hermit --version`, and Cargo-built Hermit reports the package version; they must agree."
+        );
+        return Ok(1);
+    }
+
+    eprintln!(
+        "Buck release version: {BUCK_RELEASE_VALUES_SITE} gives {RELEASE_VERSION_NAME} {version}, which equals {RELEASE_VERSION_MANIFEST}'s version."
     );
     Ok(0)
 }
@@ -2387,6 +2673,10 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let buck_code = check_buck_build_pin_binding(&root, pin)?;
     if buck_code != 0 {
         return Ok(buck_code);
+    }
+    let version_code = check_buck_release_version(&root)?;
+    if version_code != 0 {
+        return Ok(version_code);
     }
 
     let entries = pins.len();
@@ -2972,12 +3262,9 @@ mod tests {
         let main = "2".repeat(40);
         let root = core_carry_fixture("core-interrupted-carry", &old);
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
-        let buck = |pin: &str| {
-            format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
-            )
-        };
-        fs::write(root.join(BUCK_BUILD_PIN_SITE), buck(&old)).unwrap();
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), release_buck("")).unwrap();
+        let values = |pin: &str| release_values("0.5.7", pin);
+        write_release_values(&root, &values(&old));
         fs::write(
             root.join("ci/cache.yml"),
             format!("key: liteinst-runtime-{}\n", &main[..7]),
@@ -2986,10 +3273,10 @@ mod tests {
         assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
         assert!(finish_core_pin_update(&root, &main, &main, true, false).is_err());
         assert_eq!(
-            fs::read_to_string(root.join(BUCK_BUILD_PIN_SITE)).unwrap(),
-            buck(&old)
+            fs::read_to_string(root.join(BUCK_RELEASE_VALUES_SITE)).unwrap(),
+            values(&old)
         );
-        fs::write(root.join(BUCK_BUILD_PIN_SITE), buck(&main)).unwrap();
+        write_release_values(&root, &values(&main));
         fs::write(
             root.join("ci/cache.yml"),
             format!("key: liteinst-runtime-{}\n", &old[..7]),
@@ -3016,13 +3303,19 @@ mod tests {
         let main = "2".repeat(40);
         let root = core_carry_fixture("core-complete-carry", &old);
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
-        fs::write(root.join(BUCK_BUILD_PIN_SITE), format!("LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{old}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n")).unwrap();
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), release_buck("")).unwrap();
+        write_release_values(&root, &release_values("0.5.7", &old));
         assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
         finish_core_pin_update(&root, &old, &main, false, false).unwrap();
-        assert!(
-            fs::read_to_string(root.join(BUCK_BUILD_PIN_SITE))
-                .unwrap()
-                .contains(&main)
+        // The pin bump carries the release values file like any derived site,
+        // and leaves the shared hermit-cli/BUCK alone.
+        assert_eq!(
+            fs::read_to_string(root.join(BUCK_RELEASE_VALUES_SITE)).unwrap(),
+            release_values("0.5.7", &main)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(BUCK_BUILD_PIN_SITE)).unwrap(),
+            release_buck("")
         );
         let derived = fs::read_to_string(root.join("ci/derived-pin-fixture.sh")).unwrap();
         assert!(derived.contains(&main));
@@ -3146,6 +3439,7 @@ mod tests {
         assert!(help.contains("every tracked Cargo.toml and Cargo.lock"));
         assert!(help.contains("Excludes other non-Cargo files"));
         assert!(help.contains("hermit-cli/BUCK"));
+        assert!(help.contains(BUCK_RELEASE_VALUES_SITE));
         assert!(help.contains("--no-verify-build"));
         assert!(help.contains("UNSAFE"));
     }
@@ -3745,13 +4039,8 @@ mod tests {
         let (root, unreachable) = offline_fixture("offline-stale-buck", pin);
         let buck_dir = root.join("hermit-cli");
         fs::create_dir_all(&buck_dir).expect("create Buck fixture directory");
-        fs::write(
-            buck_dir.join("BUCK"),
-            format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
-            ),
-        )
-        .expect("write stale Buck binding");
+        fs::write(buck_dir.join("BUCK"), release_buck("")).expect("write Buck fixture");
+        write_release_values(&root, &release_values("0.5.7", stale));
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check stale Buck binding"),
             1,
@@ -4471,6 +4760,27 @@ mod tests {
         assert!(exact_40_hex_tokens("liteinst-runtime-build-7951770 abc123").is_empty());
     }
 
+    /// hermit-cli/BUCK in its current shape: the one load of the release
+    /// values, `extra` lines, the build environment taking both values by
+    /// name, and its three consumers.
+    fn release_buck(extra: &str) -> String {
+        format!(
+            "{BUCK_RELEASE_VALUES_LOAD}\n{extra}LIBHERMIT_ENV = {{\n    \"CARGO_PKG_VERSION\": HERMIT_VERSION,\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
+        )
+    }
+
+    /// The release values file in its current shape.
+    fn release_values(version: &str, pin: &str) -> String {
+        format!("HERMIT_VERSION = \"{version}\"\nHERMIT_REVERIE_PIN = \"{pin}\"\n")
+    }
+
+    fn write_release_values(root: &Path, contents: &str) {
+        let path = root.join(BUCK_RELEASE_VALUES_SITE);
+        fs::create_dir_all(path.parent().expect("release values directory"))
+            .expect("create release values directory");
+        fs::write(path, contents).expect("write release values");
+    }
+
     #[test]
     fn buck_build_pin_binding_accepts_exact_pin_and_refuses_drift_or_erasure() {
         let root = temp_path("buck-build-pin");
@@ -4479,122 +4789,168 @@ mod tests {
         let pin = "0123456789abcdef0123456789abcdef01234567";
         let stale = "89abcdef0123456789abcdef0123456789abcdef";
         let buck = buck_dir.join("BUCK");
+        let check = |what: &str| check_buck_build_pin_binding(&root, pin).expect(what);
         let consumed = |body: String| {
             format!(
-                "{body}rust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
+                "{BUCK_RELEASE_VALUES_LOAD}\n{body}rust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
             )
         };
+        write_release_values(&root, &release_values("0.5.7", pin));
 
+        // Comments may name the pin anywhere; only active text counts.
         fs::write(
             &buck,
             consumed(format!(
-                "# HERMIT_REVERIE_PIN = {stale}\nLIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\", # previously {stale}\n}}\nnote = \"HERMIT_REVERIE_PIN {stale}\"\n"
+                "# HERMIT_REVERIE_PIN = \"{stale}\"\nLIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN, # previously {stale}\n}}\n"
             )),
         )
         .expect("write matching Buck binding");
-        assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check matching Buck binding"),
-            0
+        write_release_values(
+            &root,
+            &format!("# HERMIT_REVERIE_PIN = \"{stale}\"\nHERMIT_REVERIE_PIN = \"{pin}\" # now\n"),
         );
+        assert_eq!(check("check matching Buck binding"), 0);
+        fs::write(&buck, release_buck("")).expect("write current Buck shape");
+        write_release_values(&root, &release_values("0.5.7", pin));
+        assert_eq!(check("check the current shape"), 0);
 
-        fs::write(
-            &buck,
-            consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
-            )),
-        )
-        .expect("write stale Buck binding");
+        write_release_values(&root, &release_values("0.5.7", stale));
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check stale Buck binding"),
+            check("check stale release value"),
             1,
             "a stale Buck compile-time provenance value must fail closed"
         );
-
-        fs::write(
-            &buck,
-            consumed(format!("note = \"HERMIT_REVERIE_PIN {pin}\"\n")),
-        )
-        .expect("write non-binding spoof");
-        assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check non-binding spoof"),
-            1,
-            "a note containing the key and pin must not impersonate the dictionary binding"
-        );
+        write_release_values(&root, &release_values("0.5.7", pin));
 
         fs::write(
             &buck,
             consumed(format!(
-                "LIBHERMIT_ENV = {{\n}}\nunused_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
             )),
+        )
+        .expect("write a literal pin");
+        assert_eq!(
+            check("check literal pin"),
+            1,
+            "a literal pin in the shared file is a second copy of the value and must fail closed"
+        );
+
+        fs::write(
+            &buck,
+            release_buck(&format!("note = \"HERMIT_REVERIE_PIN {pin}\"\n")),
+        )
+        .expect("write a note naming the pin");
+        assert_eq!(
+            check("check note naming the pin"),
+            1,
+            "an active mention of the pin's name outside the block must fail closed"
+        );
+
+        fs::write(
+            &buck,
+            release_buck(&format!("HERMIT_REVERIE_PIN = \"{stale}\"\n")),
+        )
+        .expect("write a rebinding of the loaded name");
+        assert_eq!(
+            check("check rebinding"),
+            1,
+            "a rebinding of the loaded name must not stand beside the load"
+        );
+
+        // The version is loaded beside the pin, and Buck reports a rebound
+        // value just the same.
+        fs::write(&buck, release_buck("HERMIT_VERSION = \"9.9.9\"\n"))
+            .expect("write a rebinding of the loaded version");
+        assert_eq!(
+            check("check version rebinding"),
+            1,
+            "a rebinding of the loaded version must not stand beside the load"
+        );
+
+        fs::write(
+            &buck,
+            consumed(
+                "LIBHERMIT_ENV = {\n}\nunused_env = {\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\n"
+                    .to_string(),
+            ),
         )
         .expect("write binding in an unused dictionary");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check unused dictionary spoof"),
+            check("check unused dictionary spoof"),
             1,
             "a binding outside LIBHERMIT_ENV must not satisfy the build provenance gate"
         );
 
         fs::write(
             &buck,
-            consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nLIBHERMIT_ENV = {{ # later shadow\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
-            )),
+            consumed(
+                "LIBHERMIT_ENV = {\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\nLIBHERMIT_ENV = { # later shadow\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\n"
+                    .to_string(),
+            ),
         )
         .expect("write shadowing build environment");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check shadowing assignment"),
+            check("check shadowing assignment"),
             1,
             "a later assignment must not shadow the checked build environment"
         );
 
         fs::write(
             &buck,
-            consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nLIBHERMIT_ENV.update({{\"OTHER\": \"value\"}})\n"
-            )),
+            consumed(
+                "LIBHERMIT_ENV = {\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\nLIBHERMIT_ENV.update({\"OTHER\": \"value\"})\n"
+                    .to_string(),
+            ),
         )
         .expect("write build environment mutation");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check build environment mutation"),
+            check("check build environment mutation"),
             1,
             "post-definition mutation of LIBHERMIT_ENV must fail closed"
         );
 
-        fs::write(
-            &buck,
-            consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"unknown\", # expected {pin}\n}}\n"
-            )),
-        )
-        .expect("write malformed binding with a pin in its comment");
-        assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check malformed binding"),
-            1,
-            "a pin in a trailing comment must not rescue a malformed active value"
-        );
+        for value in [
+            "\"unknown\", # expected HERMIT_REVERIE_PIN".to_string(),
+            "HERMIT_REVERIE_PIN_OLD,".to_string(),
+            "HERMIT_REVERIE_PIN + \"\",".to_string(),
+        ] {
+            fs::write(
+                &buck,
+                consumed(format!(
+                    "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": {value}\n}}\n"
+                )),
+            )
+            .expect("write malformed binding");
+            assert_eq!(
+                check("check malformed binding"),
+                1,
+                "the entry must be exactly the loaded name: {value}"
+            );
+        }
 
         fs::write(
             &buck,
-            consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
-            )),
+            consumed(
+                "LIBHERMIT_ENV = {\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\n"
+                    .to_string(),
+            ),
         )
         .expect("write duplicate bindings");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check duplicate bindings"),
+            check("check duplicate bindings"),
             1,
             "duplicate active bindings are ambiguous and must fail closed"
         );
 
         let aliased = |alias: &str| {
             consumed(format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_release_targets(\n{alias})\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}}\nhermit_release_targets(\n{alias})\n"
             ))
         };
         fs::write(&buck, aliased(&format!("    {UNSTAMPED_RELEASE_ALIAS}\n")))
             .expect("write unstamped release alias");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check unstamped release alias"),
+            check("check unstamped release alias"),
             0,
             "the unstamped release alias reads the checked block and is accepted"
         );
@@ -4606,63 +4962,168 @@ mod tests {
         )
         .expect("write duplicated unstamped release alias");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check duplicated alias"),
+            check("check duplicated alias"),
             1,
             "a second alias line is ambiguous and must fail closed"
         );
         fs::write(&buck, aliased("    unstamped_env = LIBHERMIT_ENV | {},\n"))
             .expect("write near-miss alias");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check near-miss alias"),
+            check("check near-miss alias"),
             1,
             "only the exact alias line is accepted"
         );
 
         fs::write(&buck, consumed("LIBHERMIT_ENV = {}\n".to_string())).expect("erase Buck binding");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check erased Buck binding"),
+            check("check erased Buck binding"),
             1,
             "a present Buck file whose pin binding disappeared must fail closed"
         );
 
-        fs::write(
-            &buck,
-            format!("LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"),
-        )
-        .expect("write build environment with zero consumers");
-        assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check zero consumers"),
-            1,
-            "an unconsumed build environment must not satisfy the provenance gate"
-        );
-
-        fs::write(
-            &buck,
-            format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\n"
+        let block = "LIBHERMIT_ENV = {\n    \"HERMIT_REVERIE_PIN\": HERMIT_REVERIE_PIN,\n}\n";
+        for (consumers, what) in [
+            (
+                "",
+                "an unconsumed build environment must not satisfy the provenance gate",
             ),
-        )
-        .expect("write build environment with one consumer");
-        assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check one consumer"),
-            1,
-            "every current Buck consumer must consume the checked build environment"
-        );
+            (
+                "rust_library(\n    env = LIBHERMIT_ENV,\n)\n",
+                "every current Buck consumer must consume the checked build environment",
+            ),
+            (
+                "rust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n",
+                "a dropped consumer must fail closed rather than pass on a smaller count",
+            ),
+        ] {
+            fs::write(
+                &buck,
+                format!("{BUCK_RELEASE_VALUES_LOAD}\n{block}{consumers}"),
+            )
+            .expect("write build environment with too few consumers");
+            assert_eq!(check("check consumer count"), 1, "{what}");
+        }
 
+        // The load: exactly one, at exactly the agreed label and names.
+        let unloaded = release_buck("").replacen(&format!("{BUCK_RELEASE_VALUES_LOAD}\n"), "", 1);
+        fs::write(&buck, &unloaded).expect("write Buck file without the load");
+        assert_eq!(
+            check("check missing load"),
+            1,
+            "a build environment naming a value it never loads must fail closed"
+        );
         fs::write(
             &buck,
-            format!(
-                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
-            ),
+            release_buck(&format!("{BUCK_RELEASE_VALUES_LOAD}\n")),
         )
-        .expect("write build environment with two consumers");
+        .expect("write duplicated load");
+        assert_eq!(check("check duplicated load"), 1, "two loads are ambiguous");
+        for near_miss in [
+            "load(\"@fbcode//hermetic_infra/hermit/fb-only:other.bzl\", \"HERMIT_REVERIE_PIN\", \"HERMIT_VERSION\")",
+            "load(\"@fbcode//hermetic_infra/hermit/fb-only:release.bzl\", \"HERMIT_REVERIE_PIN\")",
+        ] {
+            fs::write(&buck, format!("{near_miss}\n{unloaded}")).expect("write near-miss load");
+            assert_eq!(
+                check("check near-miss load"),
+                1,
+                "only the agreed load line is accepted: {near_miss}"
+            );
+        }
+
+        // The release values file: present, one assignment, a full revision.
+        fs::write(&buck, release_buck("")).expect("write current Buck shape");
+        fs::remove_file(root.join(BUCK_RELEASE_VALUES_SITE)).expect("remove release values");
         assert_eq!(
-            check_buck_build_pin_binding(&root, pin).expect("check two consumers"),
+            check("check missing release values"),
             1,
-            "a dropped consumer must fail closed rather than pass on a smaller count"
+            "hermit-cli/BUCK loads the release values, so their file must exist"
         );
+        for (contents, what) in [
+            (
+                format!("HERMIT_REVERIE_PIN = \"{pin}\"\nHERMIT_REVERIE_PIN = \"{pin}\"\n"),
+                "two assignments are ambiguous",
+            ),
+            (
+                format!("HERMIT_REVERIE_PIN = \"{}\"\n", &pin[..12]),
+                "a short revision is not a pin",
+            ),
+            (
+                format!("HERMIT_REVERIE_PIN = {pin}\n"),
+                "an unquoted value is not the agreed shape",
+            ),
+            (
+                format!("# HERMIT_REVERIE_PIN = \"{pin}\"\n"),
+                "a pin only in a comment is no assignment",
+            ),
+            (
+                format!("HERMIT_REVERIE_PIN = \"{pin}\"\nPIN = HERMIT_REVERIE_PIN\n"),
+                "any other active mention of the name is refused",
+            ),
+        ] {
+            write_release_values(&root, &contents);
+            assert_eq!(check("check release values"), 1, "{what}");
+        }
 
         fs::remove_dir_all(root).expect("remove Buck fixture");
+    }
+
+    #[test]
+    fn buck_release_version_must_equal_the_cli_package_version() {
+        let root = temp_path("buck-release-version");
+        fs::create_dir_all(root.join("hermit-cli")).expect("create Buck fixture directory");
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let check = || check_buck_release_version(&root).expect("check the release version");
+        assert_eq!(
+            check(),
+            0,
+            "a tree without hermit-cli/BUCK has nothing to check"
+        );
+
+        let buck = root.join(BUCK_BUILD_PIN_SITE);
+        let manifest = root.join(RELEASE_VERSION_MANIFEST);
+        fs::write(&buck, release_buck("")).expect("write Buck fixture");
+        write_release_values(&root, &release_values("0.5.7", pin));
+        fs::write(
+            &manifest,
+            "[dependencies]\nreverie = { version = \"0.9.9\" }\n\n[package]\nname = \"hermit\"\nversion = \"0.5.7\" # the release\n",
+        )
+        .expect("write manifest");
+        assert_eq!(check(), 0, "only the [package] version counts");
+
+        write_release_values(&root, &release_values("0.5.6", pin));
+        assert_eq!(
+            check(),
+            1,
+            "a release value behind the package version must fail closed"
+        );
+        write_release_values(&root, &format!("HERMIT_REVERIE_PIN = \"{pin}\"\n"));
+        assert_eq!(
+            check(),
+            1,
+            "a release values file without the version must fail closed"
+        );
+        write_release_values(&root, &release_values("0.5.7", pin));
+
+        fs::write(
+            &buck,
+            release_buck("").replace("HERMIT_VERSION,\n", "\"0.5.7\",\n"),
+        )
+        .expect("write a literal version");
+        assert_eq!(
+            check(),
+            1,
+            "a literal version in the shared file must fail closed"
+        );
+        fs::write(&buck, release_buck("")).expect("write Buck fixture");
+
+        fs::write(
+            &manifest,
+            "[package]\nname = \"hermit\"\nversion.workspace = true\n",
+        )
+        .expect("write manifest without a literal version");
+        assert_eq!(check(), 1, "a version that cannot be read must fail closed");
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]

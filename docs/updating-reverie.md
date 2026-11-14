@@ -109,7 +109,10 @@ scope was exercised when introduced, not a fixed expected count; the runtime
 counts are authoritative as the repository changes.
 
 Core build references also occur outside Cargo metadata, including the Buck
-build environment. The updater carries full-length occurrences mechanically
+build's pin. hermit-cli/BUCK, which fbsource shares, takes it from this tree's
+release values file, `shim/hermetic_infra/hermit/fb-only/release.bzl` (fbsource
+keeps its own `fb-only/release.bzl`), so a pin bump edits that file and never
+hermit-cli/BUCK. The updater carries full-length occurrences mechanically
 and checks the selected Buck and LiteInst cache bindings before compiling.
 Derive the current sites by search rather than a fixed list:
 

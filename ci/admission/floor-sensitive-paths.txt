@@ -29,7 +29,8 @@
 # Command::new. It does not see a pathspec built with format! from a variable,
 # a widened filter in check-reverie-pin's base_pin (same call text, more files
 # read), or a copy of the floor under another name. A reviewer of any change
-# to a floor read must check it by hand. Also hand-maintained: hermit-cli/BUCK
+# to a floor read must check it by hand. Also hand-maintained: hermit-cli/BUCK,
+# the release values it loads (shim/hermetic_infra/hermit/fb-only/release.bzl)
 # and **/Cargo.lock (read from the target, not the floor), the planner and DAG
 # entries, and the driver entries (scripts/validate.rs, scripts/lib/validate*);
 # the test names each of them explicitly.
@@ -88,9 +89,11 @@ ci/rust-script-bin/
 # `git log {floor} -- hermit-cli/src/metadata.rs` and reads every
 # RECORD_VERSION in that history (its FLOOR_READ_PATHSPECS).
 hermit-cli/src/metadata.rs
-# Derived pin binding: the Buck build's Reverie pin
-# (check-reverie-pin.rs BUCK_BUILD_PIN_SITE).
+# Derived pin binding: the Buck build's Reverie pin, which hermit-cli/BUCK
+# loads from this tree's release values file (check-reverie-pin.rs
+# BUCK_BUILD_PIN_SITE and BUCK_RELEASE_VALUES_SITE).
 hermit-cli/BUCK
+shim/hermetic_infra/hermit/fb-only/release.bzl
 
 # The floor comparators themselves, the pin-uniformity check the reverie-pin
 # wrapper also compiles, and the Makefile recipes that hand the comparators the

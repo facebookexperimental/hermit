@@ -2191,6 +2191,10 @@ for entry in Path('/proc/self/fd').iterdir():
                 "check-reverie-pin.rs BUCK_BUILD_PIN_SITE: the Buck build's pin",
             ),
             (
+                "shim/hermetic_infra/hermit/fb-only/release.bzl",
+                "check-reverie-pin.rs BUCK_RELEASE_VALUES_SITE: the release values hermit-cli/BUCK loads",
+            ),
+            (
                 "scripts/check-reverie-pin.rs",
                 "the floor comparator of pre.reverie_pin*",
             ),
