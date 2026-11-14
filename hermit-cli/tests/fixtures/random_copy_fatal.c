@@ -1,6 +1,9 @@
 /* Real process_vm_readv/writev permission failures; no injected backend error.
  */
+/* fbcode compiles with -D_GNU_SOURCE=1; the host-cc build does not. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>

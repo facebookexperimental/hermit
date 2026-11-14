@@ -805,14 +805,31 @@ fn captured_output_timeout_names_the_orphan_after_its_root_exits() {
             let fifo = directory.path().join("never-written");
             let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-            let mut command = reverie::process::Command::new("/bin/sh");
-            command
-                .args([
-                    "-c",
-                    "printf 'before-orphan\\n'; exec /bin/cat \"$1\" & exit 0",
-                    "orphan-capture",
-                ])
-                .arg(&fifo);
+            // The freestanding guest where the build supplies it, which runs
+            // under the x86-64-v2 profile on any host (crate::unit_guest);
+            // otherwise the host's shell and cat. The guest's orphan execs
+            // itself through a link named "cat", which names the process
+            // "cat" as `exec /bin/cat` does, and blocks in openat as cat does.
+            let command = match crate::unit_guest() {
+                Some(guest) => {
+                    let cat = directory.path().join("cat");
+                    std::os::unix::fs::symlink(&guest, &cat).unwrap();
+                    let mut command = reverie::process::Command::new(&guest);
+                    command.arg("orphan").arg(&fifo).arg(&cat);
+                    command
+                }
+                None => {
+                    let mut command = reverie::process::Command::new("/bin/sh");
+                    command
+                        .args([
+                            "-c",
+                            "printf 'before-orphan\\n'; exec /bin/cat \"$1\" & exit 0",
+                            "orphan-capture",
+                        ])
+                        .arg(&fifo);
+                    command
+                }
+            };
             let mut config = detcore::Config {
                 sequentialize_threads: true,
                 deterministic_io: true,

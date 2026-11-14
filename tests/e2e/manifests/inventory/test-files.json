@@ -3157,6 +3157,12 @@
       "why": "tests/c/simple/racewrite_nostdlib.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/c/simple/unit_guest_nostdlib.c",
+      "runner": "Meta Buck test targets",
+      "why": "tests/c/simple/unit_guest_nostdlib.c is owned by Meta Buck test targets: A freestanding guest (raw system calls, no C library, statically linked with no program interpreter, compiled for x86-64-v2) that the Buck target //hermetic_infra/hermit/tests:unit_guest builds for hermit-cli's library unit tests, which launch it through HERMIT_UNIT_GUEST in place of the host's /bin/sh and /bin/echo. Its touch, echo, orphan and open modes serve those tests' exact assertions; it has no standalone output contract, so it has no manifest-test entry."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/sleep_ignored_sigchld.c",
       "runner": "hermit-cli/tests/cli.rs",

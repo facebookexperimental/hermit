@@ -341,11 +341,22 @@ async fn authentic_legacy_chosen_json_is_refused_by_both_library_dispatches() {
     let marker = directory.path().join("guest-started");
     let bytes = include_bytes!("../tests/fixtures/chosen-before-reserved-input.json");
     std::fs::write(&path, bytes).unwrap();
-    let command = || {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "printf started > \"$1\"", "admission-marker"]);
-        command.arg(&marker);
-        command
+    // Either guest writes the marker if it ever runs; the freestanding one
+    // keeps the host's shell from being refused for its CPU profile before
+    // the refusal under test (crate::unit_guest).
+    let guest = crate::unit_guest();
+    let command = || match &guest {
+        Some(guest) => {
+            let mut command = Command::new(guest);
+            command.arg("touch").arg(&marker);
+            command
+        }
+        None => {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf started > \"$1\"", "admission-marker"]);
+            command.arg(&marker);
+            command
+        }
     };
     for route in ["schedule", "priority", "both"] {
         let mut config = config(0);

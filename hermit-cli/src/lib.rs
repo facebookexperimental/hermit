@@ -109,6 +109,65 @@ pub(crate) fn run_in_fresh_process(name: &str) -> bool {
     );
     true
 }
+
+/// The freestanding guest (`tests/c/simple/unit_guest_nostdlib.c`) that unit
+/// tests launch in place of the host's `/bin/sh` and `/bin/echo`, or `None`
+/// where the build supplies none.
+///
+/// A host program, or the loader it names, can declare that it needs more of
+/// the CPU than x86-64-v2 (an x86-64-v3 ISA marker). `--cpu-profile auto` then
+/// resolves it to x86-64-v3, which a library launch refuses before the check a
+/// test means to reach, and an x86-64-v2 run refuses it at its exec. This guest
+/// declares no ISA level and names no program interpreter, so auto resolves it
+/// to x86-64-v2 and nothing it loads can declare more. Both facts are asserted
+/// here rather than trusted to its build flags.
+///
+/// Buck names it in `HERMIT_UNIT_GUEST` for `:libhermit-unittest-gated`,
+/// possibly relative to the project root; it is returned absolute, so that a
+/// symbolic link made to it elsewhere resolves. An fbcode build without the
+/// variable fails here rather than quietly launching the host's programs.
+/// Elsewhere (Cargo, and the open-source Buck build, which does not set it)
+/// `None` keeps the host programs the tests launched before.
+///
+/// The variable is resolved once per test process, by the first caller, so
+/// tests that run concurrently all receive the same path.
+#[cfg(test)]
+#[allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+pub(crate) fn unit_guest() -> Option<PathBuf> {
+    static GUEST: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    GUEST
+        .get_or_init(|| {
+            let Some(named) = std::env::var_os("HERMIT_UNIT_GUEST") else {
+                assert!(
+                    !cfg!(fbcode_build),
+                    "HERMIT_UNIT_GUEST is unset: the fbcode build supplies \
+                     //hermetic_infra/hermit/tests:unit_guest through \
+                     :libhermit-unittest-gated"
+                );
+                return None;
+            };
+            let guest = fs::canonicalize(&named).unwrap_or_else(|error| {
+                panic!("HERMIT_UNIT_GUEST={}: {error}", Path::new(&named).display())
+            });
+            assert_eq!(
+                detcore::exec_record::IsaNeeds::read_path_strict(&guest),
+                Some(detcore::exec_record::IsaNeeds::Unmarked),
+                "{} must declare no x86 ISA level",
+                guest.display()
+            );
+            assert_eq!(
+                detcore::exec_record::program_interpreter(&guest),
+                Ok(None),
+                "{} must name no program interpreter",
+                guest.display()
+            );
+            Some(guest)
+        })
+        .clone()
+}
 mod ptrace_completion;
 #[cfg(test)]
 mod replay_departure_completion_tests;
@@ -5770,6 +5829,10 @@ mod in_guest_delivery_harness;
 mod exclusive_rewrite_summary;
 
 #[cfg(test)]
+#[path = "../tests/common/test_skip.rs"]
+mod test_skip;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5953,14 +6016,8 @@ mod tests {
     fn the_library_entry_points_refuse_untrapping_without_its_prerequisites() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("guest-started");
-        let command = || {
-            let mut command = Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg("touch \"$0\"")
-                .arg(marker.as_os_str());
-            command
-        };
+        let guest = crate::unit_guest();
+        let command = || marker_guest_command(guest.as_deref(), &marker);
         let timerless = DetConfig {
             untrap_passthrough_syscalls: true,
             sequentialize_threads: true,
@@ -6015,6 +6072,65 @@ mod tests {
         assert_eq!(detcore::untrap_passthrough_admission(&qualified), Ok(()));
         <detcore::Detcore as reverie::Tool>::facility_admission(&qualified)
             .expect("the mode with RCB time and no record is admitted");
+    }
+
+    /// A guest that writes `marker` if it ever runs, for the refusal tests
+    /// whose marker must stay absent: the freestanding `guest` where the build
+    /// supplies it, which keeps the host's shell from being refused for its
+    /// CPU profile before the refusal under test (crate::unit_guest), else
+    /// the host's shell.
+    fn marker_guest_command(guest: Option<&Path>, marker: &Path) -> Command {
+        match guest {
+            Some(guest) => {
+                let mut command = Command::new(guest);
+                command.arg("touch").arg(marker);
+                command
+            }
+            None => {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .arg("-c")
+                    .arg("touch \"$0\"")
+                    .arg(marker.as_os_str());
+                command
+            }
+        }
+    }
+
+    /// The control for the refusal tests' absent marker: the same guest,
+    /// launched through `run` and through `run_with_output` with a
+    /// configuration their checks admit, exits 0 and writes its marker, so a
+    /// marker that stays absent there means the guest never ran. Where the
+    /// build supplies the freestanding guest, the launch names the x86-64-v2
+    /// profile, which crate::unit_guest checks it fits; the host's shell runs
+    /// under the default profile, as the refusal tests launch it.
+    #[test]
+    fn the_marker_guest_writes_its_marker_when_its_launch_is_admitted() {
+        let guest = crate::unit_guest();
+        let mut config = DetConfig {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Default::default()
+        };
+        if guest.is_some() {
+            config.cpu_profile = detcore::CpuProfile::X86_64V2;
+        }
+        for route in ["run", "run_with_output"] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("guest-started");
+            let command = marker_guest_command(guest.as_deref(), &marker);
+            let status = if route == "run" {
+                run(command, config.clone(), false, &None)
+            } else {
+                run_with_output(command, config.clone(), false, &None).map(|output| output.status)
+            }
+            .unwrap_or_else(|error| panic!("{route}: {error:#}"));
+            assert_eq!(status, ExitStatus::Exited(0), "{route}");
+            assert!(
+                marker.exists(),
+                "{route}: the guest did not write its marker"
+            );
+        }
     }
 
     /// The standard streams a launch hands a KVM guest are grouped by the
@@ -9246,6 +9362,13 @@ mod tests {
             std::fs::write(&record, json).unwrap();
             let config = super::DetConfig {
                 replay_schedule_from: Some(record.clone()),
+                // The profile `auto` selects for a /bin/echo that declares no
+                // more than x86-64-v2. One that declares x86-64-v3 would be
+                // refused for that profile before the rewrite check; the
+                // guest never runs here, and should the refusal regress, its
+                // exec would be refused at x86-64-v2 instead and the
+                // assertions below would still fail.
+                cpu_profile: detcore::CpuProfile::X86_64V2,
                 ..super::DetConfig::default()
             };
             let mut command = super::Command::new("/bin/echo");
@@ -9304,6 +9427,13 @@ mod tests {
             )
         };
         let current = crate::aarch64_lse::REWRITE_FORMAT_VERSION;
+        // The guest: the freestanding one where the build supplies it, which
+        // runs under the x86-64-v2 profile on any host (crate::unit_guest);
+        // otherwise the host's /bin/echo. Both print the same line.
+        let guest = crate::unit_guest();
+        let program = guest
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/bin/echo"));
         for (name, json, in_memory, overlay) in [
             (
                 "memory-now.json",
@@ -9327,15 +9457,15 @@ mod tests {
             let config = super::DetConfig {
                 replay_schedule_from: Some(record),
                 rewrite_exclusives_in_memory: in_memory,
-                rewrite_exclusives_overlay: overlay
-                    .then(|| std::path::PathBuf::from("/bin/echo"))
-                    .into_iter()
-                    .collect(),
+                rewrite_exclusives_overlay: overlay.then(|| program.clone()).into_iter().collect(),
                 sequentialize_threads: true,
                 max_timeslice: None,
                 ..super::DetConfig::default()
             };
-            let mut command = super::Command::new("/bin/echo");
+            let mut command = super::Command::new(&program);
+            if guest.is_some() {
+                command.arg("echo");
+            }
             command.arg("PROVENANCE_GUEST_STARTED");
             let result = super::run_with_output(command, config, false, &None);
             let lse_refusal =
@@ -9367,11 +9497,62 @@ mod tests {
         }
     }
 
+    /// The dynamically linked echo that kvm_runs_dynamic_echo_through_detcore
+    /// and liteinst_public_dispatch_runs_in_guest_detcore launch, and whether
+    /// HERMIT_TEST_DYNAMIC_ECHO named it: Buck's dynamic-echo-guest
+    /// (tests/fixtures/dynamic_echo.c) where the variable names it, else the
+    /// host's /bin/echo. Buck passes a path relative to the project root,
+    /// which the test runs from; the launch needs one that names the same file
+    /// from anywhere. Both tests need an image loaded through its program
+    /// interpreter (the KVM test covers a dynamic guest, and in-guest LiteInst
+    /// refuses a statically linked one), so that is checked rather than
+    /// assumed.
+    fn dynamic_echo() -> (PathBuf, bool) {
+        let named = std::env::var_os("HERMIT_TEST_DYNAMIC_ECHO");
+        let echo = match &named {
+            Some(path) => fs::canonicalize(path).unwrap_or_else(|error| {
+                panic!("HERMIT_TEST_DYNAMIC_ECHO={path:?} names no file: {error}")
+            }),
+            None => PathBuf::from("/bin/echo"),
+        };
+        assert!(
+            matches!(
+                detcore::exec_record::program_interpreter(&echo),
+                Ok(Some(_))
+            ),
+            "{} names no program interpreter; this test needs a dynamically linked image",
+            echo.display()
+        );
+        (echo, named.is_some())
+    }
+
     #[test]
     fn liteinst_public_dispatch_runs_in_guest_detcore() {
-        if Backend::Liteinst.ensure_available().is_err() {
+        const TEST: &str = "tests::liteinst_public_dispatch_runs_in_guest_detcore";
+        if let Err(error) = Backend::Liteinst.ensure_available() {
+            // With the liteinst feature, an unavailable runtime fails this
+            // case, as it fails the in_guest_delivery_harness cases.
+            if cfg!(feature = "liteinst") {
+                panic!("the in-guest runtime is unavailable (a skip is a failure): {error}");
+            }
+            // Without it there is no LiteInst backend to test: a skip the
+            // runner counts as one, not a pass.
+            test_skip::record_test_skip(TEST, &error.to_string());
             return;
         }
+
+        // The guests: where HERMIT_TEST_DYNAMIC_ECHO names dynamic_echo, it
+        // serves both runs, `-n` alone standing in for /bin/true (no output,
+        // exit 0), since the host's programs may declare x86-64-v3; otherwise
+        // the host's /bin/echo and /bin/true.
+        let (echo, named) = dynamic_echo();
+        let truth = if named {
+            let mut command = super::Command::new(&echo);
+            command.arg("-n");
+            command
+        } else {
+            super::Command::new("/bin/true")
+        };
 
         // In-guest LiteInst has no preemption timer and refuses a maximum
         // timeslice, so this run disables preemption; preemption is not what
@@ -9380,7 +9561,7 @@ mod tests {
             max_timeslice: None,
             ..super::DetConfig::default()
         };
-        let mut command = super::Command::new("/bin/echo");
+        let mut command = super::Command::new(&echo);
         command.arg("hello");
         let output = super::run_with_output_backend(
             command,
@@ -9389,7 +9570,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/echo through in-guest LiteInst");
+        .expect("run the dynamic echo through in-guest LiteInst");
         // Include captured output so a failed backend launch reports its diagnostics.
         assert_eq!(
             output.status,
@@ -9400,14 +9581,8 @@ mod tests {
         );
         assert_eq!(output.stdout, b"hello\n");
 
-        let status = super::run_with_backend(
-            super::Command::new("/bin/true"),
-            config,
-            false,
-            &None,
-            Backend::Liteinst,
-        )
-        .expect("run /bin/true through in-guest LiteInst");
+        let status = super::run_with_backend(truth, config, false, &None, Backend::Liteinst)
+            .expect("run /bin/true, or its stand-in, through in-guest LiteInst");
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
@@ -9503,16 +9678,58 @@ mod tests {
     fn kvm_runs_dynamic_echo_through_detcore_body() {
         use clap::Parser;
 
-        if kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_some() {
+        const TEST: &str = "tests::kvm_runs_dynamic_echo_through_detcore";
+        // As the CLI's KVM tests decide (tests/cli.rs `kvm_unavailable`): a
+        // host with no /dev/kvm records a skip, which the runner counts as
+        // one rather than a pass, and HERMIT_REQUIRE_KVM makes that a
+        // failure. A device that exists but cannot be opened read-write fails
+        // the test, naming why.
+        let kvm = std::path::Path::new("/dev/kvm");
+        if !kvm.exists() {
+            assert!(
+                std::env::var_os("HERMIT_REQUIRE_KVM").is_none(),
+                "HERMIT_REQUIRE_KVM is set, but this host has no /dev/kvm, so {TEST} cannot \
+                 exercise the backend it claims to cover."
+            );
+            test_skip::record_test_skip(TEST, "no /dev/kvm on this host");
             return;
         }
+        if let Some(reason) = kvm_device_unavailable_reason(kvm) {
+            panic!(
+                "/dev/kvm exists, but {reason}, so {TEST} cannot exercise the backend it claims \
+                 to cover."
+            );
+        }
 
-        let mut command = super::Command::new("/bin/echo");
+        let (echo, named) = dynamic_echo();
+        // What the launch below resolves auto to (resolve_launch_auto reads the
+        // same file). The KVM backend runs only x86-64-v2 guests, on every host
+        // (refuse_unadmitted_launch), and a v3-built program interpreter
+        // refuses to start under the x86-64-v2 CPUID table that Detcore
+        // presents, so a guest that declares x86-64-v3 cannot cover this test.
+        // That is a setup failure, named here, rather than a skip.
+        let (profile, why) =
+            crate::cpu_profile_admission::resolve_auto(&echo, |path| Some(path.to_path_buf()))
+                .unwrap_or_else(|why| panic!("auto cannot resolve {}: {why}", echo.display()));
+        assert_ne!(
+            profile,
+            detcore::CpuProfile::X86_64V3,
+            "{} resolves to x86-64-v3 ({why}), which the KVM backend does not run; {}",
+            echo.display(),
+            if named {
+                "HERMIT_TEST_DYNAMIC_ECHO must name a dynamically linked x86-64-v2 echo"
+            } else {
+                "set HERMIT_TEST_DYNAMIC_ECHO to a dynamically linked x86-64-v2 echo (Buck builds \
+                 one as dynamic-echo-guest)"
+            }
+        );
+
+        let mut command = super::Command::new(&echo);
         command.arg("hello");
         let mut config = super::DetConfig::parse_from(["hermit-kvm-test"]);
         config.validate();
         let output = super::run_with_output_backend(command, config, false, &None, Backend::Kvm)
-            .expect("run dynamic /bin/echo through KvmGuest<Detcore>");
+            .expect("run the dynamic echo through KvmGuest<Detcore>");
 
         // Include captured output so a failed backend launch reports its diagnostics.
         assert_eq!(

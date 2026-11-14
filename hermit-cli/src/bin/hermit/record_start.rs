@@ -1767,36 +1767,63 @@ mod tests {
             .unwrap();
 
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
-        let prepare_calls = std::cell::Cell::new(0);
-        let prepare = |_target: &Path| -> Result<Option<PathBuf>, Error> {
-            prepare_calls.set(prepare_calls.get() + 1);
-            panic!("an inexact counter reached e9patch record preprocessing");
+        // The refusal under test is the counter's. Auto, the parsed default
+        // (or whatever HERMIT_CPU_PROFILE names), would resolve /bin/true
+        // first, and where that image declares x86-64-v3 the v3 host
+        // qualification would refuse before the counter is consulted (and,
+        // on a host that qualifies, would leave this process's admission
+        // state behind for the other tests). x86-64-v2 needs no qualification,
+        // so the counter's refusal is the first one this call can reach.
+        options.cpu_profile = detcore_model::cpu_profile::CpuProfile::X86_64V2;
+        let refused_before_preprocessing = |options: &StartOpts| {
+            let prepare_calls = std::cell::Cell::new(0);
+            let prepare = |_target: &Path| -> Result<Option<PathBuf>, Error> {
+                prepare_calls.set(prepare_calls.get() + 1);
+                panic!("an inexact counter reached e9patch record preprocessing");
+            };
+            let error = options
+                .main_with_preparation(
+                    &ptrace,
+                    RecordPreparation {
+                        backend_name: "e9patch",
+                        prepare: Some(&prepare),
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains("`ptrace` backend"), "{error:#}");
+            assert!(
+                error.to_string().contains("SpecLockMap is enabled"),
+                "{error:#}"
+            );
+            assert_eq!(
+                prepare_calls.get(),
+                0,
+                "a refused recording reached preprocessing"
+            );
         };
-        let error = options
-            .main_with_preparation(
-                &ptrace,
-                RecordPreparation {
-                    backend_name: "e9patch",
-                    prepare: Some(&prepare),
-                },
-            )
-            .unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::app::container::PolicyRefusal>()
-                .is_some(),
-            "{error:#}"
-        );
-        assert!(error.to_string().contains("`ptrace` backend"), "{error:#}");
-        assert!(
-            error.to_string().contains("SpecLockMap is enabled"),
-            "{error:#}"
-        );
-        assert_eq!(
-            prepare_calls.get(),
-            0,
-            "a refused recording reached preprocessing"
-        );
+        refused_before_preprocessing(&options);
+
+        // The same refusal after auto resolves a profile, on every host: a
+        // readable program that is neither an ELF image nor a script declares
+        // no ISA level, so auto falls back to x86-64-v2 and calls itself again
+        // with that profile, which reaches the counter's refusal. The profile
+        // is set to auto explicitly, not left to HERMIT_CPU_PROFILE.
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("not-an-image");
+        std::fs::write(&program, b"not an image\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut options = parse(&["start", "--strict", program.to_str().unwrap()]);
+        assert!(options.strict);
+        options.cpu_profile = detcore_model::cpu_profile::CpuProfile::Auto;
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        refused_before_preprocessing(&options);
     }
 
     /// `record start` takes `run`'s networking contract, local by default,

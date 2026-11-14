@@ -163,9 +163,10 @@ mod real_random {
         assert!(!skip_without_pmu("t", Ok(()), false));
         assert!(!skip_without_pmu("t", Ok(()), true));
         assert!(skip_without_pmu("t", Err("no counters".to_string()), false));
-        let failed =
-            std::panic::catch_unwind(|| skip_without_pmu("t", Err("no counters".to_string()), true))
-                .is_err();
+        let failed = std::panic::catch_unwind(|| {
+            skip_without_pmu("t", Err("no counters".to_string()), true)
+        })
+        .is_err();
         assert!(
             failed,
             "HERMIT_REQUIRE_PMU must fail a test its host cannot run"
@@ -316,6 +317,64 @@ mod real_random {
         }
     }
 
+    /// The CPU profile `exercise` names for the guest, and the one
+    /// `assert_guest_fits_profile` checks the guest against.
+    const GUEST_PROFILE: detcore::CpuProfile = detcore::CpuProfile::X86_64V2;
+
+    /// Fail the case at setup, naming the remedy, where the guest at
+    /// `binary` (from HERMIT_RANDOM_FAILURE_GUEST where `overridden`, else
+    /// compiled by the host `cc`) or its program interpreter declares more
+    /// than the x86-64-v2 profile `exercise` names (`GUEST_PROFILE`).
+    /// Detcore's per-exec ISA check would refuse that exec anyway, before any
+    /// case could run, but only with its policy exit (122) from inside the
+    /// isolated child. This reads the executable and the on-disk interpreter
+    /// its PT_INTERP names, and evaluates their declarations as
+    /// `exec_objects` and `first_needing_above` do, each declaration a lower
+    /// bound, so it fails only where that check would refuse the exec,
+    /// whenever CPUID is virtualized and intercepted, which these cases
+    /// require. A
+    /// guest whose interpreter cannot be read is left to the run to report.
+    fn assert_guest_fits_profile(binary: &Path, overridden: bool) {
+        use detcore::exec_record::IsaNeeds;
+        let level = GUEST_PROFILE
+            .x86_64_level()
+            .expect("x86-64-v2 presents a fixed x86-64 level");
+        let interpreter = detcore::exec_record::program_interpreter(binary)
+            .ok()
+            .flatten();
+        let objects = detcore::exec_record::exec_objects(
+            IsaNeeds::read_path(binary),
+            interpreter.as_deref().map(IsaNeeds::read_path),
+        );
+        let Some((what, needed)) = detcore::exec_record::first_needing_above(level, &objects)
+        else {
+            return;
+        };
+        let what = match (what, &interpreter) {
+            ("its program interpreter", Some(path)) => {
+                format!("its program interpreter {}", path.display())
+            }
+            _ => what.to_owned(),
+        };
+        let guest = if overridden {
+            format!("HERMIT_RANDOM_FAILURE_GUEST={}", binary.display())
+        } else {
+            format!(
+                "the real_random guest {}, compiled by the host `cc`,",
+                binary.display()
+            )
+        };
+        panic!(
+            "{guest} cannot run under these cases' x86-64-v2 CPU profile: {what} declares that \
+             it needs {} (GNU_PROPERTY_X86_ISA_1_NEEDED), so Detcore's per-exec ISA check would \
+             refuse its exec (exit 122) before any case ran. Set HERMIT_RANDOM_FAILURE_GUEST to \
+             a path to tests/fixtures/random_copy_fatal.c built by a toolchain whose \
+             executable and program interpreter declare at most x86-64-v2 (the Buck gated test \
+             passes :random-copy-fatal-guest).",
+            detcore::exec_record::x86_64_level_name(needed),
+        );
+    }
+
     fn case_body(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
         if pmu_unavailable(name) {
             return;
@@ -337,9 +396,18 @@ mod real_random {
             compile_fixture(name, &source, &binary);
             binary
         };
-        let binary = match std::env::var_os("HERMIT_RANDOM_FAILURE_GUEST") {
+        let overridden = std::env::var_os("HERMIT_RANDOM_FAILURE_GUEST");
+        let binary = match &overridden {
             Some(binary) => {
-                let binary = PathBuf::from(binary);
+                // Buck's `$(location ...)` names the guest relative to the
+                // project root, the test's working directory; the isolated
+                // child and the guest command receive it absolute.
+                let binary = std::fs::canonicalize(binary).unwrap_or_else(|error| {
+                    panic!(
+                        "HERMIT_RANDOM_FAILURE_GUEST={}: {error}",
+                        Path::new(binary).display()
+                    )
+                });
                 assert!(binary.is_absolute() && binary.is_file());
                 binary
             }
@@ -348,6 +416,7 @@ mod real_random {
                 include_bytes!("../tests/fixtures/random_copy_fatal.c"),
             ),
         };
+        assert_guest_fits_profile(&binary, overridden.is_some());
         let probe = compile(
             "permission-probe",
             include_bytes!("../tests/fixtures/ptrace_copy_permission.c"),
@@ -451,13 +520,20 @@ mod real_random {
                     detlog_io_buffers: true,
                     // This case spawns the tracer directly, bypassing the
                     // library launch that resolves an unnamed `auto` CPU
-                    // profile from the guest image, so name the profile that
-                    // resolution selects for this guest: it declares
-                    // x86-64-v2 and its loader declares nothing, which is
-                    // also the profile every launch of it ran under before
-                    // the unnamed default became `auto`. Detcore's refusal
-                    // of a genuinely unresolved `auto` is unchanged.
-                    cpu_profile: detcore::CpuProfile::X86_64V2,
+                    // profile from the guest image, so it names x86-64-v2,
+                    // the profile every launch of this guest ran under
+                    // before the unnamed default became `auto`. Neither the
+                    // guest nor its program interpreter may declare more:
+                    // Detcore's per-exec ISA check would refuse the exec.
+                    // That holds only where the toolchain builds the guest
+                    // to declare at most x86-64-v2 and names an interpreter
+                    // that does too, which a host `cc` declaring x86-64-v3
+                    // does not; `assert_guest_fits_profile` checks the guest
+                    // at setup and names HERMIT_RANDOM_FAILURE_GUEST, through
+                    // which the Buck gated test passes its own build.
+                    // Detcore's refusal of a genuinely unresolved `auto` is
+                    // unchanged.
+                    cpu_profile: GUEST_PROFILE,
                     ..Default::default()
                 };
                 config.validate();
@@ -580,7 +656,10 @@ mod real_random {
         // RCB identity in the `rcb_history` envelope around the record.
         let recording =
             detcore::preemptions::boundary_recording::Recording::read(&recording).unwrap();
-        assert!(recording.identity().is_some(), "the recording states its RCB identity");
+        assert!(
+            recording.identity().is_some(),
+            "the recording states its RCB identity"
+        );
         let record = recording.into_legacy("real_random recording").unwrap();
         assert_eq!(
             record.extract_all().len(),
