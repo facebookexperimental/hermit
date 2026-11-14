@@ -9,22 +9,22 @@
 use reverie::syscalls::Sysno;
 
 #[cfg(target_arch = "x86_64")]
-const EXPECTED_SYSNO_COUNT: usize = 380;
+const EXPECTED_SYSNO_COUNT: usize = 383;
 #[cfg(target_arch = "aarch64")]
-const EXPECTED_SYSNO_COUNT: usize = 343;
+const EXPECTED_SYSNO_COUNT: usize = 345;
 
 // `Sysno` is externally `#[non_exhaustive]`. These assertions make additions,
 // removals, or a changed table endpoint fail at compile time instead of silently
 // reaching the required final arm.
 const _: () = {
     assert!(Sysno::count() == EXPECTED_SYSNO_COUNT);
-    assert!(Sysno::last().id() == 467);
+    assert!(Sysno::last().id() == 469);
 };
 
 /// Every syscall in the pinned table for the target architecture, including
 /// the final entry.
 ///
-/// `Sysno::iter()` in `syscalls` 0.7.0 stops one short: its loop bound is
+/// `Sysno::iter()` in `syscalls` 0.8.1 stops one short: its loop bound is
 /// strict, so `Sysno::last()` is never yielded. Any policy sweep written as
 /// `Sysno::iter().filter(..)` therefore silently drops the last row of the
 /// table. That is not hypothetical — it dropped `lsm_list_modules` (id 461,
@@ -895,6 +895,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::restart_syscall
+        | Sysno::file_getattr
+        | Sysno::file_setattr
         | Sysno::getxattrat
         | Sysno::listxattrat
         | Sysno::mseal
@@ -902,7 +904,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setxattrat
         => SyscallClassification::Unsupported,
         #[cfg(target_arch = "x86_64")]
-        Sysno::uretprobe => SyscallClassification::Unsupported,
+        Sysno::uprobe | Sysno::uretprobe => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
         // ===== AARCH64-ONLY TABLE ENTRIES =====
@@ -2017,12 +2019,16 @@ mod tests {
 
     /// Syscalls with no deterministic implementation, using the configured fallback.
     const UNSUPPORTED_SYSCALLS: &[&str] = &[
+        "file_getattr",
+        "file_setattr",
         "getxattrat",
         "listxattrat",
         "mseal",
         "removexattrat",
         "restart_syscall",
         "setxattrat",
+        #[cfg(target_arch = "x86_64")]
+        "uprobe",
         #[cfg(target_arch = "x86_64")]
         "uretprobe",
     ];

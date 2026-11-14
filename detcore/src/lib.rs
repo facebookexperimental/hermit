@@ -9093,25 +9093,24 @@ mod subscription_tests {
     }
 
     /// The last row of the pinned table is the one a `Sysno::iter()` sweep
-    /// drops. `open_tree_attr` is Determinized AND deterministically refused,
-    /// so without the fix it would execute natively against the host under
-    /// `--passthru-opt` — which is the default for `hermit record` and
-    /// `hermit replay` — instead of receiving its fixed refusal.
+    /// drops. `file_setattr` is Unsupported, so without the fix it would
+    /// execute natively against the host under `--passthru-opt` — which is the
+    /// default for `hermit record` and `hermit replay` — instead of being
+    /// reported and failing closed.
     #[test]
     fn passthru_opt_covers_the_final_row_of_the_pinned_table() {
         let last = Sysno::last();
         // Guard the premise: if the table endpoint moves, this test must be
         // re-derived rather than silently passing on a different syscall.
-        assert_eq!(last, Sysno::open_tree_attr);
-        assert!(crate::is_determinized_syscall(last));
-        assert!(crate::is_deterministically_refused_syscall(last));
+        assert_eq!(last, Sysno::file_setattr);
+        assert!(crate::is_unsupported_syscall(last));
         // The bug this pins: the final row is absent from `Sysno::iter()`.
         assert!(!Sysno::iter().any(|sysno| sysno == last));
 
         let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
         assert!(
             subscriptions.iter_syscalls().any(|sysno| sysno == last),
-            "{last} must be intercepted under passthru_opt; it is deterministically refused"
+            "{last} must be intercepted under passthru_opt; it is unsupported"
         );
     }
 
@@ -9128,11 +9127,15 @@ mod subscription_tests {
                 Sysno::restart_syscall,
                 #[cfg(target_arch = "x86_64")]
                 Sysno::uretprobe,
+                #[cfg(target_arch = "x86_64")]
+                Sysno::uprobe,
                 Sysno::mseal,
                 Sysno::setxattrat,
                 Sysno::getxattrat,
                 Sysno::listxattrat,
                 Sysno::removexattrat,
+                Sysno::file_getattr,
+                Sysno::file_setattr,
             ]
         );
         for syscall in unsupported {
