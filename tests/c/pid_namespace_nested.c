@@ -70,6 +70,10 @@
  *   init_dies:    the init forks a child that waits forever, and exits; Linux
  *                 kills the child (zap_pid_namespace) at a moment the host
  *                 chooses, which Hermit reports as a determinism loss.
+ *   init_dies_then_spin: init_dies, then the outer process spins forever,
+ *                 so only a bound such as --timeout ends the run.
+ *   init_dies_then_wait: init_dies, then the outer process waits on a futex
+ *                 nobody wakes: a deadlock under Hermit's model.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -415,7 +419,7 @@ static int init_main(const char *mode) {
     memset(&info, 0, sizeof info);
     waitid(P_PID, c, &info, WEXITED | WNOWAIT);
     printf("init_leaves_zombie child=%d\n", c);
-  } else if (!strcmp(mode, "init_dies")) {
+  } else if (!strncmp(mode, "init_dies", 9)) {
     pid_t c = fork();
     if (c == 0) {
       for (;;) pause();
@@ -498,5 +502,14 @@ int main(int argc, char **argv) {
   if (waitpid((pid_t)c, &st, 0) != (pid_t)c) return 81;
   if (outer_zombie_pid > 0) waitpid(outer_zombie_pid, NULL, 0);
   printf("init exit=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+  fflush(stdout);
+  if (!strcmp(mode, "init_dies_then_spin")) {
+    for (volatile unsigned long n = 0;; n++) {
+    }
+  }
+  if (!strcmp(mode, "init_dies_then_wait")) {
+    static int never;
+    for (;;) syscall(SYS_futex, &never, FUTEX_WAIT, 0, NULL, NULL, 0);
+  }
   return 0;
 }

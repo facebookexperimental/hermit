@@ -396,6 +396,101 @@ fn paired_verify_runs_refuse_a_virtual_timeout_run_one_like_run_verify() {
     );
 }
 
+/// A run that records a determinism loss is never compared, even when it
+/// ended with a terminal outcome that an explicit `--verify-allow=both`
+/// admits. Each `--verify-run` keeps its deadlock's status and class and
+/// names the loss. Its record saves the loss as the run's failure, and
+/// `log-diff --verify-json` refuses the pair by name (exit 122 and the
+/// determinism-loss class line) as `run --verify` refuses the same run 1:
+/// the same report, exit code and stdout, never `matched` and never a
+/// verification. A deadlock without a loss stays comparable
+/// (ptrace, `--strict`).
+#[test]
+fn paired_verify_runs_refuse_a_lossy_deadlock_under_verify_allow_both() {
+    let _guard = hermit_run_guard();
+    let flags = ["--strict", "--base-env=minimal", "--verify-strict"];
+    let clean = super::condvar_join_deadlock_guest().to_str().unwrap();
+    let matched = assert_paired_matches_run_verify("clean deadlock", &[], &flags, "both", &[clean]);
+    assert_eq!(matched["verdict"], "matched", "{matched}");
+    assert_eq!(matched["verified"], true, "{matched}");
+
+    let lossy = super::pid_namespace_nested_guest().to_str().unwrap();
+    let guest = [lossy, "init_dies_then_wait"];
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directories = [root.path().join("run1"), root.path().join("run2")];
+    for directory in &directories {
+        let mut run_flags = flags.to_vec();
+        run_flags.extend(["--verify-run", directory.to_str().unwrap()]);
+        let run = hermit_run(&[], &run_flags, &guest, EPOCH);
+        let log = stderr(&run);
+        assert_eq!(
+            run.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line == detcore_model::HERMIT_MODEL_DEADLOCK_LINE),
+            "{log}"
+        );
+        assert!(super::names_the_namespace_init_loss(&log), "{log}");
+        assert!(!log.contains(super::DETERMINISM_LOSS_REFUSAL_LINE), "{log}");
+        let record = report(&directory.join("verify-run.json"));
+        assert_eq!(record["outcome"]["kind"], "run_failed", "{record}");
+        assert_eq!(record["outcome"]["failure"], "determinism_loss", "{record}");
+    }
+    let paired_report = root.path().join("paired.json");
+    let paired = log_diff(
+        &paired_report,
+        [&directories[0], &directories[1]],
+        &["--verify-allow", "both"],
+    );
+    let log = stderr(&paired);
+    assert_eq!(
+        paired.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE),
+        "{log}"
+    );
+    assert!(!log.contains("Determinism verified"), "{log}");
+    let refused = report(&paired_report);
+    assert_ne!(refused["verdict"], "matched", "{refused}");
+    assert_eq!(refused["verified"], false, "{refused}");
+
+    let internal_report = root.path().join("internal.json");
+    let mut run_flags = flags.to_vec();
+    run_flags.extend([
+        "--verify",
+        "--verify-allow",
+        "both",
+        "--verify-json",
+        internal_report.to_str().unwrap(),
+    ]);
+    let internal = hermit_run(&[], &run_flags, &guest, EPOCH);
+    assert_eq!(
+        refused,
+        report(&internal_report),
+        "{log}\n{}",
+        stderr(&internal)
+    );
+    assert_eq!(
+        paired.status.code(),
+        internal.status.code(),
+        "{log}\n{}",
+        stderr(&internal)
+    );
+    assert_eq!(
+        paired.stdout,
+        internal.stdout,
+        "{log}\n{}",
+        stderr(&internal)
+    );
+}
+
 /// `hermit record start --verify-run`, then the same with
 /// `--verify-replay-of` the first, then `log-diff --verify-json`, against
 /// `record start --verify --verify-json`: the same report, exit code and

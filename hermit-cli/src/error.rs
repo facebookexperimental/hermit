@@ -48,6 +48,11 @@ pub enum FailureKind {
     /// publish the named infrastructure error instead of leaving the pending
     /// no-result.
     SkidOvershoot { count: u64 },
+    /// A finished run that claims determinism recorded a determinism loss, and
+    /// the child refused its result ([`crate::DeterminismLossRefusal`]). The
+    /// child printed the reasons; the parent re-attaches the type so the exit
+    /// status is the policy refusal's (122) and the class line names the cause.
+    DeterminismLoss,
     /// The child stopped because HERMIT'S OWN `--timeout` BOUND was reached.
     ///
     /// ⚠️ THE SAME ARGUMENT A THIRD TIME, and it is not hypothetical: measured
@@ -353,6 +358,11 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::SkidOvershoot {
             count: error.count(),
         }
+    } else if error
+        .downcast_ref::<crate::DeterminismLossRefusal>()
+        .is_some()
+    {
+        FailureKind::DeterminismLoss
     } else if error
         .chain()
         .any(|cause| cause.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>())
@@ -795,6 +805,20 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<String>>(),
         )
+    }
+
+    #[test]
+    fn a_determinism_loss_refusal_is_serialized_as_its_own_kind() {
+        let refusal = SerializableError::from(Error::new(crate::DeterminismLossRefusal::new(
+            2,
+            reverie::process::ExitStatus::Exited(0),
+        )));
+        assert_eq!(refusal.kind(), FailureKind::DeterminismLoss);
+        assert!(
+            refusal
+                .error
+                .contains("recorded 2 determinism loss reason(s)")
+        );
     }
 
     #[test]

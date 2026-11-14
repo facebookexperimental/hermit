@@ -268,7 +268,14 @@ fn failed_run(
             if let Some(path) = verify_json {
                 write_report_json(path, &run_failed_report(run, *failure, reported))?;
             }
-            Error::msg(format!("{label}: {detail}"))
+            // A saved loss refuses the comparison with the error `run
+            // --verify` refuses the same run with, and so its exit status.
+            match detail.strip_prefix(super::run::SAVED_LOSS_DETAIL_PREFIX) {
+                Some(reason) if *failure == RunFailure::DeterminismLoss => {
+                    Error::new(super::run::DeterminismLossRecorded::new(label, reason))
+                }
+                _ => Error::msg(format!("{label}: {detail}")),
+            }
         }
         VerifyRunOutcome::ContainerFailed { disposition } => {
             if let Some(path) = verify_json {

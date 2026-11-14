@@ -948,21 +948,58 @@ static RECEIVER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// replaced or cleared.
 static RECEIVER_STOP: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
 
-/// The first determinism loss recorded in this process, never cleared: a run
-/// that recorded one must not be compared, whatever reached its log (see
+/// How many distinct determinism-loss reasons [`determinism_losses`] keeps.
+/// Further distinct reasons are counted, not kept.
+pub const LOSS_REASONS_KEPT: usize = 16;
+
+/// Every distinct determinism loss recorded in this process, never cleared:
+/// the first [`LOSS_REASONS_KEPT`] reasons in the order they were recorded,
+/// the hashes of all of them (to count each distinct reason once), and how
+/// many there were. A run that recorded one must not be compared, and a run
+/// that claims determinism is refused, whatever reached its log (see
 /// [`determinism_loss`]).
-static DETERMINISM_LOSS: Mutex<Option<String>> = Mutex::new(None);
+struct DeterminismLosses {
+    reasons: Vec<String>,
+    seen: std::collections::BTreeSet<u64>,
+}
+
+impl DeterminismLosses {
+    const fn new() -> Self {
+        Self {
+            reasons: Vec::new(),
+            seen: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        !self.seen.is_empty()
+    }
+
+    /// Counts `reason` once, and keeps it if it is new and fewer than
+    /// [`LOSS_REASONS_KEPT`] are kept. A trailing newline is not part of it.
+    fn record(&mut self, reason: &str) {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let reason = reason.trim_end_matches('\n');
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        reason.hash(&mut hasher);
+        if self.seen.insert(hasher.finish()) && self.reasons.len() < LOSS_REASONS_KEPT {
+            self.reasons.push(reason.to_owned());
+        }
+    }
+}
+
+static DETERMINISM_LOSS: Mutex<DeterminismLosses> = Mutex::new(DeterminismLosses::new());
 
 /// Records that this run's records can no longer be trusted to compare: a
-/// record was lost, or an event happened at a moment the host chose. The first
-/// reason is kept. Verification refuses to compare a run whose
-/// [`determinism_loss`] is set, independently of whether the corresponding
-/// loss notice reached the log.
+/// record was lost, or an event happened at a moment the host chose. Every
+/// distinct reason is counted, and the first [`LOSS_REASONS_KEPT`] are kept in
+/// the order they were recorded; a trailing newline (a forwarded notice
+/// record's) is not part of the reason. Verification refuses to compare a run
+/// whose [`determinism_loss`] is set, independently of whether the
+/// corresponding loss notice reached the log.
 pub fn record_determinism_loss(reason: &str) {
-    let mut loss = DETERMINISM_LOSS.lock().unwrap();
-    if loss.is_none() {
-        *loss = Some(reason.to_owned());
-    }
+    DETERMINISM_LOSS.lock().unwrap().record(reason);
 }
 
 static REPLAY_REFUSAL: Mutex<Option<String>> = Mutex::new(None);
@@ -988,7 +1025,16 @@ pub fn replay_refusal() -> Option<String> {
 /// The first determinism loss [`record_determinism_loss`] recorded in this
 /// process, if any.
 pub fn determinism_loss() -> Option<String> {
-    DETERMINISM_LOSS.lock().unwrap().clone()
+    DETERMINISM_LOSS.lock().unwrap().reasons.first().cloned()
+}
+
+/// Every determinism loss [`record_determinism_loss`] recorded in this
+/// process: the first [`LOSS_REASONS_KEPT`] distinct reasons, in the order they
+/// were recorded, and the number of distinct reasons in all. Empty and 0 when
+/// none was recorded.
+pub fn determinism_losses() -> (Vec<String>, u64) {
+    let losses = DETERMINISM_LOSS.lock().unwrap();
+    (losses.reasons.clone(), losses.seen.len() as u64)
 }
 
 /// Writes a [`FORWARDING_LOSS_NOTICE`] line with `reason` through the
@@ -3928,6 +3974,27 @@ mod tests {
             text(order.untagged(b"INFO detcore: DETLOG legacy-2\n")),
             ["INFO detcore: DETLOG legacy-2\n"]
         );
+    }
+
+    /// Each distinct reason is counted once and kept in the order it was
+    /// recorded, up to `LOSS_REASONS_KEPT`; later distinct reasons are counted
+    /// only, and a trailing newline does not make a reason distinct.
+    #[test]
+    fn determinism_losses_count_distinct_reasons_and_keep_the_first() {
+        let mut losses = super::DeterminismLosses::new();
+        assert!(!losses.is_some());
+        losses.record("first\n");
+        losses.record("first");
+        losses.record("second");
+        assert!(losses.is_some());
+        assert_eq!(losses.reasons, ["first", "second"]);
+        assert_eq!(losses.seen.len(), 2);
+        for n in 0..super::LOSS_REASONS_KEPT + 3 {
+            losses.record(&format!("reason {n}"));
+        }
+        assert_eq!(losses.reasons.len(), super::LOSS_REASONS_KEPT);
+        assert_eq!(losses.reasons[..2], ["first", "second"]);
+        assert_eq!(losses.seen.len(), 2 + super::LOSS_REASONS_KEPT + 3);
     }
 
     #[test]

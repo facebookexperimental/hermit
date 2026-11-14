@@ -1173,6 +1173,22 @@ fn terminal_outcome_of(error: &Error) -> Option<detcore::TerminalOutcome> {
 /// Typed refusals that can reach the outer CLI before a container serializes them.
 /// Keep exit status and the diagnostic class on the same decision; matching
 /// message text alone never turns a parse or I/O failure into an admission refusal.
+/// Whether `error` refuses a run because it recorded a determinism loss: a
+/// plain run's refusal ([`hermit::DeterminismLossRefusal`], or its marker after
+/// the container boundary) or a verification run's
+/// ([`run::DeterminismLossRecorded`]).
+fn is_determinism_loss_refusal(error: &Error) -> bool {
+    error
+        .downcast_ref::<hermit::DeterminismLossRefusal>()
+        .is_some()
+        || error
+            .downcast_ref::<hermit::DeterminismLossMarker>()
+            .is_some()
+        || error
+            .downcast_ref::<run::DeterminismLossRecorded>()
+            .is_some()
+}
+
 fn is_outer_policy_refusal(error: &Error) -> bool {
     error.downcast_ref::<PolicyRefusal>().is_some()
         || error
@@ -1252,6 +1268,11 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
         return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
     }
+    // A run that claims determinism and recorded a determinism loss, plain or
+    // verified: Hermit declines to vouch for it, a policy refusal.
+    if is_determinism_loss_refusal(error) {
+        return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    }
     // ⚠️ A REFUSAL IS NOT A FAILURE, AND IT IS CHECKED FIRST FOR THAT REASON.
     // A fail-closed policy stopping the run is hermit working; reporting it as
     // HERMIT_INTERNAL_FAILURE_EXIT tells the operator to file a bug against a
@@ -1325,6 +1346,9 @@ fn classify_failure(error: &Error) -> String {
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={}",
             overshoot.count()
         );
+    }
+    if is_determinism_loss_refusal(error) {
+        return "HERMIT_POLICY_REFUSAL class=policy-refusal cause=determinism-loss".to_string();
     }
     // ⚠️ REFUSAL BEFORE FAILURE. This arm and the ContainerChildExit arm below
     // describe the SAME observation -- a container child that exited -- and
@@ -3027,6 +3051,60 @@ mod tests {
         assert_eq!(
             classify_failure(&error),
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2"
+        );
+    }
+
+    /// A determinism-loss refusal exits 122 with its own class line, from the
+    /// plain run's type, from the marker the parent re-attaches at the
+    /// container boundary, and from the verify path's type.
+    #[test]
+    fn a_determinism_loss_uses_the_policy_refusal_exit_and_marker() {
+        for error in [
+            Error::new(hermit::DeterminismLossRefusal::new(
+                1,
+                reverie::process::ExitStatus::Exited(0),
+            )),
+            Error::msg("the child's message")
+                .context(hermit::DeterminismLossMarker)
+                .context(super::PolicyRefusal),
+            Error::new(super::run::DeterminismLossRecorded::new(
+                "run 1", "a reason",
+            )),
+        ] {
+            assert_eq!(
+                failure_exit_code(&error),
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                "{error:#}"
+            );
+            assert_eq!(
+                classify_failure(&error),
+                "HERMIT_POLICY_REFUSAL class=policy-refusal cause=determinism-loss",
+                "{error:#}"
+            );
+        }
+    }
+
+    /// A run that already failed keeps its own exit and class line: the loss
+    /// lines are printed beside it, and nothing typed is attached to it.
+    #[test]
+    fn a_failed_run_keeps_its_exit_and_marker_beside_a_determinism_loss() {
+        let wall = Error::new(super::container::RunTimeoutMarker);
+        assert_eq!(failure_exit_code(&wall), hermit::HERMIT_DEADLINE_EXIT);
+        assert_eq!(
+            classify_failure(&wall),
+            "HERMIT_RUN_TIMEOUT class=run-timeout"
+        );
+        let deadlock = Error::new(hermit::SchedulerEndedRun::new(
+            detcore::TerminalOutcome::GuestDeadlock,
+            None,
+        ));
+        assert_eq!(
+            failure_exit_code(&deadlock),
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
+        );
+        assert_eq!(
+            classify_failure(&deadlock),
+            "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"
         );
     }
 

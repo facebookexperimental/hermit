@@ -5913,6 +5913,11 @@ pub fn classify_container_result<T>(
                 FailureKind::SkidOvershoot { count } => error
                     .context(SkidOvershootError::new(count))
                     .context(PolicyRefusal),
+                // The reasons were printed by the child; the marker keeps the
+                // refusal's exit status and class line.
+                FailureKind::DeterminismLoss => error
+                    .context(hermit::DeterminismLossMarker)
+                    .context(PolicyRefusal),
                 // ⚠️ THE LIMIT IS RE-DERIVED, NOT RE-PARSED. `kind` says a
                 // deadline fired; the seconds live only in the message the
                 // child wrote, and `RunTimeoutMarker` deliberately carries no
@@ -6847,6 +6852,27 @@ mod tests {
                 .expect("the parent must recover the typed cause")
                 .count(),
             3
+        );
+    }
+
+    /// A plain run's determinism-loss refusal crosses the container boundary
+    /// as its own kind, and the parent re-attaches the marker that keeps its
+    /// exit status and class line.
+    #[test]
+    fn a_determinism_loss_refusal_survives_the_container_boundary() {
+        let reported = SerializableError::from(Error::new(hermit::DeterminismLossRefusal::new(
+            2,
+            reverie::process::ExitStatus::Exited(0),
+        )));
+        assert_eq!(reported.kind(), FailureKind::DeterminismLoss);
+
+        let classified = classify_container_result::<()>(Ok(Err(reported)))
+            .expect_err("a determinism-loss refusal is not a success");
+        assert!(classified.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(
+            classified
+                .downcast_ref::<hermit::DeterminismLossMarker>()
+                .is_some()
         );
     }
 

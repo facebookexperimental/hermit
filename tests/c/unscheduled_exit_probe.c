@@ -14,6 +14,8 @@
  *                        while its parent exits;
  *   vfork-parent-killed  a vfork child kills its parent; the grandparent, the
  *                        surviving work, reaps the parent and goes on.
+ *   sigkill-child        a parent sends SIGKILL to a child blocked in pselect6
+ *                        and reaps it (https://github.com/rrnewton/hermit/issues/5459).
  *
  * Each line printed is fixed, so the output is the same in every run. Whether
  * the runs' records can be compared is the backend's decision: a backend that
@@ -30,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/select.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -119,6 +123,40 @@ static int vfork_parent_killed(void) {
   return 0;
 }
 
+/* Blocks in pselect6 on a pipe nobody writes, for at most `ms` milliseconds. */
+static void block_ms(long ms) {
+  int p[2];
+  if (pipe(p) != 0) {
+    fail("pipe");
+  }
+  fd_set readable;
+  FD_ZERO(&readable);
+  FD_SET(p[0], &readable);
+  struct timespec timeout = {ms / 1000, (ms % 1000) * 1000000L};
+  syscall(SYS_pselect6, p[0] + 1, &readable, NULL, NULL, &timeout, NULL);
+}
+
+static int sigkill_child(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    block_ms(3000);
+    say("child survived\n");
+    return 0;
+  }
+  block_ms(50);
+  int rc = kill(child, SIGKILL);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    fail("waitpid");
+  }
+  printf("kill rc=%d signaled=%d sig=%d\n", rc, WIFSIGNALED(status),
+         WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "pdeathsig") == 0) {
     return pdeathsig();
@@ -126,6 +164,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "vfork-parent-killed") == 0) {
     return vfork_parent_killed();
   }
-  fprintf(stderr, "usage: %s pdeathsig|vfork-parent-killed\n", argv[0]);
+  if (argc == 2 && strcmp(argv[1], "sigkill-child") == 0) {
+    return sigkill_child();
+  }
+  fprintf(stderr, "usage: %s pdeathsig|vfork-parent-killed|sigkill-child\n", argv[0]);
   return 2;
 }

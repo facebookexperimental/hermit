@@ -2681,6 +2681,111 @@ impl std::fmt::Display for SkidOvershootError {
 
 impl std::error::Error for SkidOvershootError {}
 
+/// The `determinism loss recorded: <reason>` lines for the determinism losses
+/// this process recorded ([`detcore::detlog::determinism_losses`]): one per
+/// kept reason, in the order they were recorded, then one line counting the
+/// distinct reasons not kept. Empty when there were none.
+pub fn determinism_loss_lines(reasons: &[String], total: u64) -> Vec<String> {
+    let mut lines: Vec<String> = reasons
+        .iter()
+        .map(|reason| format!("determinism loss recorded: {reason}"))
+        .collect();
+    let unkept = total.saturating_sub(reasons.len() as u64);
+    if unkept > 0 {
+        lines.push(format!(
+            "determinism loss recorded: and {unkept} more distinct reason(s)"
+        ));
+    }
+    lines
+}
+
+/// What a finished run does with the determinism losses it recorded
+/// ([`decide_determinism_loss`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeterminismLossDecision {
+    /// No loss was recorded: the run's result stands.
+    None,
+    /// A run that claims determinism finished with the guest's status: print
+    /// the loss lines and refuse the result ([`DeterminismLossRefusal`],
+    /// exit 122).
+    Refuse,
+    /// A run that already failed (`--timeout`, a scheduler deadlock, any other
+    /// error), or a relaxed run (`--no-sequentialize-threads`), which declares
+    /// itself non-deterministic: print the loss lines and keep the result.
+    Report,
+}
+
+/// Decides what a finished run does with the determinism losses it recorded.
+/// A run claims determinism when it sequentializes its threads (Hermit's
+/// default, with or without `--strict`); `finished` is whether it ended with
+/// the guest's status rather than an error of its own.
+pub fn decide_determinism_loss(
+    claims_determinism: bool,
+    finished: bool,
+    losses: u64,
+) -> DeterminismLossDecision {
+    match (losses > 0, claims_determinism && finished) {
+        (false, _) => DeterminismLossDecision::None,
+        (true, true) => DeterminismLossDecision::Refuse,
+        (true, false) => DeterminismLossDecision::Report,
+    }
+}
+
+/// A finished run that claims determinism recorded a determinism loss, so
+/// Hermit refuses its result: the guest ran to completion and kept its output,
+/// but the run is not deterministic evidence. The reasons are printed before
+/// the refusal (`determinism loss recorded: <reason>`).
+///
+/// This is a type rather than a message match because it crosses the container
+/// error boundary as [`error::FailureKind::DeterminismLoss`] (exit 122,
+/// `HERMIT_POLICY_REFUSAL class=policy-refusal cause=determinism-loss`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterminismLossRefusal {
+    total: u64,
+    guest_status: String,
+}
+
+impl DeterminismLossRefusal {
+    pub fn new(total: u64, guest_status: ExitStatus) -> Self {
+        debug_assert!(total > 0, "a determinism-loss refusal requires a loss");
+        let guest_status = match (guest_status.code(), guest_status.signal()) {
+            (Some(code), _) => format!("exited with status {code}"),
+            (None, Some(signal)) => format!("was killed by signal {signal}"),
+            (None, None) => format!("{guest_status:?}"),
+        };
+        Self {
+            total,
+            guest_status,
+        }
+    }
+}
+
+impl std::fmt::Display for DeterminismLossRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing the result: this run recorded {} determinism loss reason(s) \
+             (named above), so it is not deterministic evidence (the guest {})",
+            self.total, self.guest_status
+        )
+    }
+}
+
+impl std::error::Error for DeterminismLossRefusal {}
+
+/// The parent side of a [`DeterminismLossRefusal`] that crossed the container
+/// boundary: the kind survives as a type, the text as the message chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeterminismLossMarker;
+
+impl std::fmt::Display for DeterminismLossMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the run recorded a determinism loss")
+    }
+}
+
+impl std::error::Error for DeterminismLossMarker {}
+
 /// The skid overshoots one run reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SkidOvershoots {
@@ -5633,6 +5738,72 @@ mod exclusive_rewrite_summary;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The determinism-loss contract's six cells: a run that claims
+    /// determinism and finished is refused; a run that already failed, or a
+    /// relaxed one, keeps its result and reports the loss; no loss, no change.
+    #[test]
+    fn the_determinism_loss_decision_covers_every_cell() {
+        use DeterminismLossDecision::*;
+        for (claims, finished, losses, expected) in [
+            (true, true, 1, Refuse),
+            (true, false, 1, Report),
+            (false, true, 1, Report),
+            (false, false, 1, Report),
+            (true, true, 0, None),
+            (false, false, 0, None),
+        ] {
+            assert_eq!(
+                decide_determinism_loss(claims, finished, losses),
+                expected,
+                "claims={claims} finished={finished} losses={losses}"
+            );
+        }
+    }
+
+    /// One line per kept reason, then one counting the reasons not kept.
+    #[test]
+    fn determinism_loss_lines_name_each_kept_reason_and_count_the_rest() {
+        assert!(determinism_loss_lines(&[], 0).is_empty());
+        let reasons = ["first".to_owned(), "second".to_owned()];
+        assert_eq!(
+            determinism_loss_lines(&reasons, 2),
+            [
+                "determinism loss recorded: first",
+                "determinism loss recorded: second"
+            ]
+        );
+        assert_eq!(
+            determinism_loss_lines(&reasons, 5)
+                .last()
+                .map(String::as_str),
+            Some("determinism loss recorded: and 3 more distinct reason(s)")
+        );
+    }
+
+    /// The refusal names how many reasons there were and the guest's own
+    /// status, which the run kept.
+    #[test]
+    fn a_determinism_loss_refusal_names_the_guest_status() {
+        let exited = DeterminismLossRefusal::new(2, ExitStatus::Exited(3)).to_string();
+        assert!(
+            exited.contains("recorded 2 determinism loss reason(s)"),
+            "{exited}"
+        );
+        assert!(
+            exited.contains("the guest exited with status 3"),
+            "{exited}"
+        );
+        let killed = DeterminismLossRefusal::new(
+            1,
+            ExitStatus::Signaled(reverie::process::Signal::SIGKILL, false),
+        )
+        .to_string();
+        assert!(
+            killed.contains("the guest was killed by signal 9"),
+            "{killed}"
+        );
+    }
 
     #[test]
     fn a_failed_rewrite_without_a_scanned_pair_is_rejected() {

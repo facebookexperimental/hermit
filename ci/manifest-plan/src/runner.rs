@@ -30828,7 +30828,7 @@ cp "{}" "$verdict"
         use crate::canonical_verdict::VerificationRun;
         for (status, failure) in [
             (125, RunFailure::BackendFailure),
-            (125, RunFailure::DeterminismLoss),
+            (122, RunFailure::DeterminismLoss),
             (122, RunFailure::PolicyRefusal),
         ] {
             for run in [VerificationRun::Run1, VerificationRun::Run2] {

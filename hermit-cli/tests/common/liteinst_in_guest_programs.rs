@@ -390,6 +390,38 @@ fn assert_liteinst_in_guest_output(output: Output) -> Output {
     output
 }
 
+/// A claimed in-guest run that recorded a determinism loss: Hermit printed its
+/// `selected` line and never named the retired host hybrid, the guest ran to
+/// completion and kept its output, and Hermit refused the result with exit
+/// 122, a `determinism loss recorded:` line containing `reason`, and the
+/// determinism-loss class line after it.
+fn assert_liteinst_in_guest_loss_refusal(output: Output, selected: &str, reason: &str) -> Output {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "status={:?}\nstdout={}\nstderr={stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(stderr.lines().any(|line| line == selected), "{stderr}");
+    assert!(!stderr.contains("liteinst host hybrid"), "{stderr}");
+    assert!(!stderr.contains("LiteInst host hybrid"), "{stderr}");
+    let loss = stderr
+        .lines()
+        .position(|line| line.starts_with("determinism loss recorded: ") && line.contains(reason))
+        .unwrap_or_else(|| panic!("no loss line naming {reason:?}:\n{stderr}"));
+    let class = stderr
+        .lines()
+        .position(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE)
+        .unwrap_or_else(|| panic!("no determinism-loss class line:\n{stderr}"));
+    assert!(
+        loss < class,
+        "the loss line, then the class line:\n{stderr}"
+    );
+    output
+}
+
 fn run_liteinst_in_guest(program: &Path, args: &[&str]) -> Output {
     assert_liteinst_in_guest_output(run_liteinst(program, args))
 }
@@ -1679,7 +1711,11 @@ fn assert_entry_delivery_runs_and_refuses_verification(
             .arg(guest)
             .stdin(Stdio::null()),
     );
-    let output = assert_liteinst_in_guest_output(output);
+    let output = assert_liteinst_in_guest_loss_refusal(
+        output,
+        IN_GUEST_SELECTED,
+        "before a syscall that has not run",
+    );
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     let output = super::hermit_test::hermit_output(
         "hermit run",
@@ -1700,6 +1736,17 @@ fn assert_entry_delivery_runs_and_refuses_verification(
         "{stderr}"
     );
     assert!(!stderr.contains("Determinism verified"), "{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE),
+        "{stderr}"
+    );
 }
 
 /// Signal phase 1, the I4 addendum: a SIGALRM that becomes pending while a
@@ -4358,9 +4405,11 @@ fn assert_reserved_probe_runs_for(
 /// Runs `mode` of `reserved_signal_send_probe` for `signals` under `backend`,
 /// whose sends of them each kill a child that dies unscheduled
 /// ([`unscheduled_deaths_under`]): plainly, which must print `expected`
-/// (Linux's answer) with no reserved-signal WARN, and under `--verify
-/// --verify-strict`, which must refuse the run for the recorded loss and
-/// never report it verified. Returns the plain run's stderr.
+/// (Linux's answer) with no reserved-signal WARN and, since the run claims
+/// determinism, end refused with exit 122 for that loss ("exited without
+/// deregistering", https://github.com/rrnewton/hermit/issues/5459), and under
+/// `--verify --verify-strict`, which must refuse the run for the recorded loss
+/// and never report it verified. Returns the plain run's stderr.
 fn assert_unscheduled_probe_deaths(
     backend: &str,
     mode: &str,
@@ -4370,11 +4419,24 @@ fn assert_unscheduled_probe_deaths(
     let output = run_reserved_signal_probe_for(backend, &[], mode, signals);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         "{backend} {mode} {signals:?}: status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
+    let loss = stderr
+        .lines()
+        .position(|line| {
+            line.starts_with("determinism loss recorded: process ")
+                && line.ends_with(" exited without deregistering; its exit was not scheduled")
+        })
+        .unwrap_or_else(|| panic!("{backend} {mode} {signals:?}: no loss line: {stderr}"));
+    let class = stderr
+        .lines()
+        .position(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE)
+        .unwrap_or_else(|| panic!("{backend} {mode} {signals:?}: no class line: {stderr}"));
+    assert!(loss < class, "{backend} {mode} {signals:?}: {stderr}");
     assert_eq!(stdout, expected, "{backend} {mode} {signals:?}: {stderr}");
     assert!(
         !stderr.contains("HERMIT_RESERVED_SIGNAL"),
@@ -4396,6 +4458,17 @@ fn assert_unscheduled_probe_deaths(
     );
     assert!(
         !verified_stderr.contains("Determinism verified"),
+        "{backend} {mode} {signals:?} --verify: {verified_stderr}"
+    );
+    assert_eq!(
+        verified.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{backend} {mode} {signals:?} --verify: {verified_stderr}"
+    );
+    assert!(
+        verified_stderr
+            .lines()
+            .any(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE),
         "{backend} {mode} {signals:?} --verify: {verified_stderr}"
     );
     stderr
@@ -5773,7 +5846,9 @@ fn liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the
 /// on. In-guest LiteInst cannot schedule such a death, so it retires the
 /// process when its exit completes and records a determinism loss (the C3.5
 /// design's consumption case). Each run completes with the program's output,
-/// never a hang, and verification refuses to compare it, never a match.
+/// never a hang. A plain run, which claims determinism, is refused with exit
+/// 122 and the loss named; verification refuses to compare it, never a match,
+/// and exits the same way.
 #[test]
 fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
     let _guard = hermit_run_guard();
@@ -5796,7 +5871,11 @@ fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
                 .arg(mode)
                 .stdin(Stdio::null()),
         );
-        let output = assert_liteinst_in_guest_output(output);
+        let output = assert_liteinst_in_guest_loss_refusal(
+            output,
+            IN_GUEST_SELECTED,
+            " exited without deregistering; its exit was not scheduled",
+        );
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{mode}");
 
         let output = super::hermit_test::hermit_output(
@@ -5818,6 +5897,96 @@ fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
             "{mode}: {stderr}"
         );
         assert!(!stderr.contains("Determinism verified"), "{mode}: {stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line == super::DETERMINISM_LOSS_REFUSAL_LINE),
+            "{mode}: {stderr}"
+        );
+    }
+}
+
+/// The run of https://github.com/rrnewton/hermit/issues/5459: a parent sends
+/// SIGKILL to its child. An in-guest backend cannot retire that death at the
+/// kill turn, so it records a determinism loss. A plain run claims
+/// determinism with or without `--strict`, so each is refused with exit 122
+/// after the guest's output (which is kept), naming the loss; before, both
+/// exited 0 and said nothing. On ptrace, which retires the kill at its turn,
+/// the same runs and `--verify` stay 0 with no loss line (the control).
+#[test]
+fn a_cross_guest_sigkill_is_a_named_refusal_on_the_in_guest_routes() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&UNSCHEDULED_EXIT_GUEST, "unscheduled_exit_probe");
+    let expected = "kill rc=0 signaled=1 sig=9\n";
+    for (backend, selected) in [
+        ("liteinst", IN_GUEST_SELECTED),
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
+    ] {
+        for strict in [true, false] {
+            // `liteinst_command`'s arguments, on `backend`, with or without
+            // its `--strict`.
+            let mut command = Command::new(hermit_binary());
+            super::hermit_test::pin_canonical_epoch(&mut command);
+            command.args(liteinst_command("off").get_args().filter_map(|argument| {
+                let argument = argument.to_str().expect("UTF-8 argument");
+                match argument {
+                    "liteinst" => Some(backend),
+                    "--strict" if !strict => None,
+                    argument => Some(argument),
+                }
+            }));
+            let output = super::hermit_test::hermit_output(
+                "hermit run",
+                command
+                    .arg("--")
+                    .arg(guest)
+                    .arg("sigkill-child")
+                    .stdin(Stdio::null()),
+            );
+            let output = assert_liteinst_in_guest_loss_refusal(
+                output,
+                selected,
+                " exited without deregistering; its exit was not scheduled",
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                expected,
+                "{backend} strict={strict}"
+            );
+        }
+    }
+    for verify in [false, true] {
+        // The default log level: `--verify` refuses `--log=off`.
+        let mut command = Command::new(hermit_binary());
+        command.args(["run", "--strict", "--base-env=minimal"]);
+        super::hermit_test::pin_canonical_epoch(&mut command);
+        if verify {
+            command.args(["--verify", "--verify-strict"]);
+        }
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                .arg("--")
+                .arg(guest)
+                .arg("sigkill-child")
+                .stdin(Stdio::null()),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "ptrace verify={verify}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "ptrace verify={verify}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("determinism loss recorded"),
+            "ptrace verify={verify}: {stderr}"
+        );
     }
 }
 

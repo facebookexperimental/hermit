@@ -1763,7 +1763,14 @@ impl ProcessExitCleanup {
         process: DetPid,
         consume_unreported: bool,
     ) -> (bool, Option<String>) {
-        let loss = (consume_unreported && sched.has_unreported_exit(process)).then(|| {
+        // A process that filed a fail-closed policy refusal ends itself after
+        // it, without deregistering: the run is already refused, and that exit
+        // is Hermit's teardown, not a death at a moment the host chose. Its
+        // registrations are still retired below. This physical exit ends the
+        // note, so it never covers a later process with the same number.
+        let refusal_ends = sched.take_policy_refusal_end(process);
+        let unreported = consume_unreported && sched.has_unreported_exit(process);
+        let loss = (unreported && !refusal_ends).then(|| {
             let reason = format!(
                 "process {process} exited without deregistering; its exit was not scheduled"
             );
@@ -1782,7 +1789,7 @@ impl ProcessExitCleanup {
         self.process_auxv.lock().unwrap().forget_process(process);
         if consume_unreported {
             let consumed = sched.consume_unreported_exit(process);
-            debug_assert_eq!(consumed, loss.is_some());
+            debug_assert_eq!(consumed, unreported);
         }
         self.shared_open_files
             .lock()
@@ -2649,6 +2656,8 @@ impl GlobalState {
                 if let Some(counts) = skid_overshoots {
                     summary.record_skid_overshoots(counts.events, counts.reports);
                 }
+                let (reasons, total) = crate::detlog::determinism_losses();
+                summary.record_determinism_losses(reasons, total);
                 summary.watch = watch_summary;
                 // No summary is published unless terminal validation and recording
                 // output both succeeded. Output errors retain their ordinary class.
@@ -4791,6 +4800,7 @@ impl GlobalState {
             }
             GlobalRequest::PolicyRefusal(reason) => {
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                self.sched.lock().unwrap().note_policy_refusal(dtid);
                 R::PolicyRefusal(())
             }
             GlobalRequest::PidfdSelfQualificationRefusal(refusal) => {
@@ -17110,6 +17120,215 @@ mod tests {
             .expect("cleanup must leave the kernel status for the parent");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert_eq!(status.code(), None);
+    }
+
+    /// A process that filed a fail-closed policy refusal ends itself after it,
+    /// without deregistering, on a backend whose Tool runs inside the guest.
+    /// Its completion still retires it, but records no determinism loss: the
+    /// exit is the refusal's own teardown, not a death the host timed.
+    #[tokio::test]
+    async fn the_exit_that_follows_a_policy_refusal_records_no_determinism_loss() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "the_exit_that_follows_a_policy_refusal_records_no_determinism_loss",
+        ) {
+            return;
+        }
+        use super::open_process_pidfd;
+        use super::wait_for_process_exit;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let pidfd = open_process_pidfd(physical_pid).expect("a live child has a process pidfd");
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(41);
+        let mm = MmId::initial(dettid);
+        let pending_request = {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(dettid, dettid, true);
+            sched.record_thread_mm(dettid, mm);
+            sched
+                .register_physical_thread(dettid, mm, physical_pid, physical_pid)
+                .unwrap();
+            sched.next_turns.insert(
+                dettid,
+                crate::scheduler::ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            sched.note_policy_refusal(dettid);
+            sched.next_turns[&dettid].req.clone()
+        };
+        child.0.kill().unwrap();
+        assert!(
+            wait_for_process_exit(pidfd, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+
+        state.complete_physical_process_exit(dettid.as_raw());
+        assert!(pending_request.get().await.is_err());
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&dettid));
+        assert!(sched.process_physically_gone(DetPid::from_raw(41)));
+        drop(sched);
+        assert_eq!(crate::detlog::determinism_loss(), None);
+    }
+
+    /// A policy refusal exempts only the refusing process's own exit. Another
+    /// process that dies beside it without deregistering still records the
+    /// determinism loss, and the refusing process's exit, which records none,
+    /// leaves no note behind for a later holder of its number.
+    #[test]
+    fn a_policy_refusal_exempts_only_the_refusing_processs_exit() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "a_policy_refusal_exempts_only_the_refusing_processs_exit",
+        ) {
+            return;
+        }
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let state = GlobalState::initialize(&config, false);
+        let cleanup = state.process_exit_cleanup();
+        let (refusing, other) = (DetTid::from_raw(41), DetTid::from_raw(42));
+        let mut sched = state.sched.lock().unwrap();
+        for thread in [refusing, other] {
+            sched.thread_tree.add_child(thread, thread, true);
+            sched.record_thread_mm(thread, MmId::initial(thread));
+            sched.next_turns.insert(
+                thread,
+                crate::scheduler::ThreadNextTurn {
+                    dettid: thread,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        sched.note_policy_refusal(refusing);
+        let other_loss = "process 42 exited without deregistering; its exit was not scheduled";
+        assert_eq!(
+            cleanup
+                .complete_locked(&mut sched, DetPid::from_raw(42), true)
+                .1
+                .as_deref(),
+            Some(other_loss)
+        );
+        assert_eq!(
+            cleanup
+                .complete_locked(&mut sched, DetPid::from_raw(41), true)
+                .1,
+            None
+        );
+        assert!(!sched.take_policy_refusal_end(DetPid::from_raw(41)));
+        drop(sched);
+        assert_eq!(
+            crate::detlog::determinism_losses(),
+            (vec![other_loss.to_owned()], 1)
+        );
+    }
+
+    /// A refusing process's number is never registered again, so its refusal
+    /// cannot cover a later process with that number: completing its exit
+    /// tombstones its thread (`Scheduler::consume_unreported_exit`), and a
+    /// later child registration under the number is refused before the child
+    /// reaches the scheduler, or any exit completion.
+    #[tokio::test]
+    async fn a_refusing_processs_number_is_not_registered_again() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "a_refusing_processs_number_is_not_registered_again",
+        ) {
+            return;
+        }
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let state = GlobalState::initialize(&config, false);
+        let (root, refusing) = (DetTid::from_raw(3), DetTid::from_raw(41));
+        let root_mm = MmId::initial(root);
+        let registration = |child_dettid, flags| super::ChildRegistration {
+            parent_dettid: root,
+            parent_detpid: root,
+            child_dettid,
+            child_tid_addr: 0,
+            flags,
+            exit_signal: libc::SIGCHLD,
+            physical_ids: None,
+            maybe_priority: Some(DEFAULT_PRIORITY),
+            parent_is_kernel_blocked: false,
+        };
+        for child in [root, refusing] {
+            let flags = (child != root).then(CloneFlags::empty);
+            assert!(matches!(
+                state
+                    .recv_create_child_thread(
+                        Tid::from_raw(root.as_raw()),
+                        root_mm,
+                        registration(child, flags),
+                    )
+                    .await,
+                SchedulerRpcResult::Continue(())
+            ));
+        }
+        state.sched.lock().unwrap().note_policy_refusal(refusing);
+        state.complete_physical_process_exit(refusing.as_raw());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            assert!(sched.thread_is_logically_killed(refusing));
+            assert!(!sched.take_policy_refusal_end(DetPid::from_raw(41)));
+        }
+        assert!(matches!(
+            state
+                .recv_create_child_thread(
+                    Tid::from_raw(root.as_raw()),
+                    root_mm,
+                    registration(refusing, Some(CloneFlags::empty())),
+                )
+                .await,
+            SchedulerRpcResult::ThreadExited
+        ));
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&refusing));
+        drop(sched);
+        assert_eq!(crate::detlog::determinism_loss(), None);
     }
 
     #[tokio::test]

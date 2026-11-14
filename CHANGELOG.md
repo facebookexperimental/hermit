@@ -5,6 +5,29 @@ describe crate releases; 0.5.1 and 0.5.3 describe selected development
 snapshots, and 0.5.4 is a package-version alignment. The 0.5.2 release
 branches from 0.5.0.
 
+## Unreleased
+
+- Determinism loss: a run that claims determinism (Hermit's default thread
+  sequentialization, with or without `--strict`) and records a determinism
+  loss is now refused with exit 122, after the guest's output, which is
+  kept. Hermit prints `determinism loss recorded: <reason>` for each reason
+  and `HERMIT_POLICY_REFUSAL class=policy-refusal cause=determinism-loss`.
+  Before, a plain run exited with the guest's status and said nothing, for
+  example after a cross-process `SIGKILL` on the in-guest backends
+  (https://github.com/rrnewton/hermit/issues/5459).
+  - `--verify` exits 122 with the same class line, where it exited 125 with
+    `class=cli-error`. So does `log-diff --verify-json` for a saved
+    `--verify-run` directory that recorded a loss, where it exited 125.
+  - A `--verify-run` that recorded a loss and ended with a deadlock or a
+    virtual timeout keeps that outcome's status, and its record saves the
+    loss, so no `--verify-allow` lets `log-diff --verify-json` compare it.
+  - A run with `--no-sequentialize-threads` keeps the guest's status and
+    prints the losses it records, a partial list (the user guide names the
+    known gaps); a run that already failed (`--timeout`, a
+    scheduler deadlock) keeps its own status and class line and prints them.
+  - `--summary-json` reports `determinism_loss` (`null`, or the reasons and
+    their distinct total).
+
 ## 0.5.7
 
 Release for the 2026-11-11 fbsource import. It pins Reverie 0.5.7

@@ -153,6 +153,12 @@ use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
+/// The class line of a run refused because it recorded a determinism loss
+/// (`classify_failure` in hermit-cli/src/bin/hermit/mod.rs), printed after one
+/// `determinism loss recorded: <reason>` line per reason.
+const DETERMINISM_LOSS_REFUSAL_LINE: &str =
+    "HERMIT_POLICY_REFUSAL class=policy-refusal cause=determinism-loss";
+
 static PIPE_READER_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIRST_SLICE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -4830,6 +4836,34 @@ fn hermit_with_closed_stdin(args: &[&str]) -> Output {
         });
     }
     hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
+}
+
+/// A run that claims determinism and recorded a determinism loss
+/// (https://github.com/rrnewton/hermit/issues/5459): it ran to completion and
+/// kept the guest's output, and Hermit refused the result with exit 122, a
+/// `determinism loss recorded:` line containing `reason`, and the
+/// determinism-loss class line after it.
+fn assert_determinism_loss_refusal(output: &Output, args: &[&str], reason: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "hermit {args:?} exited {}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let loss = stderr
+        .lines()
+        .position(|line| line.starts_with("determinism loss recorded: ") && line.contains(reason))
+        .unwrap_or_else(|| panic!("hermit {args:?}: no loss line naming {reason:?}:\n{stderr}"));
+    let class = stderr
+        .lines()
+        .position(|line| line == DETERMINISM_LOSS_REFUSAL_LINE)
+        .unwrap_or_else(|| panic!("hermit {args:?}: no determinism-loss class line:\n{stderr}"));
+    assert!(
+        loss < class,
+        "hermit {args:?}: the loss line, then the class line:\n{stderr}"
+    );
 }
 
 fn assert_success(output: &Output, args: &[&str]) {
@@ -12122,7 +12156,11 @@ fn namespace_only_mounts_no_placeholder_directory() {
 /// natively, as root in new user, mount and PID namespaces with a procfs of
 /// its own. Relaxation: not under `--verify`, which refuses the run, because
 /// Detcore names no procfs inode for a process whose root is not the
-/// container's (a determinism loss). KVM is named as not checked: its
+/// container's (a determinism loss). The plain `--strict` run claims
+/// determinism, so it is refused for that loss too (exit 122, "procfs inode
+/// numbers: a procfs file outside the guest's procfs mounts",
+/// https://github.com/rrnewton/hermit/issues/5459), after the guest's output,
+/// which is still checked. KVM is named as not checked: its
 /// executor refuses `chroot` (ENOSYS).
 #[test]
 fn kept_procfs_directories_are_served_after_a_chroot() {
@@ -12162,7 +12200,11 @@ fn kept_procfs_directories_are_served_after_a_chroot() {
         "--chroot-only",
     ];
     let output = hermit(&args);
-    assert_success(&output, &args);
+    assert_determinism_loss_refusal(
+        &output,
+        &args,
+        "procfs inode numbers: a procfs file outside the guest's procfs mounts",
+    );
     assert_eq!(stdout(&output), expected, "ptrace");
     eprintln!("{test}: kvm: NOT CHECKED: KVM's executor refuses chroot (ENOSYS)");
 }
@@ -12774,6 +12816,9 @@ fn detcore_renders_process_cgroup_under_relaxed_threads() {
     };
     outcome("zombie-owner", &["global-root", "live-owner"]);
     outcome("reaped-child-file", &["absent", "still-listed"]);
+    // A relaxed run already declares itself non-deterministic: whatever it
+    // records, it keeps the guest's status (above) and is never refused.
+    assert!(!stderr.contains(DETERMINISM_LOSS_REFUSAL_LINE), "{stderr}");
 }
 
 /// Under `--no-sequentialize-threads` Detcore does not adopt a rendered
@@ -14853,7 +14898,10 @@ fn detcore_follows_the_target_processs_root_for_its_mount_table() {
     // (its own, none), never the launch table. Natively first; then on
     // ptrace, unverified: a chrooted task's open of a procfs file has no
     // procfs mount below its root to name the file's inode by, which Detcore
-    // records as a determinism loss that --verify-strict refuses.
+    // records as a determinism loss that --verify-strict refuses. The plain
+    // --strict run claims determinism, so it is refused too (exit 122,
+    // https://github.com/rrnewton/hermit/issues/5459), after the guest's
+    // output, which is still Linux's.
     let nested_expected = "nested pid: a chrooted CLONE_NEWPID child reading self/mountinfo \
                            through a kept /proc descriptor sees its own view (0 rows)\n";
     let native = Command::new("unshare")
@@ -14876,7 +14924,11 @@ fn detcore_follows_the_target_processs_root_for_its_mount_table() {
         "--nested-pid",
     ];
     let output = hermit(&args);
-    assert_success(&output, &args);
+    assert_determinism_loss_refusal(
+        &output,
+        &args,
+        "procfs inode numbers: a procfs file outside the guest's procfs mounts",
+    );
     assert_eq!(stdout(&output), nested_expected, "ptrace --nested-pid");
 }
 
@@ -63180,7 +63232,10 @@ fn a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity() {
 /// its namespace ends the namespace: Linux kills that process
 /// (`zap_pid_namespace`) at a moment the host chooses, which Hermit cannot
 /// order, so a strict verified run stops on a determinism loss that names the
-/// init and the live process (https://github.com/rrnewton/hermit/issues/4155).
+/// init and the live process (https://github.com/rrnewton/hermit/issues/4155),
+/// refused with exit 122 and the determinism-loss class line
+/// (https://github.com/rrnewton/hermit/issues/5459; before, 125 and
+/// `class=cli-error`).
 #[test]
 fn a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_loss() {
     let guest = pid_namespace_nested_guest().to_str().unwrap().to_owned();
@@ -63204,7 +63259,7 @@ fn a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_
     );
     assert_eq!(
         status.and_then(|status| status.code()),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
         "{log}"
     );
     assert!(
@@ -63212,6 +63267,145 @@ fn a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_
             && log.contains("exited while its namespace still held live processes"),
         "{log}"
     );
+    assert!(
+        log.lines()
+            .any(|line| line == DETERMINISM_LOSS_REFUSAL_LINE),
+        "{log}"
+    );
+}
+
+/// Runs `pid_namespace_nested <mode>` under ptrace with `--strict` and the
+/// extra run options, and returns its status, stdout and stderr.
+fn run_pid_namespace_nested(
+    mode: &str,
+    extra: &[&str],
+) -> (Option<std::process::ExitStatus>, String, String) {
+    let guest = pid_namespace_nested_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["run", "--strict"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", guest.as_str(), mode]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status, stdout, log)
+}
+
+/// The determinism-loss line `init_dies` names: the namespace init and the
+/// process it left.
+fn names_the_namespace_init_loss(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.starts_with("determinism loss recorded: PID namespace init")
+            && line.contains("exited while its namespace still held live processes")
+    })
+}
+
+/// A plain `--strict` run, which claims determinism, of a namespace init that
+/// exits beside a live process runs to completion with the guest's output and
+/// is then refused: exit 122, the loss line naming the init, and the
+/// determinism-loss class line after it. Before
+/// https://github.com/rrnewton/hermit/issues/5459 it exited 0 and said nothing.
+#[test]
+fn a_plain_strict_run_that_records_a_determinism_loss_is_refused_by_name() {
+    let (status, stdout, log) = run_pid_namespace_nested("init_dies", &["--timeout", "60"]);
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(stdout.starts_with("init_dies child="), "{stdout}\n{log}");
+    assert!(stdout.ends_with("init exit=0\n"), "{stdout}\n{log}");
+    let loss = log
+        .lines()
+        .position(|line| {
+            line.starts_with("determinism loss recorded: PID namespace init")
+                && line.contains("exited while its namespace still held live processes")
+        })
+        .unwrap_or_else(|| panic!("no loss line naming the init:\n{log}"));
+    let class = log
+        .lines()
+        .position(|line| line == DETERMINISM_LOSS_REFUSAL_LINE)
+        .unwrap_or_else(|| panic!("no determinism-loss class line:\n{log}"));
+    assert!(loss < class, "the loss line, then the class line:\n{log}");
+}
+
+/// A relaxed run (`--no-sequentialize-threads`) already declares itself
+/// non-deterministic, so a determinism loss it records keeps the guest's
+/// status and is named, with no refusal. Without its own PID namespace the
+/// guest's tids name host tasks, so a stat of a procfs file reaches Detcore's
+/// procfs naming, which a relaxed run does not do and records as a loss
+/// (ptrace).
+#[test]
+fn a_relaxed_run_keeps_its_status_and_names_its_determinism_loss() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--no-namespace",
+            "--no-sequentialize-threads",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--timeout",
+            "60",
+            "--",
+            "/usr/bin/stat",
+            "/proc/self/status",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(0), "{log}");
+    assert!(
+        log.lines().any(|line| line
+            == "determinism loss recorded: procfs inode numbers: the guest's threads are not \
+                sequentialized, so Detcore does not name procfs files"),
+        "{log}"
+    );
+    assert!(!log.contains(DETERMINISM_LOSS_REFUSAL_LINE), "{log}");
+}
+
+/// A run that records a determinism loss and is then ended by `--timeout`
+/// keeps the timeout's status and class line: the loss does not replace them.
+/// It adds the loss line, and is not refused as a loss.
+#[test]
+fn a_timed_out_run_keeps_its_status_and_names_its_determinism_loss() {
+    let (status, _, log) = run_pid_namespace_nested("init_dies_then_spin", &["--timeout", "5"]);
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(hermit::HERMIT_DEADLINE_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == "HERMIT_RUN_TIMEOUT class=run-timeout"),
+        "{log}"
+    );
+    assert!(names_the_namespace_init_loss(&log), "{log}");
+    assert!(!log.contains(DETERMINISM_LOSS_REFUSAL_LINE), "{log}");
+}
+
+/// A run that records a determinism loss and then deadlocks under Hermit's
+/// model keeps the deadlock's status and class line, and adds the loss line.
+#[test]
+fn a_deadlocked_run_keeps_its_status_and_names_its_determinism_loss() {
+    let (status, _, log) = run_pid_namespace_nested("init_dies_then_wait", &["--timeout", "60"]);
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == detcore_model::HERMIT_MODEL_DEADLOCK_LINE),
+        "{log}"
+    );
+    assert!(names_the_namespace_init_loss(&log), "{log}");
+    assert!(!log.contains(DETERMINISM_LOSS_REFUSAL_LINE), "{log}");
 }
 
 /// A guest `SIGCHLD` that carries the scheduler's own-copy mark (`SI_QUEUE`
@@ -75456,7 +75650,10 @@ fn procfs_own_directory_at_l2(backend: &str, level: &str, modes: &[&str]) -> Str
 /// The own-directory guest's transcript under Hermit on `backend` at
 /// `--proc=standard`, in the guest's `modes`, by one `run --strict` (no
 /// verification).
-fn procfs_own_directory_strict(backend: &str, modes: &[&str]) -> String {
+/// One `--strict` run of the own-directory guest, which records a determinism
+/// loss containing `loss` and so is refused (exit 122) after its output;
+/// returns that output.
+fn procfs_own_directory_strict(backend: &str, modes: &[&str], loss: &str) -> String {
     let guest = procfs_own_directory_guest();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut args = vec![
@@ -75473,7 +75670,7 @@ fn procfs_own_directory_strict(backend: &str, modes: &[&str]) -> String {
     ];
     args.extend_from_slice(modes);
     let output = procfs_own_directory_hermit(&args);
-    assert_success(&output, &args);
+    assert_determinism_loss_refusal(&output, &args, loss);
     stdout(&output)
 }
 
@@ -75753,12 +75950,19 @@ const OWN_DIRECTORY_MODES: [(&str, &str); 4] = [
 /// kernel's fstat of a reaped task's directory leaves Detcore no inode
 /// number to give, which it records as a determinism loss
 /// (`procfs_inode::refuse_deleted`), so that run is compared under
-/// `--strict` alone, not at L2.
+/// `--strict` alone, not at L2: it claims determinism, so it is refused with
+/// exit 122 for that loss ("an entry of a task that has exited",
+/// https://github.com/rrnewton/hermit/issues/5459), and its output, which it
+/// keeps, is compared with Linux's.
 #[test]
 fn the_callers_own_proc_directories_answer_as_linux() {
     read_the_callers_own_proc_directories("ptrace");
     assert_eq!(
-        procfs_own_directory_strict("ptrace", &["held-thread"]),
+        procfs_own_directory_strict(
+            "ptrace",
+            &["held-thread"],
+            ", an entry of a task that has exited"
+        ),
         held_thread_native(),
         "ptrace held-thread"
     );

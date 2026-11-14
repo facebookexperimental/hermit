@@ -1463,7 +1463,6 @@ pub(super) struct DeterminismLossRecorded {
 }
 
 impl DeterminismLossRecorded {
-    #[cfg(test)]
     pub(super) fn new(run: &str, reason: &str) -> Self {
         Self {
             run: run.to_owned(),
@@ -17627,7 +17626,22 @@ impl RunOpts {
                 terminal_outcome,
                 pending,
             } = completed;
-            latches.refuse_comparison("run")?;
+            // A run that ended with a terminal outcome keeps it as this
+            // command's error, and its loss is named on stderr. The record
+            // still refuses the comparison: it saves the loss as the run's
+            // failure, so no `--verify-allow` admits the run to `log-diff`.
+            // Any other loss refuses here.
+            let loss = match latches.refuse_comparison("run") {
+                Err(error)
+                    if terminal_outcome.is_some() && error.is::<DeterminismLossRecorded>() =>
+                {
+                    Some(error)
+                }
+                result => {
+                    result?;
+                    None
+                }
+            };
             let forwarded_syscalls = self.take_forwarded_detlogs_for_transport(
                 &log_path,
                 &mut output.stderr,
@@ -17647,10 +17661,11 @@ impl RunOpts {
                 forwarded_syscalls,
                 terminal_outcome,
                 evidence,
+                loss,
             ))
         });
         let (outcome, native_record, result) = match completed {
-            Ok((output, skid_overshoots, forwarded_syscalls, terminal_outcome, evidence)) => {
+            Ok((output, skid_overshoots, forwarded_syscalls, terminal_outcome, evidence, loss)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
                 writer.write(verify_run::STDERR, &output.stderr)?;
                 let (guest_deadlock, virtual_timeout_ns) =
@@ -17663,14 +17678,18 @@ impl RunOpts {
                         })
                     })
                     .transpose()?;
-                (
-                    verify_run::VerifyRunOutcome::Completed {
+                let outcome = match &loss {
+                    Some(loss) => verify_run_outcome_of(loss),
+                    None => verify_run::VerifyRunOutcome::Completed {
                         status: verify_run::recorded_status(output.status),
                         skid_overshoots,
                         forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
                         guest_deadlock,
                         virtual_timeout_ns,
                     },
+                };
+                (
+                    outcome,
                     native_record,
                     match terminal_outcome {
                         Some(ended) => Err(Error::new(SchedulerOutcome(ended))),
@@ -18203,6 +18222,28 @@ impl RunOpts {
         // The latches first: a determinism loss is named as one, even when its
         // loss notice also reached the forwarded records.
         if let Err(error) = latches1.refuse_comparison("run 1") {
+            // A first run that ended with a terminal outcome `--verify-allow`
+            // rejects keeps that outcome's class and status; its loss is named
+            // on stderr. Allowed, the loss still refuses the comparison.
+            if terminal_outcome1.is_some()
+                && error.is::<DeterminismLossRecorded>()
+                && let Some(rejection) = reject_first_run(
+                    self.verify_json.as_deref(),
+                    self.verify_allow,
+                    &out1,
+                    skid_overshoots_run1,
+                    summary1_path
+                        .as_deref()
+                        .and_then(read_verify_summary)
+                        .as_ref(),
+                )
+            {
+                let error = rejected_first_run(rejection, terminal_outcome1);
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(error);
+            }
             let error =
                 publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
             if self.keep_logs {
@@ -20807,6 +20848,7 @@ impl RunOpts {
         detcore::detlog::validate_plain_info_directives(&directives).map_err(Error::msg)?;
         config.in_guest_detlog_forward_policy =
             Some(hermit::in_guest_detlog_forward_policy_for_native().encode());
+        let claims_determinism = config.sequentialize_threads;
         // SAFETY: explicit bounded intermediate opt-in, internally exact-bound
         // actual phase4 artifact, same original ptracer and retained lexical
         // cleanup root. Full landing machine qualification is NOT claimed.
@@ -20822,15 +20864,11 @@ impl RunOpts {
         };
         let flushed = log.with(|writer| writer.flush());
         let failure = log.failure();
-        let status = outcome?;
+        let status = apply_determinism_loss_contract(claims_determinism, outcome)?;
         flushed?;
         anyhow::ensure!(
             failure.is_none(),
             "actual mapped INFO/DETLOG sink failed: {failure:?}"
-        );
-        anyhow::ensure!(
-            detcore::detlog::determinism_loss().is_none(),
-            "actual mapped DETLOG reports determinism loss"
         );
         Ok((status, None, None))
     }
@@ -20879,15 +20917,18 @@ impl RunOpts {
             ))
             .map(|(out, outcome)| (out.status, Some(out), outcome))
         } else {
-            hermit::run_with_backend_timeout(
+            // Read before the configuration moves into the run.
+            let claims_determinism = config.sequentialize_threads;
+            let result = hermit::run_with_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &summary_json,
                 backend,
                 timeout,
-            )
-            .map(|status| (status, None, None))
+            );
+            apply_determinism_loss_contract(claims_determinism, result)
+                .map(|status| (status, None, None))
         }
     }
 
@@ -20970,6 +21011,7 @@ impl RunOpts {
                 },
             ));
             detcore::detlog::clear_forwarded_source();
+            print_determinism_loss_lines();
             let output = result?;
             let _ = log.clone().flush();
             let latches = RunLatches {
@@ -20996,6 +21038,9 @@ impl RunOpts {
             // Records sent after the guest's last request, then close the socket.
             detcore::detlog::clear_forwarded_source();
         }
+        // Named here, at the end of the run, whatever its outcome; the
+        // verifying process refuses the comparison from the latch.
+        print_determinism_loss_lines();
         // A run that ended with a terminal outcome carries its output in
         // `hermit::SchedulerEndedRun`; one that also overshot its skid stays that
         // refusal.
@@ -21014,6 +21059,46 @@ impl RunOpts {
             log_sink_failure: log.failure(),
         };
         Ok((output, skid_overshoots, latches, terminal_outcome))
+    }
+}
+
+/// Prints a `determinism loss recorded: <reason>` line for each determinism
+/// loss this process recorded and returns how many distinct reasons there
+/// were. Called once, at the end of a run, after the guest's output, whether
+/// or not a forwarded sink is registered.
+fn print_determinism_loss_lines() -> u64 {
+    let (reasons, total) = detcore::detlog::determinism_losses();
+    for line in hermit::determinism_loss_lines(&reasons, total) {
+        crate::app::tracing::diagnostic_eprintln!("{line}");
+    }
+    total
+}
+
+/// Applies the determinism-loss contract to a finished plain run. A run that
+/// claims determinism (sequentialized threads, Hermit's default, with or
+/// without `--strict`) and finished with the guest's status is refused with
+/// [`hermit::DeterminismLossRefusal`] (exit 122) if it recorded a loss. A
+/// relaxed run (`--no-sequentialize-threads`) keeps the guest's status, and a
+/// run that already failed keeps its own error, so a timeout or a scheduler
+/// deadlock is not masked. Every case with a loss names it.
+fn apply_determinism_loss_contract(
+    claims_determinism: bool,
+    result: Result<ExitStatus, Error>,
+) -> Result<ExitStatus, Error> {
+    let (_, losses) = detcore::detlog::determinism_losses();
+    match hermit::decide_determinism_loss(claims_determinism, result.is_ok(), losses) {
+        hermit::DeterminismLossDecision::None => result,
+        hermit::DeterminismLossDecision::Report => {
+            print_determinism_loss_lines();
+            result
+        }
+        hermit::DeterminismLossDecision::Refuse => {
+            let total = print_determinism_loss_lines();
+            let status = result?;
+            Err(Error::new(hermit::DeterminismLossRefusal::new(
+                total, status,
+            )))
+        }
     }
 }
 
@@ -21042,6 +21127,7 @@ fn finish_mapped_verification_log(
     // Flush the same writer even after an execution refusal. A later log error
     // cannot replace the original typed execution error or disappear silently.
     let _ = log.flush();
+    print_determinism_loss_lines();
     let latches = RunLatches {
         determinism_loss: detcore::detlog::determinism_loss(),
         log_sink_failure: log.failure(),
@@ -21139,6 +21225,10 @@ pub(super) fn reject_first_run(
     Some(Error::msg(format!("First run during --verify {status}")))
 }
 
+/// How a saved run's [`verify_run::VerifyRunOutcome::RunFailed`] detail
+/// begins for a determinism loss, before the loss's reason.
+pub(super) const SAVED_LOSS_DETAIL_PREFIX: &str = "determinism loss recorded: ";
+
 /// How a `--verify-run` execution that returned `error` ended, classified as
 /// `run --verify` classifies the same error of one of its runs.
 pub(super) fn verify_run_outcome_of(error: &Error) -> verify_run::VerifyRunOutcome {
@@ -21154,7 +21244,7 @@ pub(super) fn verify_run_outcome_of(error: &Error) -> verify_run::VerifyRunOutco
         // A determinism loss names its run (`RunLatches::refuse_comparison`);
         // the comparison names it again by its place in the pair.
         let detail = match error.downcast_ref::<DeterminismLossRecorded>() {
-            Some(loss) => format!("determinism loss recorded: {}", loss.reason),
+            Some(loss) => format!("{SAVED_LOSS_DETAIL_PREFIX}{}", loss.reason),
             None => format!("{error:#}"),
         };
         return verify_run::VerifyRunOutcome::RunFailed { failure, detail };

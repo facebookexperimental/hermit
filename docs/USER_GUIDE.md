@@ -288,10 +288,29 @@ guest's exit waits for. Reading plain files on a FUSE filesystem is not
 affected, and `userfaultfd` is supported.
 
 In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
-start on an older kernel. `--verify` refuses to compare a run that recorded a
-determinism loss (an in-guest process died at a moment the host chose,
-without finishing its exit, or a DETLOG record was lost) or whose log failed
-a write, even if later writes succeeded. The runtime schedules a process's
+start on an older kernel.
+
+A run that claims determinism, which is every run with Hermit's default
+thread sequentialization (with or without `--strict`) and every `--verify`
+run, is refused with exit 122 if it records a determinism loss. Examples: a
+process died at a moment the host chose without finishing its exit, a DETLOG
+record was lost, or a procfs entry could not be named. The guest runs to
+completion and keeps its output. Hermit prints `determinism loss recorded:
+<reason>` for each reason and `HERMIT_POLICY_REFUSAL class=policy-refusal
+cause=determinism-loss`. A run with `--no-sequentialize-threads` already
+declares itself non-deterministic: it keeps the guest's status and still
+prints a `determinism loss recorded:` line for each loss Hermit records. That
+list is partial, because such a run does not record every loss. Two gaps are
+known: a PID namespace whose init exits while other processes still live in
+it is not reported, and neither are answers from procfs files Hermit renders
+itself (such as `/proc/<pid>/cgroup` and `/proc/version`) that depend on when
+another process's exit was seen. A run that already failed (a
+`--timeout`, a scheduler deadlock) keeps its own status and class line and
+adds the loss lines. `--summary-json` reports `determinism_loss`. `--verify`
+also refuses to compare a run whose log failed a write, even if later writes
+succeeded.
+
+The runtime schedules a process's
 own `kill`, `tkill` or `tgkill` (including `abort` and `raise`) when it names
 the calling process or thread and sends an unblocked standard signal with a
 terminating default action. This includes the guest's default SIGTRAP action,
@@ -933,6 +952,12 @@ given both; the comparison refuses directories that differ in either. Where
 `--verify` would not have started its second run (the first failed, or its
 status is not one `--verify-allow` admits), the second directory need not
 exist.
+
+A run that records a determinism loss is never compared. Its `--verify-run`
+keeps the status of a deadlock or a virtual timeout it ended with, and prints
+the loss, but its record saves the loss as the run's failure: `log-diff
+--verify-json` refuses that directory with exit 122, as `--verify` refuses
+the same run, even under `--verify-allow=both`.
 
 ### Record And Replay
 

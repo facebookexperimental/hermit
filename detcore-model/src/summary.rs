@@ -244,6 +244,16 @@ impl fmt::Display for PropertySnapshotSummary {
     }
 }
 
+/// The determinism losses of a run, as [`RunSummary::determinism_loss`]
+/// reports them.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeterminismLossSummary {
+    /// The first distinct reasons, in the order they were recorded.
+    pub reasons: Vec<String>,
+    /// The number of distinct reasons in all, kept or not.
+    pub total: u64,
+}
+
 /// Statistics that summarize a hermit run.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RunSummary {
@@ -488,6 +498,14 @@ pub struct RunSummary {
     /// `skid_overshoots` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skid_overshoot_reports: Option<u64>,
+
+    /// The determinism losses the run recorded when its summary was written
+    /// (`detcore::detlog::determinism_losses`): the first distinct reasons,
+    /// in the order they were recorded, and the number of distinct reasons in
+    /// all. `null` when none was recorded. A run that claims determinism and
+    /// recorded one is refused (exit 122); a relaxed run reports it.
+    #[serde(default)]
+    pub determinism_loss: Option<DeterminismLossSummary>,
 
     /// `false` when this execution was not reproducible from its seed and
     /// configuration: a skid overshoot moved a preemption point in this run by
@@ -838,6 +856,13 @@ impl RunSummary {
         self.seed_reproducible = (reports > 0).then_some(false);
     }
 
+    /// Records the determinism losses of the run: the first distinct
+    /// `reasons` and the `total` number of distinct reasons. No losses
+    /// (`total == 0`) leaves the field `null`.
+    pub fn record_determinism_losses(&mut self, reasons: Vec<String>, total: u64) {
+        self.determinism_loss = (total > 0).then_some(DeterminismLossSummary { reasons, total });
+    }
+
     pub fn info<'a>(&'a self, reprio_description: Option<&'a str>) -> RunSummaryInfo<'a> {
         RunSummaryInfo {
             summary: self,
@@ -892,6 +917,7 @@ impl RunSummary {
             run_timeout_secs,
             skid_overshoots,
             skid_overshoot_reports,
+            determinism_loss: _,
             seed_reproducible: _,
             watch,
             stdio_changed: _,
@@ -1148,6 +1174,27 @@ mod tests {
     use super::RunSummary;
     use super::StoreExclusiveCounts;
     use super::TimesliceStats;
+
+    /// `determinism_loss` is `null` without a loss and names the kept reasons
+    /// and the distinct total with one; a summary written before the field
+    /// existed still reads.
+    #[test]
+    fn the_summary_reports_the_determinism_losses() {
+        let mut summary = RunSummary::default();
+        summary.record_determinism_losses(Vec::new(), 0);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["determinism_loss"], serde_json::Value::Null);
+        summary.record_determinism_losses(vec!["a reason".to_owned()], 3);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json["determinism_loss"],
+            serde_json::json!({ "reasons": ["a reason"], "total": 3 })
+        );
+        let mut older = json;
+        older.as_object_mut().unwrap().remove("determinism_loss");
+        let read: RunSummary = serde_json::from_value(older).unwrap();
+        assert_eq!(read.determinism_loss, None);
+    }
 
     #[test]
     fn replay_diagnostics_are_optional_json_and_never_change_compared_display() {

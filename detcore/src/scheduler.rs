@@ -2235,6 +2235,17 @@ pub struct Scheduler {
     /// deadlocked.
     namespace_zap_victims: BTreeSet<DetPid>,
 
+    /// Processes that filed a fail-closed policy refusal
+    /// (`GlobalRequest::PolicyRefusal`). On a backend whose Tool runs inside
+    /// the guest, the refusing process then ends itself
+    /// (`tool_global::unrecoverable_shutdown`) without deregistering, so its
+    /// exit is Hermit's own teardown of a run already refused, not a death at
+    /// a moment the host chose (`ProcessExitCleanup::complete_locked`). An
+    /// entry lasts one process's lifetime: its physical exit takes it
+    /// (`Self::take_policy_refusal_end`), and a new process with the same
+    /// number never inherits it (`Self::forget_previous_process_exit`).
+    policy_refusing_processes: BTreeSet<DetPid>,
+
     /// Processes a fatal signal is ending: one of their threads died of a
     /// signal that ends its whole thread group (`note_signal_killed_group`),
     /// and Linux is ending the others, whose deaths are reported one by one
@@ -6476,6 +6487,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             namespace_zap_victims: Default::default(),
+            policy_refusing_processes: Default::default(),
             signal_death_victims: Default::default(),
             namespace_zap_wait_since: None,
             namespace_zap_valve: Self::NAMESPACE_ZAP_VALVE,
@@ -10827,6 +10839,23 @@ impl Scheduler {
         !unreported.is_empty()
     }
 
+    /// Notes that `tid`'s process filed a fail-closed policy refusal, after
+    /// which it ends itself as part of the refusal
+    /// ([`Self::take_policy_refusal_end`]).
+    pub(crate) fn note_policy_refusal(&mut self, tid: DetTid) {
+        if let Some(process) = self.registered_process(tid) {
+            self.policy_refusing_processes.insert(process);
+        }
+    }
+
+    /// Whether the process `detpid`, whose physical exit is being completed,
+    /// filed a fail-closed policy refusal, so that its exit without
+    /// deregistering is the refusal's own teardown. Its exit ends the note:
+    /// a later process with the same number did not file it.
+    pub(crate) fn take_policy_refusal_end(&mut self, detpid: DetPid) -> bool {
+        self.policy_refusing_processes.remove(&detpid)
+    }
+
     pub(crate) fn has_unreported_exit(&self, detpid: DetPid) -> bool {
         self.thread_tree.contains(&detpid)
             && self
@@ -14440,11 +14469,13 @@ impl Scheduler {
     /// gone, so its holder was reaped automatically or by init, and the
     /// record that it exited (`exited_process_is_zombie`) would otherwise
     /// describe the new process (<https://github.com/rrnewton/hermit/issues/4266>).
-    /// Dispositions the old process published would describe it too.
+    /// Dispositions the old process published would describe it too, and so
+    /// would a policy refusal it filed (`Self::take_policy_refusal_end`).
     pub fn forget_previous_process_exit(&mut self, pid: DetPid) {
         self.logically_exited_processes.remove(&pid);
         self.autoreaped_exits.remove(&pid);
         self.published_dispositions.remove(&pid);
+        self.policy_refusing_processes.remove(&pid);
     }
 
     /// The processes `/proc` lists, and, for `process`, the threads its
@@ -24585,6 +24616,8 @@ impl Scheduler {
                 // The backend's precise timers count these.
                 skid_overshoots: None,
                 skid_overshoot_reports: None,
+                // GlobalState records it when it writes the summary.
+                determinism_loss: None,
                 seed_reproducible: None,
                 // GlobalState takes it from the access trace.
                 watch: None,
@@ -38872,6 +38905,32 @@ mod test {
             victims.iter().map(|victim| victim.tid).collect::<Vec<_>>(),
             [process]
         );
+    }
+
+    /// A policy refusal covers the exit of the process that filed it and no
+    /// other: completing that exit takes the note, a new process given the
+    /// number never inherits an untaken one, and another process's refusal
+    /// does not cover this process.
+    #[test]
+    fn a_policy_refusal_note_lasts_one_process_lifetime() {
+        let (refusing, other) = (DetTid::from_raw(41), DetTid::from_raw(42));
+        let (refusing_process, other_process) = (DetPid::from_raw(41), DetPid::from_raw(42));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(refusing, refusing, true);
+        scheduler.thread_tree.add_child(other, other, true);
+
+        scheduler.note_policy_refusal(refusing);
+        assert!(!scheduler.take_policy_refusal_end(other_process));
+        assert!(scheduler.take_policy_refusal_end(refusing_process));
+        assert!(!scheduler.take_policy_refusal_end(refusing_process));
+
+        scheduler.note_policy_refusal(refusing);
+        scheduler.forget_previous_process_exit(refusing_process);
+        assert!(!scheduler.take_policy_refusal_end(refusing_process));
+
+        scheduler.note_policy_refusal(other);
+        assert!(!scheduler.take_policy_refusal_end(refusing_process));
+        assert!(scheduler.take_policy_refusal_end(other_process));
     }
 
     /// Process 38 has gone and Linux has given 38 to a live thread of
