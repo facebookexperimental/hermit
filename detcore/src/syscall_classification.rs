@@ -9,22 +9,22 @@
 use reverie::syscalls::Sysno;
 
 #[cfg(target_arch = "x86_64")]
-const EXPECTED_SYSNO_COUNT: usize = 373;
+const EXPECTED_SYSNO_COUNT: usize = 380;
 #[cfg(target_arch = "aarch64")]
-const EXPECTED_SYSNO_COUNT: usize = 337;
+const EXPECTED_SYSNO_COUNT: usize = 343;
 
 // `Sysno` is externally `#[non_exhaustive]`. These assertions make additions,
 // removals, or a changed table endpoint fail at compile time instead of silently
 // reaching the required final arm.
 const _: () = {
     assert!(Sysno::count() == EXPECTED_SYSNO_COUNT);
-    assert!(Sysno::last().id() == 461);
+    assert!(Sysno::last().id() == 467);
 };
 
 /// Every syscall in the pinned table for the target architecture, including
 /// the final entry.
 ///
-/// `Sysno::iter()` in `syscalls` 0.6.18 stops one short: its loop bound is
+/// `Sysno::iter()` in `syscalls` 0.7.0 stops one short: its loop bound is
 /// strict, so `Sysno::last()` is never yielded. Any policy sweep written as
 /// `Sysno::iter().filter(..)` therefore silently drops the last row of the
 /// table. That is not hypothetical — it dropped `lsm_list_modules` (id 461,
@@ -358,6 +358,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mount_setattr
         | Sysno::move_mount
         | Sysno::open_tree
+        | Sysno::open_tree_attr
         | Sysno::fsopen
         | Sysno::fsmount
         | Sysno::fsconfig
@@ -842,6 +843,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msync
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readahead
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::sync_file_range
         // Ptrace executes rt_sigreturn directly; DBT has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -856,9 +859,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::link
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::symlink
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::sync_file_range => SyscallClassification::PassThrough,
+        | Sysno::symlink => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
         // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
@@ -894,18 +895,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::restart_syscall
+        | Sysno::getxattrat
+        | Sysno::listxattrat
+        | Sysno::mseal
+        | Sysno::removexattrat
+        | Sysno::setxattrat
         => SyscallClassification::Unsupported,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::uretprobe => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
         // ===== AARCH64-ONLY TABLE ENTRIES =====
         // `fstatat` is x86_64's `newfstatat` (number 79 in the generic table)
-        // and `sync_file_range2` is the name the syscalls crate gives the
-        // generic table's number 84, which arm64 wires to plain
-        // `sync_file_range`; each takes its x86_64 twin's classification.
+        // and takes its x86_64 twin's classification.
         #[cfg(target_arch = "aarch64")]
         Sysno::fstatat => SyscallClassification::Determinized,
-        #[cfg(target_arch = "aarch64")]
-        Sysno::sync_file_range2 => SyscallClassification::PassThrough,
         // The 32-bit `*_time64` entry points are in the generic table but the
         // 64-bit arm64 kernel does not wire them up, so Detcore refuses them
         // with the kernel's own ENOSYS (see is_unimplemented_enosys_syscall).
@@ -1061,6 +1065,7 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
             | Sysno::mount_setattr
             | Sysno::move_mount
             | Sysno::open_tree
+            | Sysno::open_tree_attr
             | Sysno::fsopen
             | Sysno::fsmount
             | Sysno::fsconfig
@@ -1525,10 +1530,10 @@ mod tests {
     // A name only one architecture's table has carries that `target_arch`
     // cfg. x86_64 keeps legacy entry points (open, stat, poll, ...) that the
     // generic table aarch64 uses (include/uapi/asm-generic/unistd.h) omits.
-    // Two names are renames, not omissions: aarch64 has newfstatat and
-    // sync_file_range too, which the syscalls crate calls fstatat and
-    // sync_file_range2 there. The crate's aarch64 table also has the generic
-    // table's 32-bit `*_time64` numbers, which a 64-bit kernel leaves unwired.
+    // One name is a rename, not an omission: aarch64 has newfstatat too,
+    // which the syscalls crate calls fstatat there. The crate's aarch64 table
+    // also has the generic table's 32-bit `*_time64` numbers, which a 64-bit
+    // kernel leaves unwired.
 
     /// Syscalls Detcore models, replaces deterministically, or explicitly refuses.
     const DETERMINIZED_SYSCALLS: &[&str] = &[
@@ -1737,6 +1742,7 @@ mod tests {
         "open",
         "open_by_handle_at",
         "open_tree",
+        "open_tree_attr",
         "openat",
         "openat2",
         #[cfg(target_arch = "x86_64")]
@@ -2000,10 +2006,7 @@ mod tests {
         "symlink",
         "symlinkat",
         "sync",
-        #[cfg(target_arch = "x86_64")]
         "sync_file_range",
-        #[cfg(target_arch = "aarch64")]
-        "sync_file_range2",
         "syncfs",
         "truncate",
         "umask",
@@ -2013,7 +2016,16 @@ mod tests {
     ];
 
     /// Syscalls with no deterministic implementation, using the configured fallback.
-    const UNSUPPORTED_SYSCALLS: &[&str] = &["restart_syscall"];
+    const UNSUPPORTED_SYSCALLS: &[&str] = &[
+        "getxattrat",
+        "listxattrat",
+        "mseal",
+        "removexattrat",
+        "restart_syscall",
+        "setxattrat",
+        #[cfg(target_arch = "x86_64")]
+        "uretprobe",
+    ];
 
     /// Bucket every pinned syscall by `classify`, sorted by name.
     ///
@@ -2313,8 +2325,7 @@ mod tests {
         }
         for sysno in [
             // Names under the x86_64 cfg are absent from the aarch64 table,
-            // which has only their *at successors; sync_file_range2 is
-            // aarch64's sync_file_range.
+            // which has only their *at successors.
             Sysno::capget,
             Sysno::capset,
             Sysno::chdir,
@@ -2364,10 +2375,7 @@ mod tests {
             #[cfg(target_arch = "x86_64")]
             Sysno::symlink,
             Sysno::symlinkat,
-            #[cfg(target_arch = "x86_64")]
             Sysno::sync_file_range,
-            #[cfg(target_arch = "aarch64")]
-            Sysno::sync_file_range2,
             Sysno::truncate,
             Sysno::umask,
             #[cfg(target_arch = "x86_64")]
@@ -3042,6 +3050,7 @@ mod tests {
             Sysno::mount_setattr,
             Sysno::move_mount,
             Sysno::open_tree,
+            Sysno::open_tree_attr,
             Sysno::fsopen,
             Sysno::fsmount,
             Sysno::fsconfig,

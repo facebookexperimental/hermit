@@ -8254,7 +8254,7 @@ fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
         #[cfg(target_arch = "x86_64")]
         Sysno::sync_file_range | Sysno::dup2 | Sysno::getdents => DescriptorPositions::Always(&[0]),
         #[cfg(target_arch = "aarch64")]
-        Sysno::sync_file_range2 => DescriptorPositions::Always(&[0]),
+        Sysno::sync_file_range => DescriptorPositions::Always(&[0]),
         Sysno::mmap => DescriptorPositions::Always(&[4]),
         Sysno::sendfile | Sysno::tee => DescriptorPositions::Always(&[0, 1]),
         Sysno::splice | Sysno::copy_file_range => DescriptorPositions::Always(&[0, 2]),

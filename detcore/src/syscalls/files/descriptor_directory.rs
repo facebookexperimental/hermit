@@ -960,10 +960,9 @@ fn placeholder_operand<M: MemoryAccess>(
         Sysno::getdents | Sysno::sync_file_range => Some(0),
         // aarch64 number 84 is sys_sync_file_range with the same
         // (fd, offset, nbytes, flags) order: arm64 does not select
-        // __ARCH_WANT_SYNC_FILE_RANGE2, so the crate's
-        // sync_file_range2 name carries sync_file_range semantics.
+        // __ARCH_WANT_SYNC_FILE_RANGE2.
         #[cfg(target_arch = "aarch64")]
-        Sysno::sync_file_range2 => Some(0),
+        Sysno::sync_file_range => Some(0),
         // A file-backed mapping only: an anonymous one ignores its
         // descriptor argument (`ksys_mmap_pgoff`).
         Sysno::mmap if args.arg3 as i32 & libc::MAP_ANONYMOUS == 0 => Some(4),
@@ -4090,7 +4089,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         #[cfg(not(target_arch = "x86_64"))]
         let x86_only_path_only = false;
         #[cfg(target_arch = "aarch64")]
-        let aarch64_path_only = sysno == Sysno::sync_file_range2;
+        let aarch64_path_only = sysno == Sysno::sync_file_range;
         #[cfg(not(target_arch = "aarch64"))]
         let aarch64_path_only = false;
         let path_only_refused = state.path_only
@@ -4238,7 +4237,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // aarch64 number 84 is sys_sync_file_range with the
                 // same (fd, offset, nbytes, flags) order (see above).
                 #[cfg(target_arch = "aarch64")]
-                Sysno::sync_file_range2 => {
+                Sysno::sync_file_range => {
                     sync_file_range_answer(args.arg1 as i64, args.arg2 as i64, args.arg3 as u32)
                         .map_err(Into::into)
                 }
@@ -7542,10 +7541,10 @@ mod tests {
         // Pin the number so a syscalls-crate renaming cannot silently
         // change the arm above.
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(Sysno::sync_file_range2.id(), 84);
+        assert_eq!(Sysno::sync_file_range.id(), 84);
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
-            placeholder_operand(&memory, Sysno::sync_file_range2, &args([3, 0, 0, 0, 0, 0])),
+            placeholder_operand(&memory, Sysno::sync_file_range, &args([3, 0, 0, 0, 0, 0])),
             Some(0)
         );
         #[cfg(target_arch = "x86_64")]

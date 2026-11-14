@@ -9093,8 +9093,8 @@ mod subscription_tests {
     }
 
     /// The last row of the pinned table is the one a `Sysno::iter()` sweep
-    /// drops. `lsm_list_modules` is Determinized AND deterministically refused,
-    /// so before this was fixed it executed natively against the host under
+    /// drops. `open_tree_attr` is Determinized AND deterministically refused,
+    /// so without the fix it would execute natively against the host under
     /// `--passthru-opt` — which is the default for `hermit record` and
     /// `hermit replay` — instead of receiving its fixed refusal.
     #[test]
@@ -9102,7 +9102,7 @@ mod subscription_tests {
         let last = Sysno::last();
         // Guard the premise: if the table endpoint moves, this test must be
         // re-derived rather than silently passing on a different syscall.
-        assert_eq!(last, Sysno::lsm_list_modules);
+        assert_eq!(last, Sysno::open_tree_attr);
         assert!(crate::is_determinized_syscall(last));
         assert!(crate::is_deterministically_refused_syscall(last));
         // The bug this pins: the final row is absent from `Sysno::iter()`.
@@ -9122,7 +9122,19 @@ mod subscription_tests {
             .filter(|sysno| crate::is_unsupported_syscall(*sysno))
             .collect();
 
-        assert_eq!(unsupported, [Sysno::restart_syscall]);
+        assert_eq!(
+            unsupported,
+            [
+                Sysno::restart_syscall,
+                #[cfg(target_arch = "x86_64")]
+                Sysno::uretprobe,
+                Sysno::mseal,
+                Sysno::setxattrat,
+                Sysno::getxattrat,
+                Sysno::listxattrat,
+                Sysno::removexattrat,
+            ]
+        );
         for syscall in unsupported {
             assert!(
                 subscriptions

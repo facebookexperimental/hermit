@@ -492,11 +492,11 @@ fn operand_fds(sysno: Sysno, args: [u64; 6]) -> Vec<(i32, Role)> {
         }
         // The legacy calls only x86_64 has. aarch64's generic table
         // (include/uapi/asm-generic/unistd.h) has getdents64, epoll_pwait and
-        // dup3 above instead, and names sync_file_range sync_file_range2.
+        // dup3 above instead.
         #[cfg(target_arch = "x86_64")]
         getdents | sync_file_range | epoll_wait | dup2 => vec![(fd(0), Role::Use)],
         #[cfg(target_arch = "aarch64")]
-        sync_file_range2 => vec![(fd(0), Role::Use)],
+        sync_file_range => vec![(fd(0), Role::Use)],
         _ => Vec::new(),
     }
 }

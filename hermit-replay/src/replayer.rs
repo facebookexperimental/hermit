@@ -1089,7 +1089,7 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         }
         // aarch64 number 84 is sys_sync_file_range (descriptor in arg0).
         #[cfg(target_arch = "aarch64")]
-        Sysno::sync_file_range2 => arg(args.arg0),
+        Sysno::sync_file_range => arg(args.arg0),
         #[cfg(target_arch = "x86_64")]
         Sysno::newfstatat | Sysno::futimesat => arg(args.arg0),
         #[cfg(target_arch = "aarch64")]

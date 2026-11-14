@@ -119,7 +119,7 @@ test = false
 close-err = "1.0.2"
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["fs", "process", "sched", "signal"] }
-syscalls = "0.6.18"
+syscalls = "0.7.0"
 tempfile = "3.27.0"
 
 # The programs are the fixtures internal Hermit shares, not code written for
