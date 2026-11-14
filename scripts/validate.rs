@@ -24310,7 +24310,8 @@ fn admitted_receipt_evidence(
 /// validation requires canonical current-main authority; frozen validation
 /// requires a fully checked lock holder that remains explicitly noncanonical;
 /// an fbexp post-land run requires a fully admitted lock holder naming the
-/// main-ancestor floor.
+/// main-ancestor floor, or the current-main floor only when its target is the
+/// observed export main tip.
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
 fn validate_lock_status(tool_root: Option<&Path>) -> Result<Vec<u8>, String> {
@@ -24520,11 +24521,17 @@ fn validate_lock_status_reason(
             // A facebookexperimental post-land run. The lock authority
             // admits it outright (unlike frozen, which it labels
             // noncanonical), so every admitted conjunct must hold here,
-            // and only the main-ancestor floor is accepted: the export
-            // target main already contains, as its own floor. The typed
-            // floor is then re-proved from Git in `verify_source`; this
-            // arm only binds the lock response's own claim, so a response
-            // naming any other floor (current-main included) is refused
+            // and only two floors are accepted: main-ancestor, the export
+            // target main already contains, as its own floor; and
+            // current-main, which for this authority means the target IS
+            // the observed export main tip (the floor, the observed main
+            // and the target are one commit). A target strictly ahead of
+            // that main is not on main yet, so a current-main response for
+            // it is refused here, as is one for a target behind or diverged
+            // from main. The typed floor is then re-proved from Git in
+            // `verify_source`; this arm only binds the lock response's own
+            // claim, so a response naming any other floor, or a
+            // current-main floor that is not its own target, is refused
             // before a floor is ever selected.
             if value
                 .get("lock_admissible")
@@ -24549,11 +24556,34 @@ fn validate_lock_status_reason(
                 .get("admission_floor")
                 .and_then(|floor| floor.get("kind"))
                 .and_then(serde_json::Value::as_str);
-            if floor_kind != Some("main-ancestor") {
+            if !matches!(floor_kind, Some("main-ancestor" | "current-main")) {
                 return Err(format!(
-                    "the fbexp authority carries admission floor kind {}, not \"main-ancestor\"",
+                    "the fbexp authority carries admission floor kind {}, not \"main-ancestor\" \
+                     or \"current-main\"",
                     shown(floor_kind)
                 ));
+            }
+            if floor_kind == Some("current-main") {
+                let floor_text = |key: &str| {
+                    value
+                        .get("admission_floor")
+                        .and_then(|floor| floor.get(key))
+                        .and_then(serde_json::Value::as_str)
+                };
+                let target = object_string(holder, "target");
+                if target.is_none()
+                    || floor_text("sha") != target
+                    || floor_text("observed_main_sha") != target
+                {
+                    return Err(format!(
+                        "the fbexp authority's current-main floor {} (observed main {}) is not \
+                         its target {}: for this authority current-main admits only a target \
+                         that is the observed export main tip",
+                        shown(floor_text("sha")),
+                        shown(floor_text("observed_main_sha")),
+                        shown(target)
+                    ));
+                }
             }
         }
         Some("frozen-validate") => {
@@ -24785,7 +24815,8 @@ fn product_front_door_bracket() -> Result<(), String> {
     }
 
     // The fbexp post-land authority is admitted only fully admitted and
-    // only with the main-ancestor floor named in the response itself.
+    // only with the main-ancestor floor, or the current-main floor at the
+    // export main tip, named in the response itself.
     let mut fbexp_authority = authority.clone();
     fbexp_authority["holder"]["kind"] = serde_json::json!("fbexp-validate");
     fbexp_authority["admission_floor"] = serde_json::json!({
@@ -24800,6 +24831,19 @@ fn product_front_door_bracket() -> Result<(), String> {
     ) {
         return Err("product front door refused exact fbexp authority".into());
     }
+    // A run at the export main tip: the floor, the observed main and the
+    // target are one commit, so current-main is admitted.
+    let mut fbexp_tip_authority = fbexp_authority.clone();
+    fbexp_tip_authority["admission_floor"]["kind"] = serde_json::json!("current-main");
+    if !validate_lock_status_admits(
+        &encode(&fbexp_tip_authority),
+        commit,
+        host,
+        Some(boot_id),
+        &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+    ) {
+        return Err("product front door refused exact current-main fbexp authority".into());
+    }
     let mut fbexp_weakened = Vec::new();
     let mut value = fbexp_authority.clone();
     value["lock_admissible"] = serde_json::json!(false);
@@ -24811,8 +24855,39 @@ fn product_front_door_bracket() -> Result<(), String> {
     value["reason_code"] = serde_json::json!("owner-not-ancestor");
     fbexp_weakened.push(("non-null refusal reason", value));
     let mut value = fbexp_authority.clone();
-    value["admission_floor"]["kind"] = serde_json::json!("current-main");
-    fbexp_weakened.push(("current-main floor", value));
+    value["admission_floor"]["kind"] = serde_json::json!("disjoint-main");
+    fbexp_weakened.push(("disjoint-main floor", value));
+    let mut value = fbexp_authority.clone();
+    value["admission_floor"]["kind"] = serde_json::json!("queue-base");
+    fbexp_weakened.push(("queue-base floor", value));
+    let mut value = fbexp_authority.clone();
+    value["admission_floor"]["kind"] = serde_json::json!("frozen-target");
+    fbexp_weakened.push(("frozen-target floor", value));
+    let mut value = fbexp_authority.clone();
+    value.as_object_mut().unwrap().remove("admission_floor");
+    fbexp_weakened.push(("no admission floor", value));
+    // current-main is tip-only for this authority: a target that is not the
+    // observed main (strictly ahead of it, behind it or diverged from it all
+    // look like this without Git) is refused, and so is a floor that is not
+    // the observed main or not the target.
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    let mut value = fbexp_tip_authority.clone();
+    value["admission_floor"]["sha"] = serde_json::json!(other);
+    value["admission_floor"]["tree"] = serde_json::json!(other);
+    value["admission_floor"]["observed_main_sha"] = serde_json::json!(other);
+    fbexp_weakened.push(("current-main floor at a main the target is not", value));
+    let mut value = fbexp_tip_authority.clone();
+    value["admission_floor"]["observed_main_sha"] = serde_json::json!(other);
+    fbexp_weakened.push(("current-main floor beside another observed main", value));
+    let mut value = fbexp_tip_authority.clone();
+    value["admission_floor"]["sha"] = serde_json::json!(other);
+    fbexp_weakened.push(("current-main floor that is not the target", value));
+    let mut value = fbexp_tip_authority.clone();
+    value["admission_floor"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observed_main_sha");
+    fbexp_weakened.push(("current-main floor without an observed main", value));
     let mut value = fbexp_authority.clone();
     value["state"] = serde_json::json!("free");
     fbexp_weakened.push(("lock not held", value));

@@ -910,16 +910,41 @@ impl AuthenticatedValidationAdmission {
                     ],
                 )?;
             }
+            // A facebookexperimental post-land run (`fbexp-validate`) at the
+            // export main tip. For this authority current-main means the
+            // target IS the observed export main: the floor, the observed
+            // main and the target are one commit with one tree. A target
+            // strictly ahead of that main is not on main yet, so a run of it
+            // is not a main run and is refused here, unlike the ordinary
+            // current-main arm above; so is a target behind main or diverged
+            // from it. The ordinary Git re-proof is kept as well, under the
+            // same grafts- and replace-refs-free view.
+            ("fbexp-validate", "current-main")
+                if self.floor.sha == self.floor.observed_main_sha
+                    && self.floor.sha == self.authority.target
+                    && self.floor.tree == self.target_tree =>
+            {
+                git(
+                    root,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &self.floor.sha,
+                        &self.authority.target,
+                    ],
+                )?;
+            }
             // A post-landing run of a commit main already contains. Its floor is
             // the target itself, exactly the floor a current-main run of the
             // same commit had while it was the tip, so the run measures the same
             // tree against the same pin base. The authority observed a later
             // main; this re-proves that the target is that main's ancestor, so
             // a diverged head can never select this kind. The facebookexperimental
-            // post-land authority (`fbexp-validate`) selects this floor alone,
-            // under the same guard and the same Git re-proof; no other floor
-            // kind pairs with it, so every other fbexp pairing still falls to
-            // the catch-all refusal below.
+            // post-land authority (`fbexp-validate`) selects this floor too,
+            // under the same guard and the same Git re-proof; the tip-only
+            // current-main arm above is the only other floor kind that pairs
+            // with it, so every other fbexp pairing still falls to the
+            // catch-all refusal below.
             ("validate", "main-ancestor") | ("fbexp-validate", "main-ancestor")
                 if self.floor.sha == self.authority.target
                     && self.floor.tree == self.target_tree
@@ -1582,10 +1607,11 @@ for entry in Path('/proc/self/fd').iterdir():
     }
 
     /// A facebookexperimental post-land run (`fbexp-validate`) is admitted
-    /// only with the main-ancestor floor and every authority condition
-    /// holding: admitted, that floor, state held, canonical anchor held.
-    /// Each condition's failure is its own named refusal, and no other
-    /// floor kind is admitted for this authority in this change.
+    /// only with the main-ancestor floor, or the current-main floor at the
+    /// export main tip, and every authority condition holding: admitted, one
+    /// of those floors, state held, canonical anchor held. Each condition's
+    /// failure is its own named refusal, and no other floor kind is admitted
+    /// for this authority.
     #[test]
     fn fbexp_main_ancestor_floor_admits_only_with_all_authority_conditions() {
         let f = Fixture::new();
@@ -1634,12 +1660,26 @@ for entry in Path('/proc/self/fd').iterdir():
         with_reason["reason_code"] = "owner-not-ancestor".into();
         let e = refused(with_reason);
         assert!(e.contains("reason_code"), "{e}");
-        // The current-main floor is not admitted for this authority here,
-        // even though the lock producer can record it.
-        let mut current = f.authority(&target, &base);
-        current["holder"]["kind"] = "fbexp-validate".into();
-        let e = refused(current);
-        assert!(e.contains("main-ancestor"), "{e}");
+        // For this authority a current-main floor is admitted only at the
+        // export main tip (see `fbexp_current_main_floor_admits_a_run_at_the_tip`).
+        // This target is strictly ahead of the observed main `base`: it is
+        // not on main yet, so the run is refused.
+        let mut ahead = f.authority(&target, &base);
+        ahead["holder"]["kind"] = "fbexp-validate".into();
+        let e = refused(ahead.clone());
+        assert!(e.contains("observed export main tip"), "{e}");
+        // The same status under ordinary authority is still admitted, so
+        // the refusal above is the fbexp rule alone.
+        let mut ordinary = ahead;
+        ordinary["holder"]["kind"] = "validate".into();
+        assert!(f.admit(&ordinary, &target).unwrap().canonical());
+        // Every other floor kind is refused before a floor is selected.
+        for kind in ["disjoint-main", "queue-base", "frozen-target"] {
+            let mut other = fbexp(&target, &main);
+            other["admission_floor"]["kind"] = kind.into();
+            let e = refused(other);
+            assert!(e.contains("admission floor kind"), "{kind}: {e}");
+        }
         // State and anchor bind this authority exactly as the others.
         let mut free = fbexp(&target, &main);
         free["state"] = "free".into();
@@ -1654,6 +1694,178 @@ for entry in Path('/proc/self/fd').iterdir():
         unknown["holder"]["kind"] = "other".into();
         let e = refused(unknown);
         assert!(e.contains("held lock is kind"), "{e}");
+    }
+
+    /// An fbexp post-land run at the export main tip is admitted with the
+    /// current-main floor: the floor, the observed main and the target are
+    /// one commit. It is re-proved from Git like an ordinary current-main
+    /// run and stays noncanonical and not frozen. A current-main floor
+    /// whose observed main is not the floor is refused.
+    #[test]
+    fn fbexp_current_main_floor_admits_a_run_at_the_tip() {
+        let f = Fixture::new();
+        let base = f.commit("main before the export target landed");
+        let target = f.commit("landed export target at the tip");
+        let mut tip = f.authority(&target, &target);
+        tip["holder"]["kind"] = "fbexp-validate".into();
+
+        let admitted = f.admit(&tip, &target).unwrap();
+        assert_eq!(admitted.floor().kind, "current-main");
+        assert_eq!(admitted.floor().sha, target);
+        assert_eq!(admitted.floor().observed_main_sha, target);
+        // An fbexp run mints no rrnewton landing evidence, at the tip too.
+        assert!(!admitted.canonical());
+        assert!(!admitted.frozen());
+        admitted.verify_source(&f.0).unwrap();
+
+        // The floor is the target, but the observed main is another commit.
+        let mut split = tip.clone();
+        split["admission_floor"]["observed_main_sha"] = base.as_str().into();
+        let e = f.admit(&split, &target).unwrap_err();
+        assert!(e.contains("observed export main tip"), "{e}");
+        // The same split, past the response check, is refused by the floor
+        // re-proof itself.
+        let mut split = admitted;
+        split.floor.observed_main_sha = base;
+        let e = split.verify_source(&f.0).unwrap_err();
+        assert!(e.contains("does not match"), "{e}");
+    }
+
+    /// For the fbexp authority, current-main means the target IS the
+    /// observed export main tip. A target strictly ahead of that main is not
+    /// on main yet, so a run of it is not a main run: it is refused even
+    /// though the observed main is its ancestor, both where the lock
+    /// response is bound and where the floor is re-proved. The ordinary
+    /// current-main re-proof still admits the same target.
+    #[test]
+    fn fbexp_current_main_floor_refuses_a_target_ahead_of_main() {
+        let f = Fixture::new();
+        let main = f.commit("observed export main");
+        let target = f.commit("export target ahead of main");
+        // The floor the lock records for this target: the observed main,
+        // which the target contains.
+        let mut ahead = f.authority(&target, &main);
+        ahead["holder"]["kind"] = "fbexp-validate".into();
+        let e = f.admit(&ahead, &target).unwrap_err();
+        assert!(e.contains("observed export main tip"), "{e}");
+
+        // Past the response check, the floor re-proof refuses it too.
+        let mut tip = f.authority(&target, &target);
+        tip["holder"]["kind"] = "fbexp-validate".into();
+        let mut proof = f.admit(&tip, &target).unwrap();
+        proof.floor.sha = main.clone();
+        proof.floor.tree = f.command(&["rev-parse", &format!("{main}^{{tree}}")]);
+        proof.floor.observed_main_sha = main;
+        let e = proof.verify_source(&f.0).unwrap_err();
+        assert!(e.contains("does not match"), "{e}");
+        // The ordinary current-main arm, which this change leaves alone,
+        // still admits the same floor for the same target.
+        proof.authority.kind = "validate".into();
+        proof.verify_source(&f.0).unwrap();
+    }
+
+    /// An fbexp current-main floor refuses a target behind the observed
+    /// main (main moved past it) and a target diverged from it, where the
+    /// lock response is bound and where the floor is re-proved, and
+    /// neither grafts nor replace refs change that.
+    #[test]
+    fn fbexp_current_main_floor_refuses_a_target_behind_or_diverged_from_main() {
+        let f = Fixture::new();
+        let base = f.commit("base");
+        let target = f.commit("export target");
+        let later = f.commit("main advanced past the export target");
+        f.command(&["checkout", "--quiet", "--detach", &base]);
+        let diverged = f.commit("main diverged from the export target");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+        let fbexp = |floor: &str| {
+            let mut status = f.authority(&target, floor);
+            status["holder"]["kind"] = "fbexp-validate".into();
+            status
+        };
+        let mut tip = f.authority(&target, &target);
+        tip["holder"]["kind"] = "fbexp-validate".into();
+        let tip = f.admit(&tip, &target).unwrap();
+        let reproved = |main: &str| {
+            let mut proof = tip.clone();
+            proof.floor.sha = main.into();
+            proof.floor.tree = f.command(&["rev-parse", &format!("{main}^{{tree}}")]);
+            proof.floor.observed_main_sha = main.into();
+            proof.verify_source(&f.0)
+        };
+        let refuses_both = |label: &str| {
+            for main in [&later, &diverged] {
+                let e = f.admit(&fbexp(main), &target).unwrap_err();
+                assert!(e.contains("observed export main tip"), "{label}: {e}");
+                let e = reproved(main).unwrap_err();
+                assert!(e.contains("does not match"), "{label}: {e}");
+            }
+        };
+
+        refuses_both("plain");
+        // A literal commit can be made to claim false ancestry by .git/info/grafts.
+        std::fs::write(
+            f.0.join(".git/info/grafts"),
+            format!("{target} {later}\n{later}\n"),
+        )
+        .unwrap();
+        assert!(
+            crate::scratch_git()
+                .args(["merge-base", "--is-ancestor", &later, &target])
+                .current_dir(&f.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        refuses_both("grafts");
+        std::fs::remove_file(f.0.join(".git/info/grafts")).unwrap();
+        f.command(&["replace", &target, &later]);
+        refuses_both("replace refs");
+    }
+
+    /// An fbexp current-main admission at the export main tip passes
+    /// through retention end to end: the retained context validates in
+    /// the ledger crate, binds the original files, and is never canonical
+    /// evidence, so it can never satisfy the canonical cache either.
+    #[test]
+    fn fbexp_current_main_tip_admission_is_retained_as_noncanonical_evidence() {
+        let f = Fixture::new();
+        std::fs::write(f.0.join(".gitignore"), "ignored/\n").unwrap();
+        f.command(&["add", ".gitignore"]);
+        f.commit("export main before the target landed");
+        let target = f.commit("landed export target at the tip");
+        let mut tip = f.authority(&target, &target);
+        tip["holder"]["kind"] = "fbexp-validate".into();
+        let admitted = f.admit(&tip, &target).unwrap();
+        let canonical = crate::validate_plan::validation_config(&source_root()).unwrap();
+        let view = BoundExecutionPlan::bind(&canonical, None, Some(&admitted)).unwrap();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let log_path = f.0.join("ignored/validate/driver.log");
+        let log = state.create(&state.locator(&log_path).unwrap()).unwrap();
+        log.write_exact(b"fbexp driver log\n").unwrap();
+        let retained = view
+            .retain(
+                &admitted,
+                &f.0,
+                &state,
+                "fixture-fbexp-run",
+                "2026-09-18T15:00:00Z",
+                &log,
+            )
+            .unwrap();
+        retained.verify(&state, &log).unwrap();
+        let evidence = &retained.evidence;
+        evidence.validate().unwrap();
+        assert_eq!(
+            std::fs::read(retained.artifact_path(&state)).unwrap(),
+            evidence.context_bytes().unwrap()
+        );
+        assert_eq!(evidence.authority().kind, "fbexp-validate");
+        assert_eq!(evidence.floor().kind, "current-main");
+        assert_eq!(evidence.floor().sha, target);
+        assert_eq!(evidence.floor().observed_main_sha, target);
+        // Canonical evidence stays the ordinary validate authority's.
+        assert!(!evidence.is_canonical());
+        assert!(!view.cache_matches(&admitted, evidence));
     }
 
     impl Fixture {

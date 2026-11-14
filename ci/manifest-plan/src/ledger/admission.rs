@@ -861,9 +861,28 @@ impl AdmissionIdentity<'_> {
                 if f.sha == self.target_sha
                     && f.tree == self.target_tree
                     && f.observed_main_sha != self.target_sha => {}
+            // A facebookexperimental post-land run at the export main tip.
+            // For this authority current-main means the target IS the
+            // observed export main: the floor, the observed main and the
+            // target are one commit with one tree. A target strictly ahead
+            // of that main is not on main yet, so its record is not a main
+            // record and is refused here, unlike the ordinary current-main
+            // arm above, which also admits a target ahead of main. This
+            // reader has no Git, so it checks only these identities; it
+            // cannot tell whether the observed main really was the export
+            // main tip (the authority's claim) and cannot tell a target
+            // behind main from a diverged one (both are refused because the
+            // target is not the observed main). The driver re-proves the
+            // floor from Git, and [`AdmissionEvidence::is_canonical`] stays
+            // false for the record (it mints no rrnewton landing evidence).
+            ("fbexp-validate", "current-main")
+                if f.sha == f.observed_main_sha
+                    && f.sha == self.target_sha
+                    && f.tree == self.target_tree => {}
             // A facebookexperimental post-land run of an export commit the
             // observed export main already contains: the same target's-own
-            // floor under the export authority. Only this floor pairs with
+            // floor under the export authority. This and the tip-only
+            // current-main arm above are the only floors that pair with
             // that authority here; the driver re-proves the ancestry from
             // Git, and [`AdmissionEvidence::is_canonical`] stays false for
             // the record (it mints no rrnewton landing evidence).
@@ -1137,11 +1156,11 @@ impl AdmissionEvidence {
     /// caller that has Git recomputes that merge base itself.
     ///
     /// An `fbexp-validate` record is NOT canonical here either, even with
-    /// a `main-ancestor` floor: canonical is the ordinary `validate`
-    /// authority's alone, and an export run mints no rrnewton landing
-    /// evidence. (Until that authority was admitted, `validate()` alone
-    /// implied the kind; the kind is now stated so the new pairing
-    /// cannot silently widen this verdict.)
+    /// a `main-ancestor` or tip-only `current-main` floor: canonical is
+    /// the ordinary `validate` authority's alone, and an export run mints
+    /// no rrnewton landing evidence. (Until that authority was admitted,
+    /// `validate()` alone implied the kind; the kind is now stated so the
+    /// new pairings cannot silently widen this verdict.)
     pub fn is_canonical(&self) -> bool {
         self.validate().is_ok()
             && self.authority().kind == "validate"
@@ -1679,10 +1698,13 @@ mod tests {
         assert!(refused(pin).contains("pin binding"));
     }
 
-    /// An fbexp post-land record (`fbexp-validate`) is well formed only
-    /// with the target's own main-ancestor floor, and it is never
-    /// canonical from the record alone: canonical stays the ordinary
-    /// `validate` authority's. No other floor kind pairs with it here.
+    /// An fbexp post-land record (`fbexp-validate`) is well formed with
+    /// the target's own main-ancestor floor, and it is never canonical
+    /// from the record alone: canonical stays the ordinary `validate`
+    /// authority's. The only other floor that pairs with it is the
+    /// tip-only current-main floor (see
+    /// `fbexp_current_main_floor_is_well_formed_only_at_the_tip`); every
+    /// other floor kind is refused.
     #[test]
     fn fbexp_main_ancestor_floor_is_well_formed_but_never_canonical() {
         let mut fbexp = context_v2();
@@ -1706,10 +1728,22 @@ mod tests {
         let mut tip = fbexp.clone();
         tip.floor.observed_main_sha = tip.target_sha.clone();
         assert!(refused(tip).contains("floor disagrees"));
-        // The current-main floor does not pair with this authority here.
+        // A current-main floor pairs with this authority only at the tip.
+        // This fixture's target is strictly ahead of its observed main, so
+        // it is not on main yet and is refused.
         let mut current = context_v2();
         current.authority.kind = "fbexp-validate".into();
         assert!(refused(current).contains("floor disagrees"));
+        // The remaining floor kinds never pair with this authority.
+        let mut disjoint = disjoint_main_context();
+        disjoint.authority.kind = "fbexp-validate".into();
+        assert!(refused(disjoint).contains("floor disagrees"));
+        let mut queue = queue_base_context();
+        queue.authority.kind = "fbexp-validate".into();
+        assert!(refused(queue).contains("floor disagrees"));
+        let mut frozen = fbexp.clone();
+        frozen.floor.kind = "frozen-target".into();
+        assert!(refused(frozen).contains("floor disagrees"));
         // An unknown authority kind pairs with no floor.
         let mut unknown = fbexp.clone();
         unknown.authority.kind = "other".into();
@@ -1720,6 +1754,75 @@ mod tests {
         ordinary.authority.kind = "validate".into();
         ordinary.validate().unwrap();
         assert!(AdmissionEvidence::V2(evidence_v2(ordinary)).is_canonical());
+    }
+
+    /// An fbexp post-land record pairs with a current-main floor only at
+    /// the export main tip: the floor, the observed main and the target are
+    /// one commit with one tree. A target strictly ahead of the observed
+    /// main is not on main yet, so its record is not a main record and is
+    /// refused. Without Git this reader cannot tell a target ahead of main
+    /// from one behind it or diverged from it; each is a target that is not
+    /// the observed main, and each is refused. The record is never
+    /// canonical. The ordinary current-main pairing is unchanged and still
+    /// admits a target ahead of main.
+    #[test]
+    fn fbexp_current_main_floor_is_well_formed_only_at_the_tip() {
+        let mut tip = context_v2();
+        tip.authority.kind = "fbexp-validate".into();
+        tip.floor.sha = tip.target_sha.clone();
+        tip.floor.tree = tip.target_tree.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        tip.pin_bindings[0].base_sha = tip.target_sha.clone();
+        tip.validate().unwrap();
+        admission_context_v2_bytes(&tip).unwrap();
+        assert!(!AdmissionEvidence::V2(evidence_v2(tip.clone())).is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // The target is not the observed main (strictly ahead of it here;
+        // behind or diverged has the same identities): the floor is that
+        // main, as the lock records it.
+        let mut ahead = tip.clone();
+        ahead.floor.sha = "4".repeat(40);
+        ahead.floor.tree = "5".repeat(40);
+        ahead.floor.observed_main_sha = "4".repeat(40);
+        ahead.pin_bindings[0].base_sha = "4".repeat(40);
+        assert!(refused(ahead.clone()).contains("floor disagrees"));
+        // The same record under ordinary authority is still admitted and
+        // canonical, so the refusal above is the fbexp rule alone.
+        let mut ordinary = ahead;
+        ordinary.authority.kind = "validate".into();
+        ordinary.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(ordinary)).is_canonical());
+        // The floor is the target, but the observed main is another commit.
+        let mut observed = tip.clone();
+        observed.floor.observed_main_sha = "a".repeat(40);
+        assert!(refused(observed).contains("floor disagrees"));
+        // The observed main is the target, but the floor is another commit.
+        let mut floor = tip.clone();
+        floor.floor.sha = "4".repeat(40);
+        floor.floor.tree = "5".repeat(40);
+        floor.pin_bindings[0].base_sha = "4".repeat(40);
+        assert!(refused(floor).contains("floor disagrees"));
+        // Same-tree ahead case (an empty commit, or a commit plus its revert).
+        let mut same_tree = tip.clone();
+        same_tree.floor.sha = "4".repeat(40);
+        same_tree.floor.observed_main_sha = "4".repeat(40);
+        same_tree.pin_bindings[0].base_sha = "4".repeat(40);
+        assert_eq!(same_tree.floor.tree, same_tree.target_tree);
+        assert!(refused(same_tree.clone()).contains("floor disagrees"));
+        // Under ordinary authority the same record is admitted, so only the
+        // fbexp arm's commit identity refuses it.
+        let mut same_tree_ordinary = same_tree;
+        same_tree_ordinary.authority.kind = "validate".into();
+        same_tree_ordinary.validate().unwrap();
+        // The floor names the target with another tree.
+        let mut tree = tip.clone();
+        tree.floor.tree = "b".repeat(40);
+        assert!(refused(tree).contains("floor disagrees"));
+        // A pin binding against another base than the floor.
+        let mut pin = tip;
+        pin.pin_bindings[0].base_sha = "4".repeat(40);
+        assert!(refused(pin).contains("pin binding"));
     }
 
     /// A disjoint-main context: the target contains the main E it queued
