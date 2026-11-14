@@ -6,6 +6,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+
 //! Run `cargo fmt` with the pinned formatter toolchain, and refuse to run it
 //! with any other formatter.
 //!

@@ -1676,7 +1676,12 @@ fn find_manifest(cache: &Path) -> serde_json::Value {
     }
     let mut found = Vec::new();
     walk(&cache.join("hermit"), &mut found);
-    assert_eq!(found.len(), 1, "manifests under {}: {found:?}", cache.display());
+    assert_eq!(
+        found.len(),
+        1,
+        "manifests under {}: {found:?}",
+        cache.display()
+    );
     serde_json::from_slice(&std::fs::read(&found[0]).unwrap()).unwrap()
 }
 
@@ -1718,8 +1723,7 @@ fn image_runs_record_resolved_identity_in_v2_manifest() {
     assert_eq!(manifest["schema"], "hermit-recording-manifest/v2");
     assert_eq!(manifest["image"]["source"], "podman-store");
     assert_eq!(
-        manifest["image"]["reference"],
-        "store-test:latest",
+        manifest["image"]["reference"], "store-test:latest",
         "supplied reference must survive canonicalization: {manifest}"
     );
     assert_eq!(manifest["image"]["identity"], "a".repeat(64));
@@ -1778,7 +1782,10 @@ fn image_runs_record_resolved_identity_in_v2_manifest() {
     let manifest = find_manifest(&docker_cache);
     assert_eq!(manifest["image"]["source"], "docker-archive");
     assert!(manifest["image"].get("reference").is_none(), "{manifest}");
-    assert!(manifest["image"].get("manifest_digest").is_none(), "{manifest}");
+    assert!(
+        manifest["image"].get("manifest_digest").is_none(),
+        "{manifest}"
+    );
     assert_eq!(manifest["image"]["identity"], manifest["image"]["image_id"]);
 }
 

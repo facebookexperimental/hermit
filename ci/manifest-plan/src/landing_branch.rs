@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! The branch settings of `ci/landing-branches.env`.
 //!
 //! The landing branch is the branch changes land on: the merge queue's base,

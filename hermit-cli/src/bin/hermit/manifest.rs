@@ -437,9 +437,7 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 fn is_sha256_digest(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(is_sha256_hex)
+    value.strip_prefix("sha256:").is_some_and(is_sha256_hex)
 }
 
 impl Image {
@@ -1328,7 +1326,10 @@ mod tests {
             "identity": "b".repeat(64),
             "manifest_digest": format!("sha256:{}", "b".repeat(64)),
         });
-        assert!(parse(&oci.to_string()).is_err(), "oci-dir hosts no reference");
+        assert!(
+            parse(&oci.to_string()).is_err(),
+            "oci-dir hosts no reference"
+        );
     }
 
     #[test]

@@ -105,9 +105,9 @@
     "sha256": "b41103fa7f60290d5836aa87978d7f8828a798d1025f972510164a1b64cc9b15"
   },
   {
-    "bytes": 2316,
+    "bytes": 2525,
     "path": "test_elf_metadata.py",
-    "sha256": "02d6743db03b3dbec5f87818f3a0c5536b77f5b7595540de6021aa5e797597ed"
+    "sha256": "672735bacdcee4ca9839b61fb4d9a093752858ad720e452f3dd4fbcb0a01d496"
   },
   {
     "bytes": 19889,

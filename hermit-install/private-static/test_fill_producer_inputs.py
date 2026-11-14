@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Filler controls on a synthetic tree; no pipeline stage or build runs.
 
 The code-pinned digests cannot be fabricated, so each synthetic file's real
@@ -76,11 +82,11 @@ class SyntheticTree:
         for name in ('cargo', 'rustc', 'rustdoc'):
             self.write(f'prefix/bin/{name}', f'private-{name}'.encode(), executable=True)
         gnu = 'prefix/lib/rustlib/x86_64-unknown-linux-gnu/bin/'
-        lld = self.write(gnu + 'rust-lld', b'lld')
-        objdump = self.write(gnu + 'llvm-objdump', b'objdump')
+        self.write(gnu + 'rust-lld', b'lld')
+        self.write(gnu + 'llvm-objdump', b'objdump')
         base = 'prefix/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/'
-        libc = self.write(base + 'libc.a', b'libc-bytes')
-        libunwind = self.write(base + 'libunwind.a', b'unwind')
+        self.write(base + 'libc.a', b'libc-bytes')
+        self.write(base + 'libunwind.a', b'unwind')
         host_objdump = self.write('host-objdump', b'gnu-objdump')
         inventory = self.write('input-inventory.json', b'{}')
         self.pins.update(

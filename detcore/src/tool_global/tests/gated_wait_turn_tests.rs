@@ -3891,10 +3891,12 @@ async fn a_marked_sigalrm_completion_delivers_or_stops_the_run() {
     );
 }
 
-/// Collects every INFO message that is a DETLOG syscall finish record.
+/// Collects every INFO message that is a DETLOG syscall finish record. Only the x86_64 test below uses it.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Default)]
 struct FinishLog(std::sync::Arc<Mutex<Vec<String>>>);
 
+#[cfg(target_arch = "x86_64")]
 impl tracing::Subscriber for FinishLog {
     // As `WarnLog`: "sometimes" for every callsite, so another test's
     // subscriber cannot leave the INFO callsite cached as never.

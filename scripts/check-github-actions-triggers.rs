@@ -1556,7 +1556,10 @@ mod tests {
     #[test]
     fn checked_in_workflows_parse_as_yaml() {
         for (name, source) in [
-            (PORTABLE, include_str!("../.github/workflows/ci-portable.yml")),
+            (
+                PORTABLE,
+                include_str!("../.github/workflows/ci-portable.yml"),
+            ),
             (
                 VALIDATION_LEVELS,
                 include_str!("../.github/workflows/validation-levels.yml"),

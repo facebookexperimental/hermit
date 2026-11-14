@@ -226,16 +226,11 @@ impl PodmanStore {
         let digest = podman_output(&["image", "inspect", &id, "--format", "{{.Digest}}"])
             .ok()
             .filter(|d| d.starts_with("sha256:"));
-        let repo_digests = podman_output(&[
-            "image",
-            "inspect",
-            &id,
-            "--format",
-            "{{json .RepoDigests}}",
-        ])
-        .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default();
+        let repo_digests =
+            podman_output(&["image", "inspect", &id, "--format", "{{json .RepoDigests}}"])
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
         Ok(ResolvedImage {
             reference: reference.to_string(),
             id,

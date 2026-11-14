@@ -129,10 +129,15 @@ pub(crate) fn canonical_image_ref(image_ref: &str) -> String {
 /// algorithm prefix. Accepts `name@sha256:<hex>`, `sha256:<hex>` and a bare
 /// 64-hex image ID.
 fn pinned_sha256(image_ref: &str) -> Option<String> {
-    let candidate = image_ref
-        .trim()
-        .rsplit_once("@sha256:")
-        .map_or_else(|| image_ref.trim().strip_prefix("sha256:").unwrap_or(image_ref.trim()), |(_, digest)| digest);
+    let candidate = image_ref.trim().rsplit_once("@sha256:").map_or_else(
+        || {
+            image_ref
+                .trim()
+                .strip_prefix("sha256:")
+                .unwrap_or(image_ref.trim())
+        },
+        |(_, digest)| digest,
+    );
     (candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()))
         .then(|| candidate.to_ascii_lowercase())
 }
@@ -241,9 +246,9 @@ pub(crate) fn resolved_image_identity(
             let identity = crate::app::image_source::local_identity(kind, &path)?;
             image_from_local_identity(kind, &identity)
         }
-        ImageSourceRef::BareRelative { kind, remainder } => {
-            Err(crate::app::image_source::bare_relative_error(kind, &remainder))
-        }
+        ImageSourceRef::BareRelative { kind, remainder } => Err(
+            crate::app::image_source::bare_relative_error(kind, &remainder),
+        ),
         ImageSourceRef::StoreReference => {
             let store = crate::app::podman_store::PodmanStore::probe()?
                 .ok_or_else(|| {
@@ -579,7 +584,10 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<MaterializedRootfs, 
     // identity of the tree being executed. A failed resolution preserves
     // the legacy cache-hit fallback, but yields no identity.
     let resolved_store = match crate::app::podman_store::PodmanStore::probe()? {
-        Some(store) => store.resolve(image_ref).ok().map(|resolved| (store, resolved)),
+        Some(store) => store
+            .resolve(image_ref)
+            .ok()
+            .map(|resolved| (store, resolved)),
         None => None,
     };
     let identity = resolved_store
@@ -609,9 +617,7 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<MaterializedRootfs, 
 
     // Copy the merged tree out of the local podman store's overlay layers.
     let materialized = match &resolved_store {
-        Some((store, resolved)) => {
-            materialize_via_podman_store(store, resolved, &cache, &rootfs)?
-        }
+        Some((store, resolved)) => materialize_via_podman_store(store, resolved, &cache, &rootfs)?,
         None => false,
     };
     if materialized {
@@ -1423,22 +1429,13 @@ mod tests {
         // A multi-arch pin names the repo/index digest, while `digest`
         // names the selected platform manifest; both are accepted only
         // when the store resolution itself records that relationship.
-        let by_repo = format!(
-            "docker.io/library/debian@sha256:{}",
-            "c".repeat(64)
-        );
+        let by_repo = format!("docker.io/library/debian@sha256:{}", "c".repeat(64));
         assert!(image_from_resolved(&by_repo, &resolved).is_ok());
-        let by_manifest = format!(
-            "docker.io/library/debian@sha256:{}",
-            "b".repeat(64)
-        );
+        let by_manifest = format!("docker.io/library/debian@sha256:{}", "b".repeat(64));
         assert!(image_from_resolved(&by_manifest, &resolved).is_ok());
         let by_id = "a".repeat(64);
         assert!(image_from_resolved(&by_id, &resolved).is_ok());
-        let mismatch = format!(
-            "docker.io/library/debian@sha256:{}",
-            "d".repeat(64)
-        );
+        let mismatch = format!("docker.io/library/debian@sha256:{}", "d".repeat(64));
         let err = image_from_resolved(&mismatch, &resolved).unwrap_err();
         assert!(
             format!("{err:#}").contains("pins sha256:"),
@@ -1465,9 +1462,7 @@ mod tests {
             ensure_materialized_identity_matches("debian", Some(&expected), Some(&different))
                 .is_err()
         );
-        assert!(
-            ensure_materialized_identity_matches("debian", Some(&expected), None).is_err()
-        );
+        assert!(ensure_materialized_identity_matches("debian", Some(&expected), None).is_err());
         ensure_materialized_identity_matches("debian", None, None).unwrap();
     }
 
@@ -1490,10 +1485,16 @@ mod tests {
             pinned_sha256(&format!("docker.io/library/debian@sha256:{digest}")),
             Some(digest.clone())
         );
-        assert_eq!(pinned_sha256(&format!("sha256:{digest}")), Some(digest.clone()));
+        assert_eq!(
+            pinned_sha256(&format!("sha256:{digest}")),
+            Some(digest.clone())
+        );
         assert_eq!(pinned_sha256(&digest), Some(digest));
         assert_eq!(pinned_sha256("docker.io/library/debian:trixie-slim"), None);
-        assert_eq!(pinned_sha256("docker.io/library/debian@sha256:not-hex"), None);
+        assert_eq!(
+            pinned_sha256("docker.io/library/debian@sha256:not-hex"),
+            None
+        );
         assert_eq!(pinned_sha256("docker.io/library/debian@sha512:abcd"), None);
     }
 
