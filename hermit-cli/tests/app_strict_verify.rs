@@ -351,7 +351,13 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             // The test does not assert CPUID or PMU behavior; these flags
             // keep the test portable to runners without those capabilities. They do not
             // weakening determinism (they do not disable strict mode).
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     configure_guest_execution(&mut command, None);
@@ -555,7 +561,10 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
         .args([
             // The test does not assert CPUID or PMU behavior; these flags keep
             // it portable without weakening strict determinism.
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // assert_l2_under_strict_verify.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     configure_guest_execution(&mut command, Some("minimal"));
@@ -661,7 +670,10 @@ fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
             "--verify",
             // Relax only CPUID virtualization; keep RCB preemption on so the
             // JVM's internal threads make progress (see the doc comment).
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // assert_l2_under_strict_verify.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ]);
     configure_guest_execution(&mut command, None);
     command.arg("--").arg(program).args(args);
@@ -930,7 +942,10 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
             "run",
             "--strict",
             detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // assert_l2_under_strict_verify.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     configure_guest_execution(&mut command, None);
@@ -1201,7 +1216,10 @@ fn make_command_with_execution_root(
             "run",
             "--strict",
             detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // assert_l2_under_strict_verify.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     // The empty execution root is separate from the populated input/output

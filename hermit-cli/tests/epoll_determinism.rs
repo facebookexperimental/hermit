@@ -87,7 +87,13 @@ fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
     command.args([
         "run",
         "--base-env=minimal",
+        // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+        // profile's table. x86-64-v2 is named because it is the one profile
+        // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+        // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+        // crt objects do), and v3 is refused without CPUID virtualization.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     command.arg("--").arg(guest).arg(scenario);
@@ -135,7 +141,9 @@ fn assert_scenario_reaches_l2(scenario: &str) {
             "run",
             "--strict",
             "--verify",
+            // x86-64-v2 beside --no-virtualize-cpuid: see run_scenario.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--preemption-timeout=disabled",
         ]);
     command.arg("--").arg(guest).arg(scenario);

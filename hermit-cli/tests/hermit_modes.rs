@@ -411,7 +411,16 @@ fn hermit_command_with_execution_root(
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"])
+        // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+        // profile's table. x86-64-v2 is named because it is the one profile
+        // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+        // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+        // crt objects do), and v3 is refused without CPUID virtualization.
+        .args([
+            "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
+            "--max-timeslice=disabled",
+        ])
         .args(execution_root_args(requested_workdir)?);
     Ok(command)
 }
@@ -438,7 +447,13 @@ fn verify_guest_command(
         .args(extra_options)
         .args([
             "--base-env=minimal",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     configure_execution_root(&mut command);
@@ -1202,7 +1217,10 @@ fn no_hardware_stacktrace_signal() {
         "--stacktrace-event=10",
         "--record-preemptions",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see
+        // hermit_command_with_execution_root.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     configure_execution_root(&mut command);
@@ -1400,7 +1418,10 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
             "--detlog-heap",
             "--detlog-stack",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // hermit_command_with_execution_root.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
     configure_execution_root(&mut command);
@@ -1492,7 +1513,10 @@ int main(void) {
             "--verify",
             "--base-env=empty",
             "--env=VERIFY_CONFIGURED=expected",
+            // x86-64-v2 beside --no-virtualize-cpuid: see
+            // hermit_command_with_execution_root.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ])
         .arg(format!("--tmp={}", tmp.path().display()));
@@ -1514,7 +1538,10 @@ fn hello_race_chaos_verify() {
         "--verify-allow=both",
         "--chaos",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see
+        // hermit_command_with_execution_root.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--env=HERMIT_MODE=chaos",
     ]);

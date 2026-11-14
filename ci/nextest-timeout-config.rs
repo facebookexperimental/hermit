@@ -348,6 +348,21 @@ const RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME: &str = "hermit-rr-vdso-clock-gettime-c
 const RR_VDSO_CLOCK_GETTIME_CPU_SECONDS: u64 = 24;
 const SHIPPED_EXPORT_WRAPPER_NAME: &str = "hermit-shipped-export-cpu";
 const SHIPPED_EXPORT_CPU_SECONDS: u64 = 35;
+// hermit-detcore-tests::tests_misc
+// post_crash::a_recovered_lineage_does_not_take_another_crashs_switch now
+// execs this test binary as its no-op instead of /bin/true (CentOS 10
+// binaries declare x86-64-v3, which the run's x86-64-v2 profile refuses at
+// exec). The exec happens in the recovered, unswitched lineage, so the
+// binary's dynamic-loader start-up (about 327k relocations) runs at the
+// test's fine bound. Measured in this repository's validation cohort (the
+// counted runner with test.detcore_misc's command, the case alone, caps
+// raised, 3 runs): before this change 4.331, 4.262 and 4.687 CPU seconds
+// (median 4.33, wall median 4.07 s); with it 27.20, 24.30 and 26.63 (median
+// 26.6, wall median 24.3 s), all above the 22-second default.
+// 41 = ceil(1.5 * 27.20), the largest; the wall is eight times the cap, 328,
+// as for the other measured allowances.
+const POST_CRASH_RECOVERED_LINEAGE_WRAPPER_NAME: &str = "hermit-post-crash-recovered-lineage-cpu";
+const POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS: u64 = 41;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,7 +431,7 @@ const PMU_SCHEDULE_OFFSET_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance
     wall_seconds: None,
 };
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 45] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 46] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -737,6 +752,14 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 45] = [
         test: "manifest_metadata::tests::shipped_export_is_deterministic_and_matches_the_comparable_projection",
         cpu_seconds: SHIPPED_EXPORT_CPU_SECONDS,
         wall_seconds: Some(8 * SHIPPED_EXPORT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: POST_CRASH_RECOVERED_LINEAGE_WRAPPER_NAME,
+        package: "hermit-detcore-tests",
+        binary: "hermit-detcore-tests::tests_misc",
+        test: "post_crash::a_recovered_lineage_does_not_take_another_crashs_switch",
+        cpu_seconds: POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS,
+        wall_seconds: Some(8 * POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS),
     },
 ];
 
@@ -3525,6 +3548,149 @@ mod tests {
     }
 
     #[test]
+    fn post_crash_recovered_lineage_has_its_measured_cap_and_wall_backstop() {
+        let identity = nextest_cpu::AttemptIdentity {
+            package: "hermit-detcore-tests".into(),
+            binary: "hermit-detcore-tests::tests_misc".into(),
+            test: "post_crash::a_recovered_lineage_does_not_take_another_crashs_switch".into(),
+            attempt: 1,
+        };
+        let inventory = measured_inventory(std::slice::from_ref(&identity));
+        let selected = prepared_selected_cpu_allowances(true, false, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].wrapper_name,
+            POST_CRASH_RECOVERED_LINEAGE_WRAPPER_NAME
+        );
+        assert_eq!(
+            (selected[0].cpu_seconds, selected[0].wall_seconds),
+            (41, Some(328))
+        );
+        for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
+            let rendered = scaled_config_with_allowances(
+                include_str!("../.config/nextest.toml"),
+                wall_multiplier,
+                Some((Path::new("/fixture/wrapper"), cpu_multiplier)),
+                &selected,
+            )
+            .unwrap();
+            let doc = rendered.parse::<DocumentMut>().unwrap();
+            let cpu_seconds =
+                timeouts::scale_timeout_seconds(41, cpu_multiplier, "CPU multiplier").unwrap();
+            assert_eq!(
+                wrapper_argv(&doc, POST_CRASH_RECOVERED_LINEAGE_WRAPPER_NAME)[2],
+                (cpu_seconds * 1_000_000).to_string()
+            );
+            // 8x policy: the test carries its own wall backstop.
+            let filter = exact_filter(&identity);
+            let matching = doc["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            let wall_seconds =
+                timeouts::scale_timeout_seconds(328, wall_multiplier, "wall multiplier").unwrap();
+            assert_eq!(
+                matching[0]["slow-timeout"]["period"].as_str(),
+                Some(format!("{wall_seconds}s").as_str())
+            );
+            assert!(wall_seconds > cpu_seconds + CPU_TERMINATION_GRACE_SECONDS);
+        }
+        // Without prepared admission the test keeps the ordinary 22-second cap.
+        assert!(
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    /// Crate roots of the `hermit-detcore-tests` test targets an allowance
+    /// names, as (target, its `path` in detcore/tests/Cargo.toml, source).
+    const DETCORE_TEST_ROOT_SOURCES: [(&str, &str, &str); 1] = [(
+        "tests_misc",
+        "misc/mod.rs",
+        include_str!("../detcore/tests/misc/mod.rs"),
+    )];
+
+    /// Modules of those targets an allowance names, as (target, module, source).
+    const DETCORE_TEST_MODULE_SOURCES: [(&str, &str, &str); 1] = [(
+        "tests_misc",
+        "post_crash",
+        include_str!("../detcore/tests/misc/post_crash.rs"),
+    )];
+
+    /// Nextest matches an allowance by exact spelling only, so an identity
+    /// naming no real test bounds nothing and fails nothing. Every allowance
+    /// for package hermit-detcore-tests must name a `[[test]]` target of
+    /// detcore/tests/Cargo.toml, a module its crate root declares, and a
+    /// top-level `#[test]` function of that module, spelled exactly; one whose
+    /// target or module is missing from the tables above fails until added.
+    #[test]
+    fn detcore_test_allowances_name_real_tests() {
+        let manifest = include_str!("../detcore/tests/Cargo.toml");
+        assert!(manifest.contains("[package]\nname = \"hermit-detcore-tests\"\n"));
+        let mut checked = Vec::new();
+        for allowance in MEASURED_CPU_ALLOWANCES
+            .iter()
+            .filter(|allowance| allowance.package == "hermit-detcore-tests")
+        {
+            let target = allowance
+                .binary
+                .strip_prefix("hermit-detcore-tests::")
+                .unwrap_or_else(|| panic!("{:?} is not a test target id", allowance.binary));
+            let (_, root_path, root) = DETCORE_TEST_ROOT_SOURCES
+                .iter()
+                .find(|(name, _, _)| *name == target)
+                .unwrap_or_else(|| panic!("add {target}'s crate root to the table"));
+            assert!(
+                manifest.contains(&format!(
+                    "[[test]]\nname = \"{target}\"\npath = \"{root_path}\"\n"
+                )),
+                "{target} is not a [[test]] target at {root_path}"
+            );
+            let (module, function) = allowance
+                .test
+                .split_once("::")
+                .unwrap_or_else(|| panic!("{:?} names no module", allowance.test));
+            assert!(
+                !function.contains("::"),
+                "{:?}: extend this check to nested modules",
+                allowance.test
+            );
+            assert_eq!(
+                root.matches(&format!("\nmod {module};\n")).count(),
+                1,
+                "{target} does not declare mod {module}"
+            );
+            let (_, _, source) = DETCORE_TEST_MODULE_SOURCES
+                .iter()
+                .find(|(name, declared, _)| *name == target && *declared == module)
+                .unwrap_or_else(|| panic!("add {target}'s module {module} to the table"));
+            assert_eq!(
+                source
+                    .matches(&format!("\n#[test]\nfn {function}() {{\n"))
+                    .count(),
+                1,
+                "{module} has no top-level #[test] fn {function}"
+            );
+            checked.push(allowance.test);
+        }
+        assert!(
+            checked
+                .contains(&"post_crash::a_recovered_lineage_does_not_take_another_crashs_switch"),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
     fn original_five_allowance_subsets_partition_once_and_scale_independently() {
         let names = [
             DETCORE_ALLOCATOR_WRAPPER_NAME,
@@ -3801,7 +3967,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 45);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 46);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),

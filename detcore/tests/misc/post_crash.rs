@@ -19,9 +19,13 @@
 //! this test binary again, which runs the scenario named in
 //! `SCENARIO_ENV`.
 
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::num::NonZeroU64;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use detcore::Detcore;
 
@@ -41,6 +45,9 @@ const SCENARIO_ENV: &str = "HERMIT_POST_CRASH_SCENARIO";
 /// In the re-executed test binary, run the scenario `test` names; outside
 /// it, return.
 fn run_scenario_if_inner() {
+    if std::env::var_os(SCENARIO_ENV).is_some() {
+        prepare_noop();
+    }
     match std::env::var(SCENARIO_ENV).as_deref() {
         Ok("abort_handler_execs") => abort_handler_execs(),
         Ok("resolved_fault_then_exec") => resolved_fault_then_exec(),
@@ -57,10 +64,113 @@ fn run_scenario_if_inner() {
         Ok("one_of_two_crashed_processes_recovers") => one_of_two_crashed_processes_recovers(),
         Ok("two_trials_crash_in_turn") => two_trials_crash_in_turn(),
         Ok("handler_aborts") => handler_aborts(),
+        Ok("drain_stdin") => drain_stdin(),
         Ok(other) => panic!("unknown scenario {other}"),
         Err(_) => return,
     }
     std::process::exit(0);
+}
+
+/// The arguments that make this test binary a program that does nothing and
+/// exits 0: list, quietly, the tests whose name is exactly one no test has.
+const NOOP_ARGS: [&str; 4] = [
+    "--list",
+    "--exact",
+    "--format=terse",
+    "post_crash::no_such_test",
+];
+
+/// The program a scenario execs where it needs one that does nothing and
+/// exits 0: this test binary under [`NOOP_ARGS`], with this process's
+/// environment less `SCENARIO_ENV`, so it runs no scenario and its runtime
+/// reads the same options as the scenario's (a sanitizer's among them).
+///
+/// Not a host program such as `/bin/true`: the run's CPU profile admits an
+/// exec only of an image whose declared x86-64 level it covers, and a host's
+/// own programs may declare a later level than this binary, which the
+/// profile already admitted to start the scenario.
+///
+/// Built before the scenario installs any handler, so that a child forked
+/// inside a handler execs it without allocating ([`exec_noop`]).
+struct Noop {
+    /// This test binary.
+    exe: PathBuf,
+    /// The strings `argv` and `envp` point into.
+    _strings: Vec<CString>,
+    /// `execve`'s argument vector and environment, each null-terminated.
+    argv: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+}
+
+// SAFETY: the pointers point into the strings the same value owns, which
+// nothing changes or drops once the value is in `NOOP`.
+unsafe impl Send for Noop {}
+// SAFETY: as for `Send`; nothing writes through the pointers.
+unsafe impl Sync for Noop {}
+
+static NOOP: OnceLock<Noop> = OnceLock::new();
+
+/// Build [`NOOP`], in the re-executed test binary before its scenario runs.
+fn prepare_noop() {
+    NOOP.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let argv: Vec<CString> = std::iter::once(exe.as_os_str().as_bytes())
+            .chain(NOOP_ARGS.iter().map(|arg| arg.as_bytes()))
+            .map(|arg| CString::new(arg).unwrap())
+            .collect();
+        let envp: Vec<CString> = std::env::vars_os()
+            .filter(|(name, _)| name.as_os_str() != OsStr::new(SCENARIO_ENV))
+            .map(|(name, value)| {
+                CString::new([name.as_bytes(), b"=".as_slice(), value.as_bytes()].concat()).unwrap()
+            })
+            .collect();
+        let pointers = |strings: &[CString]| -> Vec<*const libc::c_char> {
+            strings
+                .iter()
+                .map(|string| string.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect()
+        };
+        Noop {
+            exe,
+            argv: pointers(&argv),
+            envp: pointers(&envp),
+            _strings: argv.into_iter().chain(envp).collect(),
+        }
+    });
+}
+
+/// [`NOOP`], which [`run_scenario_if_inner`] built.
+fn noop() -> &'static Noop {
+    NOOP.get().expect("built before the scenario")
+}
+
+/// In a forked child, possibly inside a signal handler: exec [`NOOP`].
+/// Allocates nothing.
+fn exec_noop() -> ! {
+    // SAFETY: the path, argument vector and environment are NUL-terminated
+    // strings and null-terminated arrays that live as long as this process.
+    unsafe {
+        if let Some(noop) = NOOP.get() {
+            libc::execve(noop.argv[0], noop.argv.as_ptr(), noop.envp.as_ptr());
+        }
+        libc::_exit(127);
+    }
+}
+
+/// [`NOOP`] as a command to spawn.
+fn noop_command() -> std::process::Command {
+    let noop = noop();
+    let mut command = std::process::Command::new(&noop.exe);
+    command.args(NOOP_ARGS).env_remove(SCENARIO_ENV);
+    command
+}
+
+/// Read stdin until it ends, as `cat` with its output discarded does: the
+/// program a scenario spawns where it needs one that runs until its parent
+/// closes the pipe to it.
+fn drain_stdin() {
+    std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
 }
 
 /// Keep the scenario processes from dumping core, so a trial that crashes (a
@@ -126,7 +236,7 @@ fn make_pipes() {
     }
 }
 
-/// In the descendant: wait for the release byte, then exec `true`.
+/// In the descendant: wait for the release byte, then exec [`NOOP`].
 fn descendant_waits_then_execs() -> ! {
     use std::sync::atomic::Ordering;
     let mut byte = 0u8;
@@ -151,14 +261,7 @@ fn descendant_waits_then_execs() -> ! {
             1,
         );
     }
-    // SAFETY: replaces this descendant with /bin/true.
-    unsafe {
-        let path = c"/bin/true";
-        let argv = [path.as_ptr(), std::ptr::null()];
-        let envp = [std::ptr::null()];
-        libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-        libc::_exit(127);
-    }
+    exec_noop();
 }
 
 /// The armed handler of the killed-handler scenario: fork the descendant,
@@ -336,6 +439,8 @@ struct Recorded {
     switches: Vec<detcore::post_crash::PostCrashSwitch>,
     /// How many slice ends the record holds, across all threads.
     slice_ends: usize,
+    /// How many slice ends the record holds for each thread.
+    thread_slice_ends: std::collections::BTreeMap<detcore::DetTid, usize>,
     /// The record's events, in the run's order.
     events: Vec<detcore_model::schedule::SchedEvent>,
 }
@@ -409,12 +514,22 @@ fn read(path: &Path) -> Recorded {
         switch: record.post_crash().first().copied(),
         switches: record.post_crash().to_vec(),
         slice_ends: reader.size(),
+        thread_slice_ends: reader
+            .all_threads()
+            .into_iter()
+            .map(|tid| {
+                // One entry per slice, the last one included: one more than
+                // the slice ends `size` counts for the thread.
+                let slices = reader.extract_thread_record(&tid).unwrap().as_vec();
+                (tid, slices.len() - 1)
+            })
+            .collect(),
         events: record.schedevents().clone(),
     }
 }
 
-/// SIGABRT's handler forks a child that execs `true`, as debuggerd's handler
-/// starts `crash_dump`, waits for it, computes, and exits without
+/// SIGABRT's handler forks a child that execs [`NOOP`], as debuggerd's
+/// handler starts `crash_dump`, waits for it, computes, and exits without
 /// returning.
 fn abort_handler_execs() {
     extern "C" fn on_abort(_: libc::c_int) {
@@ -422,11 +537,7 @@ fn abort_handler_execs() {
         unsafe {
             let child = libc::fork();
             if child == 0 {
-                let path = c"/bin/true";
-                let argv = [path.as_ptr(), std::ptr::null()];
-                let envp = [std::ptr::null()];
-                libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-                libc::_exit(127);
+                exec_noop();
             }
             let mut status = 0;
             libc::waitpid(child, &mut status, 0);
@@ -467,6 +578,34 @@ fn a_crash_handler_that_execs_switches_to_the_post_crash_bound() {
         with + 5 <= without,
         "slice ends with the switch {with}, without {without}"
     );
+    // The same for the crashed thread alone, whose handler runs the loop.
+    // The child is in the crash's lineage, so its startup runs at the
+    // post-crash bound too and can make the gap above by itself; a switch
+    // that reached only the child would leave this thread's slices as they
+    // were. Each run's crashed thread is the one its record shows receiving
+    // SIGABRT: the two runs need not number their threads alike.
+    use detcore_model::schedule::Op;
+    let crashed_thread = |run: &Recorded| {
+        let crashed = run
+            .events
+            .iter()
+            .find(|event| matches!(event.op, Op::SignalReceived(sig) if sig.0 == libc::SIGABRT))
+            .expect("the record holds the SIGABRT's delivery")
+            .dettid;
+        let slice_ends = run
+            .thread_slice_ends
+            .get(&crashed)
+            .copied()
+            .expect("the record holds the crashed thread's slices");
+        (crashed, slice_ends)
+    };
+    let (crashed, with) = crashed_thread(&switched);
+    assert_eq!(crashed, switch.dtid, "{switch:?}");
+    let (_, without) = crashed_thread(&off);
+    assert!(
+        with + 5 <= without,
+        "slice ends of the crashed thread with the switch {with}, without {without}"
+    );
 }
 
 /// SIGSEGV from a real fault, which the handler resolves (it makes the page
@@ -494,7 +633,7 @@ fn resolved_fault_then_exec() {
         libc::signal(libc::SIGSEGV, on_segv as *const () as libc::sighandler_t);
         assert_eq!(std::ptr::read_volatile(page as *const u8), 0);
     }
-    let status = std::process::Command::new("/bin/true").status().unwrap();
+    let status = noop_command().status().unwrap();
     assert!(status.success());
 }
 
@@ -588,7 +727,7 @@ fn handler_waits_while_sibling_execs() {
         while !IN_HANDLER.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let status = std::process::Command::new("/bin/true").status().unwrap();
+        let status = noop_command().status().unwrap();
         assert!(status.success());
         // SAFETY: wakes the faulting thread's handler.
         unsafe {
@@ -666,7 +805,7 @@ fn handler_unblocks_then_sibling_execs() {
         while !UNBLOCKING.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let status = std::process::Command::new("/bin/true").status().unwrap();
+        let status = noop_command().status().unwrap();
         assert!(status.success());
     });
     // SAFETY: the read faults; the handler makes the page readable.
@@ -725,7 +864,7 @@ fn pending_realtime_handler_execs() {
     use std::sync::atomic::Ordering;
     static PAGE: AtomicUsize = AtomicUsize::new(0);
     extern "C" fn on_rt(_: libc::c_int) {
-        let status = std::process::Command::new("/bin/true").status().unwrap();
+        let status = noop_command().status().unwrap();
         assert!(status.success());
     }
     extern "C" fn on_segv(_: libc::c_int) {
@@ -818,7 +957,10 @@ fn recovered_then_rdtsc_until_sibling_execs() {
             std::thread::yield_now();
         }
         SEEN.store(TRAPS.load(Ordering::SeqCst), Ordering::SeqCst);
-        let mut program = std::process::Command::new("/bin/cat")
+        let mut program = std::process::Command::new(&noop().exe)
+            .arg("post_crash::a_recovered_handler_followed_by_rdtsc_traps_does_not_switch")
+            .args(["--exact", "--nocapture", "--test-threads=1"])
+            .env(SCENARIO_ENV, "drain_stdin")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -955,7 +1097,7 @@ fn one_of_two_crashed_processes_recovers() {
     PAGE.store(page, Ordering::SeqCst);
     // SAFETY: the read faults; the handler makes the page readable.
     assert_eq!(unsafe { std::ptr::read_volatile(page as *const u8) }, 0);
-    let status = std::process::Command::new("/bin/true").status().unwrap();
+    let status = noop_command().status().unwrap();
     assert!(status.success());
     // SAFETY: ends and reaps the child.
     unsafe {
@@ -1058,11 +1200,7 @@ fn sent_segv_handler_execs() {
         unsafe {
             let child = libc::fork();
             if child == 0 {
-                let path = c"/bin/true";
-                let argv = [path.as_ptr(), std::ptr::null()];
-                let envp = [std::ptr::null()];
-                libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-                libc::_exit(127);
+                exec_noop();
             }
             let mut status = 0;
             libc::waitpid(child, &mut status, 0);
