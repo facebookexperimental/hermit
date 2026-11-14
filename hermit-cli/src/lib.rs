@@ -423,6 +423,32 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              or another `HERMIT_INTERNAL_FAILURE class=` for Hermit failing.
 //   128 + N    analyze stopped by signal N (SIGTERM, SIGINT or SIGHUP).
 //
+// External supervision (not an exit status emitted by Hermit itself):
+//   193        safehermit could not verify the required terminal Result of its
+//              registered unit. It emits `safehermit: RESULT UNKNOWN:` and
+//              records `result_capture_state=UNKNOWN` with a reason. An rc-only
+//              consumer must fail closed: this is not a pass, deadline, or
+//              verified guest outcome.
+//   137        One narrowly authenticated safehermit outcome retains the
+//              reporting body's SIGKILL status while the unit Result remains
+//              UNKNOWN. It requires `safehermit: BODY SIGNAL:` and
+//              `body_termination_state=NOT_VERIFIED_BODY_KILLED`. This names
+//              the reporting body's termination, NOT a payload SIGKILL or a
+//              verified unit Result. For this required-capture arbitration
+//              exception, an undelivered marker leaves UNKNOWN status 193
+//              in force unless an independent stronger fact applies. This
+//              does not reinterpret a guest's own legal exit status 137.
+//
+// The typed supervision fields and their source facts take precedence over
+// the number. UNKNOWN also accompanies an authenticated child refusal (122)
+// or child 124 with that run's retained deadline marker; neither creates a
+// wrapper wall breach. A factual wrapper deadline retains its own precedence.
+// 193 is outside the Linux signal-exit band (128 + 1 through 128 + 64); 137 is
+// inside it. Both remain legal guest statuses. No Hermit status is allocated
+// here, and no signal mapping changes. In particular, a guest can itself exit
+// 193: the authenticated typed evidence distinguishes that from supervision
+// UNKNOWN. The number alone cannot do so.
+//
 // ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
 // status, so a guest may return 125 or 127 of its own accord and this table
 // cannot stop it. The table removes GUARANTEED collisions, not possible ones.
@@ -438,12 +464,20 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 // teardown inside hermit, a cell bound set too low, a run that escaped every
 // inner bound -- so `$?` cannot route the reader to any of them.
 //
-// The discriminator is again the marker on stderr, and it is a CONTRACT rather
-// than a diagnostic nicety: `class=run-timeout` for hermit's own bound (which
-// also states the bound in seconds), `HERMIT_RUN_TIMEOUT_FALLBACK` for the
-// unwind failing to complete, `safehermit: bound.wall=` for the cgroup reap.
-// EXIT 124 WITH NO MARKER AT ALL MEANS NO INNER BOUND FIRED -- something outside
-// hermit killed the run -- which is a configuration error and not a slow guest.
+// The discriminator is the fact marker and its recorded source, not 124 alone:
+// `class=run-timeout` names Hermit's own bound (and its duration), and
+// `HERMIT_RUN_TIMEOUT_FALLBACK` names failure to finish the timeout unwind.
+// `safehermit: DEADLINE:` names the external supervisor's latched deadline
+// fact; its wording identifies the source. `safehermit: bound.wall=` is only
+// the pre-launch announcement of an applied bound, NOT evidence that it fired.
+// `safehermit: RESULT UNKNOWN:` and `result_capture_state=UNKNOWN` mean the
+// required supervision result was not verified; they do not assert a timeout.
+// `safehermit: BODY SIGNAL:` with
+// `body_termination_state=NOT_VERIFIED_BODY_KILLED` describes an authenticated
+// reporting-body SIGKILL while that unit Result remains UNKNOWN. It is not a
+// deadline marker and does not establish that the payload was killed.
+// A guest can also exit 124. Missing, undelivered or unreadable evidence is not
+// proof that an inner bound did or did not fire; do not infer it from rc alone.
 // The full picture, including which rung bounds which quantity and the
 // strict-inequality invariant between them, is docs/TIMEOUT_LADDER.md.
 //

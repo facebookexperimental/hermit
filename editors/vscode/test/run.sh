@@ -84,32 +84,69 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# stop_server PID GRACE: wait up to GRACE tenths of a second for a session's
+# These are wrapper supervision facts, never successful guest/debug outcomes.
+# The marker or typed field is sufficient to refuse a contradictory exit 0.
+safehermit_failure_reason() {
+    local log=$1
+    if grep -q '^safehermit: DEADLINE:' "$log"; then
+        printf '%s\n' 'deadline (confirmed by wrapper fact)'
+        return 0
+    fi
+    if grep -Eq '^safehermit: (BODY SIGNAL:|body_termination_state=NOT_VERIFIED_BODY_KILLED$)' "$log"; then
+        printf '%s\n' 'killed (external signal, outcome not verified)'
+        return 0
+    fi
+    if grep -Eq '^safehermit: (RESULT UNKNOWN:|body_termination_state=|result_capture_state=(UNKNOWN|PENDING|PROVISIONAL)$|unit_result=UNKNOWN$)' "$log"; then
+        printf '%s\n' 'supervision outcome not verified'
+        return 0
+    fi
+    return 1
+}
+
+# Retain the real wait status. A successful debug session cannot make a
+# failed or unverified wrapper successful. GRACE=0 already denotes a failed
+# session, so its requested cleanup signal is not a second status failure.
+check_server_result() {
+    local pid=$1 grace=$2 log=$3 status=0 reason
+    wait "$pid" 2>/dev/null || status=$?
+    if reason=$(safehermit_failure_reason "$log"); then
+        echo "FAIL Hermit session: $reason; see $log" >&2
+        return 1
+    fi
+    if [ "$grace" -gt 0 ] && [ "$status" -ne 0 ]; then
+        echo "FAIL Hermit session: wrapper exited $status (outcome not verified); see $log" >&2
+        return 1
+    fi
+    return 0
+}
+
+# stop_server PID GRACE LOG: wait up to GRACE tenths of a second for a session's
 # Hermit process to exit on its own, as it does when the debug session ends;
 # then kill it. After a failed session GRACE is 0: the process is killed at
 # once. Fails if a process with a grace period had to be killed, or if one
 # would not exit even then, so no wait is unbounded.
 stop_server() {
-    local pid=$1 grace=$2
+    local pid=$1 grace=$2 log=$3
     if [ "$grace" -eq 0 ]; then
         kill "$pid" 2>/dev/null || true
     fi
     for _ in $(seq "$grace"); do
         if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true
-            return 0
+            check_server_result "$pid" "$grace" "$log"
+            return $?
         fi
         sleep 0.1
     done
     kill "$pid" 2>/dev/null || true
     for _ in $(seq 100); do
         if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || true
+            local status=0
+            check_server_result "$pid" "$grace" "$log" || status=$?
             if [ "$grace" -gt 0 ]; then
                 echo "run.sh: Hermit process $pid did not exit after the session; killed it" >&2
                 return 1
             fi
-            return 0
+            return "$status"
         fi
         sleep 0.1
     done
@@ -166,7 +203,7 @@ run_code() {
         --extensionDevelopmentPath="$here/.." --extensionTestsPath="$here/index.js" \
         "$work" >"$work/$name-vscode.log" 2>&1 || status=$?
     if [ "$status" -ne 0 ]; then
-        echo "FAIL $name (VS Code exit $status$([ "$status" -ge 124 ] && echo ", timed out after ${trial_timeout} s or killed")); see $work/$name-vscode.log" >&2
+        echo "FAIL $name (VS Code exit $status); see $work/$name-vscode.log" >&2
         return 1
     fi
     if ! check_result "$name" "$expect" "$nonce" 2>"$work/$name-check.log"; then
@@ -204,7 +241,7 @@ else
     grace=0
     failed=1
 fi
-stop_server "$server" "$grace" || failed=1
+stop_server "$server" "$grace" "$work/forward-hermit.log" || failed=1
 
 # run-listen: VS Code connects to hermit run --dap-listen.
 gdb_port=$(free_port)
@@ -227,7 +264,7 @@ else
     grace=0
     failed=1
 fi
-stop_server "$server" "$grace" || failed=1
+stop_server "$server" "$grace" "$work/run-listen-hermit.log" || failed=1
 
 # reverse: VS Code connects to hermit replay --dap-listen.
 rm -rf "${work:?}/recordings"
@@ -235,8 +272,12 @@ record_status=0
 timeout --kill-after=10 "$trial_timeout" \
     "${hermit_cmd[@]}" record start --data-dir "$work/recordings" -- "$work/squares" \
     </dev/null >"$work/record.log" 2>&1 || record_status=$?
+if record_failure=$(safehermit_failure_reason "$work/record.log"); then
+    echo "FAIL reverse: $record_failure; see $work/record.log" >&2
+    exit 1
+fi
 if [ "$record_status" -ne 0 ] || [ ! -s "$work/recordings/last" ]; then
-    echo "FAIL reverse: hermit record start exited $record_status$([ "$record_status" -ge 124 ] && echo ", timed out after ${trial_timeout} s or killed"); see $work/record.log" >&2
+    echo "FAIL reverse: hermit record start exited $record_status; see $work/record.log" >&2
     exit 1
 fi
 recording=$(cat "$work/recordings/last")
@@ -261,6 +302,6 @@ else
     grace=0
     failed=1
 fi
-stop_server "$server" "$grace" || failed=1
+stop_server "$server" "$grace" "$work/reverse-hermit.log" || failed=1
 
 exit "$failed"
