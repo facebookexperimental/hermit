@@ -430,6 +430,23 @@ jobs:
         run: |
           rustup toolchain install --profile minimal
           rustup toolchain list
+      # lint.rustfmt runs scripts/cargo-fmt-pinned.rs, which formats only with the
+      # nightly pinned in ci/rustfmt-toolchain.toml. Its own `rustup run --install
+      # <channel>` installs that nightly without the rustfmt component on this
+      # runner, so run 43527288774 refused with exit 2 ("... has no
+      # .../toolchains/nightly-2026-07-12-x86_64-unknown-linux-gnu/bin/rustfmt").
+      # "Rust components" above adds rustfmt to the default toolchain only. The
+      # channel is read from ci/rustfmt-toolchain.toml, so a bump there needs no
+      # edit here; the version line in the job log is the identity the script
+      # checks. The pinned validation image does not carry this formatter yet:
+      # https://github.com/rrnewton/hermit/issues/5397.
+      - name: Install the pinned formatter toolchain
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' ci/rustfmt-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
+          "$(rustup which --toolchain "$channel" rustfmt)" --version
       # check.script_unit_tests runs the real structured-Nextest fixture.  Installing
       # rust-script alone made that fixture fail with "no such command:
       # nextest" on run 35335623037; the fixture is a test of the production
