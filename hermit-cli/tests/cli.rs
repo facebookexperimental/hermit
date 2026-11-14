@@ -61535,6 +61535,17 @@ enum IsaLink<'a> {
 /// `status`, executing nothing above baseline x86-64, so that a refusal and
 /// a run tell only the declaration apart.
 fn isa_fixture(name: &str, bits: Option<u32>, status: u8, link: IsaLink) -> PathBuf {
+    let mut defines = vec![format!("-DISA_EXIT={status}")];
+    if let Some(bits) = bits {
+        defines.push(format!("-DISA_NEEDED=\"{bits:#x}\""));
+    }
+    nostdlib_fixture("isa_needed.c", name, &defines, link)
+}
+
+/// `hermit-cli/tests/fixtures/isa/<source>`, a program with no C library,
+/// built as `name` in this process's build root with the preprocessor
+/// `defines`, linked `link`.
+fn nostdlib_fixture(source: &str, name: &str, defines: &[String], link: IsaLink) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -61543,10 +61554,7 @@ fn isa_fixture(name: &str, bits: Option<u32>, status: u8, link: IsaLink) -> Path
     let image = build_root.join(name);
     let mut command = Command::new("cc");
     command.args(["-O1", "-nostdlib", "-Wall", "-Wextra", "-Werror"]);
-    command.arg(format!("-DISA_EXIT={status}"));
-    if let Some(bits) = bits {
-        command.arg(format!("-DISA_NEEDED=\"{bits:#x}\""));
-    }
+    command.args(defines);
     match link {
         IsaLink::Static => command.args(["-static", "-fno-pie", "-no-pie"]),
         IsaLink::StaticWithLargeNote => {
@@ -61564,7 +61572,11 @@ fn isa_fixture(name: &str, bits: Option<u32>, status: u8, link: IsaLink) -> Path
             .arg(format!("-Wl,--dynamic-linker={}", interpreter.display())),
     };
     let output = command
-        .arg(repository.join("hermit-cli/tests/fixtures/isa/isa_needed.c"))
+        .arg(
+            repository
+                .join("hermit-cli/tests/fixtures/isa")
+                .join(source),
+        )
         .arg("-o")
         .arg(&image)
         .output()
@@ -62019,6 +62031,418 @@ fn a_v3_profile_runs_an_image_declaring_v3() {
         "{stderr}"
     );
     assert!(!stdout.contains("ran"), "{stdout}");
+}
+
+/// glibc's dynamic loader's exit status after a fatal error. A fixture that
+/// ends as the loader does exits with it as its own status wherever Hermit
+/// does not refuse the run (EXIT-CLASS: guest).
+const GLIBC_LOADER_FATAL_EXIT: i32 = 127;
+
+/// A fixture's own status other than the loader's (EXIT-CLASS: guest).
+const OTHER_GUEST_EXIT: i32 = 1;
+
+/// What glibc's loader writes for `level` before it exits
+/// [`GLIBC_LOADER_FATAL_EXIT`]: the format both the el9 (glibc 2.34) and the
+/// el10 (glibc 2.39) loaders hold, `Fatal glibc error: CPU does not support
+/// x86-64-v%d\n`, filled with the level.
+fn glibc_loader_cpu_message(level: u8) -> String {
+    format!("Fatal glibc error: CPU does not support x86-64-v{level}\n")
+}
+
+/// An image naming as its program interpreter `loader_cpu_abort.c` built
+/// with `defines`, and that interpreter.
+fn image_with_aborting_loader(name: &str, defines: &[&str]) -> (PathBuf, PathBuf) {
+    let defines: Vec<String> = defines.iter().map(|define| define.to_string()).collect();
+    let loader = nostdlib_fixture(
+        "loader_cpu_abort.c",
+        &format!("{name}-loader"),
+        &defines,
+        IsaLink::Interpreter,
+    );
+    let image = isa_fixture(name, None, 0, IsaLink::Interpreted(&loader));
+    (image, loader)
+}
+
+/// `hermit run --cpu-profile x86-64-v2 <extra> -- <program>`.
+fn run_under_v2(extra: &[&str], program: &Path) -> (Option<i32>, String, String) {
+    let mut args = vec!["run", "--cpu-profile", "x86-64-v2"];
+    args.extend_from_slice(extra);
+    args.extend(["--", program.to_str().unwrap()]);
+    isa_run(&args)
+}
+
+/// A program interpreter that ends as glibc's loader ends on a CPU below the
+/// x86-64 level it was built for, writing the loader's message to stderr and
+/// exiting 127 before it opens anything or tries to set the thread pointer,
+/// is refused by policy (exit 122) and by name, plain and under --verify,
+/// whether it writes with writev, as glibc does, or with write, and after an
+/// arch_prctl other than ARCH_SET_FS, as the el9 loader queries CET before
+/// its level check. In a plain run its own line still reaches stderr. The
+/// el10 loader names x86-64-v3, above the profile; the el9 loader names
+/// x86-64-v2, which only a defect in Hermit's CPU table could fail
+/// (https://github.com/rrnewton/hermit/issues/4695).
+#[test]
+fn a_loaders_cpu_level_abort_is_refused_by_name() {
+    for (name, defines, level) in [
+        ("loader-abort-v3", &["-DABORT_LEVEL=\"3\""][..], 3),
+        (
+            "loader-abort-v3-write",
+            &["-DABORT_LEVEL=\"3\"", "-DABORT_WITH_WRITE"][..],
+            3,
+        ),
+        ("loader-abort-v2", &["-DABORT_LEVEL=\"2\""][..], 2),
+        // An arch_prctl other than ARCH_SET_FS before the message does not
+        // end the loader's startup: the el9 loader's CET query (0x3001)
+        // comes before its level check; ARCH_SET_GS (0x1001) is no thread
+        // pointer glibc sets.
+        (
+            "loader-abort-v3-cet-query",
+            &["-DABORT_LEVEL=\"3\"", "-DABORT_ARCH_PRCTL=0x3001"][..],
+            3,
+        ),
+        (
+            "loader-abort-v3-set-gs",
+            &["-DABORT_LEVEL=\"3\"", "-DABORT_ARCH_PRCTL=0x1001"][..],
+            3,
+        ),
+    ] {
+        let (image, loader) = image_with_aborting_loader(name, defines);
+        let message = glibc_loader_cpu_message(level);
+        let refusal = format!(
+            "--cpu-profile x86-64-v2 refused: the program interpreter {} of {} stopped before \
+             the program started, printing \"{}\" and exiting 127; ",
+            loader.display(),
+            image.display(),
+            message.trim_end(),
+        );
+        let why = if level == 3 {
+            "the x86-64-v2 CPU this profile presents is below the x86-64-v3 it was built for; \
+             rerun with --cpu-profile x86-64-v3, on a host that qualifies for it"
+        } else {
+            "although this profile presents x86-64-v2, which satisfies x86-64-v2: Hermit's CPU \
+             table lacks a feature the loader checks, so please report this message"
+        };
+        for extra in [&[][..], &["--verify"][..]] {
+            let (status, stdout, stderr) = run_under_v2(extra, &image);
+            let context = format!("{name} {extra:?}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{context}");
+            assert!(stderr.contains("HERMIT_POLICY_REFUSAL"), "{context}");
+            // A plain run passes the loader's own line through. --verify
+            // captures each run's guest output for its comparison, which a
+            // refused run never reaches, so only the refusal is printed.
+            if extra.is_empty() {
+                assert!(stderr.contains(&message), "{context}");
+            }
+            assert!(stderr.contains(&format!("{refusal}{why}")), "{context}");
+            assert!(!stdout.contains("ran"), "{context}");
+        }
+    }
+}
+
+/// Asserts that `hermit run --cpu-profile <profile> <extra> -- <program>`
+/// kept the program's own status and stdout, with glibc's x86-64-v3 loader
+/// message, which it wrote itself, on stderr, and neither Hermit's typed
+/// refusal nor this refusal's words there (an unrelated "refused" on stderr
+/// is not this check's).
+fn assert_cpu_message_kept(
+    what: &str,
+    profile: &str,
+    extra: &[&str],
+    program: &Path,
+    status: i32,
+    out: &str,
+) {
+    let mut args = vec!["run", "--cpu-profile", profile];
+    args.extend_from_slice(extra);
+    args.extend(["--", program.to_str().unwrap()]);
+    let (actual, stdout, stderr) = isa_run(&args);
+    let context = format!("{what} {args:?}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!((actual, stdout.as_str()), (Some(status), out), "{context}");
+    assert!(stderr.contains(&glibc_loader_cpu_message(3)), "{context}");
+    assert!(
+        !stderr.contains("HERMIT_POLICY_REFUSAL")
+            && !stderr.contains("stopped before the program started"),
+        "{context}"
+    );
+}
+
+/// The debug log of `hermit run --cpu-profile <profile> -- <program>`, which
+/// must exit `status`, having armed the program interpreter's startup watch
+/// and ended it at an `ARCH_SET_FS` attempt.
+fn assert_watch_ended_at_set_fs(what: &str, profile: &str, program: &Path, status: i32) -> String {
+    let args = [
+        "--log=debug",
+        "run",
+        "--cpu-profile",
+        profile,
+        "--",
+        program.to_str().unwrap(),
+    ];
+    let (actual, _, stderr) = isa_run(&args);
+    let context = format!("{what} {args:?}:\nstderr:\n{stderr}");
+    assert_eq!(actual, Some(status), "{context}");
+    assert!(
+        stderr.contains("startup watch armed")
+            && stderr.contains("startup watch ended at SetsThreadPointer"),
+        "{context}"
+    );
+    stderr
+}
+
+/// Only a program interpreter's abort is refused, never another program
+/// writing the same bytes: an interpreter that writes the loader's message
+/// and then runs on, or exits with another status; one that writes it and
+/// exits 127 after an `ARCH_SET_FS` attempt, successful or not; a statically
+/// linked image, which has no interpreter, writing it to stderr before it
+/// opens anything and exiting 127; and the abort itself under
+/// --no-virtualize-cpuid, where the guest sees the host's CPUID. Each keeps
+/// its own status and output
+/// (https://github.com/rrnewton/hermit/issues/4695). The debug log shows the
+/// two `ARCH_SET_FS` cases end the watch there. A dynamically linked
+/// program's own message is in `a_dynamic_programs_own_cpu_message_is_kept`.
+#[test]
+fn only_a_loaders_cpu_level_abort_is_refused() {
+    const V2: &str = "x86-64-v2";
+    let (runs_on, _) =
+        image_with_aborting_loader("loader-message-then-runs", &["-DABORT_THEN_RUN"]);
+    assert_cpu_message_kept(
+        "the message, then the program",
+        V2,
+        &[],
+        &runs_on,
+        0,
+        "ran\n",
+    );
+    let (exits_other, _) = image_with_aborting_loader("loader-message-exit-1", &["-DABORT_EXIT=1"]);
+    assert_cpu_message_kept(
+        "the message, then exit 1",
+        V2,
+        &[],
+        &exits_other,
+        OTHER_GUEST_EXIT,
+        "",
+    );
+    // The loader's startup is over at its ARCH_SET_FS attempt, whether the
+    // call succeeds or, with an address the kernel refuses (EPERM), fails.
+    for (name, defines) in [
+        (
+            "loader-set-fs-then-message",
+            &["-DABORT_ARCH_PRCTL=0x1002"][..],
+        ),
+        (
+            "loader-failed-set-fs-then-message",
+            &["-DABORT_ARCH_PRCTL=0x1002", "-DABORT_ARCH_PRCTL_FAILS"][..],
+        ),
+    ] {
+        let (image, _) = image_with_aborting_loader(name, defines);
+        assert_cpu_message_kept(name, V2, &[], &image, GLIBC_LOADER_FATAL_EXIT, "");
+        assert_watch_ended_at_set_fs(name, V2, &image, GLIBC_LOADER_FATAL_EXIT);
+    }
+    let static_image = nostdlib_fixture(
+        "loader_cpu_abort.c",
+        "static-loader-message",
+        &[],
+        IsaLink::Static,
+    );
+    assert_cpu_message_kept(
+        "a static image",
+        V2,
+        &[],
+        &static_image,
+        GLIBC_LOADER_FATAL_EXIT,
+        "",
+    );
+    let (aborts, _) = image_with_aborting_loader("loader-abort-host-cpuid", &[]);
+    assert_cpu_message_kept(
+        "the abort with CPUID not virtualized",
+        V2,
+        &["--no-virtualize-cpuid"],
+        &aborts,
+        GLIBC_LOADER_FATAL_EXIT,
+        "",
+    );
+}
+
+/// The x86-64 ABI's glibc program interpreter, which the dynamically linked
+/// fixtures here name.
+const HOST_LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
+
+/// `hermit-cli/tests/fixtures/isa/<source>` built as `name` in this process's
+/// build root by the C compiler, with `flags` before the source and `link`
+/// after it.
+fn cc_fixture(source: &str, name: &str, flags: &[&str], link: &[&str]) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("isa-needed");
+    fs::create_dir_all(&build_root).expect("failed to create the ISA fixture directory");
+    let program = build_root.join(name);
+    let output = Command::new("cc")
+        .args(["-O1", "-Wall", "-Wextra", "-Werror"])
+        .args(flags)
+        .arg(
+            repository
+                .join("hermit-cli/tests/fixtures/isa")
+                .join(source),
+        )
+        .args(link)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to compile {source}: {error}"));
+    assert!(
+        output.status.success(),
+        "{source} compilation failed:\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    program
+}
+
+/// The CPU profile under which this host's glibc loader starts a program,
+/// so that the program's own main runs: x86-64-v2 for a loader built for it
+/// (el9's), x86-64-v3 for one built for x86-64-v3 (el10's), whose genuine
+/// abort under x86-64-v2 is refused by name. Decided with a program with no C
+/// library that names the host loader and only writes "ran\n". `None` where
+/// the loader needs x86-64-v3 and this host does not qualify for it, as
+/// `v3_run_or_refusal` decides: a named skip for `test`, or a failure under
+/// HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
+fn host_loader_profile(test: &str) -> Option<&'static str> {
+    let dynamic_linker = format!("-Wl,--dynamic-linker={HOST_LOADER}");
+    let ran = cc_fixture(
+        "isa_needed.c",
+        "host-loader-ran",
+        &[
+            "-nostdlib",
+            "-DISA_EXIT=0",
+            "-fPIE",
+            "-pie",
+            dynamic_linker.as_str(),
+        ],
+        &[],
+    );
+    let run =
+        |profile: &str| isa_run(&["run", "--cpu-profile", profile, "--", ran.to_str().unwrap()]);
+    let (status, stdout, stderr) = run("x86-64-v2");
+    if (status, stdout.as_str()) == (Some(0), "ran\n") {
+        return Some("x86-64-v2");
+    }
+    assert!(
+        status == Some(HERMIT_POLICY_REFUSAL_EXIT)
+            && stderr.contains(
+                "stopped before the program started, printing \"Fatal glibc error: CPU does \
+                 not support x86-64-v3\""
+            ),
+        "{HOST_LOADER} neither started under x86-64-v2 nor aborted for x86-64-v3: \
+         {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    v3_run_or_refusal(test, || {
+        let (status, stdout, stderr) = run("x86-64-v3");
+        (status, stdout, stderr, ())
+    })
+    .map(|(stdout, stderr, ())| {
+        assert_eq!(stdout, "ran\n", "{stderr}");
+        "x86-64-v3"
+    })
+}
+
+/// A dynamically linked program that prints the loader's message from its
+/// own main and exits 127 keeps that exit, with neither refusal marker: an
+/// ordinary C program, which opens and maps its C library first, and one
+/// with no C library, whose only library is the loader, so that nothing is
+/// opened or mapped, printing it through the loader's own
+/// `_dl_fatal_printf`, which writes it and exits 127 from the loader's code.
+/// That one is told from the loader's abort only by the loader's
+/// `ARCH_SET_FS` attempt before its main, which its debug log shows ended the
+/// watch. Main proves it ran by writing "main\n" to stdout; the program
+/// without a C library is also run without that write, so that every system
+/// call it makes comes from the loader's code, as in the loader's own abort.
+/// Each runs under the profile this host's loader starts programs under, so
+/// that main is reached (`host_loader_profile`); the debug log's configuration
+/// shows that profile, and under x86-64-v3 that it was admitted, with the
+/// host facts it binds, which an x86-64-v2 run's never has
+/// (https://github.com/rrnewton/hermit/issues/4695).
+#[test]
+fn a_dynamic_programs_own_cpu_message_is_kept() {
+    let Some(profile) = host_loader_profile("a_dynamic_programs_own_cpu_message_is_kept") else {
+        return;
+    };
+    let from_main = cc_fixture(
+        "loader_message_from_main.c",
+        "loader-message-from-main",
+        &[],
+        &[],
+    );
+    assert_cpu_message_kept(
+        "a dynamically linked program's main",
+        profile,
+        &[],
+        &from_main,
+        GLIBC_LOADER_FATAL_EXIT,
+        "main\n",
+    );
+    let dynamic_linker = format!("-Wl,--dynamic-linker={HOST_LOADER}");
+    for (name, marker, stdout) in [
+        (
+            "loader-fatal-printf-from-main-marked",
+            Some("-DMAIN_MARKER"),
+            "main\n",
+        ),
+        ("loader-fatal-printf-from-main", None, ""),
+    ] {
+        let mut flags = vec!["-fPIE", "-pie", "-nostdlib"];
+        flags.extend(marker);
+        let program = cc_fixture(
+            "loader_fatal_printf_from_main.c",
+            name,
+            &flags,
+            &[HOST_LOADER, dynamic_linker.as_str()],
+        );
+        // It names the host loader, and needs no library but that loader.
+        let readelf = Command::new("readelf")
+            .args(["-W", "-l", "-d"])
+            .arg(&program)
+            .output()
+            .expect("failed to run readelf");
+        let elf = String::from_utf8_lossy(&readelf.stdout);
+        assert!(
+            elf.contains(&format!("[Requesting program interpreter: {HOST_LOADER}]")),
+            "{name}:\n{elf}"
+        );
+        let needed: Vec<&str> = elf
+            .lines()
+            .filter(|line| line.contains("(NEEDED)"))
+            .collect();
+        assert!(
+            needed.len() == 1 && needed[0].trim_end().ends_with("[ld-linux-x86-64.so.2]"),
+            "{name}:\n{elf}"
+        );
+        assert_cpu_message_kept(
+            name,
+            profile,
+            &[],
+            &program,
+            GLIBC_LOADER_FATAL_EXIT,
+            stdout,
+        );
+        let log = assert_watch_ended_at_set_fs(name, profile, &program, GLIBC_LOADER_FATAL_EXIT);
+        // The configuration the guest runs under, as Detcore logs it at
+        // debug: under x86-64-v3 it carries the host facts only v3 admission
+        // binds, which shows the profile was admitted (the admission's own
+        // info line is written before the run's log starts); under x86-64-v2
+        // it names that profile and binds no host facts.
+        let (named, bound) = if profile == "x86-64-v3" {
+            (("cpu_profile: X86_64V3", "cpu_profile_host: Some("), true)
+        } else {
+            (("cpu_profile: X86_64V2", "cpu_profile_host: None"), false)
+        };
+        assert!(
+            log.contains(named.0)
+                && log.contains(named.1)
+                && log.contains("cpu_profile: X86_64V3") == bound
+                && log.contains("cpu_profile_host: Some(") == bound,
+            "{name} under {profile}:\n{log}"
+        );
+    }
 }
 
 /// `--cpu-profile auto` (opt-in, never the default) runs the lowest named

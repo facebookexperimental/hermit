@@ -71,6 +71,9 @@ mod io_buffers;
 mod iovecs;
 #[allow(unused)]
 mod ivar;
+// Its refusal runs only where CPU profiles do (x86-64).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+mod loader_cpu_abort;
 pub mod logdiff;
 pub mod machine;
 mod memory;
@@ -6186,6 +6189,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     delivered_since_request: false,
                     returned_from_sigreturn: false,
                     delivery_entered: false,
+                    loader_cpu_abort: None,
                     // A child starts with no announcement: its parent
                     // settles its own before it returns from the clone.
                     signal_announcements: Vec::new(),
@@ -6478,6 +6482,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
                 .await;
+        }
+        // A loader that declares nothing can still be built for more than
+        // the profile presents, and say so only by exiting 127 with glibc's
+        // message: watch this exec's interpreter for exactly that abort, to
+        // refuse it by name instead (`crate::loader_cpu_abort`). Every exec
+        // replaces the previous image's watch, or ends it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let watch = self.loader_cpu_abort_watch(guest);
+            guest.thread_state_mut().loader_cpu_abort = watch;
         }
         // Exec gives the task filesystem information of its own
         // (`unshare_fs_struct`): a root it shared through CLONE_FS is now its
@@ -6820,6 +6834,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Before anything this callback changes: the slice ends a lone thread
         // ran past came first (`catch_up_lone_slice_ends`).
         self.catch_up_lone_slice_ends(guest).await;
+        // During a program interpreter's startup, each call advances the
+        // watch for its CPU-level abort, which ends the run with a refusal
+        // at the loader's exit (`crate::loader_cpu_abort`). The call is then
+        // handled as it would be. Boxed: it runs for a few calls per exec,
+        // and must not grow this future (`hot_path_futures_stay_small`).
+        #[cfg(target_arch = "x86_64")]
+        if guest.thread_state().loader_cpu_abort.is_some() {
+            Box::pin(self.watch_loader_cpu_abort(guest, &call)).await;
+        }
         #[cfg(feature = "dispatch-observer")]
         if let Some(observer) = dispatch_observer::installed() {
             // This is the genuine incoming event. An entry record does not

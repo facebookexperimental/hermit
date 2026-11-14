@@ -1828,6 +1828,113 @@ impl<T: RecordOrReplay> Detcore<T> {
         ))
     }
 
+    /// The watch [`crate::loader_cpu_abort`] keeps over the program
+    /// interpreter the calling thread's exec just loaded, or `None` where it
+    /// keeps none. Kept under the conditions of [`Self::isa_refusal`] (a
+    /// profile with a fixed x86-64 level, whose CPUID Detcore answers for
+    /// this image, and no declared launcher), and only where the exec loaded
+    /// an interpreter (`AT_BASE` set) whose mappings the process's maps show:
+    /// a statically linked program is never watched. Like
+    /// [`Self::isa_refusal`] it reads the process's own procfs objects, so
+    /// it keeps none where guest threads are not host tasks (KVM).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn loader_cpu_abort_watch<G: Guest<Self>>(
+        &self,
+        guest: &G,
+    ) -> Option<crate::loader_cpu_abort::Watch> {
+        self.cfg.cpu_profile.x86_64_level()?;
+        if !self.cfg.virtualize_cpuid || !guest.has_cpuid_interception() || self.declares_launcher()
+        {
+            return None;
+        }
+        let directory = guest_task_objects_procfs(&self.cfg.backend, guest.tid().as_raw())?;
+        let base = crate::util::raw_read_file(&directory.join("auxv"))
+            .ok()
+            .and_then(|auxv| crate::exec_record::auxv_entry(&auxv, libc::AT_BASE))
+            .filter(|&base| base != 0)?;
+        let maps = crate::util::raw_read_file(&directory.join("maps")).ok()?;
+        let (start, end, loader) = crate::exec_record::image_mapping_range(&maps, base)?;
+        let executable = crate::util::raw_read_link(&directory.join("exe"))
+            .map_or_else(|_| "?".into(), |path| path.display().to_string());
+        let watch = crate::loader_cpu_abort::Watch {
+            start,
+            end,
+            loader: String::from_utf8_lossy(&loader).into_owned(),
+            executable,
+            printed: None,
+        };
+        tracing::debug!(
+            "[detcore] the program interpreter {} of {}: startup watch armed for its CPU-level \
+             abort, over {:#x}..{:#x}",
+            watch.loader,
+            watch.executable,
+            watch.start,
+            watch.end
+        );
+        Some(watch)
+    }
+
+    /// Advances the calling thread's loader watch
+    /// ([`crate::loader_cpu_abort::Watch::step`]) by the system call `call`
+    /// it is entering, from the instruction address its registers hold, and
+    /// refuses the run (exit 122) at the `exit_group(127)` that completes
+    /// its loader's CPU-level abort. The call itself is otherwise handled as
+    /// it would be: a `write` of the loader's message reaches standard error
+    /// unchanged. Called only while a watch is kept, which is from an exec
+    /// to the loader's `arch_prctl(ARCH_SET_FS)`, its first file open or
+    /// mapping, or its first system call from outside its own mappings: a few
+    /// calls per exec.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn watch_loader_cpu_abort<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) {
+        use crate::loader_cpu_abort::Step;
+        let Some(watch) = guest.thread_state().loader_cpu_abort.clone() else {
+            return;
+        };
+        let address = guest.regs().await.rip;
+        let written = match call {
+            Syscall::Write(w) if w.fd() == libc::STDERR_FILENO => Some(
+                crate::loader_cpu_abort::read_write(&guest.memory(), w.buf(), w.len()),
+            ),
+            Syscall::Writev(w) if w.fd() == libc::STDERR_FILENO => Some(
+                crate::loader_cpu_abort::read_writev(&guest.memory(), w.iov(), w.len()),
+            ),
+            _ => None,
+        };
+        let event =
+            crate::loader_cpu_abort::classify(call, written.as_ref().map(|bytes| bytes.as_deref()));
+        match watch.step(address, event) {
+            Step::Keep => {}
+            Step::Clear => {
+                tracing::debug!(
+                    "[detcore] the program interpreter {}'s startup watch ended at {event:?} \
+                     from {address:#x}",
+                    watch.loader
+                );
+                guest.thread_state_mut().loader_cpu_abort = None;
+            }
+            Step::Printed(level) => {
+                if let Some(watch) = guest.thread_state_mut().loader_cpu_abort.as_mut() {
+                    watch.printed = Some(level);
+                }
+            }
+            Step::Refuse(level) => {
+                use std::io::Write as _;
+                let message = watch.refusal(self.cfg.cpu_profile, level);
+                tracing::error!("{message}");
+                let _ = writeln!(crate::util::RetryingStderr, "{message}");
+                crate::tool_global::unrecoverable_shutdown(
+                    guest,
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                )
+                .await;
+            }
+        }
+    }
+
     /// Check Detcore's model of the program break for the image an exec just
     /// ran (`Self::modeled_start_brk`) against the kernel's `start_brk`
     /// (`/proc/<pid>/stat` field 47), and log the outcome

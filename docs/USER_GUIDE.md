@@ -1615,7 +1615,15 @@ a preemption, so a run can be slower than with one CPU.
 #### The x86-64-v3 CPU profile
 
 By default every guest sees the same x86-64-v2 CPU, so software built for
-x86-64-v3 (CentOS Stream 10's glibc, for example) refuses to start.
+x86-64-v3 (CentOS Stream 10's glibc, for example) refuses to start. Its
+loader prints `Fatal glibc error: CPU does not support x86-64-v3` and exits
+127 before it opens any library or first tries to set the thread pointer
+(`arch_prctl(ARCH_SET_FS)`). On the ptrace backend with virtual CPUID, Hermit
+recognises exactly that abort and refuses the run by name instead (exit 122),
+naming the loader and `--cpu-profile x86-64-v3`. A program that prints the
+same line itself, even through the loader's own code once the loader has
+started it, keeps its exit
+(<https://github.com/rrnewton/hermit/issues/4695>).
 `--cpu-profile x86-64-v3`, on `hermit run` and `hermit record start`, adds the
 v3 features: AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE and XSAVE. RDRAND, RDSEED,
 TSX and AVX-512 stay hidden (<https://github.com/rrnewton/hermit/issues/4243>).

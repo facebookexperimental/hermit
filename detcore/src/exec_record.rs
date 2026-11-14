@@ -740,6 +740,48 @@ pub fn first_image_mapping(maps: &[u8], bias: u64) -> Option<(u64, Vec<u8>)> {
         .min_by_key(|&(start, _)| start)
 }
 
+/// The extent of the image whose first segment [`first_image_mapping`] finds
+/// at or above `bias` in `maps`, with its pathname: from that mapping's start
+/// to the end of the last mapping of the same file (the same inode and
+/// pathname, as [`first_image_mapping`] matches it) at or above that start.
+/// Every instruction the image's code executes lies in this range. Its
+/// anonymous mappings (`.bss`) are not counted: no code runs there.
+pub fn image_mapping_range(maps: &[u8], bias: u64) -> Option<(u64, u64, Vec<u8>)> {
+    let mappings: Vec<(u64, u64, u64, u64, Vec<u8>)> = maps
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.splitn(6, |&byte| byte == b' ');
+            let range = std::str::from_utf8(fields.next()?).ok()?;
+            let (start, end) = range.split_once('-')?;
+            let start = u64::from_str_radix(start, 16).ok()?;
+            let end = u64::from_str_radix(end, 16).ok()?;
+            let _permissions = fields.next()?;
+            let offset = u64::from_str_radix(std::str::from_utf8(fields.next()?).ok()?, 16).ok()?;
+            let _device = fields.next()?;
+            let inode: u64 = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+            let path = fields
+                .next()
+                .unwrap_or_default()
+                .trim_ascii_start()
+                .to_vec();
+            (inode != 0).then_some((start, end, offset, inode, path))
+        })
+        .collect();
+    let (first, _, _, inode, path) = mappings
+        .iter()
+        .filter(|&&(start, _, offset, _, _)| start >= bias && offset == 0)
+        .min_by_key(|&&(start, ..)| start)?
+        .clone();
+    let end = mappings
+        .iter()
+        .filter(|(start, _, _, other_inode, other_path)| {
+            *start >= first && *other_inode == inode && *other_path == path
+        })
+        .map(|&(_, end, ..)| end)
+        .max()?;
+    Some((first, end, path))
+}
+
 /// The objects an exec ran, each `(what, declaration)` for
 /// [`first_needing_above`]: the executable, and its program interpreter
 /// wherever the kernel loaded one (`loader` is `Some` where `AT_BASE` is
@@ -1536,6 +1578,36 @@ mod tests {
             Some((0x7f00_0001_0000, b"/lib/ld so".to_vec()))
         );
         assert_eq!(first_image_mapping(maps, 0x7f00_0002_0000), None);
+    }
+
+    #[test]
+    fn an_images_mapping_range_spans_its_segments_and_nothing_else() {
+        // A loader's five segments with its anonymous .bss between them and
+        // a library after it; another file's mapping with the loader's
+        // inode on another path does not extend it.
+        let maps =
+            b"7f0000000000-7f0000001000 r--p 00000000 fd:01 99 /lib64/ld-linux-x86-64.so.2\n\
+                     7f0000001000-7f0000027000 r-xp 00001000 fd:01 99 /lib64/ld-linux-x86-64.so.2\n\
+                     7f0000027000-7f0000031000 r--p 00027000 fd:01 99 /lib64/ld-linux-x86-64.so.2\n\
+                     7f0000032000-7f0000034000 r--p 00031000 fd:01 99 /lib64/ld-linux-x86-64.so.2\n\
+                     7f0000034000-7f0000036000 rw-p 00033000 fd:01 99 /lib64/ld-linux-x86-64.so.2\n\
+                     7f0000036000-7f0000037000 rw-p 00000000 00:00 0 \n\
+                     7f0000040000-7f0000041000 r--p 00000000 fd:01 99 /other/ld.so\n\
+                     555555554000-555555555000 r--p 00000000 fd:01 7 /usr/bin/true\n";
+        assert_eq!(
+            image_mapping_range(maps, 0x7f00_0000_0000),
+            Some((
+                0x7f00_0000_0000,
+                0x7f00_0003_6000,
+                b"/lib64/ld-linux-x86-64.so.2".to_vec()
+            ))
+        );
+        // Above the loader, the next image is the other file.
+        assert_eq!(
+            image_mapping_range(maps, 0x7f00_0000_1000),
+            Some((0x7f00_0004_0000, 0x7f00_0004_1000, b"/other/ld.so".to_vec()))
+        );
+        assert_eq!(image_mapping_range(maps, 0x7f00_0005_0000), None);
     }
 
     #[test]

@@ -6933,6 +6933,12 @@ pub struct ThreadState<T> {
     /// (`record_delivery_entry` at the waiter's next syscall entry).
     #[serde(default)]
     pub(crate) delivery_entered: bool,
+    /// The watch over the program interpreter this thread's last exec
+    /// loaded, from that exec to the end of the interpreter's startup
+    /// (`crate::loader_cpu_abort`). `None` for a new thread: no clone happens
+    /// during a loader's startup.
+    #[serde(default)]
+    pub(crate) loader_cpu_abort: Option<crate::loader_cpu_abort::Watch>,
     /// Deliveries announced to `Tool::announce_signal_event` and neither
     /// committed nor withdrawn yet, with what each one's turn left for its
     /// commit. A backend settles every announcement before it returns to
@@ -8040,6 +8046,7 @@ impl<T> ThreadState<T> {
             delivered_since_request: false,
             returned_from_sigreturn: false,
             delivery_entered: false,
+            loader_cpu_abort: None,
             signal_announcements: Vec::new(),
             next_signal_announcement: 0,
             consecutive_continuations: 0,
