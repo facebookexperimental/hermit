@@ -54995,13 +54995,12 @@ fn absent_cpu_node_backlinks(backend: &str) {
          fd access numa_node: ENOENT\n\
          fd open numa_node: ENOENT\n",
     );
-    // KVM refuses every name below a guest's `/proc/self/fd/<n>` with ELOOP
-    // (as it did before Hermit presented a kernel without NUMA), where Linux
-    // walks into the directory.
-    expected.push_str(match backend {
-        "kvm" => "fd stat vendor: ELOOP\n",
-        _ => "fd stat vendor: ok\n",
-    });
+    // A name below a guest's own `/proc/self/fd/<n>` resolves per file
+    // against the presented sysfs: the absent `numa_node` is ENOENT and
+    // the present `vendor` stats as it is, on every backend (the fd-link
+    // spellings through the links directory below are the ones KVM
+    // refuses with ELOOP, where ptrace walks the link as Linux does).
+    expected.push_str("fd stat vendor: ok\n");
     expected.push_str(
         "overwritten stat alias attribute: ENOENT\n\
          overwritten stat alias control: ok\n",
