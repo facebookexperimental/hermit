@@ -160,7 +160,13 @@ fn run_replay_epoch_guest(options: &[String], epoch_env: Option<&str>) -> Output
     command.args([
         "run",
         "--base-env=minimal",
+        // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+        // profile's table. x86-64-v2 is named because it is the one profile
+        // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+        // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+        // crt objects do), and v3 is refused without CPUID virtualization.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     command.args(options).arg("--").arg(replay_epoch_guest());
@@ -214,7 +220,9 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
     command.args([
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see run_replay_epoch_guest.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     command.arg(format!("--epoch={REPEATABLE_EPOCH}")).arg("--");
@@ -251,7 +259,9 @@ fn run_date_at_epoch(epoch: Option<&str>) -> Output {
     command.args([
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see run_replay_epoch_guest.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     if let Some(epoch) = epoch {
@@ -483,7 +493,9 @@ fn replay_without_virtual_time_adopts_the_recorded_epoch() {
         command.env_remove("HERMIT_EPOCH").args([
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see run_replay_epoch_guest.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ]);
         command.args(options).args(["--", "/bin/true"]);

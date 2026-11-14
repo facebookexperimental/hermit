@@ -5703,7 +5703,13 @@ fn assert_readonly_proc_run(namespace_only: bool) {
         // Local networking would require another flags-zero mount for sysfs.
         "--network=host",
         "--max-timeslice=disabled",
+        // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+        // profile's table. x86-64-v2 is named because it is the one profile
+        // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+        // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+        // crt objects do), and v3 is refused without CPUID virtualization.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ]);
     args.extend_from_slice(&["--", "/bin/cat", "/proc/mounts", "/proc/self/status"]);
     let output = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&args));
@@ -5832,7 +5838,9 @@ fn run_verify_uses_readonly_proc_after_permission_denial() {
         "--verify",
         "--network=host",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--",
         "/bin/true",
     ];
@@ -6029,7 +6037,9 @@ fn run_strict_flag_is_accepted_and_runs() {
         "run",
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--",
         "/bin/true",
     ];
@@ -10888,8 +10898,13 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         }
         // The guest shown the vCPU's own CPUID (OSPKE clear, PKU set) reads
         // the same block: the kernel serving it decides, not the CPUID.
-        let (code, nocpuid, stderr) =
-            address_space_listing_with(backend, "files", false, &["--no-virtualize-cpuid"]);
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
+        let (code, nocpuid, stderr) = address_space_listing_with(
+            backend,
+            "files",
+            false,
+            &["--no-virtualize-cpuid", "--cpu-profile=x86-64-v2"],
+        );
         assert_eq!(code, Some(0), "--no-virtualize-cpuid:\n{nocpuid}\n{stderr}");
         assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
         assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
@@ -12377,7 +12392,9 @@ fn check_forged_cpuinfo_placeholder(backend: &str) {
         backend,
         "run",
         "--strict",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--base-env=minimal",
         "--",
         guest.to_str().expect("guest path is UTF-8"),
@@ -22749,7 +22766,9 @@ int main(int argc, char **argv) {
         "--strict",
         "--verify",
         "--verify-strict",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--tmp=/tmp",
         "--base-env=minimal",
@@ -22775,7 +22794,9 @@ int main(int argc, char **argv) {
         "--strict",
         "--verify",
         "--verify-strict",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--tmp=/tmp",
         "--base-env=minimal",
@@ -30605,7 +30626,9 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let mut command = hermit_command_under_host_filter(&[
             "run",
             "--max-timeslice=disabled",
+            // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--",
             "/bin/true",
         ]);
@@ -30636,7 +30659,9 @@ fn run_ptrace_virtual_clock_advances_across_execve() {
         "run",
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--",
         program,
     ];
@@ -30667,7 +30692,9 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
         "run",
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--",
         program,
     ];
@@ -30696,7 +30723,9 @@ fn timed_wait_spread_args(seed: &str, extra: &[&'static str]) -> Vec<String> {
         "--strict",
         "--chaos",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--sleep-registration=first-pass",
     ]
     .iter()
@@ -30803,7 +30832,9 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
             "--strict",
             "--chaos",
             "--max-timeslice=disabled",
+            // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--chaos-timed-wait-spread=10",
             seed_arg.as_str(),
         ];
@@ -30842,7 +30873,9 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
         "--strict",
         "--chaos",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--chaos-timed-wait-spread=10",
         "--sleep-registration=when-chosen",
         "--seed=1",
@@ -30858,7 +30891,9 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
         "--strict",
         "--chaos",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--chaos-timed-wait-spread=10",
         "--seed=1",
         replay_arg.as_str(),
@@ -30891,7 +30926,9 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
         "--strict",
         "--verify",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--",
         program,
     ];
@@ -32535,10 +32572,12 @@ fn output_of(status: Option<std::process::ExitStatus>, stdout: Vec<u8>, stderr: 
 /// The options [`run_uses_readonly_proc_after_permission_denial`] runs with
 /// under [`readonly_proc_command`]: local networking would need another
 /// writable mount, for sysfs.
-const READONLY_PROC_RUN_OPTIONS: [&str; 3] = [
+const READONLY_PROC_RUN_OPTIONS: [&str; 4] = [
     "--network=host",
     "--max-timeslice=disabled",
+    // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
     "--no-virtualize-cpuid",
+    "--cpu-profile=x86-64-v2",
 ];
 
 /// The capped run of
@@ -38796,7 +38835,9 @@ fn log_diff_refuses_two_logs_without_evidence() {
             // Without CPUID faulting Reverie logs one ERROR record per exec;
             // not asking for CPUID interception keeps the log empty on every
             // host.
+            // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--epoch=2026-01-01T00:00:00Z",
             "--",
@@ -50209,7 +50250,9 @@ fn a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux() {
     let strict = [
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ];
     for mode in [&strict[..], &[], &["--no-sequentialize-threads"]] {
         let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
@@ -50277,7 +50320,9 @@ fn a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline() {
     let strict = [
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ];
     for (mode, line) in expected {
         let native = Command::new(guest)
@@ -65444,7 +65489,9 @@ fn kernel_run_sleeps_and_futex_waits_restart_as_on_linux() {
     let strict = [
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ];
     for mode in ["nanosleep", "clock_nanosleep", "abs", "futex", "alrm"] {
         let native = Command::new(guest)
@@ -73615,7 +73662,9 @@ fn check_kernel_run_waits_are_not_ended_by_ignored_signals(
     let strict = [
         "--strict",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see assert_readonly_proc_run.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ];
     for mode in ["chld", "storm", "sigign", "alrm", "exit"] {
         let native = Command::new(guest)

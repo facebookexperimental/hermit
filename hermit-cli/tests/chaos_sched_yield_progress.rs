@@ -214,7 +214,13 @@ fn chaos_output(
         .args([
             "run",
             "--base-env=minimal",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--chaos",
         ])
         .args(chaos_args)
@@ -465,7 +471,9 @@ fn targeted_chaos_preemption_replay_matches_two_pinned_records() {
                 .args([
                     "run",
                     "--base-env=minimal",
+                    // x86-64-v2 beside --no-virtualize-cpuid: see chaos_output.
                     "--no-virtualize-cpuid",
+                    "--cpu-profile=x86-64-v2",
                     "--chaos",
                     "--chaos-target-races",
                     "--max-timeslice=300000",
@@ -511,7 +519,9 @@ fn run_strict_guest(args: &[&str]) {
             "--strict",
             "--verify",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see chaos_output.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--",
         ])
         .arg(guest())
@@ -574,7 +584,9 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
                 "--preemption-timeout=disabled",
                 &option,
                 "--base-env=minimal",
+                // x86-64-v2 beside --no-virtualize-cpuid: see chaos_output.
                 "--no-virtualize-cpuid",
+                "--cpu-profile=x86-64-v2",
                 "--",
             ])
             .arg(guest())

@@ -268,7 +268,13 @@ fn guest_command(
     }
     command
         .args([
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
@@ -2616,7 +2622,9 @@ fn a_vfork_after_an_ofd_lock_is_refused_on_dbt_and_runs_on_ptrace() {
             "run",
             "--strict",
             "--proc=standard",
+            // x86-64-v2 beside --no-virtualize-cpuid: see guest_command.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
@@ -2704,7 +2712,9 @@ fn a_copied_childs_ofd_unlock_is_refused_on_dbt_and_seen_on_ptrace() {
             .args(policy)
             .args([
                 "--proc=standard",
+                // x86-64-v2 beside --no-virtualize-cpuid: see guest_command.
                 "--no-virtualize-cpuid",
+                "--cpu-profile=x86-64-v2",
                 "--max-timeslice=disabled",
                 "--base-env=minimal",
                 "--",

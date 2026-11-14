@@ -123,7 +123,13 @@ fn read_procfs_with(
         "--log=error",
         "run",
         "--base-env=minimal",
+        // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+        // profile's table. x86-64-v2 is named because it is the one profile
+        // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+        // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+        // crt objects do), and v3 is refused without CPUID virtualization.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     if STANDARD_LEVEL_FILES.contains(&path) {
@@ -246,7 +252,9 @@ fn assert_absent(path: &str) {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
             "/bin/cat",
@@ -416,7 +424,9 @@ fn proc_self_cgroup_seeks_as_a_seq_file() {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ])
@@ -471,7 +481,9 @@ fn a_bind_mounted_cgroup_file_reads_as_the_root_cgroup() {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ])
@@ -522,7 +534,9 @@ fn a_bind_of_proc_reads_cgroup_as_root_and_leaves_mountinfo_alone() {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ])
@@ -570,7 +584,9 @@ fn a_bind_mounted_status_file_keeps_its_seeks() {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ])
@@ -1149,7 +1165,9 @@ fn read_procfs_at_first_read(path: &str) -> String {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
         ])
         .arg(format!("--epoch={ACCOUNTING_EPOCH}"))
@@ -1317,7 +1335,9 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--proc=standard",
         "--epoch=2000-12-31T23:59:59+00:00",
@@ -1559,7 +1579,9 @@ fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     if no_virtualize_metadata {
@@ -2081,7 +2103,9 @@ fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
                 "--log=error",
                 "run",
                 "--base-env=minimal",
+                // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
                 "--no-virtualize-cpuid",
+                "--cpu-profile=x86-64-v2",
                 "--max-timeslice=disabled",
                 "--tmp=/tmp",
             ])
@@ -2262,7 +2286,9 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--",
         "/bin/sh",
@@ -2559,7 +2585,9 @@ fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--",
         "/bin/cat",
@@ -2622,7 +2650,9 @@ fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bo
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
         "--tmp=/tmp",
         "--",
@@ -2715,7 +2745,9 @@ fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
         "--log=error",
         "run",
         "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--max-timeslice=disabled",
     ]);
     if no_namespace {
@@ -2765,7 +2797,9 @@ fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
             "--log=error",
             "run",
             "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--no-namespace",
             "--",

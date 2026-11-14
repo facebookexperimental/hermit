@@ -100,7 +100,13 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
             "run",
             "--strict",
             "--verify",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--preemption-timeout=disabled",
             "--base-env=minimal",
             "--",

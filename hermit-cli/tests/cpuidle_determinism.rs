@@ -43,7 +43,13 @@ fn assert_l2(case: &ProgramCase) {
             "run",
             "--strict",
             "--verify",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ])

@@ -212,7 +212,13 @@ fn run_signal_scenario_on_backend(
         command.arg("run");
         command.args([
             "--base-env=minimal",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--",
         ]);
@@ -385,7 +391,9 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
             // committed virtual time; do not strip or quantize their contents.
             "--epoch=2026-01-01T00:00:00.123456789Z",
             "--strict",
+            // x86-64-v2 beside --no-virtualize-cpuid: see run_signal_scenario_on_backend.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
             "--max-timeslice=disabled",
             "--base-env=minimal",
             "--",

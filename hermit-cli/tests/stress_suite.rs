@@ -197,7 +197,13 @@ fn stress_command(category: &str, threads: usize, seed: u64) -> Command {
             "--chaos",
             "--sched-heuristic=random",
             "--max-timeslice=disabled",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ])
         .arg(format!("--seed={seed}"))
         .arg(&stress_binaries().concurrency)
@@ -212,7 +218,9 @@ fn chaos_demo_command(seed: Option<u64>) -> Command {
         "run",
         "--base-env=minimal",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
     ]);
     if let Some(seed) = seed {
         command
@@ -231,7 +239,9 @@ fn chaos_demo_command_targeted(seed: u64, targeted: bool) -> Command {
         "run",
         "--base-env=minimal",
         "--max-timeslice=disabled",
+        // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
         "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
         "--chaos",
         "--sched-heuristic=random",
     ]);
@@ -436,7 +446,9 @@ fn publish_ordering_schedule_command(seed: u64, schedule: &Path) -> Command {
             "--chaos",
             "--sched-heuristic=random",
             "--max-timeslice=disabled",
+            // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ])
         .arg(EPOCH)
         .arg(format!("--seed={seed}"))
@@ -485,7 +497,9 @@ fn schedule_bisect_localizes_publish_ordering_race() {
         .args([
             "--base-env=minimal",
             "--max-timeslice=disabled",
+            // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ])
         .arg(&stress_binaries().concurrency)
         .args(["publish-ordering", "2"]);
@@ -525,7 +539,9 @@ fn cas_search_command(seed: u64, schedule: &Path) -> Command {
             "--chaos",
             "--imprecise-timers",
             "--max-timeslice=10000000",
+            // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ])
         .arg(format!("--seed={seed}"))
         .arg(format!("--record-preemptions-to={}", schedule.display()))
@@ -541,7 +557,9 @@ fn cas_replay_command(seed: u64, schedule: &Path) -> Command {
             "--base-env=minimal",
             "--chaos",
             "--max-timeslice=10000000",
+            // x86-64-v2 beside --no-virtualize-cpuid: see stress_command.
             "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
         ])
         .arg(format!("--seed={seed}"))
         .arg(format!("--replay-preemptions-from={}", schedule.display()))

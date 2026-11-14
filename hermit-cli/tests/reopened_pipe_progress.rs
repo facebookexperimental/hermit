@@ -46,7 +46,17 @@ fn hermit_bash(extra: &[&str], script: &str) -> Command {
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
-        .args(["run", "--base-env=minimal", "--no-virtualize-cpuid"])
+        .args([
+            "run",
+            "--base-env=minimal",
+            // `--no-virtualize-cpuid` serves the host's CPUID, so the guest sees no
+            // profile's table. x86-64-v2 is named because it is the one profile
+            // admitted without CPUID virtualization: unnamed, `--cpu-profile=auto`
+            // picks x86-64-v3 for a guest that declares it (as CentOS 10 binaries and
+            // crt objects do), and v3 is refused without CPUID virtualization.
+            "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
+        ])
         .args(extra)
         .args(["--", "/bin/bash", "-c", script]);
     hermit_test::configure_guest_execution(&mut command);
