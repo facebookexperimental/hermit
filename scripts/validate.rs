@@ -12466,17 +12466,23 @@ fn product_front_door_applies(
 /// written outside the canonical ledger, and it never carries a label. So:
 /// - a labeled run is refused (`--no-label-pr` must be explicit);
 /// - a canonical admission (held lock kind `validate`) is refused;
+/// - a noncanonical admission that is not frozen-validate (held lock kind
+///   `fbexp-validate`) is refused: noncanonical alone never authorizes the
+///   flag, only the frozen kind does;
 /// - no admission at all is refused, since only ci-hub's frozen path sets the flag.
-/// `admission_canonical` is `Some(proof.canonical())` for an admitted run.
+/// `admission_canonical` is `Some(proof.canonical())` and `admission_frozen`
+/// is `Some(proof.frozen())` for an admitted run.
 #[cfg(test)]
 fn frozen_run_refusal(
     frozen_run: bool,
     label_pr: bool,
     no_label_pr_explicit: bool,
     admission_canonical: Option<bool>,
+    admission_frozen: Option<bool>,
 ) -> Option<String> {
-    frozen_run_label_refusal(frozen_run, label_pr, no_label_pr_explicit)
-        .or_else(|| frozen_run_admission_refusal(frozen_run, admission_canonical))
+    frozen_run_label_refusal(frozen_run, label_pr, no_label_pr_explicit).or_else(|| {
+        frozen_run_admission_refusal(frozen_run, admission_canonical, admission_frozen)
+    })
 }
 
 /// The label half of [`frozen_run_refusal`], checked before the product front
@@ -12498,22 +12504,32 @@ fn frozen_run_label_refusal(
     None
 }
 
-/// The admission half of [`frozen_run_refusal`].
+/// The admission half of [`frozen_run_refusal`]. Only the frozen
+/// predicate authorizes the flag; `admission_canonical` only selects
+/// which refusal names the run. In particular a noncanonical,
+/// non-frozen admission (an `fbexp-validate` run) is refused here, where
+/// keying on canonical alone would have accepted it.
 fn frozen_run_admission_refusal(
     frozen_run: bool,
     admission_canonical: Option<bool>,
+    admission_frozen: Option<bool>,
 ) -> Option<String> {
     if !frozen_run {
         return None;
     }
-    match admission_canonical {
-        Some(false) => None,
-        Some(true) => Some(format!(
+    match (admission_canonical, admission_frozen) {
+        (Some(false), Some(true)) => None,
+        (Some(true), _) => Some(format!(
             "{FROZEN_RUN_OPTION} is refused under a canonical validate-lock admission (holder kind \
              \"validate\"): that run's receipt is landing evidence, and {FROZEN_RUN_OPTION} withholds \
              {FROZEN_RUN_WITHHELD_TAG}"
         )),
-        None => Some(format!(
+        (Some(false), Some(false)) => Some(format!(
+            "{FROZEN_RUN_OPTION} is refused under an admission that is noncanonical but not \
+             frozen-validate: only a frozen-validate admission may carry it, and \
+             {FROZEN_RUN_OPTION} withholds {FROZEN_RUN_WITHHELD_TAG}"
+        )),
+        _ => Some(format!(
             "{FROZEN_RUN_OPTION} needs a frozen-validate admission from `ci-hub validate-run \
              --frozen-validate`; none was established for this run"
         )),
@@ -24292,7 +24308,9 @@ fn admitted_receipt_evidence(
 
 /// Ask the parent lock authority whether this exact run is admitted. Ordinary
 /// validation requires canonical current-main authority; frozen validation
-/// requires a fully checked lock holder that remains explicitly noncanonical.
+/// requires a fully checked lock holder that remains explicitly noncanonical;
+/// an fbexp post-land run requires a fully admitted lock holder naming the
+/// main-ancestor floor.
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
 fn validate_lock_status(tool_root: Option<&Path>) -> Result<Vec<u8>, String> {
@@ -24498,6 +24516,46 @@ fn validate_lock_status_reason(
                 ));
             }
         }
+        Some("fbexp-validate") => {
+            // A facebookexperimental post-land run. The lock authority
+            // admits it outright (unlike frozen, which it labels
+            // noncanonical), so every admitted conjunct must hold here,
+            // and only the main-ancestor floor is accepted: the export
+            // target main already contains, as its own floor. The typed
+            // floor is then re-proved from Git in `verify_source`; this
+            // arm only binds the lock response's own claim, so a response
+            // naming any other floor (current-main included) is refused
+            // before a floor is ever selected.
+            if value
+                .get("lock_admissible")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err("the fbexp authority itself reports lock_admissible=false".into());
+            }
+            if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err("the authority itself reports admissible=false".into());
+            }
+            if !value
+                .get("reason_code")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                return Err(format!(
+                    "the authority attached reason_code {}",
+                    shown(value.get("reason_code").and_then(serde_json::Value::as_str))
+                ));
+            }
+            let floor_kind = value
+                .get("admission_floor")
+                .and_then(|floor| floor.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            if floor_kind != Some("main-ancestor") {
+                return Err(format!(
+                    "the fbexp authority carries admission floor kind {}, not \"main-ancestor\"",
+                    shown(floor_kind)
+                ));
+            }
+        }
         Some("frozen-validate") => {
             if value
                 .get("lock_admissible")
@@ -24523,7 +24581,8 @@ fn validate_lock_status_reason(
         }
         _ => {
             return Err(format!(
-                "the held lock is kind {}, not \"validate\" or \"frozen-validate\"",
+                "the held lock is kind {}, not \"validate\", \"fbexp-validate\" or \
+                 \"frozen-validate\"",
                 shown(holder_kind)
             ));
         }
@@ -24721,6 +24780,55 @@ fn product_front_door_bracket() -> Result<(), String> {
         ) {
             return Err(format!(
                 "product front door accepted invalid frozen authority: {label}"
+            ));
+        }
+    }
+
+    // The fbexp post-land authority is admitted only fully admitted and
+    // only with the main-ancestor floor named in the response itself.
+    let mut fbexp_authority = authority.clone();
+    fbexp_authority["holder"]["kind"] = serde_json::json!("fbexp-validate");
+    fbexp_authority["admission_floor"] = serde_json::json!({
+        "kind": "main-ancestor", "sha": commit, "tree": commit, "observed_main_sha": commit
+    });
+    if !validate_lock_status_admits(
+        &encode(&fbexp_authority),
+        commit,
+        host,
+        Some(boot_id),
+        &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+    ) {
+        return Err("product front door refused exact fbexp authority".into());
+    }
+    let mut fbexp_weakened = Vec::new();
+    let mut value = fbexp_authority.clone();
+    value["lock_admissible"] = serde_json::json!(false);
+    fbexp_weakened.push(("not lock-admissible", value));
+    let mut value = fbexp_authority.clone();
+    value["admissible"] = serde_json::json!(false);
+    fbexp_weakened.push(("not admissible", value));
+    let mut value = fbexp_authority.clone();
+    value["reason_code"] = serde_json::json!("owner-not-ancestor");
+    fbexp_weakened.push(("non-null refusal reason", value));
+    let mut value = fbexp_authority.clone();
+    value["admission_floor"]["kind"] = serde_json::json!("current-main");
+    fbexp_weakened.push(("current-main floor", value));
+    let mut value = fbexp_authority.clone();
+    value["state"] = serde_json::json!("free");
+    fbexp_weakened.push(("lock not held", value));
+    let mut value = fbexp_authority.clone();
+    value["canonical_anchor_held"] = serde_json::json!(false);
+    fbexp_weakened.push(("canonical anchor absent", value));
+    for (label, value) in fbexp_weakened {
+        if validate_lock_status_admits(
+            &encode(&value),
+            commit,
+            host,
+            Some(boot_id),
+            &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+        ) {
+            return Err(format!(
+                "product front door accepted invalid fbexp authority: {label}"
             ));
         }
     }
@@ -30846,6 +30954,9 @@ check_build_mode_selection(
         admitted_context
             .as_ref()
             .map(validate_admission::AuthenticatedValidationAdmission::canonical),
+        admitted_context
+            .as_ref()
+            .map(validate_admission::AuthenticatedValidationAdmission::frozen),
     ) {
         eprintln!("validate: {refusal}");
         return RunSummary::refused(
@@ -39171,28 +39282,39 @@ mod frozen_run_tests {
     #[test]
     fn frozen_run_is_refused_wherever_it_could_produce_landing_evidence() {
         // Not requested: never refused.
-        assert_eq!(frozen_run_refusal(false, true, false, Some(true)), None);
+        assert_eq!(
+            frozen_run_refusal(false, true, false, Some(true), Some(false)),
+            None
+        );
         // A canonical full run (admission kind "validate") is refused, even
         // with --no-label-pr.
-        let canonical = frozen_run_refusal(true, false, true, Some(true)).unwrap();
+        let canonical = frozen_run_refusal(true, false, true, Some(true), Some(false)).unwrap();
         assert!(
             canonical.contains("canonical validate-lock admission"),
             "{canonical}"
         );
         // A labeled run is refused, whatever its admission.
-        let labeled = frozen_run_refusal(true, true, false, Some(false)).unwrap();
+        let labeled = frozen_run_refusal(true, true, false, Some(false), Some(true)).unwrap();
         assert!(labeled.contains("--no-label-pr"), "{labeled}");
         // The label default (no explicit --no-label-pr) is refused too.
-        assert!(frozen_run_refusal(true, false, false, Some(false)).is_some());
+        assert!(frozen_run_refusal(true, false, false, Some(false), Some(true)).is_some());
         // No admission at all (off the record, or no parent) is refused.
-        let unadmitted = frozen_run_refusal(true, false, true, None).unwrap();
+        let unadmitted = frozen_run_refusal(true, false, true, None, None).unwrap();
         assert!(
             unadmitted.contains("frozen-validate admission"),
             "{unadmitted}"
         );
+        // An fbexp-validate admission is noncanonical but not frozen, so
+        // it is refused: keying on canonical alone (Some(false)) would
+        // have accepted it.
+        let fbexp = frozen_run_refusal(true, false, true, Some(false), Some(false)).unwrap();
+        assert!(fbexp.contains("not frozen-validate"), "{fbexp}");
         // Exactly one combination is accepted: explicit --no-label-pr under a
-        // noncanonical (frozen-validate) admission.
-        assert_eq!(frozen_run_refusal(true, false, true, Some(false)), None);
+        // noncanonical frozen-validate admission.
+        assert_eq!(
+            frozen_run_refusal(true, false, true, Some(false), Some(true)),
+            None
+        );
     }
 
     /// Guard (b): the exact tag and nothing else, on the real committed plan.

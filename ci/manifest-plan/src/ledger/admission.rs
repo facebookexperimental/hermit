@@ -861,6 +861,16 @@ impl AdmissionIdentity<'_> {
                 if f.sha == self.target_sha
                     && f.tree == self.target_tree
                     && f.observed_main_sha != self.target_sha => {}
+            // A facebookexperimental post-land run of an export commit the
+            // observed export main already contains: the same target's-own
+            // floor under the export authority. Only this floor pairs with
+            // that authority here; the driver re-proves the ancestry from
+            // Git, and [`AdmissionEvidence::is_canonical`] stays false for
+            // the record (it mints no rrnewton landing evidence).
+            ("fbexp-validate", "main-ancestor")
+                if f.sha == self.target_sha
+                    && f.tree == self.target_tree
+                    && f.observed_main_sha != self.target_sha => {}
             ("frozen-validate", "frozen-target")
                 if f.sha == self.target_sha && f.tree == self.target_tree => {}
             _ => return Err("admission floor disagrees with its authority kind/identity".into()),
@@ -1125,8 +1135,16 @@ impl AdmissionEvidence {
     /// A `queue-base` floor is NOT canonical here for the same reason: its
     /// claim is that the floor is merge-base(target, M), a Git fact. A
     /// caller that has Git recomputes that merge base itself.
+    ///
+    /// An `fbexp-validate` record is NOT canonical here either, even with
+    /// a `main-ancestor` floor: canonical is the ordinary `validate`
+    /// authority's alone, and an export run mints no rrnewton landing
+    /// evidence. (Until that authority was admitted, `validate()` alone
+    /// implied the kind; the kind is now stated so the new pairing
+    /// cannot silently widen this verdict.)
     pub fn is_canonical(&self) -> bool {
         self.validate().is_ok()
+            && self.authority().kind == "validate"
             && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
     }
     pub fn log_identity(&self) -> Option<&WorkspaceLocatorV2> {
@@ -1659,6 +1677,49 @@ mod tests {
         let mut pin = ancestor;
         pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
         assert!(refused(pin).contains("pin binding"));
+    }
+
+    /// An fbexp post-land record (`fbexp-validate`) is well formed only
+    /// with the target's own main-ancestor floor, and it is never
+    /// canonical from the record alone: canonical stays the ordinary
+    /// `validate` authority's. No other floor kind pairs with it here.
+    #[test]
+    fn fbexp_main_ancestor_floor_is_well_formed_but_never_canonical() {
+        let mut fbexp = context_v2();
+        fbexp.authority.kind = "fbexp-validate".into();
+        fbexp.floor.kind = "main-ancestor".into();
+        fbexp.floor.sha = fbexp.target_sha.clone();
+        fbexp.floor.tree = fbexp.target_tree.clone();
+        fbexp.pin_bindings[0].base_sha = fbexp.target_sha.clone();
+        fbexp.validate().unwrap();
+        assert!(!AdmissionEvidence::V2(evidence_v2(fbexp.clone())).is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // The floor must still be the target itself under a later main.
+        let mut older = fbexp.clone();
+        older.floor.sha = "a".repeat(40);
+        older.pin_bindings[0].base_sha = older.floor.sha.clone();
+        assert!(refused(older).contains("floor disagrees"));
+        let mut tree = fbexp.clone();
+        tree.floor.tree = "b".repeat(40);
+        assert!(refused(tree).contains("floor disagrees"));
+        let mut tip = fbexp.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // The current-main floor does not pair with this authority here.
+        let mut current = context_v2();
+        current.authority.kind = "fbexp-validate".into();
+        assert!(refused(current).contains("floor disagrees"));
+        // An unknown authority kind pairs with no floor.
+        let mut unknown = fbexp.clone();
+        unknown.authority.kind = "other".into();
+        assert!(refused(unknown).contains("floor disagrees"));
+        // The same record under ordinary authority stays canonical, so
+        // the non-canonical verdict above is the kind's, not the floor's.
+        let mut ordinary = fbexp;
+        ordinary.authority.kind = "validate".into();
+        ordinary.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(ordinary)).is_canonical());
     }
 
     /// A disjoint-main context: the target contains the main E it queued

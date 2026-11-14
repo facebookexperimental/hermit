@@ -915,8 +915,12 @@ impl AuthenticatedValidationAdmission {
             // same commit had while it was the tip, so the run measures the same
             // tree against the same pin base. The authority observed a later
             // main; this re-proves that the target is that main's ancestor, so
-            // a diverged head can never select this kind.
-            ("validate", "main-ancestor")
+            // a diverged head can never select this kind. The facebookexperimental
+            // post-land authority (`fbexp-validate`) selects this floor alone,
+            // under the same guard and the same Git re-proof; no other floor
+            // kind pairs with it, so every other fbexp pairing still falls to
+            // the catch-all refusal below.
+            ("validate", "main-ancestor") | ("fbexp-validate", "main-ancestor")
                 if self.floor.sha == self.authority.target
                     && self.floor.tree == self.target_tree
                     && self.floor.observed_main_sha != self.authority.target =>
@@ -1032,6 +1036,14 @@ impl AuthenticatedValidationAdmission {
 
     pub(crate) fn canonical(&self) -> bool {
         self.authority.kind == "validate"
+    }
+
+    /// Whether this is a frozen-validate admission. Frozen is its own
+    /// predicate, never "not canonical": an `fbexp-validate` admission is
+    /// noncanonical (it mints no rrnewton landing evidence) but it is not
+    /// frozen, and `--frozen-run` may ride only on this predicate.
+    pub(crate) fn frozen(&self) -> bool {
+        self.authority.kind == "frozen-validate"
     }
 
     pub(crate) fn response(&self) -> &[u8] {
@@ -1509,7 +1521,9 @@ for entry in Path('/proc/self/fd').iterdir():
         frozen["admissible"] = false.into();
         frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
         frozen["admission_floor"]["kind"] = "frozen-target".into();
-        assert!(!f.admit(&frozen, &target).unwrap().canonical());
+        let frozen_admitted = f.admit(&frozen, &target).unwrap();
+        assert!(!frozen_admitted.canonical());
+        assert!(frozen_admitted.frozen());
     }
 
     /// A post-landing run of a commit that freshly fetched main already
@@ -1565,6 +1579,81 @@ for entry in Path('/proc/self/fd').iterdir():
         frozen["admissible"] = false.into();
         frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
         assert!(f.admit(&frozen, &target).is_err());
+    }
+
+    /// A facebookexperimental post-land run (`fbexp-validate`) is admitted
+    /// only with the main-ancestor floor and every authority condition
+    /// holding: admitted, that floor, state held, canonical anchor held.
+    /// Each condition's failure is its own named refusal, and no other
+    /// floor kind is admitted for this authority in this change.
+    #[test]
+    fn fbexp_main_ancestor_floor_admits_only_with_all_authority_conditions() {
+        let f = Fixture::new();
+        let base = f.commit("main before the export target landed");
+        let target = f.commit("landed export target");
+        let main = f.commit("export main advanced after the target landed");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+        let side = f.commit("diverged head built on the export target");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+        let fbexp = |target: &str, observed: &str| {
+            let mut status = f.authority(target, target);
+            status["holder"]["kind"] = "fbexp-validate".into();
+            status["admission_floor"]["kind"] = "main-ancestor".into();
+            status["admission_floor"]["observed_main_sha"] = observed.into();
+            status
+        };
+
+        let admitted = f.admit(&fbexp(&target, &main), &target).unwrap();
+        assert_eq!(admitted.floor().kind, "main-ancestor");
+        assert_eq!(admitted.floor().sha, target);
+        // An fbexp run mints no rrnewton landing evidence: it stays
+        // noncanonical even though the lock authority admits it. It is
+        // not frozen either, so --frozen-run can never ride on it.
+        assert!(!admitted.canonical());
+        assert!(!admitted.frozen());
+        admitted.verify_source(&f.0).unwrap();
+
+        // The ancestry is re-proved from Git for this authority too: a
+        // head the observed main does not contain is refused.
+        f.command(&["checkout", "--quiet", "--detach", &side]);
+        let diverged = f.admit(&fbexp(&side, &main), &side).unwrap_err();
+        assert!(diverged.contains("merge-base"), "{diverged}");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+
+        let refused = |status: Value| f.admit(&status, &target).unwrap_err();
+        // Not admitted: each conjunct is necessary.
+        let mut not_lock = fbexp(&target, &main);
+        not_lock["lock_admissible"] = false.into();
+        let e = refused(not_lock);
+        assert!(e.contains("lock_admissible"), "{e}");
+        let mut not_admissible = fbexp(&target, &main);
+        not_admissible["admissible"] = false.into();
+        let e = refused(not_admissible);
+        assert!(e.contains("admissible=false"), "{e}");
+        let mut with_reason = fbexp(&target, &main);
+        with_reason["reason_code"] = "owner-not-ancestor".into();
+        let e = refused(with_reason);
+        assert!(e.contains("reason_code"), "{e}");
+        // The current-main floor is not admitted for this authority here,
+        // even though the lock producer can record it.
+        let mut current = f.authority(&target, &base);
+        current["holder"]["kind"] = "fbexp-validate".into();
+        let e = refused(current);
+        assert!(e.contains("main-ancestor"), "{e}");
+        // State and anchor bind this authority exactly as the others.
+        let mut free = fbexp(&target, &main);
+        free["state"] = "free".into();
+        let e = refused(free);
+        assert!(e.contains("lock state is"), "{e}");
+        let mut unanchored = fbexp(&target, &main);
+        unanchored["canonical_anchor_held"] = false.into();
+        let e = refused(unanchored);
+        assert!(e.contains("canonical anchor"), "{e}");
+        // An unknown holder kind stays refused.
+        let mut unknown = fbexp(&target, &main);
+        unknown["holder"]["kind"] = "other".into();
+        let e = refused(unknown);
+        assert!(e.contains("held lock is kind"), "{e}");
     }
 
     impl Fixture {
