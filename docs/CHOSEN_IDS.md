@@ -166,7 +166,7 @@ persistent pointer. A driver can retain a nested pointer in a structure at an
 ordinary address; that case is **uncovered**, as are other unclassified driver
 effects such as deferred killing. Neither a read-only page nor sealing closes
 that gap. The existing untraced trampoline escape
-(https://github.com/rrnewton/reverie/issues/1064) is also uncertified. This work
+(https://github.com/rrnewton/reverie/issues/1523) is also uncertified. This work
 does not repair old untraced-child accounting.
 
 The environment must not permit an outside holder of a shared open-file

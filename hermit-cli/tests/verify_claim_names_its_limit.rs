@@ -410,7 +410,7 @@ fn a_guest_that_rebinds_the_path_itself_names_no_host_input_change() {
 /// the stub, and Reverie ends the run there with its named failure
 /// (`UntracedStubSyscall`, at 0x71000002), which hermit reports as a policy
 /// refusal: exit 122 in run 1, with no run 2 and no host input change named
-/// (https://github.com/rrnewton/reverie/issues/1064). Before that, Reverie
+/// (https://github.com/rrnewton/reverie/issues/1523). Before that, Reverie
 /// delivered the SIGILL and the run went on to a divergence.
 #[test]
 fn a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal() {

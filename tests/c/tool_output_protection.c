@@ -7,7 +7,7 @@
  */
 
 // Detcore's emulated syscall outputs must respect page protection, as the
-// kernel's own writes do (https://github.com/rrnewton/reverie/issues/1064).
+// kernel's own writes do (https://github.com/rrnewton/reverie/issues/1523).
 // Adapted from the reviewer's counterexample guest for that issue.
 //
 //   stack          rt_sigprocmask with RSP chosen so that the eight-byte mask

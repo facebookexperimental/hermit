@@ -333,15 +333,23 @@ The tracer enables these ptrace options:
 ### Ptrace untraced-stub gap
 
 The injection exemption also lets a deliberate guest jump to Reverie's private
-syscall stub and issue a syscall without Detcore observing it. The following
-`ud2` raises SIGILL, which records an unknown mutation, but that cannot undo the
-syscall's effect: a signal handler can retain the result, or a forked child can
-die and leave an effect behind. Rewriting or replacing the private page also
-records an unknown mutation. This remains a separate determinism gap after the
-exec-return and CPUID arming checks
-(https://github.com/rrnewton/reverie/issues/1064). The CLI's
-`unobserved_guest_execution` and `untraced_code_range` in
-`hermit-cli/src/bin/hermit/run.rs` describe the limit and guarded page range.
+syscall stub and issue a syscall without Detcore observing it. Reverie ends the
+run at the following `ud2`'s SIGILL with the named `UntracedStubSyscall`
+failure, a policy refusal, so no signal handler sees that SIGILL and no forked
+child continues past it, but the syscall's effect has already happened. Reverie
+refuses only that SIGILL, and two cases escape it. A stub syscall that never
+returns to the `ud2` raises no SIGILL at all: for example `exit`, `exit_group`,
+`execve` or `execveat`. `rt_sigreturn` from the stub is hidden from Detcore's
+`handle_sigreturn` when Detcore observes sigreturns, because the seccomp
+filter's private-page rule is checked first; otherwise `rt_sigreturn` is
+untraced from every address anyway. And a signal delivered at the stub
+syscall's return is not refused, so the guest's handler can step past the
+`ud2`; it need not come from a race, since the stub syscall can itself be a
+`tgkill` to its own thread. Rewriting or replacing the private page records an
+unknown mutation. This remains a separate determinism gap after the exec-return
+and CPUID arming checks (https://github.com/rrnewton/reverie/issues/1523).
+`untraced_code_range` in `hermit-cli/src/bin/hermit/run.rs` names the guarded
+page range.
 
 ### One tracing task per guest thread
 

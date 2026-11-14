@@ -174,19 +174,28 @@ Ordinary guest code never runs there, but a guest can jump into it on purpose,
 since the page's address is a public constant that `/proc/self/maps` also
 shows. Such a syscall, of any number, is invisible to Detcore: it is not
 determinized, recorded or refused. The instruction after the stub is `ud2`, so
-the guest takes a SIGILL as soon as its syscall returns, but that does not
-stop it. A SIGILL handler can read the result from `uc_mcontext` and carry on,
-and with no handler a forked child can make the call, die of the SIGILL, and
-leave its effect behind, in a file or shared memory. So a guest that does this
-deliberately defeats ptrace's determinism guarantee itself, with no race
-needed. Reverie today delivers that SIGILL like any other
-(https://github.com/rrnewton/reverie/issues/1064 tracks ending the run instead).
-Detcore records any SIGILL a guest takes during a verify run as a namespace
-change at `/`, which it could not establish, so no host input change is named
-in that run. A false alarm only withholds a name. A guest can also avoid the
-fault by changing the page first: making it writable with `mprotect` and
-replacing the `ud2`, mapping a page over it with `MAP_FIXED`, or writing it
-through `/proc/self/mem`. Detcore records each call
+the guest takes a SIGILL as soon as its syscall returns, and Reverie ends the
+run there with the named `UntracedStubSyscall` failure, which hermit reports as
+a policy refusal, instead of delivering the SIGILL. No signal handler sees that
+SIGILL, and a forked child that makes the call ends the run the same way. The
+syscall has still taken effect, in a file or shared memory, before the run
+ends. Reverie refuses only that SIGILL, and two cases escape it, so a guest
+that uses either deliberately can still defeat ptrace's determinism guarantee
+itself, with no race needed (https://github.com/rrnewton/reverie/issues/1523):
+a stub syscall that never returns to the `ud2` raises no SIGILL at all (for
+example `exit`, `exit_group`, `execve` or `execveat`), and a signal delivered
+at the stub syscall's return is not refused (see below). `rt_sigreturn` from
+the stub resumes where its signal frame says, so it need not reach the `ud2`
+either. When Detcore observes sigreturns, the private-page rule of Reverie's
+seccomp filter, which seccomp checks first, lets it through untraced, so
+Detcore's `handle_sigreturn` never sees it; otherwise `rt_sigreturn` is
+untraced from every address anyway. For any other illegal instruction, Detcore
+records a SIGILL a guest takes during a verify run as a namespace change at
+`/`, which it could not establish, so no host input change is named in that
+run. A false alarm only withholds a name. A guest can also avoid the fault by
+changing the page first: making it writable with `mprotect` and replacing the
+`ud2`, mapping a page over it with `MAP_FIXED`, or writing it through
+`/proc/self/mem`. Detcore records each call
 that may change the page as a change at `/` too: `mmap` with `MAP_FIXED`
 (widened to the huge page size for `MAP_HUGETLB`), `mremap` with
 `MREMAP_FIXED`, or `shmat` with `SHM_REMAP` onto it; `mprotect`,
@@ -202,10 +211,13 @@ emulates and writes into guest memory from the tracer, which does not honor
 page protections, through an output pointer into the page; a fixed `mremap` of
 a huge-page mapping, whose extent the old mapping decides; `userfaultfd` and
 other forwarded ioctls; and a process-memory descriptor received from outside
-the container. A signal delivered at the syscall's return, by racing a signal
-into those two instructions, also escapes the `ud2` (the guest's handler jumps
-elsewhere, or SIGKILL ends the process), but the handler and forked-child cases
-above already need no race.
+the container. A signal delivered at the stub syscall's return is not refused
+either: Reverie refuses only the SIGILL at the `ud2` and handles any other
+signal there as it would anywhere else, so the guest's handler can move the
+saved instruction pointer past the `ud2` or `siglongjmp` elsewhere, and SIGKILL
+ends the process with the syscall's effect in place. It need not come from a
+race, since the stub syscall can itself be a `tgkill` to its own thread
+(https://github.com/rrnewton/reverie/issues/1523).
 
 The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same
