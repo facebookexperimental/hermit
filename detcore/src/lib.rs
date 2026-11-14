@@ -3356,6 +3356,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
         };
         if !ends {
+            // The slice continues: note whether it is continuing past
+            // where the plain bound would have ended it, for this run's
+            // own uncapped-slices evidence.
+            guest.thread_state_mut().note_slice_continuation();
             return;
         }
 
@@ -6203,6 +6207,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    slice_bound_end: None,
                     post_crash_bound: None,
                     crash_armed: None,
                     // A new thread's first slice begins before it traces an
@@ -8906,6 +8911,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_start_entered: thread_state.thread_start_entered,
             vfork_origin: thread_state.vfork_origin,
             timeslice_stats: thread_state.stats.timeslice_stats,
+            slice_ran_past_bound: thread_state.stats.ran_past_bound,
             syscall_count: thread_state.stats.syscall_count,
             syscall_histogram: (&thread_state.stats.syscall_histogram).into(),
             chaos_epochs: pending_chaos_epochs,

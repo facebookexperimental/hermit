@@ -132,6 +132,7 @@ async fn a_retired_siblings_late_request_stays_unanswered() {
                         thread_start_entered: true,
                         vfork_origin: None,
                         timeslice_stats: TimesliceStats::default(),
+                        slice_ran_past_bound: false,
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),

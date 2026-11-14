@@ -171,6 +171,7 @@ pub(crate) async fn receiver_cleanup(
             "thread_start_entered": true,
             "vfork_origin": null,
             "timeslice_stats": thread.stats.timeslice_stats,
+            "slice_ran_past_bound": thread.stats.ran_past_bound,
             "syscall_count": thread.stats.syscall_count,
             "syscall_histogram": histogram,
             "chaos_epochs": [],

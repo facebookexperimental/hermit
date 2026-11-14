@@ -112,6 +112,7 @@ async fn deregister(state: &GlobalState, thread: &ThreadState<()>) {
                         wait_status: 0,
                         vfork_origin: None,
                         timeslice_stats: thread.stats.timeslice_stats,
+                        slice_ran_past_bound: false,
                         syscall_count: thread.stats.syscall_count,
                         syscall_histogram: (&thread.stats.syscall_histogram).into(),
                         chaos_epochs: Vec::new(),

@@ -6122,6 +6122,15 @@ impl Scheduler {
                         seed: Some(cfg.sched_seed()),
                     }
                 }));
+            // A run that follows a record which was itself marked keeps
+            // the mark (`PreemptionRecord::uncapped_slices`): its slices
+            // run under that record's backstop, past the bound by the
+            // followed record's own evidence, whatever this run's slices
+            // individually show.
+            let mut writer = writer;
+            if uncapped_replay_backstop.is_some() {
+                writer.note_slice_past_bound();
+            }
             // This run's own record lists every switch it takes, possibly
             // none, so its replay can refuse an unrecorded one.
             let writer = if cfg.post_crash_timeslice_in_effect().is_some() {
@@ -23794,12 +23803,24 @@ impl Scheduler {
     // TODO-HUMAN-REVIEW(#252): Confirm completed and final partial slices belong in one distribution.
     /// Fold an exiting thread's completed-timeslice distribution into the
     /// scheduler's per-thread record, to be reported in the final run summary.
-    pub fn record_timeslice_stats(&mut self, dettid: DetTid, stats: TimesliceStats) {
+    /// `slice_ran_past_bound` says some slice of the thread ran past where
+    /// the `--max-timeslice` bound would have ended it
+    /// (`ThreadStats::ran_past_bound`): the writer's uncapped-slices
+    /// evidence, where the distribution's longest logical-time span would
+    /// stamp the mark on capped slices that merely end past the bound —
+    /// the syscall costs and clock sync jumps landing at a slice's ending
+    /// check-in routinely carry its span beyond a small bound.
+    pub fn record_timeslice_stats(
+        &mut self,
+        dettid: DetTid,
+        stats: TimesliceStats,
+        slice_ran_past_bound: bool,
+    ) {
         if stats.is_empty() {
             return;
         }
-        if let Some(writer) = &mut self.preemption_writer {
-            writer.note_longest_slice(stats.max_ns);
+        if slice_ran_past_bound && let Some(writer) = &mut self.preemption_writer {
+            writer.note_slice_past_bound();
         }
         self.per_thread_timeslice
             .entry(dettid)
@@ -27366,12 +27387,19 @@ mod test {
     }
 
     /// The uncapped stamp follows the slices the scheduler actually folded
-    /// from exiting threads: a completed slice past the bound stamps, one
+    /// from exiting threads: a slice that ran past the bound stamps, one
     /// that fit under it does not, however the traced events are spaced.
+    /// The evidence is that a slice continued past the bound, not its
+    /// logical-time span: a capped slice ends past a small bound whenever
+    /// the syscall costs or clock sync jumps landing at its ending
+    /// check-in carry it there (two process syscalls alone exceed the
+    /// 400000 ns bound `hermit analyze` runs under), and stamping such a
+    /// slice makes a capped record fail to round-trip through its replay
+    /// (https://github.com/rrnewton/hermit/issues/4976).
     #[test]
     fn a_replay_stamps_uncapped_only_when_a_completed_slice_ran_past_the_bound() {
         let bound = std::num::NonZeroU64::new(1_000_000);
-        let run = |longest: u64| {
+        let run = |logical_longest: u64, past_bound: bool| {
             let mut sched = Scheduler::new(&Config::default());
             sched.preemption_writer = Some(
                 PreemptionWriter::new(None)
@@ -27379,15 +27407,17 @@ mod test {
                     .with_max_timeslice(bound),
             );
             let mut stats = TimesliceStats::default();
-            stats.record(longest);
-            sched.record_timeslice_stats(DetTid::from_raw(3), stats);
+            stats.record(logical_longest);
+            sched.record_timeslice_stats(DetTid::from_raw(3), stats, past_bound);
             let written = sched.preemption_writer.take().unwrap().into_string();
             serde_json::from_str::<crate::preemptions::PreemptionRecord>(&written)
                 .unwrap()
                 .uncapped_slices()
         };
-        assert_eq!(run(40), None);
-        assert_eq!(run(9_400_000), Some(0));
+        assert_eq!(run(40, false), None);
+        assert_eq!(run(9_400_000, true), Some(0));
+        // Logical span past the bound, ended there: no stamp.
+        assert_eq!(run(9_400_000, false), None);
     }
 
     /// Under a format-3 record, a replayed switch-in (`TraceReplay` turn) under

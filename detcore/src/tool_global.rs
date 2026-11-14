@@ -7600,6 +7600,7 @@ impl GlobalState {
             thread_start_entered: _,
             vfork_origin: _,
             timeslice_stats,
+            slice_ran_past_bound,
             syscall_count,
             syscall_histogram,
             chaos_epochs,
@@ -7638,7 +7639,7 @@ impl GlobalState {
                 writer.insert_chaos_epoch(dettid, transition);
             }
         }
-        sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched.record_timeslice_stats(dettid, timeslice_stats, slice_ran_past_bound);
         sched.record_syscall_count(dettid, syscall_count, syscall_histogram);
         // A SIGKILL victim is retired at its sender's turn, not here
         // (`scheduler::sigkill_retirement`): its receipt is accounted above
@@ -8365,6 +8366,10 @@ pub struct ThreadDeregistration {
     /// this thread, carried from the owner's `ThreadState::vfork_origin`.
     pub(crate) vfork_origin: Option<ExternalOpId>,
     pub(crate) timeslice_stats: TimesliceStats,
+    /// Some slice ran past where the `--max-timeslice` bound would have
+    /// ended it (`ThreadStats::ran_past_bound`), the uncapped-slices
+    /// evidence the scheduler forwards to its preemption writer.
+    pub(crate) slice_ran_past_bound: bool,
     pub(crate) syscall_count: u64,
     /// The thread's syscall entries and outcomes, its nonzero slots only; its
     /// total is `syscall_count`.
@@ -8599,8 +8604,9 @@ pub enum SignalScope {
 /// the append rule above does not cover them (finding 1 of rev5338-cx's
 /// review of 29b3e6a8, finding 2 of coord7's; 56 on its first rebase, 57 at
 /// its rebase onto main's 56, where https://github.com/rrnewton/hermit/pull/5259
-/// had taken 56); it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 57;
+/// had taken 56). 58 adds `ThreadDeregistration::slice_ran_past_bound`
+/// (https://github.com/rrnewton/hermit/issues/4976); it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 58;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -17244,6 +17250,7 @@ mod tests {
                     thread_start_entered: true,
                     vfork_origin: None,
                     timeslice_stats: TimesliceStats::default(),
+                    slice_ran_past_bound: false,
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
@@ -21334,6 +21341,7 @@ mod tests {
                         min_ns: 10,
                         max_ns: 10,
                     },
+                    slice_ran_past_bound: false,
                     syscall_count: 3,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
@@ -21466,6 +21474,7 @@ mod tests {
                                 min_ns: 10,
                                 max_ns: 10,
                             },
+                            slice_ran_past_bound: false,
                             syscall_count: 3,
                             syscall_histogram: Default::default(),
                             chaos_epochs: Vec::new(),
@@ -23170,6 +23179,7 @@ mod tests {
                         thread_start_entered: true,
                         vfork_origin: None,
                         timeslice_stats: TimesliceStats::default(),
+                        slice_ran_past_bound: false,
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
@@ -23883,6 +23893,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    slice_ran_past_bound: false,
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
@@ -24048,6 +24059,7 @@ mod tests {
                         detpid,
                         mm: old_mm,
                         timeslice_stats: TimesliceStats::default(),
+                        slice_ran_past_bound: false,
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
@@ -25471,6 +25483,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    slice_ran_past_bound: false,
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
@@ -25502,6 +25515,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    slice_ran_past_bound: false,
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
@@ -25830,6 +25844,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        slice_ran_past_bound: false,
                         syscall_count: 17,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
@@ -25869,6 +25884,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        slice_ran_past_bound: false,
                         syscall_count: 99,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),

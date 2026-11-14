@@ -56,6 +56,7 @@ fn deregistration(tid: DetTid, sigkilled: bool) -> ThreadDeregistration {
         thread_start_entered: true,
         vfork_origin: None,
         timeslice_stats: TimesliceStats::default(),
+        slice_ran_past_bound: false,
         syscall_count: 1,
         syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),

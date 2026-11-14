@@ -311,8 +311,10 @@ pub struct PreemptionRecord {
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     /// Set when the run that produced this record ended its slices without
     /// the `--max-timeslice` bound: a run that replayed a preemption record
-    /// (`--replay-preemptions-from`) some of whose own completed slices ran
-    /// past the bound (the writer's noted longest actual slice), or that
+    /// (`--replay-preemptions-from`) some of whose slices ran past where
+    /// the bound would have ended them (the writer's noted past-bound
+    /// slice; a slice that merely ends past the bound, on the costs and
+    /// sync jumps landing at its ending check-in, does not count), or that
     /// followed a record that was itself marked, or a schedule replay of a
     /// record that says so. A replay whose slices all fit under the bound
     /// writes no mark, so a capped record round-trips byte-identically. It holds the latest logical time, in
@@ -5058,7 +5060,6 @@ mod tests {
                 instruction_offset: None,
             });
         }
-        waited.note_longest_slice(40);
         assert!(!waited.into_string().contains("uncapped_slices"));
         // One slice dense with traced check-ins, every gap under the
         // bound, but the slice itself ran past it: it stamps.
@@ -5077,7 +5078,7 @@ mod tests {
                 instruction_offset: None,
             });
         }
-        past.note_longest_slice(9_400_000);
+        past.note_slice_past_bound();
         assert!(past.into_string().contains("\"uncapped_slices\":9400000"));
     }
 
@@ -7382,12 +7383,13 @@ pub struct PreemptionWriter {
     uncapped: bool,
     /// The run's `--max-timeslice` bound, when it has one
     /// (`with_max_timeslice`): the uncapped mark is written only when a
-    /// completed slice actually ran past it.
+    /// slice actually ran past it.
     max_timeslice: Option<std::num::NonZeroU64>,
-    /// Longest completed slice the scheduler has reported for this run
-    /// (`note_longest_slice`), in nanoseconds: actual slice evidence from
-    /// the threads' own slice accounting, not gaps between traced events.
-    longest_slice_ns: u64,
+    /// Some slice ran past where the bound would have ended it, as the
+    /// scheduler folded it from an exiting thread
+    /// (`note_slice_past_bound`): actual slice evidence, not gaps
+    /// between traced events and not a slice's logical-time span.
+    slice_past_bound: bool,
 }
 
 impl PreemptionWriter {
@@ -7405,7 +7407,7 @@ impl PreemptionWriter {
             boundary_records: None,
             uncapped: false,
             max_timeslice: None,
-            longest_slice_ns: 0,
+            slice_past_bound: false,
             dest: path,
             flushed: false,
         }
@@ -7738,22 +7740,22 @@ impl PreemptionWriter {
         self
     }
 
-    /// Note the longest completed slice the scheduler has folded for this
-    /// run so far, in nanoseconds: the actual slice evidence the mark is
-    /// gated on. A slice dense with traced check-ins is still one slice;
-    /// a wait between slices is not one either.
-    pub fn note_longest_slice(&mut self, longest_ns: u64) {
-        self.longest_slice_ns = self.longest_slice_ns.max(longest_ns);
+    /// Note that a slice the scheduler folded for this run ran past where
+    /// the bound would have ended it: the actual slice evidence the mark
+    /// is gated on. A slice dense with traced check-ins is still one
+    /// slice; a wait between slices is not one either. A slice that
+    /// merely ends past the bound is not evidence — the syscall costs
+    /// and clock sync jumps landing at its ending check-in carry a
+    /// capped slice's logical span beyond a small bound without the
+    /// slice ever continuing past it.
+    pub fn note_slice_past_bound(&mut self) {
+        self.slice_past_bound = true;
     }
 
     /// Fill in the uncapped-slices mark, if the run ends its slices without
     /// the bound, from the events recorded so far.
     fn mark_uncapped_slices(&mut self) {
-        if self.uncapped
-            && self
-                .max_timeslice
-                .is_none_or(|bound| self.longest_slice_ns > bound.get())
-        {
+        if self.uncapped && (self.max_timeslice.is_none() || self.slice_past_bound) {
             self.inner.uncapped_slices = Some(self.inner.latest_event_time());
         }
     }

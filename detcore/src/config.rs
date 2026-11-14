@@ -418,6 +418,13 @@ mod tests {
         // its rebase onto main's 55, and 57 at its rebase onto main's 56
         // (https://github.com/rrnewton/hermit/pull/5259). Digest measured at this head.
         (57, "42fff6542bd35935", "f8b1309588141fd0"),
+        // Adds `ThreadDeregistration::slice_ran_past_bound`, whether some
+        // slice of the exiting thread ran past the `--max-timeslice`
+        // bound, which gates the uncapped-slices mark in place of a
+        // slice's logical-time span
+        // (https://github.com/rrnewton/hermit/issues/4976; digest measured
+        // at this head).
+        (58, "8787ebf1ef0a87a3", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

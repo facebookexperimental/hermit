@@ -5490,6 +5490,17 @@ pub struct ThreadStats {
     /// began. `None` until the first slice is opened. Used to compute the
     /// duration of a slice when the next reset occurs.
     pub timeslice_start_ns: Option<LogicalTime>,
+
+    /// Some slice of this thread ran past where the `--max-timeslice`
+    /// bound would have ended it (`ThreadState::slice_bound_end`): the
+    /// evidence the uncapped-slices mark is gated on
+    /// (`PreemptionWriter::note_slice_past_bound`). A slice that merely
+    /// ends past the bound — the syscall costs and clock sync jumps that
+    /// land at its ending check-in carry it there, as they do in the
+    /// capped run that recorded it — does not set this; one that
+    /// continues past a check-in at or beyond the bound, or whose
+    /// recorded branch end lies past the bound's branch target, does.
+    pub ran_past_bound: bool,
 }
 
 impl ThreadStats {
@@ -7032,6 +7043,16 @@ pub struct ThreadState<T> {
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
 
+    /// Where the current slice would end under the plain `--max-timeslice`
+    /// bound alone (its start plus the bound, post-crash switch included,
+    /// replay backstop excluded), set by `next_timeslice` beside
+    /// `max_timeslice_end`. In a run the bound governs it is never passed
+    /// inside a slice; a replay following a recorded end beyond it notes
+    /// the fact (`ThreadStats::ran_past_bound`) for its own record's
+    /// uncapped-slices mark. `None` with no bound configured.
+    #[serde(default)]
+    pub slice_bound_end: Option<LogicalTime>,
+
     /// The post-crash bound, once the run has switched to it
     /// (`crate::post_crash`): this thread's slices are bounded by it from
     /// its next slice on, instead of by `max_timeslice`. Learned from the
@@ -7212,6 +7233,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
             .field("chaos_slowdown_active", &self.chaos_slowdown_active)
             .field("max_timeslice_end", &self.max_timeslice_end)
+            .field("slice_bound_end", &self.slice_bound_end)
             .field("post_crash_bound", &self.post_crash_bound)
             .field("crash_armed", &self.crash_armed)
             .field("uncapped_backstop", &self.uncapped_backstop)
@@ -8038,6 +8060,7 @@ impl<T> ThreadState<T> {
             claimed_sigchld: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
+            slice_bound_end: None,
             post_crash_bound: None,
             crash_armed: None,
             uncapped_backstop: None,
@@ -9786,6 +9809,7 @@ impl<T> ThreadState<T> {
         self.max_timeslice_end = cfg
             .max_timeslice
             .map(|max_timeslice| now + Duration::from_nanos(u64::from(max_timeslice)));
+        self.slice_bound_end = self.max_timeslice_end;
         self.last_rcb_timer = None;
         self.last_rcb_timer_is_max = false;
     }
@@ -10206,6 +10230,29 @@ impl<T> ThreadState<T> {
                 configured_max_end
             };
 
+            // Where this slice would end under the plain bound alone, for
+            // the uncapped-slices evidence: a replay that follows a
+            // recorded end beyond it ran its slices without the bound.
+            // The branch channel is decided here, where the recorded
+            // branch end and the bound's branch target (the PMU maximum's
+            // own conversion) are both in hand; the logical channel is
+            // noted at continuing check-ins (`note_slice_continuation`).
+            self.slice_bound_end = cfg.max_timeslice.map(|bound| {
+                current_ns + Duration::from_nanos(u64::from(self.after_post_crash(bound)))
+            });
+            if replay_controls_deadline
+                && let Some(bound_end) = self.slice_bound_end
+                && bound_end > current_ns
+                && let Some(rcb_end) = self.replay_rcb_end
+            {
+                let bound_target = self.committed_clock_value
+                    + (bound_end - current_ns)
+                        .into_rcbs_with_multiplier(self.clock_multiplier(cfg));
+                if rcb_end > bound_target {
+                    self.stats.ran_past_bound = true;
+                }
+            }
+
             if let (Some(target_end), Some(max_end)) =
                 (self.end_of_timeslice, self.max_timeslice_end)
                 && target_end > max_end
@@ -10225,6 +10272,7 @@ impl<T> ThreadState<T> {
             self.end_of_timeslice = None;
             self.replay_rcb_end = None;
             self.max_timeslice_end = None;
+            self.slice_bound_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
             self.armed_instruction_offset = None;
@@ -10347,6 +10395,9 @@ impl<T> ThreadState<T> {
             + Duration::from_nanos(u64::from(self.after_post_crash(max_timeslice)));
         self.end_of_timeslice = Some(end);
         self.max_timeslice_end = Some(end);
+        // The recorded run began a new slice here, so the bound the
+        // uncapped evidence compares against restarts with the backstop.
+        self.slice_bound_end = Some(end);
         self.replay_backstop = Some(end);
         self.last_rcb_timer = None;
         self.last_rcb_timer_is_max = false;
@@ -10372,6 +10423,21 @@ impl<T> ThreadState<T> {
     pub fn reset_timeslice_for_explicit_yield(&mut self) {
         let current_ns = self.thread_logical_time.as_nanos();
         self.reset_timeslice_stats(current_ns);
+    }
+
+    /// Note, at a check-in that does not end the slice, whether the slice
+    /// is continuing past where the `--max-timeslice` bound would have
+    /// ended it (`slice_bound_end`): the uncapped-slices evidence
+    /// (`ThreadStats::ran_past_bound`). In a run the bound governs this
+    /// never fires — the slice ends at that check-in instead; in a replay
+    /// whose recorded end lies further on, it does.
+    pub(crate) fn note_slice_continuation(&mut self) {
+        if self
+            .slice_bound_end
+            .is_some_and(|bound_end| self.thread_logical_time.as_nanos() >= bound_end)
+        {
+            self.stats.ran_past_bound = true;
+        }
     }
 
     fn reset_timeslice_stats(&mut self, current_ns: LogicalTime) {
@@ -11318,6 +11384,61 @@ mod timeslice_tests {
         state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, Duration::ZERO, false);
         assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
         assert_eq!(state.max_timeslice_end, Some(end));
+    }
+
+    /// The uncapped-slices evidence distinguishes a slice that ends past
+    /// the bound from one that runs past it. A capped slice ends past a
+    /// small bound whenever the costs landing at its ending check-in
+    /// carry it there — the racewrite slice of issue 4976 ends at
+    /// 500000 ns under a 400000 ns bound, on its execve and fork charges,
+    /// with its recorded branch end at 0 — and its replay must not stamp
+    /// the mark. A slice that continues past a check-in beyond the
+    /// bound, or whose recorded branch end lies past the bound's branch
+    /// target, ran without the bound and does.
+    #[test]
+    fn a_slice_ending_past_the_bound_did_not_run_past_it() {
+        let config = Config {
+            max_timeslice: nz(400_000),
+            ..Default::default()
+        };
+        let replaying = |end_ns: u64, rcb_end: u64| {
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let history = ThreadHistory::new()
+                .with_prio_changes(vec![(now + Duration::from_nanos(end_ns), DEFAULT_PRIORITY)])
+                .with_preemption_rcbs(vec![rcb_end]);
+            state.preemption_points = Some(history.into_iter());
+            state.next_timeslice(&config);
+            assert_eq!(
+                state.slice_bound_end,
+                Some(now + Duration::from_nanos(400_000))
+            );
+            (state, now)
+        };
+
+        // Ends past the bound at its ending check-in: no evidence, at
+        // install or at a check-in still inside the bound.
+        let (mut state, now) = replaying(500_000, 0);
+        assert!(!state.stats.ran_past_bound);
+        state
+            .thread_logical_time
+            .advance_to(now + Duration::from_nanos(250_000));
+        state.note_slice_continuation();
+        assert!(!state.stats.ran_past_bound);
+
+        // Continues past a check-in beyond the bound: evidence.
+        let (mut state, now) = replaying(9_400_000, 0);
+        state
+            .thread_logical_time
+            .advance_to(now + Duration::from_nanos(500_000));
+        state.note_slice_continuation();
+        assert!(state.stats.ran_past_bound);
+
+        // Recorded branch end past the bound's branch target (40000
+        // branches at this clock): evidence at install, no check-in
+        // needed.
+        let (state, _now) = replaying(500_000, 50_000);
+        assert!(state.stats.ran_past_bound);
     }
 
     /// A schedule replay of a record whose slices ran without the bound
