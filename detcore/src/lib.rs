@@ -272,6 +272,7 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
+use reverie::UnknownSyscallPolicy;
 pub use reverie::process::Namespace;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
@@ -4984,6 +4985,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // table of its own, so an untrapped guest CPUID is the host's on every backend.
             let mut subscription = Subscription::all_syscalls();
             subscription.rdtsc();
+            // A number the pinned table cannot name must reach Detcore as a
+            // raw syscall (`handle_unknown_syscall`), never execute natively
+            // unobserved: the host kernel may implement it, and its result
+            // would be host state no replay reproduces.
+            subscription.set_unknown_syscall_policy(UnknownSyscallPolicy::TrapToTool);
             if config.virtualize_cpuid {
                 subscription.cpuid();
             }
@@ -5252,6 +5258,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             subscription.syscalls(crate::all_pinned_syscalls().filter(|sysno| {
                 crate::is_determinized_syscall(*sysno) || crate::is_unsupported_syscall(*sysno)
             }));
+
+            // The passthrough opt-in narrows which *named* syscalls stop; it
+            // must not restore native execution for numbers the table cannot
+            // name, so the raw-number policy is chosen before the merge
+            // below (the merge keeps an explicitly chosen policy).
+            subscription.set_unknown_syscall_policy(UnknownSyscallPolicy::TrapToTool);
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
@@ -8781,6 +8793,150 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         result
     }
 
+    /// A guest syscall whose number the pinned table cannot name, trapped
+    /// under `UnknownSyscallPolicy::TrapToTool` (see `subscriptions`).
+    ///
+    /// The call never executes in the kernel: the host may implement the
+    /// number (it is newer than the table, or the guest invented it), and
+    /// either way its result would be host state no replay reproduces.
+    /// Instead it is accounted exactly like a named deterministic-`ENOSYS`
+    /// call — counted, charged the fallback syscall cost, DETLOGged at
+    /// entry and finish, and finished in the histogram as `Refused` — and
+    /// then answered:
+    ///
+    /// - ordinarily, the fixed `ENOSYS` a kernel without the number
+    ///   returns, so feature probes take their portable fallback;
+    /// - under `--strict` (`Config::strict_unknown_syscalls`), a policy
+    ///   refusal naming the number ends the run, with no passthrough and
+    ///   no guest-visible errno.
+    ///
+    /// What a named syscall gets that this one does not, and why. Every
+    /// item below is fused to a `Sysno`/`Syscall` this call cannot have,
+    /// and none of them can change this call's own result, which is fixed
+    /// before any argument is looked at:
+    ///
+    /// - the slice-boundary observer record (`Callback::Syscall(Sysno)`):
+    ///   the pre/post handler hooks still run (with no boundary entry), so
+    ///   scheduler check-in, slice accounting and turn hand-off are the
+    ///   same as any event's; only the observer's per-syscall record,
+    ///   which needs the `Sysno`, is absent;
+    /// - `SchedEvent` syscall traces and the dispatch observer: tracing
+    ///   only, keyed by `Sysno`;
+    /// - happens-before anchors: an occurrence anchor names a `Sysno`, so
+    ///   it cannot name this call; a syscall-*count* anchor landing
+    ///   exactly on this call's count does not fire here (the count still
+    ///   advances, so later anchors keep their numbers);
+    /// - `complete_syscall`'s due-`SIGALRM` delivery and the signal-phase
+    ///   gates: a `SIGALRM` due at this boundary is delivered at the next
+    ///   event instead of this one, on backends that virtualize guest
+    ///   `SIGALRM`; it is deferred, never dropped, and this call's result
+    ///   cannot be a wait it interrupts;
+    /// - the file/descriptor, reserved-input, host-input and FIFO checks:
+    ///   they decode a typed call's arguments, and this call names no file
+    ///   or descriptor in Detcore's model because it never runs;
+    /// - DETLOG register/memory/IO-buffer snapshots: no bytes move and no
+    ///   mapping changes, so there is nothing new for them to hash.
+    async fn handle_unknown_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw: reverie::syscalls::RawSyscall,
+    ) -> Result<i64, Error> {
+        // The slice ends a lone thread ran past came first, as at a named
+        // syscall's entry.
+        self.catch_up_lone_slice_ends(guest).await;
+        let nr = detcore_model::syscall_histogram::raw_syscall_number_key(raw.nr);
+        let name = crate::syscall_classification::unknown_syscall_name(nr);
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::KernelRun {
+            syscall: i64::from(nr),
+        });
+        let boundary_token = self
+            .pre_handler_hook_observed(guest, false, CheckIn::Event, None)
+            .await;
+
+        let dettid = guest.thread_state().dettid;
+        if guest.thread_state().guest_past_first_execve() {
+            detlog!(
+                event = crate::detlog::DetLogEvent::Syscall;
+                "[syscall][detcore, dtid {}] inbound syscall: {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = ?",
+                dettid,
+                name,
+                raw.args.arg0 as u64,
+                raw.args.arg1 as u64,
+                raw.args.arg2 as u64,
+                raw.args.arg3 as u64,
+                raw.args.arg4 as u64,
+                raw.args.arg5 as u64
+            );
+        }
+        let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
+        let new_count = {
+            let thread_state = guest.thread_state_mut();
+            thread_state.stats.count_syscall_raw(nr);
+            let charged = thread_state.charge_syscall_time_raw(in_backend_runtime_bootstrap);
+            if charged {
+                thread_state
+                    .thread_logical_time
+                    .add_syscall_with_cost(syscall_time::cost_ns_raw());
+            }
+            thread_state.in_uncharged_bootstrap_syscall = !charged;
+            thread_state.account_process_cpu_time();
+            thread_state.stats.syscall_count
+        };
+        let injected_at_entry = guest.injected_syscalls();
+
+        if self.cfg.strict_unknown_syscalls {
+            // First-class accounting before the run ends: the DETLOG finish
+            // record is the durable evidence, as the histogram itself does
+            // not survive the shutdown.
+            let res: Result<i64, Error> = Err(Error::Errno(Errno::ENOSYS));
+            syscall_histogram::mark_refused::<T, _>(guest);
+            syscall_histogram::finish_raw::<T, _>(guest, nr, &res, injected_at_entry);
+            detlog!(
+                event = crate::detlog::DetLogEvent::SyscallResult {
+                    finished_syscall_number: new_count,
+                };
+                "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
+                dettid,
+                new_count,
+                name,
+                res
+            );
+            guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+            // No post-handler hook: the shutdown below ends the process, as
+            // in `handle_unsupported_syscall`'s fail-closed path, whose
+            // posthook likewise never runs.
+            let reason = format!(
+                "unknown syscall {nr} ({name}): the number is not in the pinned syscall \
+                 table, so Detcore cannot service it deterministically; refused under \
+                 --strict"
+            );
+            crate::syscalls::helpers::report_refusal_reason(true, &reason);
+            crate::tool_global::report_policy_refusal(guest, reason).await;
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
+        }
+
+        let res: Result<i64, Error> = Err(Error::Errno(Errno::ENOSYS));
+        syscall_histogram::finish_raw::<T, _>(guest, nr, &res, injected_at_entry);
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::Return {
+            syscall: i64::from(nr),
+            result: -i64::from(Errno::ENOSYS.into_raw()),
+        });
+        detlog!(
+            event = crate::detlog::DetLogEvent::SyscallResult {
+                finished_syscall_number: new_count,
+            };
+            "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
+            dettid,
+            new_count,
+            name,
+            res
+        );
+        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
+            .await;
+        res
+    }
+
     async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
         &self,
         tid: Tid,
@@ -9112,6 +9268,23 @@ mod subscription_tests {
             subscriptions.iter_syscalls().any(|sysno| sysno == last),
             "{last} must be intercepted under passthru_opt; it is unsupported"
         );
+    }
+
+    /// Both subscription branches trap numbers the pinned table cannot
+    /// name to Detcore's `handle_unknown_syscall`: an `AllowNative` leak
+    /// here would let a syscall newer than the table execute on the host
+    /// unobserved, in the default branch and under `passthru_opt` (hence
+    /// in every `hermit record`/`replay`) alike.
+    #[test]
+    fn unknown_syscall_numbers_trap_to_the_tool() {
+        for passthru_opt in [false, true] {
+            let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
+            assert_eq!(
+                subscriptions.unknown_syscall_policy(),
+                UnknownSyscallPolicy::TrapToTool,
+                "passthru_opt={passthru_opt} must trap unknown syscall numbers to Detcore"
+            );
+        }
     }
 
     #[test]
@@ -9547,7 +9720,11 @@ mod subscription_tests {
     fn strict_subscriptions_intercept_every_event_by_default() {
         let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
 
-        assert_eq!(subscriptions, Subscription::all());
+        // Every named event, plus unknown numbers trapped to the tool:
+        // `Subscription::all()` alone would leave those to the host kernel.
+        let mut expected = Subscription::all();
+        expected.set_unknown_syscall_policy(UnknownSyscallPolicy::TrapToTool);
+        assert_eq!(subscriptions, expected);
         assert!(
             subscriptions
                 .iter_syscalls()

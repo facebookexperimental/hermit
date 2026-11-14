@@ -5517,6 +5517,17 @@ impl ThreadStats {
         self.syscall_refused = false;
     }
 
+    /// Count one entry of a raw syscall number with no `Sysno`
+    /// (`detcore_model::syscall_histogram::raw_syscall_number_key`). The
+    /// scalar counters move exactly as for a named syscall, so the
+    /// histogram's total stays equal to `syscall_count`.
+    pub fn count_syscall_raw(&mut self, nr: i32) {
+        self.syscall_count += 1;
+        self.timeslice_syscall_count += 1;
+        self.syscall_histogram.enter_raw(nr);
+        self.syscall_refused = false;
+    }
+
     /// Increment the count of signals.
     pub fn count_signal(&mut self) {
         self.signal_count += 1;
@@ -7675,6 +7686,25 @@ impl<T> ThreadState<T> {
         in_backend_runtime_bootstrap: bool,
         sysno: Sysno,
     ) -> bool {
+        self.charge_syscall_time_observed(
+            in_backend_runtime_bootstrap,
+            crate::syscall_time::observes_virtual_time(sysno),
+        )
+    }
+
+    /// [`Self::charge_syscall_time`] for a raw syscall number with no
+    /// `Sysno`: it returns no clock value, so it never observes virtual
+    /// time and the bootstrap window treats it as any other non-observing
+    /// call.
+    pub(crate) fn charge_syscall_time_raw(&mut self, in_backend_runtime_bootstrap: bool) -> bool {
+        self.charge_syscall_time_observed(in_backend_runtime_bootstrap, false)
+    }
+
+    fn charge_syscall_time_observed(
+        &mut self,
+        in_backend_runtime_bootstrap: bool,
+        observes_virtual_time: bool,
+    ) -> bool {
         if !in_backend_runtime_bootstrap {
             if self.uncharged_bootstrap_syscalls != 0 {
                 debug!(
@@ -7685,7 +7715,7 @@ impl<T> ThreadState<T> {
             }
             return true;
         }
-        if crate::syscall_time::observes_virtual_time(sysno) {
+        if observes_virtual_time {
             return true;
         }
         if self.uncharged_bootstrap_syscalls < crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS

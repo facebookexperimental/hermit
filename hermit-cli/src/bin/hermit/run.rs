@@ -14707,6 +14707,8 @@ impl RunOpts {
         config.signal_delivery_check_fatal = self.strict;
         // `--strict`'s binder policy (`Config::strict_binder`).
         config.strict_binder = self.strict;
+        // `--strict`'s unknown-syscall policy (`Config::strict_unknown_syscalls`).
+        config.strict_unknown_syscalls = self.strict;
         // `--futex-wake-yields` is accepted only where Detcore's precise futex
         // scheduler runs the guest with sequentialized threads, on the ptrace
         // backend (with or without e9patch preprocessing). Every other launch

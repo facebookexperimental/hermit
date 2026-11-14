@@ -27,6 +27,8 @@
 //!
 //! Counting reads no guest state and changes nothing the guest can observe.
 
+use std::collections::BTreeMap;
+
 use reverie_syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
@@ -185,28 +187,32 @@ impl SyscallHistogramSummary {
 
     /// The compact machine form of this histogram.
     pub fn compact(&self) -> CompactSyscallHistogram {
+        // The number is stored as its 32-bit pattern, zero-extended: for
+        // every non-negative number (the only kind a summary could carry
+        // before raw unknown numbers were counted) that is the number
+        // itself, and a negative raw number such as -1 keeps a distinct,
+        // lossless encoding above every non-negative one. The rows are
+        // therefore ordered by that encoding, which places negative raw
+        // numbers after all non-negative ones rather than before them as
+        // the summary's `i32` order does.
+        let mut counts: Vec<[u64; 5]> = self
+            .syscalls
+            .iter()
+            .map(|entry| {
+                let SyscallOutcomes {
+                    calls,
+                    detcore,
+                    backend,
+                    refused,
+                } = entry.counts;
+                [u64::from(entry.nr as u32), calls, detcore, backend, refused]
+            })
+            .collect();
+        counts.sort_by_key(|[nr, ..]| *nr);
         CompactSyscallHistogram {
             architecture: self.architecture.clone(),
             observation_scope: self.observation_scope.clone(),
-            counts: self
-                .syscalls
-                .iter()
-                .map(|entry| {
-                    let SyscallOutcomes {
-                        calls,
-                        detcore,
-                        backend,
-                        refused,
-                    } = entry.counts;
-                    [
-                        u64::from(entry.nr.unsigned_abs()),
-                        calls,
-                        detcore,
-                        backend,
-                        refused,
-                    ]
-                })
-                .collect(),
+            counts,
         }
     }
 }
@@ -223,7 +229,11 @@ pub struct CompactSyscallHistogram {
     /// Whether the counts cover every syscall the guest made.
     pub observation_scope: SyscallObservationScope,
     /// `[nr, calls, detcore, backend, refused]` for each counted syscall, by
-    /// ascending number ([`SyscallOutcomes`] names the four counts).
+    /// ascending encoded number: the `i32` number's 32-bit pattern,
+    /// zero-extended, so non-negative numbers encode as themselves and a
+    /// negative raw number sorts after them
+    /// ([`SyscallHistogramSummary::compact`] is the encoder;
+    /// [`SyscallOutcomes`] names the four counts).
     pub counts: Vec<[u64; 5]>,
 }
 
@@ -234,9 +244,10 @@ impl CompactSyscallHistogram {
     }
 
     /// Why this histogram is malformed, if it is: an architecture other than
-    /// `x86_64`, a number outside the pinned table, numbers out of ascending
-    /// order or repeated, an entry with no calls, or more outcomes than
-    /// calls.
+    /// `x86_64`, numbers out of ascending order or repeated, an entry with
+    /// no calls, or more outcomes than calls. A number outside the pinned
+    /// table is well-formed: it is a raw unknown number the guest issued,
+    /// counted under its 32-bit-pattern encoding.
     pub fn malformation(&self) -> Option<String> {
         if self.architecture != SyscallHistogramSummary::ARCHITECTURE {
             return Some(format!(
@@ -247,12 +258,8 @@ impl CompactSyscallHistogram {
         }
         let mut previous = None;
         for [nr, calls, detcore, backend, refused] in &self.counts {
-            let in_table = usize::try_from(*nr)
-                .ok()
-                .and_then(|nr| nr.checked_sub(Sysno::first().id() as usize))
-                .is_some_and(|slot| slot < SYSCALL_TABLE_SIZE);
-            if !in_table {
-                return Some(format!("syscall {nr} is outside the x86_64 table"));
+            if *nr > u64::from(u32::MAX) {
+                return Some(format!("syscall {nr} does not fit the 32-bit pattern"));
             }
             if previous.is_some_and(|previous| previous >= *nr) {
                 return Some(format!("syscall {nr} is out of ascending order"));
@@ -278,6 +285,20 @@ impl CompactSyscallHistogram {
 /// syscall table, gaps included.
 pub const SYSCALL_TABLE_SIZE: usize = Sysno::table_size();
 
+/// The histogram key for a raw syscall number the pinned table cannot name,
+/// as a backend reports it (the guest's number register, untruncated).
+///
+/// A Linux syscall number is an `int`: the kernel's entry code truncates
+/// the number register to 32 bits before dispatch, so the key keeps exactly
+/// the low 32 bits, reinterpreted as `i32`. Every number a guest can
+/// actually dispatch on keeps its value, `-1` (`u64::MAX` in the register)
+/// keys as `-1`, and two register values differing only above bit 31 share
+/// a key because they are the same kernel number. Nothing is clamped to
+/// the pinned table: a number newer than the table keeps its own key.
+pub fn raw_syscall_number_key(nr: u64) -> i32 {
+    nr as u32 as i32
+}
+
 /// A histogram indexed by x86-64 syscall number, as Detcore collects it: a
 /// dense array with one [`SyscallOutcomes`] per table slot, allocated once
 /// when the thread's state is created, so counting a syscall is two array
@@ -285,18 +306,26 @@ pub const SYSCALL_TABLE_SIZE: usize = Sysno::table_size();
 /// over only its nonzero slots ([`SparseSyscallHistogram`]), and the run's
 /// total sums those back into one dense histogram.
 ///
+/// A raw number with no table slot at all — beyond the table's end, or
+/// negative — counts in the `overflow` map beside the array, keyed by
+/// [`raw_syscall_number_key`]. A raw number inside the table's range (a gap
+/// the table does not name) uses its dense slot, so each number has exactly
+/// one home and the serialized form round-trips.
+///
 /// It serializes sparsely, as `(number, counts)` pairs for the nonzero slots in
 /// ascending order, so the thread-exit message and any saved thread state stay
 /// small.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SyscallHistogram {
     counts: Box<[SyscallOutcomes; SYSCALL_TABLE_SIZE]>,
+    overflow: BTreeMap<i32, SyscallOutcomes>,
 }
 
 impl Default for SyscallHistogram {
     fn default() -> Self {
         Self {
             counts: Box::new([SyscallOutcomes::ZERO; SYSCALL_TABLE_SIZE]),
+            overflow: BTreeMap::new(),
         }
     }
 }
@@ -304,6 +333,13 @@ impl Default for SyscallHistogram {
 /// The slot of `sysno`: every `Sysno` is in the table.
 fn slot(sysno: Sysno) -> usize {
     (sysno.id() - Sysno::first().id()) as usize
+}
+
+/// The dense slot of a raw number, when the table's range has one for it.
+fn slot_for_nr(nr: i32) -> Option<usize> {
+    nr.checked_sub(Sysno::first().id())
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index < SYSCALL_TABLE_SIZE)
 }
 
 impl SyscallHistogram {
@@ -322,21 +358,54 @@ impl SyscallHistogram {
         }
     }
 
+    /// The counts a raw number counts into: its dense slot when the table's
+    /// range has one, the overflow map otherwise.
+    fn counts_for_nr(&mut self, nr: i32) -> &mut SyscallOutcomes {
+        match slot_for_nr(nr) {
+            Some(index) => &mut self.counts[index],
+            None => self.overflow.entry(nr).or_default(),
+        }
+    }
+
+    /// Count one entry of the raw number `nr`
+    /// ([`raw_syscall_number_key`]), which has no `Sysno`.
+    pub fn enter_raw(&mut self, nr: i32) {
+        self.counts_for_nr(nr).calls += 1;
+    }
+
+    /// Record the outcome of one completed call of the raw number `nr`.
+    pub fn finish_raw(&mut self, nr: i32, outcome: SyscallOutcome) {
+        let counts = self.counts_for_nr(nr);
+        match outcome {
+            SyscallOutcome::Detcore => counts.detcore += 1,
+            SyscallOutcome::Backend => counts.backend += 1,
+            SyscallOutcome::Refused => counts.refused += 1,
+        }
+    }
+
     /// Add every count of `other` to this histogram.
     pub fn merge(&mut self, other: &SyscallHistogram) {
         for (mine, theirs) in self.counts.iter_mut().zip(other.counts.iter()) {
             mine.merge(theirs);
         }
+        for (nr, theirs) in &other.overflow {
+            self.overflow.entry(*nr).or_default().merge(theirs);
+        }
     }
 
     /// Total entries over every syscall.
     pub fn total_calls(&self) -> u64 {
-        self.counts.iter().map(|counts| counts.calls).sum()
+        self.counts.iter().map(|counts| counts.calls).sum::<u64>()
+            + self
+                .overflow
+                .values()
+                .map(|counts| counts.calls)
+                .sum::<u64>()
     }
 
     /// Whether nothing has been counted.
     pub fn is_empty(&self) -> bool {
-        self.nonzero().next().is_none()
+        self.nonzero().is_empty()
     }
 
     /// The counts of one syscall, if it was counted.
@@ -344,13 +413,36 @@ impl SyscallHistogram {
         Some(&self.counts[slot(sysno)]).filter(|counts| **counts != SyscallOutcomes::ZERO)
     }
 
-    /// The nonzero slots as `(number, counts)`, by ascending number.
-    fn nonzero(&self) -> impl Iterator<Item = (i32, &SyscallOutcomes)> {
-        self.counts
+    /// The counts of the raw number `nr`, if it was counted.
+    pub fn get_raw(&self, nr: i32) -> Option<&SyscallOutcomes> {
+        match slot_for_nr(nr) {
+            Some(index) => {
+                Some(&self.counts[index]).filter(|counts| **counts != SyscallOutcomes::ZERO)
+            }
+            None => self
+                .overflow
+                .get(&nr)
+                .filter(|counts| **counts != SyscallOutcomes::ZERO),
+        }
+    }
+
+    /// The nonzero slots as `(number, counts)`, by ascending number: the
+    /// dense table's and the overflow map's, merged (a number has one home
+    /// by construction, so the merge never actually combines two).
+    fn nonzero(&self) -> Vec<(i32, SyscallOutcomes)> {
+        let mut merged: BTreeMap<i32, SyscallOutcomes> = self
+            .counts
             .iter()
             .enumerate()
             .filter(|(_, counts)| **counts != SyscallOutcomes::ZERO)
-            .map(|(index, counts)| (Sysno::first().id() + index as i32, counts))
+            .map(|(index, counts)| (Sysno::first().id() + index as i32, *counts))
+            .collect();
+        for (nr, counts) in &self.overflow {
+            if *counts != SyscallOutcomes::ZERO {
+                merged.entry(*nr).or_default().merge(counts);
+            }
+        }
+        merged.into_iter().collect()
     }
 
     /// The run-summary form of this histogram, with its observation scope:
@@ -362,10 +454,11 @@ impl SyscallHistogram {
             observation_scope,
             syscalls: self
                 .nonzero()
+                .into_iter()
                 .map(|(nr, counts)| SyscallHistogramEntry {
                     nr,
                     name: syscall_name(nr),
-                    counts: *counts,
+                    counts,
                 })
                 .collect(),
         }
@@ -382,7 +475,7 @@ impl Serialize for SyscallHistogram {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Collected first: a length-prefixed format (the bincode RPC) needs
         // the count before the elements.
-        let pairs: Vec<_> = self.nonzero().collect();
+        let pairs: Vec<_> = self.nonzero();
         pairs.serialize(serializer)
     }
 }
@@ -393,20 +486,15 @@ impl<'de> Deserialize<'de> for SyscallHistogram {
         let mut histogram = Self::default();
         let mut previous = None;
         for (nr, counts) in pairs {
-            let index = nr
-                .checked_sub(Sysno::first().id())
-                .and_then(|index| usize::try_from(index).ok())
-                .filter(|index| *index < SYSCALL_TABLE_SIZE)
-                .ok_or_else(|| {
-                    serde::de::Error::custom(format!("syscall {nr} is outside the table"))
-                })?;
             if previous.is_some_and(|previous| previous >= nr) {
                 return Err(serde::de::Error::custom(format!(
                     "syscall {nr} is out of ascending order"
                 )));
             }
             previous = Some(nr);
-            histogram.counts[index] = counts;
+            // A number outside the table is a counted raw unknown number,
+            // not corruption: it lands in the overflow map.
+            *histogram.counts_for_nr(nr) = counts;
         }
         Ok(histogram)
     }
@@ -429,10 +517,7 @@ pub struct SparseSyscallHistogram {
 impl From<&SyscallHistogram> for SparseSyscallHistogram {
     fn from(histogram: &SyscallHistogram) -> Self {
         Self {
-            entries: histogram
-                .nonzero()
-                .map(|(nr, counts)| (nr, *counts))
-                .collect(),
+            entries: histogram.nonzero(),
         }
     }
 }
@@ -463,18 +548,11 @@ impl SparseSyscallHistogram {
         self.entries = merged;
     }
 
-    /// Add every count of this histogram to the dense `total`. A number
-    /// outside the pinned table, which no [`SyscallHistogram`] can produce,
-    /// is skipped.
+    /// Add every count of this histogram to the dense `total`, raw numbers
+    /// outside the pinned table included (they land in its overflow map).
     pub fn add_to(&self, total: &mut SyscallHistogram) {
         for (nr, counts) in &self.entries {
-            if let Some(slot) = nr
-                .checked_sub(Sysno::first().id())
-                .and_then(|slot| usize::try_from(slot).ok())
-                .filter(|slot| *slot < SYSCALL_TABLE_SIZE)
-            {
-                total.counts[slot].merge(counts);
-            }
+            total.counts_for_nr(*nr).merge(counts);
         }
     }
 
@@ -621,10 +699,16 @@ mod tests {
             serde_json::to_string(&sparse).unwrap(),
             r#"[[1,{"calls":1,"detcore":1,"backend":0,"refused":0}]]"#
         );
+        // A number outside the table is a counted raw unknown number: it
+        // deserializes into the overflow map rather than failing.
         let out_of_table = format!(
             r#"[[{SYSCALL_TABLE_SIZE},{{"calls":1,"detcore":0,"backend":0,"refused":0}}]]"#
         );
-        assert!(serde_json::from_str::<SyscallHistogram>(&out_of_table).is_err());
+        let restored: SyscallHistogram = serde_json::from_str(&out_of_table).unwrap();
+        assert_eq!(
+            restored.get_raw(SYSCALL_TABLE_SIZE as i32).unwrap().calls,
+            1
+        );
         let unordered = r#"[[1,{"calls":1,"detcore":0,"backend":0,"refused":0}],[0,{"calls":1,"detcore":0,"backend":0,"refused":0}]]"#;
         assert!(serde_json::from_str::<SyscallHistogram>(unordered).is_err());
     }
@@ -672,13 +756,6 @@ mod tests {
                     ..good.clone()
                 },
                 "architecture",
-            ),
-            (
-                CompactSyscallHistogram {
-                    counts: vec![[SYSCALL_TABLE_SIZE as u64, 1, 0, 0, 0]],
-                    ..good.clone()
-                },
-                "outside",
             ),
             (
                 CompactSyscallHistogram {
@@ -742,6 +819,104 @@ mod tests {
         assert_eq!(empty, sparse);
         empty.merge(&SparseSyscallHistogram::default());
         assert_eq!(empty, sparse);
+    }
+
+    #[test]
+    fn raw_numbers_count_beside_the_table_and_round_trip() {
+        // The first number past the pinned table (mseal on a newer kernel)
+        // has no name in it, and a negative number never can.
+        assert_eq!(syscall_name(462), "syscall_462");
+        assert_eq!(raw_syscall_number_key(462), 462);
+        assert_eq!(raw_syscall_number_key(u64::MAX), -1);
+        assert_eq!(raw_syscall_number_key(0x1_0000_01c2), 450);
+
+        let mut histogram = SyscallHistogram::default();
+        histogram.enter(Sysno::read);
+        histogram.enter_raw(462);
+        histogram.finish_raw(462, SyscallOutcome::Refused);
+        histogram.enter_raw(999);
+        histogram.enter_raw(-1);
+        histogram.finish_raw(-1, SyscallOutcome::Refused);
+        assert_eq!(histogram.total_calls(), 4);
+        assert_eq!(
+            histogram.get_raw(462),
+            Some(&SyscallOutcomes {
+                calls: 1,
+                detcore: 0,
+                backend: 0,
+                refused: 1,
+            })
+        );
+        assert_eq!(histogram.get_raw(999).unwrap().unfinished(), 1);
+
+        // The summary orders by the i32 number, negatives first.
+        let summary = histogram.summary(SyscallObservationScope::Complete);
+        let numbers: Vec<i32> = summary.syscalls.iter().map(|entry| entry.nr).collect();
+        assert_eq!(numbers, [-1, 0, 462, 999]);
+        assert_eq!(summary.get("syscall_462").unwrap().nr, 462);
+        assert_eq!(summary.total_calls(), 4);
+
+        // The compact form encodes the 32-bit pattern, so -1 sorts last and
+        // stays distinct from every non-negative number.
+        let compact = summary.compact();
+        let encoded: Vec<u64> = compact.counts.iter().map(|[nr, ..]| *nr).collect();
+        assert_eq!(encoded, [0, 462, 999, u64::from(u32::MAX)]);
+        assert_eq!(compact.malformation(), None);
+
+        // The sparse per-thread form and both wire forms keep raw counts.
+        let sparse = SparseSyscallHistogram::from(&histogram);
+        let mut total = SyscallHistogram::default();
+        sparse.add_to(&mut total);
+        assert_eq!(total, histogram);
+        let json = serde_json::to_string(&histogram).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SyscallHistogram>(&json).unwrap(),
+            histogram
+        );
+        let config = bincode::config::legacy();
+        let bytes = bincode::serde::encode_to_vec(&histogram, config).unwrap();
+        let (decoded, _): (SyscallHistogram, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(decoded, histogram);
+
+        // Merging adds overflow counts too.
+        let mut other = SyscallHistogram::default();
+        other.enter_raw(462);
+        other.finish_raw(462, SyscallOutcome::Detcore);
+        total.merge(&other);
+        let merged = total.get_raw(462).unwrap();
+        assert_eq!((merged.calls, merged.detcore, merged.refused), (2, 1, 1));
+    }
+
+    #[test]
+    fn malformed_raw_histograms_are_still_refused() {
+        // Out of ascending order stays an error with raw numbers present.
+        let unordered = r#"[[462,{"calls":1,"detcore":0,"backend":0,"refused":0}],[0,{"calls":1,"detcore":0,"backend":0,"refused":0}]]"#;
+        assert!(serde_json::from_str::<SyscallHistogram>(unordered).is_err());
+        let duplicated = r#"[[462,{"calls":1,"detcore":0,"backend":0,"refused":0}],[462,{"calls":1,"detcore":0,"backend":0,"refused":0}]]"#;
+        assert!(serde_json::from_str::<SyscallHistogram>(duplicated).is_err());
+        // The compact checks that remain still fire on raw numbers.
+        let no_calls = CompactSyscallHistogram {
+            architecture: "x86_64".into(),
+            observation_scope: SyscallObservationScope::Complete,
+            counts: vec![[462, 0, 0, 0, 0]],
+        };
+        assert!(no_calls.malformation().unwrap().contains("no calls"));
+        let too_many = CompactSyscallHistogram {
+            counts: vec![[462, 1, 0, 0, 2]],
+            ..no_calls.clone()
+        };
+        assert!(too_many.malformation().unwrap().contains("more outcomes"));
+        let repeated = CompactSyscallHistogram {
+            counts: vec![[462, 1, 0, 0, 0], [462, 1, 0, 0, 0]],
+            ..no_calls
+        };
+        assert!(repeated.malformation().unwrap().contains("ascending"));
+        let wide = CompactSyscallHistogram {
+            counts: vec![[u64::from(u32::MAX) + 1, 1, 0, 0, 0]],
+            ..repeated
+        };
+        assert!(wide.malformation().unwrap().contains("32-bit"));
     }
 
     #[test]

@@ -93,6 +93,30 @@ pub(crate) fn finish<T, G>(
     }
 }
 
+/// Record the outcome of the current call of the raw number `nr` (no
+/// `Sysno`) in the thread's histogram. The outcome is judged exactly as a
+/// named call's is, so its fixed `ENOSYS` records as `Refused`.
+pub(crate) fn finish_raw<T, G>(
+    guest: &mut G,
+    nr: i32,
+    result: &Result<i64, Error>,
+    injected_at_entry: Option<u64>,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let injected_now = guest.injected_syscalls();
+    let stats = &mut guest.thread_state_mut().stats;
+    if let Some(outcome) = outcome(
+        result,
+        stats.syscall_refused,
+        injected_at_entry,
+        injected_now,
+    ) {
+        stats.syscall_histogram.finish_raw(nr, outcome);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

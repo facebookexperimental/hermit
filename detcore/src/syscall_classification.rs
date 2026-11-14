@@ -38,6 +38,79 @@ pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
     Sysno::iter().chain(std::iter::once(Sysno::last()))
 }
 
+/// The x86_64 syscalls a host kernel may implement beyond the pinned table,
+/// in ascending, contiguous order from `Sysno::last().id() + 1`.
+///
+/// The pinned `syscalls` table ends at 461 (`lsm_list_modules`), so none of
+/// these has a `Sysno` and no `Syscall` can be built for them; they reach
+/// Detcore only as raw unknown numbers (`Tool::handle_unknown_syscall`).
+/// This list is what lets a refusal or a log line name such a number
+/// instead of printing it bare, and the census tests hold it complete
+/// against the test host's own kernel headers: a kernel that wires a
+/// number neither the table nor this list names fails the test by name,
+/// which is the prompt to extend this list (or bump the pin and move the
+/// absorbed prefix into the classification below).
+#[cfg(target_arch = "x86_64")]
+pub(crate) const KNOWN_BEYOND_PINNED_TABLE: &[(i32, &str)] = &[
+    (462, "mseal"),
+    (463, "setxattrat"),
+    (464, "getxattrat"),
+    (465, "listxattrat"),
+    (466, "removexattrat"),
+    (467, "open_tree_attr"),
+    (468, "file_getattr"),
+    (469, "file_setattr"),
+    (470, "listns"),
+    (471, "rseq_slice_yield"),
+];
+
+/// No aarch64 number beyond its pinned table is curated here yet; the
+/// architecture shares the raw-number policy but names nothing past its
+/// table.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const KNOWN_BEYOND_PINNED_TABLE: &[(i32, &str)] = &[];
+
+/// The x86_64 numbers inside the pinned table's range that newer kernels
+/// wired into slots the pinned table leaves unnamed. They have no `Sysno`
+/// for the same reason the beyond-table numbers do not; they are listed
+/// separately only because the beyond-table manifest must stay contiguous
+/// from the table's end.
+///
+/// Unlike the beyond-table numbers, these do not reach Detcore on the
+/// ptrace backend: on kernels that wire them, entry code handles them
+/// before seccomp/ptrace. Measured with a `SECCOMP_RET_ERRNO` filter
+/// returning sentinel errnos for 463 and for 335/336, the filter
+/// intercepts 463 only; 335 still delivers `SIGILL` and 336 returns its
+/// native errno. The ptrace backend therefore cannot answer `ENOSYS` or
+/// refuse them, and under Hermit ptrace they keep their native outcome
+/// (335: `SIGILL` outside a uretprobe trampoline; 336: its native errno).
+/// Backends that trap the syscall instruction itself (KVM, measured) do
+/// see them and route them through the unknown-syscall policy like any
+/// post-table number.
+///
+/// The list exists so the host-completeness census test accounts for
+/// these numbers (and fails by name when a kernel wires a further such
+/// gap), and so a future syscalls-crate bump that names them forces
+/// their classification.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const KNOWN_TABLE_GAPS: &[(i32, &str)] = &[(335, "uretprobe"), (336, "uprobe")];
+
+/// No in-range aarch64 gap is curated here yet.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const KNOWN_TABLE_GAPS: &[(i32, &str)] = &[];
+
+/// The display name of a raw syscall number the pinned table cannot name:
+/// its curated name ([`KNOWN_BEYOND_PINNED_TABLE`] or
+/// [`KNOWN_TABLE_GAPS`]) when listed, else `syscall_<number>`, the
+/// histogram summary's fallback for the same key.
+pub(crate) fn unknown_syscall_name(nr: i32) -> String {
+    KNOWN_BEYOND_PINNED_TABLE
+        .iter()
+        .chain(KNOWN_TABLE_GAPS.iter())
+        .find(|(known, _)| *known == nr)
+        .map_or_else(|| format!("syscall_{nr}"), |(_, name)| (*name).to_owned())
+}
+
 /// The syscalls `--untrap-passthrough-syscalls` leaves to the kernel without a
 /// stop (`Config::untrap_passthrough_syscalls`). Each is `PassThrough`, and
 /// Detcore's handler for it injects the call unchanged and returns the kernel's
@@ -3231,5 +3304,162 @@ mod tests {
         assert!(!is_credential_identity_noop_syscall(Sysno::chown));
         assert!(!is_credential_identity_noop_syscall(Sysno::fchownat));
         assert!(!is_ownership_change_noop_syscall(Sysno::setuid));
+    }
+
+    /// The beyond-table manifest continues the pinned table exactly: its
+    /// first number is the table's next, every number follows its
+    /// predecessor, no name repeats (and none collides with a table name),
+    /// and no entry has quietly gained a `Sysno` — one that has belongs in
+    /// the classification, not here.
+    #[test]
+    fn known_beyond_the_table_continues_it_without_gaps_or_overlap() {
+        let mut names: BTreeSet<&str> = all_pinned_syscalls().map(|sysno| sysno.name()).collect();
+        for (expected, (nr, name)) in
+            (Sysno::last().id() + 1..).zip(KNOWN_BEYOND_PINNED_TABLE.iter())
+        {
+            assert_eq!(
+                *nr, expected,
+                "KNOWN_BEYOND_PINNED_TABLE must be ascending and contiguous from \
+                 Sysno::last().id() + 1; found {nr} where {expected} belongs"
+            );
+            assert!(
+                names.insert(name),
+                "{name} (nr {nr}) duplicates a name already in the table or the manifest"
+            );
+            assert!(
+                usize::try_from(*nr).ok().and_then(Sysno::new).is_none(),
+                "{name} (nr {nr}) now has a Sysno: classify it and remove it from \
+                 KNOWN_BEYOND_PINNED_TABLE"
+            );
+        }
+        for (nr, name) in KNOWN_TABLE_GAPS {
+            assert!(
+                (Sysno::first().id()..=Sysno::last().id()).contains(nr),
+                "gap {name} (nr {nr}) is outside the table's range; it belongs in                  KNOWN_BEYOND_PINNED_TABLE"
+            );
+            assert!(
+                names.insert(name),
+                "gap {name} (nr {nr}) duplicates a name already accounted for"
+            );
+            assert!(
+                usize::try_from(*nr).ok().and_then(Sysno::new).is_none(),
+                "gap {name} (nr {nr}) now has a Sysno: classify it and remove it                  from KNOWN_TABLE_GAPS"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(unknown_syscall_name(462), "mseal");
+            assert_eq!(unknown_syscall_name(471), "rseq_slice_yield");
+            assert_eq!(unknown_syscall_name(335), "uretprobe");
+            assert_eq!(unknown_syscall_name(336), "uprobe");
+        }
+        assert_eq!(unknown_syscall_name(999), "syscall_999");
+        assert_eq!(unknown_syscall_name(-1), "syscall_-1");
+    }
+
+    /// Every syscall number the test host's kernel wires is accounted for:
+    /// it is in the pinned table or in [`KNOWN_BEYOND_PINNED_TABLE`]. This
+    /// is the tripwire that keeps the manifest complete as kernels grow —
+    /// an unaccounted number would reach guests as an unnamed raw number
+    /// and, before the TrapToTool policy, executed natively unobserved.
+    ///
+    /// The numbers come from the running kernel's own headers, preferring
+    /// its build tree (`/lib/modules/$(uname -r)/build/.../unistd_64.h`)
+    /// and falling back to the installed `/usr/include/asm/unistd_64.h`.
+    /// If neither exists, the test fails rather than passing on no
+    /// evidence, unless the operator explicitly opts out with
+    /// `HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS=1` (a hermetic sandbox with
+    /// no kernel headers says so, instead of silently weakening the check
+    /// for every other host).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn every_host_kernel_syscall_number_is_accounted_for() {
+        use std::collections::BTreeMap;
+
+        fn parse_nr_defines(text: &str, numbers: &mut BTreeMap<i32, String>) {
+            for line in text.lines() {
+                let Some(rest) = line.trim().strip_prefix("#define __NR_") else {
+                    continue;
+                };
+                let mut fields = rest.split_whitespace();
+                let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                // Only plain decimal definitions name a wired number;
+                // aliases (`__NR_x __NR_y`) and offset expressions belong
+                // to another ABI's arithmetic. `__NR_syscalls` is the
+                // table's size, not a syscall.
+                if name == "syscalls" {
+                    continue;
+                }
+                if let Ok(nr) = value.parse::<i32>() {
+                    numbers.entry(nr).or_insert_with(|| name.to_owned());
+                }
+            }
+        }
+
+        let release = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_default();
+        let candidates = [
+            format!("/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm/unistd_64.h"),
+            format!("/lib/modules/{release}/build/include/uapi/asm-generic/unistd.h"),
+            "/usr/include/asm/unistd_64.h".to_owned(),
+            "/usr/include/x86_64-linux-gnu/asm/unistd_64.h".to_owned(),
+        ];
+        let mut host: BTreeMap<i32, String> = BTreeMap::new();
+        let mut source = None;
+        for candidate in &candidates {
+            if release.is_empty() && candidate.contains("/lib/modules/") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(candidate) {
+                parse_nr_defines(&text, &mut host);
+                if !host.is_empty() {
+                    source = Some(candidate.clone());
+                    break;
+                }
+            }
+        }
+        let Some(source) = source else {
+            assert_eq!(
+                std::env::var("HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS").as_deref(),
+                Ok("1"),
+                "no host syscall table found in {candidates:?}: cannot prove \
+                 KNOWN_BEYOND_PINNED_TABLE complete on this host. Install the \
+                 kernel headers, or set HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS=1 \
+                 to opt out explicitly."
+            );
+            return;
+        };
+        // The common (non-x32) numbers only: the x32 ABI shares the header
+        // range above __X32_SYSCALL_BIT and is not a table Detcore dispatches.
+        host.retain(|nr, _| *nr >= 0 && *nr < 0x4000_0000);
+        assert!(
+            host.len() > 300,
+            "{source} yielded only {} syscall numbers; the parse is broken, not the kernel small",
+            host.len()
+        );
+        let accounted: BTreeSet<i32> = all_pinned_syscalls()
+            .map(|sysno| sysno.id())
+            .chain(KNOWN_BEYOND_PINNED_TABLE.iter().map(|(nr, _)| *nr))
+            .chain(KNOWN_TABLE_GAPS.iter().map(|(nr, _)| *nr))
+            .collect();
+        let gaps: Vec<String> = host
+            .iter()
+            .filter(|(nr, _)| !accounted.contains(nr))
+            .map(|(nr, name)| format!("{nr} {name}"))
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "{source} wires syscall numbers neither the pinned table nor \
+             KNOWN_BEYOND_PINNED_TABLE names: {}. Extend the manifest (or bump \
+             the syscalls pin and classify them).",
+            gaps.join(", ")
+        );
     }
 }

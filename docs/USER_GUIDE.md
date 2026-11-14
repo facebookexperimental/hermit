@@ -2326,6 +2326,14 @@ permits pass-through and prints a warning; it may restore compatibility but
 introduces uncontrolled behavior. A successful exit with this option does not
 establish reproducibility.
 
+Syscall numbers newer than Hermit's syscall table receive a deterministic
+`ENOSYS` by default, even when the host kernel implements them, and are
+refused by name under `--strict`. One known limitation: on kernels where
+syscalls 335 (`uretprobe`) and 336 (`uprobe`) are handled before seccomp,
+the ptrace backend cannot intercept those two numbers, so the guest gets
+the kernel's native outcome for them. The KVM backend traps them and
+answers them like other unknown numbers.
+
 To identify the first unsupported call during development:
 
 ```bash

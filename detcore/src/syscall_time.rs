@@ -163,6 +163,17 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
     }
 }
 
+/// The cost of a syscall whose number the pinned table cannot name. It is
+/// answered without running (a fixed `ENOSYS`, or a strict run's refusal),
+/// so it charges the same nonzero fallback as any other cheap refusal:
+/// virtual time still advances, by an amount that depends only on the
+/// guest's own call, never on the host kernel that might implement the
+/// number. Such a call never observes virtual time — it returns no clock
+/// value — which `ThreadState::charge_syscall_time_raw` encodes.
+pub(crate) fn cost_ns_raw() -> u64 {
+    FAST_NS
+}
+
 /// The most syscalls one backend-runtime bootstrap window may leave uncharged on
 /// the bootstrapping thread. Once a window reaches this count, every further
 /// syscall in it is charged its normal cost, so a window cannot stop the thread's

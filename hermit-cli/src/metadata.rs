@@ -1488,6 +1488,10 @@ fn record_or_replay_config_with_timer_support(
         // The copy is off, so no delivery is checked.
         signal_delivery_check_fatal: false,
         strict_binder: false,
+        // A recording answers an unknown number with ENOSYS and records
+        // that, so a replay decides it the same way; strict refusal is a
+        // `hermit run --strict` policy, not a recording's.
+        strict_unknown_syscalls: false,
         chaos: false,
         // `hermit record` draws no chaos slices.
         chaos_timeslice_range: None,
