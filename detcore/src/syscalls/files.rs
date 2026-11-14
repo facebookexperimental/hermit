@@ -18608,6 +18608,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.send_reserved_sigkill(guest, reservation, call).await;
             }
         }
+        // On a backend that keeps its own signal queues (KVM), decided before
+        // any effect, as for `kill` and `tgkill`: the thread scope names the
+        // thread whose id is the pid; the process scope names the process,
+        // whose task the descriptor names Linux tries first.
+        let admitted = match (process, receiver_id) {
+            (Some(target), Some(_)) if !exited_leader => {
+                let scope = if thread_scope {
+                    crate::scheduler::guest_send_admission::SendScope::Thread
+                } else {
+                    crate::scheduler::guest_send_admission::SendScope::Process
+                };
+                match self
+                    .admit_guest_send(
+                        guest,
+                        call,
+                        Some(target),
+                        DetTid::from_raw(named.unwrap_or(target).as_raw()),
+                        scope,
+                        signal,
+                    )
+                    .await
+                {
+                    crate::syscalls::signal::GuestSend::Refused(answer) => return answer,
+                    admitted => admitted,
+                }
+            }
+            _ => crate::syscalls::signal::GuestSend::NotDecided,
+        };
         if thread_scope {
             // A thread-scoped send queues the copy in the named thread's
             // private queue (the Claude re-check of
@@ -18634,6 +18662,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if exited_leader {
                 return Ok(value);
             }
+            self.guest_send_committed(guest, &admitted).await;
             if let (Some(thread), Some(process)) = (named, process) {
                 let thread = DetTid::from_raw(thread.as_raw());
                 if signal == libc::SIGKILL {
@@ -18727,6 +18756,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if chosen && let Some((_, process)) = receiver {
             crate::tool_global::process_signal_sent(guest, process).await;
         }
+        self.guest_send_committed(guest, &admitted).await;
         if let Some((thread, process)) = receiver {
             // Tell the scheduler, as `kill` does, so a receiver parked in a
             // blocking call (pause(), a futex wait) is woken to take it

@@ -26,6 +26,9 @@ mod gated_wait_tests;
 pub(crate) mod guest_mask_publication;
 #[cfg(test)]
 mod guest_mask_publication_tests;
+pub(crate) mod guest_send_admission;
+#[cfg(test)]
+mod guest_send_admission_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
@@ -2625,6 +2628,13 @@ pub struct Scheduler {
     /// such a thread before any other, so it is the one that takes the copy
     /// (`first_process_signal_taker`).
     process_signal_takers: BTreeMap<DetTid, u64>,
+
+    /// Where a process signal control is installed (KVM): for each thread,
+    /// the copies a guest sent from another process, or to its own while it
+    /// had another thread, that the admission chose it to take, until it
+    /// takes them (`guest_send_admission::Scheduler::guest_send_committed`,
+    /// `audit_guest_send_claims`).
+    guest_send_claims: BTreeMap<DetTid, guest_send_admission::GuestSendClaim>,
 
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
@@ -6547,6 +6557,7 @@ impl Scheduler {
             signal_curr_targets: Default::default(),
             pending_signal_curr_target: None,
             process_signal_takers: Default::default(),
+            guest_send_claims: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),

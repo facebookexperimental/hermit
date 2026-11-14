@@ -574,6 +574,16 @@ impl Scheduler {
         );
     }
 
+    /// End the run by name where acting on `tid`, a thread of `pid`, for a
+    /// signal of the process's shared queue could take a copy another
+    /// process sent and the admission claimed for a different thread
+    /// (`contested_guest_send_claim`).
+    fn refuse_contested_guest_send_claim(&self, pid: DetPid, tid: DetTid) {
+        if let Some(refusal) = self.contested_guest_send_claim(pid, tid) {
+            super::exit_on_scheduler_refusal(&refusal);
+        }
+    }
+
     fn fail_parked_location(
         &mut self,
         pid: DetPid,
@@ -1591,6 +1601,12 @@ impl Scheduler {
         let Some(control) = self.parked.control.clone() else {
             return Ok(());
         };
+        // A copy another process sent, claimed for a thread that now waits
+        // where it cannot take it, ends the run by name
+        // (`guest_send_admission`).
+        if let Some(refusal) = self.audit_guest_send_claims() {
+            super::exit_on_scheduler_refusal(&refusal);
+        }
         self.parked.alarm_takers.clear();
         // A woken poller leaves `alarm_woken` when step 3 resumes it; one
         // that left the run queue another way (it was killed) leaves here.
@@ -1653,6 +1669,7 @@ impl Scheduler {
                     // admitted so that ordinary completion can win.
                     self.admit_completed_child_wait(pid, tid, recipient.task)?;
                     if self.parked_alarm_observable(pid, tid, recipient.task)? {
+                        self.refuse_contested_guest_send_claim(pid, tid);
                         // Other wait families remain pending for their
                         // existing return boundary; this does not claim that
                         // their interruption works.
@@ -1715,6 +1732,7 @@ impl Scheduler {
                     return Ok(false);
                 };
                 if self.parked_alarm_observable(pid, tid, recipient.task)? {
+                    self.refuse_contested_guest_send_claim(pid, tid);
                     // Other wait families remain pending for their
                     // existing return boundary; this does not claim that
                     // their interruption works.
@@ -1733,6 +1751,7 @@ impl Scheduler {
                         && !turn.req.is_empty()
                         && !turn.resp.is_full()
                 }) {
+                    self.refuse_contested_guest_send_claim(pid, tid);
                     self.parked.alarm_takers.insert(pid, tid);
                 }
             }
@@ -1744,8 +1763,11 @@ impl Scheduler {
                 // here, and resumed first. Not while the alarm priority is
                 // spent: woken then, it would wait behind the run queue's
                 // own choice, which could take the copy first.
-                if self.alarm_priority_available() && self.wake_polling_alarm_receiver(tid) {
-                    self.parked.alarm_takers.insert(pid, tid);
+                if self.alarm_priority_available() {
+                    self.refuse_contested_guest_send_claim(pid, tid);
+                    if self.wake_polling_alarm_receiver(tid) {
+                        self.parked.alarm_takers.insert(pid, tid);
+                    }
                 }
             }
             // A backend-served `rt_sigsuspend` is woken for the copy by the
@@ -1840,7 +1862,12 @@ impl Scheduler {
     /// <https://github.com/rrnewton/hermit/pull/5259>, P1). A copy that was
     /// blocked when sent was queued, and keeps counting: the record keeps its
     /// bit clear (`DiscardedAtSend::note_send`).
-    fn own_signals_to_take(&self, thread: DetTid, state: &KernelSignalState, mask: u64) -> u64 {
+    pub(super) fn own_signals_to_take(
+        &self,
+        thread: DetTid,
+        state: &KernelSignalState,
+        mask: u64,
+    ) -> u64 {
         let (discarded, _) = self.discarded_bits(thread);
         state.thread_pending & !mask & !state.ignored_at_generation() & !discarded
     }

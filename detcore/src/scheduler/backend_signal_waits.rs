@@ -40,6 +40,17 @@
 //! by then, the call declines again and the thread parks again, so a wake that
 //! finds nothing is never visible to the guest.
 //!
+//! A shared copy that a guest send chose one thread of the process for (its
+//! claim or taker mark, `guest_send_admission`), whether that thread waits
+//! here, runs, or polls, wakes no other waiter of that process, as Linux's
+//! `complete_signal` wakes only the thread it chooses (`signal_wake_up`,
+//! kernel/signal.c:963-1032 at v7.1.3): a sibling the same copy would end
+//! the wait of stays parked, with no turn, no `COMMIT` record and no charge
+//! of virtual time. A claim or mark speaks only for its own process's
+//! shared queue, so it never keeps another process's waiter asleep. A copy
+//! in a waiter's own queue, or one no send chose a thread for, wakes every
+//! waiter it ends, as before.
+//!
 //! It runs at one point: the end of the step-2 drain (`step2_drain_prefix`),
 //! after every barrier, which the controlled turn loop reaches only while no
 //! guest thread holds the turn and no exit fence, child-exit reservation,
@@ -214,6 +225,33 @@ impl Scheduler {
             .is_some_and(|(mm, _)| self.rpc_incarnation_matches(dettid, mm))
     }
 
+    /// The shared copies a guest send to `thread`'s process chose it to take:
+    /// its claims (`guest_send_claims`) and its taker mark
+    /// (`process_signal_takers`).
+    fn shared_copies_chosen_for(&self, thread: DetTid) -> u64 {
+        self.guest_send_claims
+            .get(&thread)
+            .map_or(0, |claim| claim.shared)
+            | self
+                .process_signal_takers
+                .get(&thread)
+                .copied()
+                .unwrap_or(0)
+    }
+
+    /// The shared copies a guest send chose a thread of `process` other than
+    /// `thread` to take, whatever that thread is doing: claims and taker
+    /// marks speak for their own process's shared queue only.
+    fn shared_copies_chosen_for_another(&self, process: DetPid, thread: DetTid) -> u64 {
+        self.guest_send_claims
+            .keys()
+            .chain(self.process_signal_takers.keys())
+            .filter(|other| **other != thread && self.registered_process(**other) == Some(process))
+            .fold(0, |bits, other| {
+                bits | self.shared_copies_chosen_for(*other)
+            })
+    }
+
     /// Ends every parked `rt_sigsuspend` this module decides
     /// (`backend_suspend_mask`) that a pending signal now ends
     /// (`backend_suspend_signals`). Called only at
@@ -232,6 +270,10 @@ impl Scheduler {
             .keys()
             .filter_map(|&tid| self.backend_suspend_mask(tid).map(|mask| (tid, mask)))
             .collect();
+        // Each waiter a signal ends the wait of: its thread, its process,
+        // its temporary mask, the signals, and those of them only its
+        // process's shared queue holds.
+        let mut ending: Vec<(DetTid, DetPid, u64, u64, u64)> = Vec::new();
         for (dettid, mask) in waiters {
             let Some(owner) = self.registered_process(dettid) else {
                 continue;
@@ -264,6 +306,41 @@ impl Scheduler {
             let signals =
                 Self::backend_suspend_signals(&state, mask, self.host_timed_signals(dettid));
             if signals == 0 {
+                continue;
+            }
+            ending.push((
+                dettid,
+                owner,
+                mask,
+                signals,
+                signals & state.shared_pending & !state.thread_pending,
+            ));
+        }
+        for &(dettid, owner, mask, signals, shared_only) in &ending {
+            // Linux's `complete_signal` wakes the one thread it chooses for a
+            // process-directed signal (`signal_wake_up`). A waiter whose
+            // signals are all shared copies that a guest send chose another
+            // thread of its own process for (its claim or taker mark), and
+            // not it, is left asleep, whether that thread waits here or not:
+            // that thread takes them. A copy in its own queue, or one chosen
+            // for no thread of its process, still wakes it. The rule is
+            // judged again from the state at every drain, so a copy its chosen
+            // thread does not take (it blocks the signal, or exits) reaches
+            // this waiter once the claim and the mark are gone. Until then the
+            // claims audit refuses that case by name once it can read the
+            // chosen thread's state (`ClaimReason::Retarget`,
+            // `Scheduler::audit_guest_send_claims`); an unreadable claim it
+            // defers to its next pass.
+            let for_another = self.shared_copies_chosen_for_another(owner, dettid)
+                & shared_only
+                & !self.shared_copies_chosen_for(dettid);
+            if signals & !for_another == 0 {
+                tracing::info!(
+                    "[dtid {}] stays in its rt_sigsuspend: signals {:#x} it would end for are shared \
+                     copies a guest send chose another thread of its process for.",
+                    dettid,
+                    signals
+                );
                 continue;
             }
             let signals: Vec<SigWrapper> = (1..=64)

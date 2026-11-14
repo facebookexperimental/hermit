@@ -39,6 +39,8 @@ use crate::scheduler::discarded_at_send::DiscardToken;
 use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
 use crate::scheduler::discarded_at_send::DiscardedSignalControl;
 use crate::scheduler::discarded_at_send::QueueId;
+use crate::scheduler::guest_send_admission::SendAdmission;
+use crate::scheduler::guest_send_admission::SendScope;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::scheduler::process_signal_receiver::ProcessSignalReceiver;
 use crate::scheduler::signal_lists::KernelSiginfo;
@@ -2843,6 +2845,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
+        // On a backend that keeps its own signal queues (KVM), decided before
+        // any effect: `tgid` may name any live thread of the process, which
+        // Linux's `complete_signal` tries first.
+        let admitted = match self
+            .admit_guest_send(
+                guest,
+                call.into(),
+                Some(DetPid::from_raw(process)),
+                DetTid::from_raw(tgid),
+                SendScope::Process,
+                call.sig(),
+            )
+            .await
+        {
+            GuestSend::Refused(answer) => return answer,
+            admitted => admitted,
+        };
         match self
             .own_process_signal(guest, Sysno::kill, tgid, process, call.sig())
             .await?
@@ -2868,7 +2887,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tid = match target {
             ProcessSignalTarget::Thread(tid) | ProcessSignalTarget::Chosen(tid) => tid,
             ProcessSignalTarget::SharedQueue => {
-                return self
+                let value = self
                     .send_guest_signal(
                         guest,
                         call,
@@ -2879,7 +2898,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         named,
                         false,
                     )
-                    .await;
+                    .await?;
+                self.guest_send_committed(guest, &admitted).await;
+                return Ok(value);
             }
             ProcessSignalTarget::Zombie => {
                 // A zombie: exited, and its parent can still wait for it.
@@ -2974,6 +2995,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let ProcessSignalTarget::Chosen(_) = target {
             crate::tool_global::process_signal_sent(guest, DetPid::from_raw(process)).await;
         }
+        self.guest_send_committed(guest, &admitted).await;
         self.notify_cross_task_signal(
             guest,
             tid,
@@ -3719,6 +3741,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.send_reserved_sigkill(guest, reservation, call).await;
             }
         }
+        // On a backend that keeps its own signal queues (KVM), decided before
+        // any effect. Non-positive ids are EINVAL first.
+        let admitted = if reserved_exit || exited_leader || tid <= 0 || tgid <= 0 {
+            GuestSend::NotDecided
+        } else {
+            match self
+                .admit_guest_send(
+                    guest,
+                    call.into(),
+                    Some(DetPid::from_raw(tgid)),
+                    DetTid::from_raw(tid),
+                    SendScope::Thread,
+                    call.sig(),
+                )
+                .await
+            {
+                GuestSend::Refused(answer) => return answer,
+                admitted => admitted,
+            }
+        };
         let value = self
             .send_guest_signal(
                 guest,
@@ -3736,6 +3778,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if exited_leader {
             return Ok(value);
         }
+        self.guest_send_committed(guest, &admitted).await;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
@@ -3854,6 +3897,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.send_reserved_sigkill(guest, reservation, call).await;
             }
         }
+        // As in `tgkill`, decided before any effect on a backend that keeps
+        // its own signal queues.
+        let admitted = if reserved_exit || exited_leader || tid <= 0 {
+            GuestSend::NotDecided
+        } else {
+            match self
+                .admit_guest_send(
+                    guest,
+                    call.into(),
+                    None,
+                    DetTid::from_raw(tid),
+                    SendScope::Thread,
+                    call.sig(),
+                )
+                .await
+            {
+                GuestSend::Refused(answer) => return answer,
+                admitted => admitted,
+            }
+        };
         let value = self
             .send_guest_signal(
                 guest,
@@ -3870,6 +3933,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if exited_leader {
             return Ok(value);
         }
+        self.guest_send_committed(guest, &admitted).await;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
         self.notify_cross_task_signal(
@@ -4139,6 +4203,104 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::error!("{}", reason);
         crate::tool_global::stopping_refusal(guest, reason).await;
         Some(Err(Errno::EPERM.into()))
+    }
+
+    /// Section 2 of the KVM cross-process signal design: before a guest's
+    /// send that names another process, or the sender's own process while
+    /// that has another thread, goes to a backend that keeps its own signal
+    /// queues, the scheduler decides in the sender's turn whether it can
+    /// order the delivery Linux makes (`Scheduler::guest_send_admission`).
+    /// `process` is the process the call names (`None`: the named thread's),
+    /// and `named` the task Linux reads first: the thread a thread-directed
+    /// call names, and for a process-directed one the task its id names.
+    ///
+    /// A refused send gets the errno Linux gives a call it fails before it
+    /// sends anything (`refused_send_kernel_errno`), and otherwise its
+    /// refusal by name through the unsupported-operation policy, with no
+    /// effect: a fail-closed run stops with the policy-refusal status, and
+    /// `--allow-unsupported-syscalls` returns ENOSYS. Only where Detcore
+    /// answers targets that are not live from its own model
+    /// (`answers_non_live_targets`), which every caller has done by then.
+    pub(crate) async fn admit_guest_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: syscalls::Syscall,
+        process: Option<DetPid>,
+        named: DetTid,
+        scope: SendScope,
+        signal: i32,
+    ) -> GuestSend {
+        if !answers_non_live_targets(guest.config()) {
+            return GuestSend::NotDecided;
+        }
+        let refusal =
+            match crate::tool_global::guest_send_admission(guest, process, named, scope, signal)
+                .await
+            {
+                SendAdmission::NotDecided => return GuestSend::NotDecided,
+                SendAdmission::NoTransition => {
+                    return GuestSend::Admitted {
+                        receiver: None,
+                        scope,
+                        signal,
+                    };
+                }
+                SendAdmission::Catch { receiver, .. } => {
+                    return GuestSend::Admitted {
+                        receiver: Some(receiver),
+                        scope,
+                        signal,
+                    };
+                }
+                SendAdmission::Refused(refusal) => refusal,
+            };
+        let sysno = reverie::syscalls::SyscallInfo::number(&syscall);
+        let (siginfo, group) = refused_send_arguments(syscall);
+        if let Some(errno) = self
+            .refused_send_kernel_errno(guest, signal, siginfo, named, group)
+            .await
+        {
+            return GuestSend::Refused(Err(errno.into()));
+        }
+        let target = match (scope, process) {
+            (SendScope::Thread, _) => format!("thread {named}"),
+            (SendScope::Process, Some(process)) => format!("process {process}"),
+            (SendScope::Process, None) => format!("the process of thread {named}"),
+        };
+        let reason = format!(
+            "KVM cannot deliver signal {signal} to {target}: {refusal} (the KVM cross-process \
+             signal design, section 2; https://github.com/rrnewton/hermit/issues/4485)"
+        );
+        let dettid = guest.thread_state().dettid;
+        super::helpers::report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!("[dtid {dettid}] {sysno} refused: {reason}"),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        GuestSend::Refused(
+            self.refuse_unserviceable_operation_because(guest, sysno, Errno::ENOSYS, &reason)
+                .await,
+        )
+    }
+
+    /// The forwarded call of a send `admit_guest_send` admitted succeeded:
+    /// a caught copy is claimed for the thread chosen to take it
+    /// (`Scheduler::guest_send_committed`).
+    pub(crate) async fn guest_send_committed<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        send: &GuestSend,
+    ) {
+        if let GuestSend::Admitted {
+            receiver: Some(receiver),
+            scope,
+            signal,
+        } = send
+        {
+            crate::tool_global::guest_send_committed(guest, *receiver, *scope, *signal).await;
+        }
     }
 
     /// Tell the scheduler that a successful thread-directed send left a signal
@@ -4829,6 +4991,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.send_reserved_sigkill(guest, reservation, call).await;
             }
         }
+        // As in `tgkill`, decided before any effect on a backend that keeps
+        // its own signal queues. A nested caller's tgid is its namespace's,
+        // so the named thread's own process is taken.
+        let admitted = if exited_leader || tid <= 0 || call.tgid() <= 0 {
+            GuestSend::NotDecided
+        } else {
+            match self
+                .admit_guest_send(
+                    guest,
+                    call.into(),
+                    (!nested).then(|| DetPid::from_raw(call.tgid())),
+                    DetTid::from_raw(tid),
+                    SendScope::Thread,
+                    call.sig(),
+                )
+                .await
+            {
+                GuestSend::Refused(answer) => return answer,
+                admitted => admitted,
+            }
+        };
         let value = self
             .send_guest_signal(
                 guest,
@@ -4844,6 +5027,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if exited_leader {
             return Ok(value);
         }
+        self.guest_send_committed(guest, &admitted).await;
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
@@ -5029,6 +5213,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let process = signal_target_process(guest, DetPid::from_raw(tgid))
             .await
             .map_or(tgid, |process| process.as_raw());
+        // As for kill, decided before any effect on a backend that keeps its
+        // own signal queues.
+        let admitted = match self
+            .admit_guest_send(
+                guest,
+                call.into(),
+                Some(DetPid::from_raw(process)),
+                DetTid::from_raw(tgid),
+                SendScope::Process,
+                call.sig(),
+            )
+            .await
+        {
+            GuestSend::Refused(answer) => return answer,
+            admitted => admitted,
+        };
         match self
             .own_process_signal(guest, Sysno::rt_sigqueueinfo, tgid, process, call.sig())
             .await?
@@ -5074,7 +5274,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tid = match target {
             ProcessSignalTarget::Thread(tid) | ProcessSignalTarget::Chosen(tid) => tid,
             ProcessSignalTarget::SharedQueue => {
-                return self
+                let value = self
                     .send_guest_signal(
                         guest,
                         call,
@@ -5085,7 +5285,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         named,
                         false,
                     )
-                    .await;
+                    .await?;
+                self.guest_send_committed(guest, &admitted).await;
+                return Ok(value);
             }
             ProcessSignalTarget::Zombie => {
                 // A zombie: its parent can still wait for it, so Linux still
@@ -5148,6 +5350,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let ProcessSignalTarget::Chosen(_) = target {
             crate::tool_global::process_signal_sent(guest, DetPid::from_raw(process)).await;
         }
+        self.guest_send_committed(guest, &admitted).await;
         self.notify_cross_task_signal(
             guest,
             tid,
@@ -6676,6 +6879,23 @@ enum NamedThread {
     /// id no task has had, or a thread of another thread group than the one
     /// named (ESRCH).
     Gone,
+}
+
+/// What the admission of a guest's send to a backend that keeps its own
+/// signal queues answered (`Detcore::admit_guest_send`).
+pub(crate) enum GuestSend {
+    /// The admission does not decide this send: it takes its ordinary path.
+    NotDecided,
+    /// Admitted. `receiver`: the thread that is to take its caught copy, for
+    /// which the copy is claimed once the forwarded call succeeds
+    /// (`Detcore::guest_send_committed`).
+    Admitted {
+        receiver: Option<DetTid>,
+        scope: SendScope,
+        signal: i32,
+    },
+    /// Refused, with the call's answer.
+    Refused(Result<i64, Error>),
 }
 
 enum OwnProcessSend {
