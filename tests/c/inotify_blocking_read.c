@@ -725,6 +725,44 @@ static void received_nonblocking_case(const char *label, int getfl, const char *
   close(received);
 }
 
+struct announcing_read {
+  struct blocked_read *r;
+  int ready;
+};
+
+static void *announcing_reader(void *argument) {
+  struct announcing_read *handoff = argument;
+  char tid[16];
+  int length = snprintf(tid, sizeof tid, "%d", (int)syscall(SYS_gettid));
+  if (write(handoff->ready, tid, (size_t)length) != length) fail("write");
+  close(handoff->ready);
+  return blocked_reader(handoff->r);
+}
+
+// Wait until the reader thread is observed blocked (state S in its
+// presented /proc/self/task/<tid>/stat), bounded; the create that follows
+// is ordered by that observation, not by a fixed sleep.
+static void wait_until_blocked(int tid) {
+  char stat_path[64];
+  snprintf(stat_path, sizeof stat_path, "/proc/self/task/%d/stat", tid);
+  for (int attempt = 0; attempt < 10000; attempt++) {
+    FILE *stat_file = fopen(stat_path, "r");
+    if (stat_file != NULL) {
+      char buffer[512];
+      size_t got = fread(buffer, 1, sizeof buffer - 1, stat_file);
+      fclose(stat_file);
+      if (got > 0) {
+        buffer[got] = 0;
+        char *close_paren = strrchr(buffer, ')');
+        if (close_paren != NULL && close_paren[1] == ' ' && close_paren[2] == 'S') return;
+      }
+    }
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    nanosleep(&pause, NULL);
+  }
+  fail("reader never blocked");
+}
+
 // A blocking instance travels over a socket and is read while its event
 // comes 20 ms later: over a socketpair (`unmatched` 0), or over a datagram
 // socket to a name (1). A sibling reads it while the main thread makes the
@@ -773,11 +811,24 @@ static void received_case(const char *label, int unmatched, int alone, const cha
     if (setitimer(ITIMER_REAL, &later, NULL) != 0) fail("setitimer");
     blocked_reader(&r);
   } else {
+    // The sibling announces itself immediately before its read, and the
+    // main thread creates the file only after that announcement: without
+    // the handshake the create can land before the read is issued, the
+    // event is already queued, and no blocking read ever happens.
+    int ready[2];
+    if (pipe(ready) != 0) fail("pipe");
+    struct announcing_read handoff = {&r, ready[1]};
     pthread_t thread;
-    if (pthread_create(&thread, NULL, blocked_reader, &r) != 0) fail("pthread_create");
-    sleep_ms(20);
+    if (pthread_create(&thread, NULL, announcing_reader, &handoff) != 0) fail("pthread_create");
+    char announced[16];
+    ssize_t announced_got = read(ready[0], announced, sizeof announced - 1);
+    if (announced_got < 1) fail("read");
+    announced[announced_got] = 0;
+    wait_until_blocked(atoi(announced));
     create_file(dir, one);
     if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+    close(ready[0]);
+    close(ready[1]);
   }
   printf("%s read %zd bytes (%s), event %s\n", label, r.got,
          r.got < 0 ? strerrorname_np(r.error) : "ok", name_or_dash(r.buffer, r.got, EVENT));
@@ -802,9 +853,18 @@ static void received_outside_case(const char *name, const char *dir) {
   close(s);
   report("received-outside: F_GETFL shows the received descriptor blocking", !nonblocking(received));
   struct blocked_read r = {.fd = received, .how = READ};
+  int ready[2];
+  if (pipe(ready) != 0) fail("pipe");
+  struct announcing_read handoff = {&r, ready[1]};
   pthread_t thread;
-  if (pthread_create(&thread, NULL, blocked_reader, &r) != 0) fail("pthread_create");
-  sleep_ms(20);
+  if (pthread_create(&thread, NULL, announcing_reader, &handoff) != 0) fail("pthread_create");
+  char announced[16];
+  ssize_t announced_got = read(ready[0], announced, sizeof announced - 1);
+  if (announced_got < 1) fail("read");
+  announced[announced_got] = 0;
+  wait_until_blocked(atoi(announced));
+  close(ready[0]);
+  close(ready[1]);
   char path[512];
   snprintf(path, sizeof path, "%s/o1", dir);
   int fd = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
