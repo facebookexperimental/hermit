@@ -10,7 +10,9 @@
 //! facts; host-no-rdrand requires CPUID faulting without the v3 qualification.
 //!
 //! Every class the v3 startup qualification cannot cover is refused by name.
-//! Neither nondefault profile silently falls back to v2 or native CPUID.
+//! Neither nondefault profile, once named, silently falls back to v2 or
+//! native CPUID. auto, the default, presents x86-64-v2 where this run or host
+//! cannot carry x86-64-v3, and says why ([`choose_auto`]).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -648,6 +650,329 @@ pub fn resolve_launch_auto(
     Ok(())
 }
 
+/// Why a run presents the CPU profile it does. A run's manifest records it
+/// beside the profile ([`ProfileChoice`]).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileReason {
+    /// `--cpu-profile`, `HERMIT_CPU_PROFILE`, a run config or a manifest
+    /// named the profile.
+    Explicit,
+    /// auto, from what the program and its interpreter declare: x86-64-v3
+    /// where one declares it, admitted afterwards as an explicit x86-64-v3
+    /// is; and for `hermit record start`, which never qualifies the host for
+    /// auto, x86-64-v2 otherwise.
+    Declared,
+    /// auto: this run's x86-64-v3 admission passed.
+    Admitted,
+    /// auto: under a hypervisor, x86-64-v2 without qualifying the host (the
+    /// probe is never cached there, so it would run again on every run).
+    Hypervisor,
+    /// auto: the host failed the x86-64-v3 qualification.
+    QualificationRefused,
+    /// auto: this run's backend or options cannot carry x86-64-v3, whatever
+    /// the host.
+    RequestNotAdmissible,
+}
+
+impl ProfileReason {
+    /// The reason's name, as a manifest writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProfileReason::Explicit => "explicit",
+            ProfileReason::Declared => "declared",
+            ProfileReason::Admitted => "admitted",
+            ProfileReason::Hypervisor => "hypervisor",
+            ProfileReason::QualificationRefused => "qualification-refused",
+            ProfileReason::RequestNotAdmissible => "request-not-admissible",
+        }
+    }
+
+    /// Whether the profile chosen for this reason depends on the host, so
+    /// that the same command on another host can present another CPU.
+    pub fn host_dependent(self) -> bool {
+        matches!(
+            self,
+            ProfileReason::Admitted
+                | ProfileReason::Hypervisor
+                | ProfileReason::QualificationRefused
+        )
+    }
+}
+
+/// The profile a run presents and why: the `cpu_profile` of its manifest.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileChoice {
+    pub profile: CpuProfile,
+    pub reason: ProfileReason,
+    /// For `qualification-refused` and `request-not-admissible`, the
+    /// refusal's own words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ProfileChoice {
+    /// What the debug resolution line says of this choice after the profile.
+    pub fn because(&self) -> String {
+        let detail = self.detail.as_deref().unwrap_or_default();
+        match self.reason {
+            ProfileReason::Explicit => "named".to_owned(),
+            ProfileReason::Declared => "from the program's declarations".to_owned(),
+            ProfileReason::Admitted => "this run and host qualify for x86-64-v3".to_owned(),
+            ProfileReason::Hypervisor => {
+                "under a hypervisor, auto does not qualify the host for x86-64-v3".to_owned()
+            }
+            ProfileReason::QualificationRefused => {
+                format!("the host does not qualify for x86-64-v3: {detail}")
+            }
+            ProfileReason::RequestNotAdmissible => {
+                format!("this run cannot carry x86-64-v3: {detail}")
+            }
+        }
+    }
+}
+
+/// What auto chose for a `hermit run`: the choice, and what to say of it in the
+/// run's log, never on stderr, which a default run leaves to its guest: the
+/// qualification's announcement when this process qualified the host, and a
+/// line saying so when a check that can change from one run to the next (the
+/// XINUSE probe, its counters, its deadline), not a fixed fact of the host,
+/// took x86-64-v3 away. The run's manifest records the choice itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoChoice {
+    pub choice: ProfileChoice,
+    pub log: Vec<String>,
+}
+
+/// The host's answer for auto, decided once per process ([`AUTO_HOST`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AutoHost {
+    Admitted,
+    Hypervisor,
+    /// `dynamic`: the fixed checks (kernel, CPUID bits, AMX) passed and the
+    /// probe or the facts after it refused.
+    Refused {
+        why: AdmissionRefusal,
+        dynamic: bool,
+    },
+}
+
+/// This process's [`AutoHost`]. A refusal is kept too, unlike [`ADMITTED`],
+/// so that one process never runs one unmarked program under x86-64-v3 and
+/// another under x86-64-v2 because a check that failed once passed later.
+static AUTO_HOST: std::sync::OnceLock<AutoHost> = std::sync::OnceLock::new();
+
+/// A test-only variable that forces the host's answer for auto, so that the
+/// x86-64-v2 paths can be tested on a host that qualifies:
+/// `hypervisor` (the hypervisor bit, through the same branch as a reported
+/// one), `qualification-refused` or `qualification-refused-dynamic` (each a
+/// refusal that stands whether or not the host reports a hypervisor).
+/// It can only take x86-64-v3 away from a program that needs no more than
+/// x86-64-v2; a program that declares x86-64-v3 is admitted, or refused, as
+/// an explicit x86-64-v3 is. Unset in every real run.
+pub const AUTO_HOST_TEST_ENV: &str = "HERMIT_TEST_CPU_PROFILE_AUTO_HOST";
+
+/// The profile `hermit run` presents under auto for a program whose
+/// declarations ask for `needs` ([`resolve_auto`]), for `request`:
+/// - x86-64-v3 for a program that declares it (`declared`), admitted
+///   afterwards as an explicit x86-64-v3 is, so a run that cannot carry it
+///   is refused;
+/// - x86-64-v2 where `request` cannot carry x86-64-v3 ([`check_request`]);
+/// - otherwise the host's answer, once per process: x86-64-v3 where
+///   [`admit`] passes, x86-64-v2 under a hypervisor without qualifying the
+///   host, and x86-64-v2 where the qualification refuses.
+///
+/// An `Err` is a malformed [`AUTO_HOST_TEST_ENV`].
+pub fn choose_auto(
+    needs: CpuProfile,
+    request: &AdmissionRequest<'_>,
+) -> Result<AutoChoice, String> {
+    let mut announced = Vec::new();
+    let mut auto = choose_auto_with(needs, request, || {
+        if let Some(host) = AUTO_HOST.get() {
+            return Ok(host.clone());
+        }
+        // The announcement is the line an explicit x86-64-v3 prints on stderr;
+        // in the log its level says what "WARNING: " says there.
+        let host = measure_auto_host(request, forced_auto_host()?, &mut |line: &str| {
+            let line = line.trim_end();
+            announced.push(line.strip_prefix("WARNING: ").unwrap_or(line).to_owned())
+        });
+        Ok(AUTO_HOST.get_or_init(|| host).clone())
+    })?;
+    auto.log.splice(0..0, announced);
+    Ok(auto)
+}
+
+/// [`choose_auto`] with the host's answer as a parameter, for the tests. It
+/// is asked only when `needs` is below x86-64-v3 and the request could carry
+/// x86-64-v3.
+fn choose_auto_with(
+    needs: CpuProfile,
+    request: &AdmissionRequest<'_>,
+    host: impl FnOnce() -> Result<AutoHost, String>,
+) -> Result<AutoChoice, String> {
+    let chose = |profile, reason, detail| ProfileChoice {
+        profile,
+        reason,
+        detail,
+    };
+    if needs == CpuProfile::X86_64V3 {
+        return Ok(AutoChoice {
+            choice: chose(CpuProfile::X86_64V3, ProfileReason::Declared, None),
+            log: Vec::new(),
+        });
+    }
+    if let Err(why) = check_request(request) {
+        return Ok(AutoChoice {
+            choice: chose(
+                CpuProfile::X86_64V2,
+                ProfileReason::RequestNotAdmissible,
+                Some(why),
+            ),
+            log: Vec::new(),
+        });
+    }
+    Ok(match host()? {
+        AutoHost::Admitted => AutoChoice {
+            choice: chose(CpuProfile::X86_64V3, ProfileReason::Admitted, None),
+            log: Vec::new(),
+        },
+        AutoHost::Hypervisor => AutoChoice {
+            choice: chose(CpuProfile::X86_64V2, ProfileReason::Hypervisor, None),
+            log: Vec::new(),
+        },
+        AutoHost::Refused { why, dynamic } => AutoChoice {
+            log: dynamic
+                .then(|| {
+                    format!(
+                        "x86-64-v3 is unavailable for this run ({why}); running x86-64-v2. \
+                         Name --cpu-profile to choose the profile."
+                    )
+                })
+                .into_iter()
+                .collect(),
+            choice: chose(
+                CpuProfile::X86_64V2,
+                ProfileReason::QualificationRefused,
+                Some(why),
+            ),
+        },
+    })
+}
+
+/// What [`AUTO_HOST_TEST_ENV`] forces: the hypervisor bit, or a refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ForcedHost {
+    Hypervisor,
+    Refused {
+        why: AdmissionRefusal,
+        dynamic: bool,
+    },
+}
+
+/// The host's answer for auto, measured: a forced refusal, whatever the host
+/// reports; x86-64-v3 already admitted in this process; a hypervisor
+/// (reported, or `forced`), without probing; a fixed check's refusal; or what
+/// [`admit`] says, with the qualification's announcement sent to `announce`
+/// rather than stderr.
+fn measure_auto_host(
+    request: &AdmissionRequest<'_>,
+    forced: Option<ForcedHost>,
+    announce: &mut dyn FnMut(&str),
+) -> AutoHost {
+    measure_auto_host_with(
+        forced,
+        || ADMITTED.get().is_some(),
+        under_hypervisor,
+        || {
+            if let Err(why) = fixed_host_checks() {
+                return AutoHost::Refused {
+                    why,
+                    dynamic: false,
+                };
+            }
+            match admit_announcing_to(request, announce) {
+                Ok(_) => AutoHost::Admitted,
+                Err(why) => AutoHost::Refused { why, dynamic: true },
+            }
+        },
+    )
+}
+
+/// [`measure_auto_host`] with this process's admission, the reported
+/// hypervisor bit and the qualification as parameters, for the tests. A
+/// forced refusal comes first, so that it stands on a host that reports a
+/// hypervisor as well: it can only take x86-64-v3 away. A forced hypervisor
+/// takes the same branch as a reported one, before the host is qualified.
+fn measure_auto_host_with(
+    forced: Option<ForcedHost>,
+    admitted: impl FnOnce() -> bool,
+    reported_hypervisor: impl FnOnce() -> bool,
+    qualify: impl FnOnce() -> AutoHost,
+) -> AutoHost {
+    let forced_hypervisor = match forced {
+        Some(ForcedHost::Refused { why, dynamic }) => return AutoHost::Refused { why, dynamic },
+        Some(ForcedHost::Hypervisor) => true,
+        None => false,
+    };
+    if admitted() {
+        return AutoHost::Admitted;
+    }
+    if forced_hypervisor || reported_hypervisor() {
+        return AutoHost::Hypervisor;
+    }
+    qualify()
+}
+
+/// What [`AUTO_HOST_TEST_ENV`] forces, if it is set. A forced hypervisor
+/// takes the same branch as a reported one ([`measure_auto_host`]).
+fn forced_auto_host() -> Result<Option<ForcedHost>, String> {
+    forced_from(std::env::var_os(AUTO_HOST_TEST_ENV).as_deref())
+}
+
+/// What a value of [`AUTO_HOST_TEST_ENV`] forces.
+fn forced_from(value: Option<&std::ffi::OsStr>) -> Result<Option<ForcedHost>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let refused = |dynamic| ForcedHost::Refused {
+        why: format!("{AUTO_HOST_TEST_ENV}={} forced it", value.to_string_lossy()),
+        dynamic,
+    };
+    match value.to_str() {
+        Some("hypervisor") => Ok(Some(ForcedHost::Hypervisor)),
+        Some("qualification-refused") => Ok(Some(refused(false))),
+        Some("qualification-refused-dynamic") => Ok(Some(refused(true))),
+        _ => Err(format!(
+            "{AUTO_HOST_TEST_ENV}={value:?} is not hypervisor, qualification-refused or \
+             qualification-refused-dynamic"
+        )),
+    }
+}
+
+/// Whether this host reports a hypervisor (CPUID leaf 1, ECX bit 31), where
+/// auto presents x86-64-v2 without qualifying the host.
+#[cfg(target_arch = "x86_64")]
+pub fn under_hypervisor() -> bool {
+    std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+}
+
+/// No x86 hypervisor bit exists on another architecture.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn under_hypervisor() -> bool {
+    false
+}
+
 /// Linux's version as (major, minor), from a `uname -r` release string.
 pub fn kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(['.', '-']);
@@ -896,7 +1221,19 @@ static ADMITTED: std::sync::OnceLock<Qualification> = std::sync::OnceLock::new()
 /// refusals are checked every time; the host qualification runs once per
 /// process.
 pub fn admit(request: &AdmissionRequest<'_>) -> Result<Qualification, AdmissionRefusal> {
-    admit_with(request, qualify_host_cached)
+    admit_with(request, || {
+        qualify_host_cached_announcing(&mut |line: &str| eprint!("{line}"))
+    })
+}
+
+/// [`admit`] with the qualification's announcement (that it takes seconds, and
+/// where a pass is cached) sent to `announce` instead of stderr: auto, the
+/// default, leaves a run's stderr to its guest and logs it.
+pub fn admit_announcing_to(
+    request: &AdmissionRequest<'_>,
+    announce: &mut dyn FnMut(&str),
+) -> Result<Qualification, AdmissionRefusal> {
+    admit_with(request, || qualify_host_cached_announcing(announce))
 }
 
 /// [`admit`] with its host qualification as a parameter, so that a test can
@@ -1002,17 +1339,22 @@ pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
 }
 
 /// [`admit`]'s host half: the same qualification, with the XINUSE probe
-/// through the per-host cache ([`cached_probe`]).
+/// through the per-host cache ([`cached_probe`]), its announcement sent to
+/// `announce`.
 #[cfg(target_arch = "x86_64")]
-fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
-    qualify_host_with(cached_probe)
+fn qualify_host_cached_announcing(
+    announce: &mut dyn FnMut(&str),
+) -> Result<Qualification, AdmissionRefusal> {
+    qualify_host_with(|xcr0| cached_probe(xcr0, announce))
 }
 
 /// [`admit`]'s host half on a non-x86-64 host: the x86-64-v3 profile
 /// qualifies an x86 XSTATE probe, so no qualification exists here and
 /// admission refuses by name (issue 5131).
 #[cfg(not(target_arch = "x86_64"))]
-fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
+fn qualify_host_cached_announcing(
+    _announce: &mut dyn FnMut(&str),
+) -> Result<Qualification, AdmissionRefusal> {
     Err(
         "host qualification for the x86-64-v3 CPU profile is not available \
          on this architecture (aarch64 has no x86 XSTATE probe)"
@@ -1037,21 +1379,24 @@ fn probe_cache_inputs() -> String {
 }
 
 /// The XINUSE probe for [`admit`]: its passing report cached for this host
-/// (`crate::host_qualification`), or else a fresh probe, announced on stderr
-/// because it takes seconds, and cached if it passes. The probe certifies the
+/// (`crate::host_qualification`), or else a fresh probe, announced to
+/// `announce` (stderr for an explicit x86-64-v3, the log under auto) because
+/// it takes seconds, and cached if it passes. The probe certifies the
 /// CPU's and kernel's XSAVE behavior, which no sandbox changes, so the host
 /// key suffices; the checks that depend on the caller's sandbox run on every
 /// run (<https://github.com/rrnewton/hermit/issues/4515>). Under a hypervisor
 /// nothing is cached: a live migration keeps the boot, the kernel and CPUID
 /// but moves the guest to a host the forced-exit arm never certified.
 #[cfg(target_arch = "x86_64")]
-fn cached_probe(xcr0: u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
-    let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+fn cached_probe(
+    xcr0: u64,
+    announce: &mut dyn FnMut(&str),
+) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
     cached_probe_at(
-        cache_path_for(hypervisor).as_deref(),
+        cache_path_for(under_hypervisor()).as_deref(),
         &crate::host_qualification::HostKey::current(),
         xcr0,
-        &mut |line: &str| eprint!("{line}"),
+        announce,
         || xstate_probe::qualify(xstate_probe::ProbeOptions::default()),
     )
 }
@@ -1139,6 +1484,17 @@ fn cached_probe_at(
 fn qualify_host_with(
     probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
 ) -> Result<Qualification, AdmissionRefusal> {
+    let xcr0 = fixed_host_checks()?;
+    let probe = probe(xcr0)?;
+    let host = capture(&probe)?;
+    Ok((probe, host))
+}
+
+/// The qualification's checks of fixed host facts, which give the same answer
+/// on every run of one boot: the kernel, the every-bit CPUID check and the
+/// dynamic-feature refusal. Returns XCR0.
+#[cfg(target_arch = "x86_64")]
+fn fixed_host_checks() -> Result<u64, AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -1149,9 +1505,14 @@ fn qualify_host_with(
     // SAFETY: OSXSAVE was checked above.
     let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
     refuse_dynamic_features(xcr0, 0)?;
-    let probe = probe(xcr0)?;
-    let host = capture(&probe)?;
-    Ok((probe, host))
+    Ok(xcr0)
+}
+
+/// No x86-64 qualification exists on another architecture
+/// ([`qualify_host_cached_announcing`]).
+#[cfg(not(target_arch = "x86_64"))]
+fn fixed_host_checks() -> Result<u64, AdmissionRefusal> {
+    qualify_host_cached_announcing(&mut |_| {}).map(|_| 0)
 }
 
 /// Refuses a host with a user-dynamic xstate feature (AMX TILEDATA, bit 18) in
@@ -1473,6 +1834,286 @@ mod tests {
         let mut r = request("ptrace");
         r.namespace_only = true;
         assert!(check_request(&r).unwrap_err().contains("--namespace-only"));
+    }
+
+    /// auto's choice for `hermit run`: a program that declares x86-64-v3 gets
+    /// it (to be admitted as an explicit one is) and a request that cannot
+    /// carry it gets x86-64-v2, both without asking the host; otherwise the
+    /// host's answer decides, and only a refusal by a check that can change
+    /// between runs adds a line for the run's log.
+    #[test]
+    fn auto_asks_the_host_only_for_a_program_and_request_it_could_upgrade() {
+        let unasked = || -> Result<AutoHost, String> { panic!("the host was asked") };
+        let chosen = |needs, request: &AdmissionRequest<'_>, host: Result<AutoHost, String>| {
+            choose_auto_with(needs, request, || host).unwrap()
+        };
+        let choice = |profile, reason, detail: Option<&str>| ProfileChoice {
+            profile,
+            reason,
+            detail: detail.map(str::to_owned),
+        };
+        assert_eq!(
+            choose_auto_with(CpuProfile::X86_64V3, &request("kvm"), unasked).unwrap(),
+            AutoChoice {
+                choice: choice(CpuProfile::X86_64V3, ProfileReason::Declared, None),
+                log: Vec::new(),
+            }
+        );
+        let no_cpuid = AdmissionRequest {
+            virtualize_cpuid: false,
+            ..request("ptrace")
+        };
+        for r in [request("kvm"), request("dbt"), no_cpuid] {
+            let auto = choose_auto_with(CpuProfile::X86_64V2, &r, unasked).unwrap();
+            let why = check_request(&r).unwrap_err();
+            assert_eq!(
+                auto.choice,
+                choice(
+                    CpuProfile::X86_64V2,
+                    ProfileReason::RequestNotAdmissible,
+                    Some(&why),
+                ),
+            );
+            assert_eq!(auto.log, Vec::<String>::new());
+        }
+        let ptrace = request("ptrace");
+        assert_eq!(
+            chosen(CpuProfile::X86_64V2, &ptrace, Ok(AutoHost::Admitted)).choice,
+            choice(CpuProfile::X86_64V3, ProfileReason::Admitted, None)
+        );
+        assert_eq!(
+            chosen(CpuProfile::X86_64V2, &ptrace, Ok(AutoHost::Hypervisor)),
+            AutoChoice {
+                choice: choice(CpuProfile::X86_64V2, ProfileReason::Hypervisor, None),
+                log: Vec::new(),
+            }
+        );
+        let fixed = chosen(
+            CpuProfile::X86_64V2,
+            &ptrace,
+            Ok(AutoHost::Refused {
+                why: "AMX".into(),
+                dynamic: false,
+            }),
+        );
+        assert_eq!(
+            fixed.choice,
+            choice(
+                CpuProfile::X86_64V2,
+                ProfileReason::QualificationRefused,
+                Some("AMX")
+            )
+        );
+        assert_eq!(fixed.log, Vec::<String>::new());
+        let dynamic = chosen(
+            CpuProfile::X86_64V2,
+            &ptrace,
+            Ok(AutoHost::Refused {
+                why: "the probe's deadline passed".into(),
+                dynamic: true,
+            }),
+        );
+        assert_eq!(
+            dynamic.log,
+            vec![
+                "x86-64-v3 is unavailable for this run (the probe's deadline passed); running \
+                 x86-64-v2. Name --cpu-profile to choose the profile."
+                    .to_owned()
+            ]
+        );
+        assert_eq!(dynamic.choice.reason, ProfileReason::QualificationRefused);
+        assert_eq!(
+            choose_auto_with(CpuProfile::X86_64V2, &ptrace, || Err("bad".into())),
+            Err("bad".into())
+        );
+    }
+
+    /// The order of auto's host answer, on hosts that report a hypervisor and
+    /// hosts that do not: a forced refusal (fixed or dynamic) stands either
+    /// way, with its words, before anything else is consulted, and only a
+    /// dynamic one adds a line for the log; a forced hypervisor takes the reported
+    /// hypervisor's branch, after this process's admission and before any
+    /// qualification; unforced, the reported bit decides between that branch
+    /// and qualifying. Nothing forced ever admits.
+    #[test]
+    fn a_forced_refusal_stands_on_a_host_that_reports_a_hypervisor() {
+        let why = format!("{AUTO_HOST_TEST_ENV}=forced");
+        let refused = |dynamic| ForcedHost::Refused {
+            why: why.clone(),
+            dynamic,
+        };
+        let ptrace = request("ptrace");
+        for dynamic in [false, true] {
+            // Decided before the admission, the hypervisor bit or the
+            // qualification is consulted: each of those panics if asked.
+            let first = measure_auto_host_with(
+                Some(refused(dynamic)),
+                || panic!("a forced refusal consulted this process's admission"),
+                || panic!("a forced refusal consulted the hypervisor bit"),
+                || panic!("a forced refusal qualified the host"),
+            );
+            // And on a host that reports a hypervisor, explicitly.
+            let on_a_hypervisor = measure_auto_host_with(
+                Some(refused(dynamic)),
+                || false,
+                || true,
+                || panic!("a forced refusal qualified the host"),
+            );
+            for host in [first, on_a_hypervisor] {
+                assert_eq!(
+                    host,
+                    AutoHost::Refused {
+                        why: why.clone(),
+                        dynamic,
+                    }
+                );
+                let auto = choose_auto_with(CpuProfile::X86_64V2, &ptrace, || Ok(host)).unwrap();
+                assert_eq!(
+                    auto.choice,
+                    ProfileChoice {
+                        profile: CpuProfile::X86_64V2,
+                        reason: ProfileReason::QualificationRefused,
+                        detail: Some(why.clone()),
+                    }
+                );
+                assert_eq!(
+                    auto.log,
+                    dynamic
+                        .then(|| format!(
+                            "x86-64-v3 is unavailable for this run ({why}); running x86-64-v2. \
+                             Name --cpu-profile to choose the profile."
+                        ))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let qualified = || AutoHost::Admitted;
+        for reported in [false, true] {
+            for admitted in [false, true] {
+                let forced_hypervisor = measure_auto_host_with(
+                    Some(ForcedHost::Hypervisor),
+                    || admitted,
+                    || reported,
+                    || panic!("a forced hypervisor qualified the host"),
+                );
+                let expected = if admitted {
+                    AutoHost::Admitted
+                } else {
+                    AutoHost::Hypervisor
+                };
+                assert_eq!(
+                    forced_hypervisor, expected,
+                    "forced hypervisor, reported hypervisor {reported}, admitted {admitted}"
+                );
+                let unforced = measure_auto_host_with(None, || admitted, || reported, qualified);
+                let expected = if !admitted && reported {
+                    AutoHost::Hypervisor
+                } else {
+                    AutoHost::Admitted
+                };
+                assert_eq!(
+                    unforced, expected,
+                    "unforced, reported hypervisor {reported}, admitted {admitted}"
+                );
+            }
+        }
+        // Unforced on a reported hypervisor, the host is never qualified.
+        assert_eq!(
+            measure_auto_host_with(
+                None,
+                || false,
+                || true,
+                || panic!("a reported hypervisor qualified the host"),
+            ),
+            AutoHost::Hypervisor
+        );
+        // The values the variable forces are the ones tested above.
+        let forced_from = |value: Option<&str>| forced_from(value.map(std::ffi::OsStr::new));
+        assert_eq!(
+            forced_from(Some("qualification-refused")),
+            Ok(Some(ForcedHost::Refused {
+                why: format!("{AUTO_HOST_TEST_ENV}=qualification-refused forced it"),
+                dynamic: false,
+            }))
+        );
+        assert_eq!(
+            forced_from(Some("qualification-refused-dynamic")),
+            Ok(Some(ForcedHost::Refused {
+                why: format!("{AUTO_HOST_TEST_ENV}=qualification-refused-dynamic forced it"),
+                dynamic: true,
+            }))
+        );
+        assert_eq!(
+            forced_from(Some("hypervisor")),
+            Ok(Some(ForcedHost::Hypervisor))
+        );
+        assert_eq!(forced_from(None), Ok(None));
+        assert!(forced_from(Some("admitted")).is_err());
+    }
+
+    /// A manifest's `cpu_profile` reads back as written, with the reasons'
+    /// names; a field it does not know is refused. Only the reasons that
+    /// depend on the host are host-drawn.
+    #[test]
+    fn a_profile_choice_round_trips_and_names_its_reason() {
+        let reasons = [
+            ProfileReason::Explicit,
+            ProfileReason::Declared,
+            ProfileReason::Admitted,
+            ProfileReason::Hypervisor,
+            ProfileReason::QualificationRefused,
+            ProfileReason::RequestNotAdmissible,
+        ];
+        for reason in reasons {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(reason.name())
+            );
+            assert_eq!(
+                reason.host_dependent(),
+                matches!(
+                    reason.name(),
+                    "admitted" | "hypervisor" | "qualification-refused"
+                ),
+                "{reason:?}"
+            );
+        }
+        let choice = ProfileChoice {
+            profile: CpuProfile::X86_64V2,
+            reason: ProfileReason::QualificationRefused,
+            detail: Some("AMX".into()),
+        };
+        let written = serde_json::to_value(&choice).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "profile": "x86-64-v2",
+                "reason": "qualification-refused",
+                "detail": "AMX",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProfileChoice>(written).unwrap(),
+            choice
+        );
+        assert_eq!(
+            serde_json::to_value(ProfileChoice {
+                profile: CpuProfile::X86_64V3,
+                reason: ProfileReason::Admitted,
+                detail: None,
+            })
+            .unwrap(),
+            serde_json::json!({"profile": "x86-64-v3", "reason": "admitted"})
+        );
+        assert!(
+            serde_json::from_value::<ProfileChoice>(serde_json::json!({
+                "profile": "x86-64-v2",
+                "reason": "explicit",
+                "source": "flag",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

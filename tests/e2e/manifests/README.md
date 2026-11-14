@@ -608,6 +608,29 @@ Add `--lane portable --ci-only --prebuilt` when reproducing a portable CI node
 against fixtures from `test-harness build`. The runner owns manifest selection,
 host-capability checks, CPU and wall limits, retries, and JSONL/JUnit results.
 
+With no profile named, Hermit presents x86-64-v3 where the run and host
+qualify and x86-64-v2 elsewhere, so the runner records which one each cell got.
+It asks every `hermit run` of a cell for a manifest (`--manifest=always`) and
+points them at one directory of the cell's, `hermit-data-stage`
+(`HERMIT_DATA_DIR`, the only way `hermit run` takes it), which it moves to
+`hermit-data/<attempt>` when each attempt's process ends. The variable names the
+same path for every attempt because a custom cell outside the hermetic lane
+hands Hermit's environment to its guest, and its assertions compare its
+attempts. The runner copies the manifests' `cpu_profile` (profile, reason,
+detail) and `inputs.host_drawn["cpu-profile"]` into `cpu-profile.json` in each
+attempt's directory. Beside `results.jsonl` it writes `cpu-profiles.jsonl`, one
+row per result row combining its attempts (a chaos row's seeds, a custom row's
+runs), and `ci-environment.json`, the CI image (from `/etc/os-release`) with
+the final rows' totals by profile and reason. A row whose runs left no manifest
+recording a profile (a run refused before it started, exit 122) or whose runs
+disagree is `"resolved": false` with the reason, never a guessed profile. A
+replay row is always unresolved: its `record start --verify-run` writes no
+manifest, so the row says so by name. The run's last line gives the totals, for
+example `test-harness: cpu profile: x86-64-v3 12 (admitted 12); unresolved 0;
+replay without a manifest 4; without Hermit 0; ci image centos9`.
+`test-harness cpu-profile-record DIR` writes and prints the record for one data
+directory.
+
 `tests/manifest-cli.rs` is the interactive inventory and command renderer. Use
 `list` to find a test and `get` to inspect the direct Hermit command:
 

@@ -25,7 +25,8 @@ use serde::Serialize;
     clap::ValueEnum
 )]
 pub enum CpuProfile {
-    /// x86-64-v2, the default: the table every earlier Hermit has served.
+    /// x86-64-v2: the table every earlier Hermit has served, needing no
+    /// qualification. An absent field means this profile.
     #[default]
     #[value(name = "x86-64-v2")]
     #[serde(rename = "x86-64-v2")]
@@ -41,14 +42,15 @@ pub enum CpuProfile {
     #[value(name = "host-no-rdrand")]
     #[serde(rename = "host-no-rdrand")]
     HostNoRdrand,
-    /// The lowest named profile the guest's image and its program
-    /// interpreter declare they need (`GNU_PROPERTY_X86_ISA_1_NEEDED`):
-    /// x86-64-v2 where neither declares more, x86-64-v3 where one declares
-    /// v3. The command line's default where no profile is named. The CLI
-    /// (and the library's launch, for a configuration that names it)
-    /// resolves it to that named profile before qualification and launch,
-    /// so a run's configuration and a recording only ever hold the named
-    /// profile, and replay uses it without deriving it again.
+    /// The command line's default where no profile is named. For `hermit
+    /// run`: x86-64-v3 where the guest's image or its program interpreter
+    /// declares it (`GNU_PROPERTY_X86_ISA_1_NEEDED`), or where the run and
+    /// host qualify for it; x86-64-v2 otherwise. `hermit record start` and
+    /// the library's launch read the declarations alone: x86-64-v2 unless
+    /// one declares v3. Each resolves it to that named profile before
+    /// qualification and launch, so a run's configuration, its manifest and
+    /// a recording only ever hold the named profile, and replay uses it
+    /// without deriving it again.
     #[value(name = "auto")]
     #[serde(rename = "auto")]
     Auto,
@@ -156,13 +158,14 @@ macro_rules! v3_residual {
          samples a fixed set of cases and forces only CPUID exits, so a CPU or hypervisor \
          that behaves differently only on other instruction paths, or on VM exits the guest \
          cannot see, is not excluded. Firmware (SMM) entries cannot be checked at all. \
-         x86-64-v2 runs, including an auto run that resolves to x86-64-v2 where nothing \
-         declares more, are not affected."
+         x86-64-v2 runs, including an auto run that chose x86-64-v2, are not affected."
     };
 }
 
 /// What the host's XSAVE results can depend on, stated wherever v3 is offered:
-/// the `--cpu-profile` help, `--verify` output, the recording and the docs.
+/// the `--cpu-profile` help, `--verify` output for an x86-64-v3 named or
+/// declared, the run's manifest and log for one auto chose, the recording and
+/// the docs.
 pub const V3_RESIDUAL: &str = v3_residual!();
 
 /// The host-profile caveat, shared by help and admission diagnostics.
@@ -187,13 +190,23 @@ pub const HOST_NO_RDRAND_RESIDUAL: &str = host_no_rdrand_residual!();
 /// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
 pub const CPU_PROFILE_LONG_HELP: &str = concat!(
     "The CPU the guest sees: auto (the default), x86-64-v2, x86-64-v3, or host-no-rdrand. \
-     auto picks the lowest of x86-64-v2 and x86-64-v3 that satisfies what the guest's \
-     executable and its program interpreter declare they need (GNU_PROPERTY_X86_ISA_1_NEEDED), \
-     x86-64-v2 where nothing is declared, and refuses a program it cannot read rather than \
-     guess; the chosen profile is what runs, is qualified like an explicit one, is logged at \
-     debug level, and is what a recording holds. A later exec of an image needing more is \
-     refused where each exec is checked (the ptrace backend), never upgraded; KVM checks \
-     only the first image, so a later KVM exec gets no such refusal. auto reads no shared library: where only a library such as \
+     auto presents x86-64-v3 where the run and host qualify for it and x86-64-v2 everywhere \
+     else; name x86-64-v2 for a run whose CPU must not depend on the host. A run qualifies \
+     on the ptrace backend, with CPUID virtualized and no --gdbserver, on a host that passes \
+     the x86-64-v3 startup qualification (`hermit host-capabilities --cpu-profile x86-64-v3`); \
+     under a hypervisor auto presents x86-64-v2 without qualifying the host, and where a \
+     check that can change between runs takes x86-64-v3 away, the run's log says so; \
+     the choice is never printed on stderr, which the guest's output owns. \
+     auto also reads what the guest's executable and its program interpreter declare they \
+     need (GNU_PROPERTY_X86_ISA_1_NEEDED): a program declaring x86-64-v3 runs under it, \
+     admitted as an explicit x86-64-v3 is, or is refused (exit 122) where it cannot run; one \
+     declaring x86-64-v4, or one auto cannot read, is refused rather than guessed. \
+     `hermit record start` resolves auto by those declarations alone: x86-64-v2 unless one \
+     declares x86-64-v3. The chosen profile and why are logged at debug level and written to \
+     the run's manifest, and a recording holds the profile; replays and reruns use it and \
+     never choose again. A later exec of an image needing more is refused where each exec is checked \
+     (the ptrace backend), never upgraded; KVM checks only the first image, so a later KVM \
+     exec gets no such refusal. auto reads no shared library: where only a library such as \
      libc declares its need (as on distributions whose loader is unmarked), name the profile. \
      A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \

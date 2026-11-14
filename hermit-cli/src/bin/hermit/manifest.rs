@@ -47,6 +47,7 @@
 //!     "run": {"epoch": "2026-10-13T23:55:00.123456Z", "seed": 42},
 //!     "host_drawn": {"epoch": "host-now", "seed": "SystemRandom"}
 //!   },
+//!   "cpu_profile": {"profile": "x86-64-v2", "reason": "explicit"},
 //!   "exit": {"code": 0}
 //! }
 //! ```
@@ -54,8 +55,11 @@
 //! `inputs` names options by their long flag names, exactly as a run config
 //! (`--save-config`) does, and carries the same values, so the manifest needs
 //! no second copy of the run config. `host_drawn` names which of them Hermit
-//! drew from the host, and from where. `exit` is filled in when the guest
-//! ends; a run that never finishes keeps a manifest without it.
+//! drew from the host, and from where; a CPU profile that auto chose by the
+//! host is one (`"cpu-profile": "admitted"`, for example), so such a run
+//! leaves a manifest, and its rerun presents the same profile. `cpu_profile`
+//! records the profile the run presented and why. `exit` is filled in when
+//! the guest ends; a run that never finishes keeps a manifest without it.
 //!
 //! Three choices the owner left open are taken as the coordinator's defaults
 //! (2026-10-13): the file is named `manifest.json`; `inputs` replaces the run
@@ -541,6 +545,21 @@ pub(crate) struct Manifest {
     /// Absent for older documents and execution without instrumentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) preemption: Option<PreemptionSummary>,
+    /// The CPU profile the run presented and why: `explicit` where it was
+    /// named; for auto, `admitted` (x86-64-v3), `hypervisor`,
+    /// `qualification-refused` or `request-not-admissible` (x86-64-v2, the
+    /// last two with the refusal as `detail`), or `declared` where the
+    /// program's declarations decided it (x86-64-v3 it declares, and every
+    /// recording's auto). Absent for older documents, whose runs presented
+    /// x86-64-v2, and for a run auto could not resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_profile: Option<hermit::cpu_profile_admission::ProfileChoice>,
+    /// For an x86-64-v3 run, what its qualification leaves uncovered
+    /// (`detcore_model::cpu_profile::V3_RESIDUAL`), as a recording's metadata
+    /// states it. A `--verify` match prints it on stderr only where the user
+    /// asked for x86-64-v3; this is where an auto run's copy is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_profile_residual: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exit: Option<Exit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,6 +581,8 @@ impl Manifest {
             inputs,
             image: None,
             preemption: None,
+            cpu_profile: None,
+            cpu_profile_residual: None,
             exit: None,
             artifacts: None,
         }
@@ -574,6 +595,16 @@ impl Manifest {
         self.image = Some(image);
         self
     }
+}
+
+/// The residual a manifest records for `choice`: x86-64-v3's, for an
+/// x86-64-v3 run, and nothing otherwise.
+pub(crate) fn residual_of(
+    choice: Option<&hermit::cpu_profile_admission::ProfileChoice>,
+) -> Option<String> {
+    choice
+        .filter(|choice| choice.profile == detcore_model::cpu_profile::CpuProfile::X86_64V3)
+        .map(|_| detcore_model::cpu_profile::V3_RESIDUAL.to_owned())
 }
 
 /// Where a network recording's manifest goes: beside its trace, named after

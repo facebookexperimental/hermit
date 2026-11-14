@@ -28,6 +28,39 @@ branches from 0.5.0.
   - `--summary-json` reports `determinism_loss` (`null`, or the reasons and
     their distinct total).
 
+- CPU profile: with no profile named, `hermit run` presents x86-64-v3 where
+  the run and host qualify for it and x86-64-v2 everywhere else; name
+  `--cpu-profile x86-64-v2` to present the same CPU on every host.
+  - A run qualifies on the ptrace backend, with virtual CPUID and no
+    `--gdbserver`, on a host that passes `hermit host-capabilities
+    --cpu-profile x86-64-v3`. Under a hypervisor, `auto` presents x86-64-v2
+    without qualifying the host.
+  - The choice puts nothing on stderr, which a run leaves to its guest: the
+    profile and why are logged (`--log=debug`), including when a check that
+    can change between runs takes x86-64-v3 away, and recorded in the run's
+    manifest (`cpu_profile`). A profile chosen by the host is host-drawn, so
+    the run leaves a manifest whose rerun presents the same profile, but the
+    host-drawn warning does not name it. `--strict` allows it. Refusals of a
+    profile a user asked for, or a program declares, are printed as before.
+    A `--verify` match states x86-64-v3's residual on stderr only for an
+    x86-64-v3 named or declared; for one auto chose by the host, the log has
+    it and the manifest records it (`cpu_profile_residual`).
+  - A manifest or recording that names no profile reruns and replays as
+    x86-64-v2.
+  - The e2e runner records which profile each cell attempt's Hermit runs
+    presented, copied from their manifests: `cpu-profile.json` per attempt,
+    `cpu-profiles.jsonl` and `ci-environment.json` (with the CI image) per
+    run, and a last summary line with the totals by profile and reason. An
+    attempt without such a manifest is recorded as unresolved, never guessed;
+    a replay cell's `record start --verify-run` writes none, so replay rows
+    are unresolved by that name. A guest sees no new variable that differs
+    between the attempts of its cell.
+  - `hermit record start` and the library's launch functions are unchanged:
+    x86-64-v2 unless the program declares x86-64-v3.
+- A glibc loader that aborts because the CPU lacks its x86-64 level
+  ("Fatal glibc error: CPU does not support x86-64-v3", exit 127) is refused
+  by name (exit 122) on the ptrace backend with virtual CPUID
+  (<https://github.com/rrnewton/hermit/issues/4695>).
 ## 0.5.7
 
 Release for the 2026-11-11 fbsource import. It pins Reverie 0.5.7

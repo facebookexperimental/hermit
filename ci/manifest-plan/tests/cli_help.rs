@@ -127,6 +127,33 @@ fn every_manifest_cli_has_conventional_help() {
 }
 
 #[test]
+fn cpu_profile_record_refuses_an_option_and_creates_nothing() {
+    // A DATA_DIR that starts with '-' is a mistyped option, not a directory to
+    // create and write a record into.
+    let non_repo = non_repository_dir("cpu-profile-record-option");
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let output = run_from(harness, &["cpu-profile-record", "--bogus"], Some(&non_repo));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown option --bogus"),
+        "the refusal must name the option: {stderr}"
+    );
+    let mut entries = std::fs::read_dir(&non_repo)
+        .expect("read the working directory")
+        .map(|entry| entry.expect("read a directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [std::ffi::OsString::from(".git")],
+        "a refused cpu-profile-record must create nothing"
+    );
+    std::fs::remove_dir_all(&non_repo).expect("remove non-repository working directory");
+}
+
+#[test]
 fn every_test_harness_subcommand_has_conventional_help() {
     // This is the complete semantic command list printed by test-harness. Clap's
     // generated `help` dispatchers in sibling binaries are alternate help syntax,
@@ -145,6 +172,7 @@ fn every_test_harness_subcommand_has_conventional_help() {
         "run",
         "parity",
         "sync-cells",
+        "cpu-profile-record",
         "selftest",
     ];
 

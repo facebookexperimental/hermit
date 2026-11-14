@@ -1575,7 +1575,7 @@ tmpfs), with the capability, or with the overlay.
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
-| `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
+| `--cpu-profile PROFILE` | `auto` (the default) gives the guest x86-64-v3 where the run and host qualify and x86-64-v2 elsewhere; `x86-64-v2` and `x86-64-v3` name one profile on every host; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
 | `--virtual-cpus=N` | Tells the guest it has N CPUs (1 to 128) instead of one, so thread pools start N workers; see below. |
 
@@ -1614,9 +1614,34 @@ a preemption, so a run can be slower than with one CPU.
 
 #### The x86-64-v3 CPU profile
 
-By default every guest sees the same x86-64-v2 CPU, so software built for
-x86-64-v3 (CentOS Stream 10's glibc, for example) refuses to start. Its
-loader prints `Fatal glibc error: CPU does not support x86-64-v3` and exits
+By default (`--cpu-profile auto`) a guest sees x86-64-v3 where the run and
+host qualify for it and x86-64-v2 everywhere else; name
+`--cpu-profile x86-64-v2` when a run must see the same CPU on every host.
+
+A `hermit run` qualifies on the ptrace backend, with virtual CPUID and no
+`--gdbserver`, on a host that passes the check below. Under a hypervisor,
+where the check is never cached and would run again on every run, `auto`
+presents x86-64-v2 without running it. When a check that can change between
+runs (the probe, its counters, its deadline) takes x86-64-v3 away, the run's
+log says so. None of this reaches stderr, which a run leaves to its guest:
+the chosen profile and why are logged at `--log=debug` and recorded in the
+run's manifest, and the warning about inputs drawn from the host does not name
+the profile. A refusal (a profile you named, or the program declares, that the
+run or host cannot carry) is still printed. A `--verify` match states the
+x86-64-v3 residual below on stderr only for an x86-64-v3 you named or the
+program declares; for one auto chose, the log has it and the manifest records
+it as `cpu_profile_residual`. `hermit record start` chooses by what the program
+declares alone: x86-64-v2 unless the program or its interpreter declares
+x86-64-v3. The run's manifest records the profile and why, as `cpu_profile`
+with the reason `admitted`, `hypervisor`, `qualification-refused`,
+`request-not-admissible`, `declared` (the program declares x86-64-v3, or a
+recording) or `explicit`; its rerun (`hermit run --from`)
+presents the same profile. A manifest or recording that names no profile
+presents x86-64-v2, the profile every older run presented.
+
+So software built for x86-64-v3 (CentOS Stream 10's glibc, for example)
+starts wherever v3 can be offered. Where it cannot, its loader prints
+`Fatal glibc error: CPU does not support x86-64-v3` and exits
 127 before it opens any library or first tries to set the thread pointer
 (`arch_prctl(ARCH_SET_FS)`). On the ptrace backend with virtual CPUID, Hermit
 recognises exactly that abort and refuses the run by name instead (exit 122),
@@ -1642,6 +1667,9 @@ by name (exit 122), and never falls back to v2:
   or `perf_event_paranoid` above 1);
 - wherever the check fails.
 
+An explicit `--cpu-profile x86-64-v3` is refused in these cases; `auto`
+presents x86-64-v2 instead, unless the program declares x86-64-v3.
+
 The guest's CPUID leaf 0xD describes the host's real XSAVE layout, because a
 guest's XSAVE runs on the host. A recording therefore binds those host facts,
 and `hermit replay` refuses a host where any of them differs.
@@ -1655,7 +1683,8 @@ v3:
 > check samples a fixed set of cases and forces only CPUID exits, so a CPU or
 > hypervisor that behaves differently only on other instruction paths, or on VM
 > exits the guest cannot see, is not excluded. Firmware (SMM) entries cannot be
-> checked at all. Default runs use x86-64-v2, which this does not affect.
+> checked at all. x86-64-v2 runs, including an auto run that chose x86-64-v2,
+> are not affected.
 
 #### Host CPU features without hardware randomness
 

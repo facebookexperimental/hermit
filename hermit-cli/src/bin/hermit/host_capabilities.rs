@@ -205,7 +205,7 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
     if profile.is_default() {
         writeln!(
             stdout,
-            "{profile}: QUALIFIED — the default profile needs no qualification"
+            "{profile}: QUALIFIED — x86-64-v2 needs no qualification"
         )?;
         return Ok(ExitStatus::Exited(0));
     }
@@ -240,11 +240,25 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
                 "{profile}: QUALIFIED — {}",
                 v3_qualification(&report)
             )?;
+            if hermit::cpu_profile_admission::under_hypervisor() {
+                writeln!(
+                    stdout,
+                    "auto (the default) presents x86-64-v2 here without qualifying the host, \
+                     which reports a hypervisor; name --cpu-profile x86-64-v3 to run it"
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "auto (the default) presents x86-64-v3 to ptrace runs with virtual CPUID \
+                     on this host"
+                )?;
+            }
             writeln!(stdout, "{}", detcore_model::cpu_profile::V3_RESIDUAL)?;
             Ok(ExitStatus::Exited(0))
         }
         Err(refusal) => {
             writeln!(stdout, "{profile}: REFUSED — {refusal}")?;
+            writeln!(stdout, "auto (the default) presents x86-64-v2 on this host")?;
             Ok(ExitStatus::Exited(
                 detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
             ))

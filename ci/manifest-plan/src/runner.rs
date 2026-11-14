@@ -4107,6 +4107,12 @@ pub struct RunContext {
     /// [`crate::parity::retention_closure`]: retention only, the same
     /// `--keep-logs` retention as `keep_logs`, adding no process to the cell.
     pub parity_retained: BTreeSet<(String, String)>,
+    /// The tests whose ptrace verify run names the parity golden's CPU profile
+    /// ([`PARITY_GOLDEN_PROFILE_ARG`]): [`crate::parity::planned_comparisons`]
+    /// of the verify cells this run plans. Read from the plan alone, so the
+    /// parity post-pass's switches, which change only what is reported, never
+    /// change how a cell runs.
+    pub parity_compared: BTreeSet<String>,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
     /// Per-machine scaling for individual test CPU and wall bounds. This is execution policy,
@@ -4334,6 +4340,7 @@ impl RunContext {
                 std::env::var_os("E2E_CAPTURE_CUSTOM_RUNS").as_deref(),
             )?,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict,
             record_verify_strict,
             timeout_multipliers: timeout_multipliers_from_env()?,
@@ -4356,6 +4363,22 @@ impl RunContext {
             || self
                 .parity_retained
                 .contains(&(test.to_string(), backend.to_string()))
+    }
+
+    /// The tests whose ptrace verify run names the parity golden's CPU
+    /// profile. See [`RunContext::parity_compared`].
+    pub fn with_parity_compared(mut self, tests: BTreeSet<String>) -> Self {
+        self.parity_compared = tests;
+        self
+    }
+
+    /// Whether this run plans `test`'s ptrace verify cell and at least one
+    /// candidate's ([`RunContext::parity_compared`]). Derived from the plan,
+    /// never listed: a test gains it with its first planned candidate and
+    /// loses it with its last. Its ptrace verify run then names
+    /// [`PARITY_GOLDEN_PROFILE_ARG`].
+    pub fn parity_compares(&self, test: &str) -> bool {
+        self.parity_compared.contains(test)
     }
 
     pub fn with_scheduled_worker_capacity(
@@ -5612,6 +5635,25 @@ fn verify_selector_attempt_invocation_error<'a>(
         return Err(format!("selects a backend again after `run` ({selector})"));
     }
     let mut tokens = InvocationTokens(options);
+    // Written since runs record their CPU profile; absent from earlier rows.
+    let manifest_always = tokens.flag(crate::cpu_profile_record::MANIFEST_ALWAYS_ARG);
+    // The parity golden's profile (`names_parity_golden_profile`): only right
+    // after the manifest flag, which the executor always writes before it (a
+    // row with neither flag predates both), only on the reference backend,
+    // and (below) only in a run that virtualizes CPUID.
+    let golden_profile = tokens.flag(PARITY_GOLDEN_PROFILE_ARG);
+    if golden_profile && !manifest_always {
+        return Err(format!(
+            "names `{PARITY_GOLDEN_PROFILE_ARG}` without `{}` right before it, where the \
+             executor writes it",
+            crate::cpu_profile_record::MANIFEST_ALWAYS_ARG
+        ));
+    }
+    if golden_profile && backend != crate::parity::PARITY_REFERENCE_BACKEND {
+        return Err(format!(
+            "names `{PARITY_GOLDEN_PROFILE_ARG}` on {backend}, which is not the parity reference"
+        ));
+    }
     tokens.require("--base-env=minimal")?;
     tokens.require("--strict")?;
     let level = tokens.prefixed("--proc=");
@@ -5641,6 +5683,12 @@ fn verify_selector_attempt_invocation_error<'a>(
     if run_flags != relaxation_flags {
         return Err(format!(
             "carries the run flags {run_flags:?}, not the ones the row's relaxations record ({relaxation_flags:?})"
+        ));
+    }
+    if golden_profile && run_flags.contains(&NO_VIRTUALIZE_CPUID_ARG) {
+        return Err(format!(
+            "names `{PARITY_GOLDEN_PROFILE_ARG}` in a run with `{NO_VIRTUALIZE_CPUID_ARG}`, which \
+             presents no profile"
         ));
     }
     if tokens.value("--verify-run")? != Some(VERIFY_RUN_DIR_PLACEHOLDER) {
@@ -6208,19 +6256,27 @@ pub fn build_spec(
     };
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
-    if cell.image.is_some() {
-        // Hermit finds the podman store under the invoking user's data
-        // home; the cell's isolated HOME would hide it. The store is a
-        // host input like the Hermit binary itself.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if cell.image.is_some() {
+            // Hermit finds the podman store under the invoking user's data
+            // home; the cell's isolated HOME would hide it. The store is a
+            // host input like the Hermit binary itself.
             env.insert(
                 "XDG_DATA_HOME".into(),
                 home.join(".local/share").to_string_lossy().into_owned(),
             );
-            // Share the materialized-rootfs cache across cells (keyed by
-            // resolved image ID; roots are read-only), so each cell does
-            // not copy the image again inside its CPU budget.
+        }
+        // One cache directory for every Hermit cell. Image cells share the
+        // materialized-rootfs cache (keyed by resolved image ID; roots are
+        // read-only), so each cell does not copy the image again inside its
+        // CPU budget. Every cell shares Hermit's host qualification cache:
+        // with no profile named, Hermit qualifies the host for x86-64-v3
+        // (seconds) and caches a pass by host, boot and binary, which each
+        // cell's isolated HOME would otherwise measure again. Hermit reads
+        // the variable itself; the guest's environment is RUNNER_GUEST_ENV
+        // alone, and a naked cell's program gets nothing extra.
+        if cell.image.is_some() || cell.id.mode != "naked" {
             env.insert(
                 "XDG_CACHE_HOME".into(),
                 home.join(".cache").to_string_lossy().into_owned(),
@@ -6231,6 +6287,20 @@ pub fn build_spec(
         // An environment input preserves explicit custom --epoch precedence.
         // append_guest_env_args intentionally does not forward this CLI input.
         env.insert("HERMIT_EPOCH".into(), context.epoch.clone());
+        // Which CPU profile each run presents is copied from its manifest
+        // (`cpu_profile_record`): every `hermit run` writes one
+        // (`MANIFEST_ALWAYS_ARG`, a flag, so no variable of its own reaches a
+        // guest) into the cell's stage directory, which Hermit creates and the
+        // runner moves to the attempt's own once the attempt ends. `hermit
+        // run` takes that directory only from this variable. The path is the
+        // same for every attempt because a guest can see it: a custom cell
+        // outside the hermetic lane runs under Hermit's default
+        // `--base-env=host`, and its assertions compare its attempts.
+        let data = crate::cpu_profile_record::stage_dir(&dir);
+        env.insert(
+            crate::cpu_profile_record::DATA_DIR_ENV.into(),
+            data.to_string_lossy().into_owned(),
+        );
     }
     let sabre_path_evidence = (backend == "sabre").then(|| {
         dir.join("captures")
@@ -6309,6 +6379,7 @@ pub fn build_spec(
                 "--backend".into(),
                 backend.into(),
                 "run".into(),
+                crate::cpu_profile_record::MANIFEST_ALWAYS_ARG.into(),
             ];
             argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
             argv.extend(cell.test.modes["custom"].args.clone());
@@ -6626,6 +6697,52 @@ fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
     [verify_runs.join("run1"), verify_runs.join("run2")]
 }
 
+/// The CPU profile the ptrace verify run of a parity-compared test names
+/// ([`names_parity_golden_profile`]), right after `run`.
+///
+/// The ptrace verify log is the parity golden
+/// ([`crate::parity::PARITY_REFERENCE_BACKEND`]), and no candidate backend can
+/// carry x86-64-v3: with no profile named, auto presents x86-64-v3 on a
+/// qualifying ptrace host and x86-64-v2 on every other backend. The two
+/// profiles answer CPUID differently, so the guest's C library takes other
+/// paths and selects other routines, and Detcore's records (each CPUID
+/// check-in, every retired-branch count) differ from the first instructions:
+/// the post-pass would compare two different guests. Naming x86-64-v2 on the
+/// golden alone gives both sides the same profile. A candidate's auto already
+/// resolves to x86-64-v2 and its record keeps auto's reason, and a test
+/// planned with no candidate keeps auto, so the e2e cells still run auto's
+/// x86-64-v3 where nothing compares it across backends. Which tests are named
+/// follows the plan alone ([`crate::parity::planned_comparisons`]), never the
+/// post-pass's own switches, which change only what is reported.
+pub const PARITY_GOLDEN_PROFILE_ARG: &str = "--cpu-profile=x86-64-v2";
+
+/// The flag with which a run presents the host's CPUID instead of a profile.
+const NO_VIRTUALIZE_CPUID_ARG: &str = "--no-virtualize-cpuid";
+
+/// Whether this verified run names [`PARITY_GOLDEN_PROFILE_ARG`]: a `verify`
+/// run on the parity reference backend, of a test whose ptrace verify cell
+/// this run plans beside at least one candidate's
+/// ([`RunContext::parity_compares`]), in a run that virtualizes CPUID. A run
+/// with [`NO_VIRTUALIZE_CPUID_ARG`] (the manifest's own policy, the relaxed
+/// level or a probe) presents no profile, so naming one would only make its
+/// record claim a profile its guest never saw.
+fn names_parity_golden_profile(
+    context: &RunContext,
+    cell: &SelectedCell,
+    backend: &str,
+    invocation: &VerifiedInvocation,
+) -> bool {
+    matches!(invocation, VerifiedInvocation::Verify)
+        && backend == crate::parity::PARITY_REFERENCE_BACKEND
+        && context.parity_compares(&cell.id.test)
+        && !cell_hermit_args(&cell.test.modes[&cell.id.mode], backend)
+            .iter()
+            .map(String::as_str)
+            .chain(cell.level_relaxations().into_iter().map(|(arg, _)| arg))
+            .chain(probe_relaxation(cell, backend))
+            .any(|arg| arg == NO_VIRTUALIZE_CPUID_ARG)
+}
+
 /// The one argv builder for verify, replay and chaos cells.
 ///
 /// The three modes run the same guest under the same base environment,
@@ -6664,7 +6781,15 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
             context.record_verify_strict
         }
         VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
-            argv.push("run".into());
+            // A run writes its manifest (`cpu_profile_record`); `record start
+            // --verify-run` writes none, so it is not asked for one.
+            argv.extend([
+                "run".into(),
+                crate::cpu_profile_record::MANIFEST_ALWAYS_ARG.into(),
+            ]);
+            if names_parity_golden_profile(context, cell, backend, &invocation) {
+                argv.push(PARITY_GOLDEN_PROFILE_ARG.into());
+            }
             context.run_verify_strict
         }
     };
@@ -7084,6 +7209,12 @@ fn execute_spec_until(
             .map_err(|e| format!("cannot reset {}: {e}", workdir.display()))?;
     }
     fs::create_dir_all(workdir).map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+    // The cell's Hermit data stage and this attempt's own data directory start
+    // empty, so no earlier attempt's manifest is read as this one's.
+    let hermit_data = crate::cpu_profile_record::attempt_dirs(&spec.env, index);
+    if let Some((stage, retained)) = &hermit_data {
+        crate::cpu_profile_record::reset_attempt(stage, retained)?;
+    }
     // Each `--verify-run` directory must be new, so no earlier attempt's
     // evidence can be read as this one's.
     if let Some(verify_runs) = &spec.verify_runs {
@@ -7157,10 +7288,16 @@ fn execute_spec_until(
         binding.recheck()?;
     }
     let output = execute_process(request, (deadline, remaining_cpu_usec), observations);
+    // However the process ended, what its Hermit runs wrote becomes this
+    // attempt's before the next attempt reuses the stage.
+    let retained = hermit_data.as_ref().map_or(Ok(()), |(stage, retained)| {
+        crate::cpu_profile_record::retain_stage(stage, retained)
+    });
     if let Some(binding) = &spec.command_binding {
         binding.recheck()?;
     }
     let output = output?;
+    retained?;
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut outcome = if output.timeout.is_some() || !output.status.success() {
@@ -14540,6 +14677,7 @@ corpus:
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -15243,6 +15381,7 @@ esac
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -15316,6 +15455,143 @@ esac
             })
             .unwrap();
         assert!(retries_product_failures(&ordinary[0]));
+    }
+
+    /// The parity golden's profile follows the plan
+    /// (`names_parity_golden_profile`): a test's ptrace verify run names
+    /// x86-64-v2 exactly while the run plans it beside at least one candidate,
+    /// so a test gains the flag with its first planned candidate and loses it
+    /// with its last. Built as test-harness builds it, on the shipped
+    /// manifests: the planned verify cells, `parity::planned_comparisons`,
+    /// `RunContext::with_parity_compared`, beside the post-pass's retention
+    /// closure, which does not enter it.
+    #[test]
+    fn a_ptrace_verify_names_x86_64_v2_exactly_while_the_plan_has_a_parity_candidate() {
+        use crate::parity::ParityBackend;
+        use crate::parity::ParityCellId;
+        use crate::parity::ParityMatrix;
+        use crate::parity::SideStatus;
+        let root = crate::compiled_manifest_dir!().join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = ParityMatrix::derive(&manifests).unwrap();
+        // A population test whose kvm and liteinst candidates full validation
+        // both runs, and which has a ptrace replay cell.
+        let selected = |test: &str, backend| {
+            matrix.candidate(&ParityCellId {
+                test_id: test.into(),
+                backend,
+            }) == Some(&SideStatus::Selected)
+        };
+        let cells = |test: &str, mode: &str, backend: &str| {
+            manifests
+                .select(&Selection {
+                    test: Some(test.into()),
+                    mode: Some(mode.into()),
+                    backend: Some(backend.into()),
+                    ..Selection::default()
+                })
+                .unwrap()
+        };
+        let test = matrix
+            .population()
+            .into_iter()
+            .map(|cell| cell.test_id)
+            .find(|test| {
+                selected(test, ParityBackend::Kvm)
+                    && selected(test, ParityBackend::Liteinst)
+                    && cells(test, "replay", "ptrace").len() == 1
+            })
+            .expect("a population test with selected kvm and liteinst candidates and a replay");
+        let cell = |mode: &str, backend: &str| {
+            let found = cells(&test, mode, backend);
+            let [cell] = found.as_slice() else {
+                panic!("{test}/{mode}@{backend} is not exactly one cell: {found:?}");
+            };
+            cell.clone()
+        };
+        let scratch = std::env::temp_dir().join(format!(
+            "hermit-parity-golden-profile-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let plan = |backends: &[&str]| {
+            backends
+                .iter()
+                .map(|backend| (test.clone(), backend.to_string()))
+                .collect::<BTreeSet<_>>()
+        };
+        // The context test-harness builds for a plan.
+        let context_for = |planned: &BTreeSet<(String, String)>| {
+            let scope = crate::parity::resolve_scope(&manifests, None, planned).unwrap();
+            run_context(&scratch)
+                .with_parity_retained(crate::parity::retention_closure(&scope.cells, planned))
+                .with_parity_compared(crate::parity::planned_comparisons(planned))
+        };
+        // Whether the cell's argv names the golden's profile; where it does,
+        // once, right after the manifest flag.
+        let names = |context: &RunContext, cell: &SelectedCell| {
+            let argv = build_spec(
+                context,
+                cell,
+                scratch.join("cell"),
+                vec!["/bin/true".into()],
+                "1",
+                None,
+                3,
+            )
+            .unwrap()
+            .argv;
+            let named = argv
+                .iter()
+                .filter(|arg| *arg == PARITY_GOLDEN_PROFILE_ARG)
+                .count();
+            assert!(named <= 1, "{argv:?}");
+            if named == 1 {
+                assert!(
+                    argv.windows(2).any(|pair| pair[0]
+                        == crate::cpu_profile_record::MANIFEST_ALWAYS_ARG
+                        && pair[1] == PARITY_GOLDEN_PROFILE_ARG),
+                    "{argv:?}"
+                );
+            }
+            named == 1
+        };
+        let ptrace = cell("verify", "ptrace");
+        let pins = |backends: &[&str]| names(&context_for(&plan(backends)), &ptrace);
+
+        // Only the reference planned: nothing to compare it with, so auto.
+        assert!(!pins(&["ptrace"]), "{test}");
+        // It gains the pin with a candidate, kvm or liteinst alike...
+        assert!(pins(&["ptrace", "kvm"]), "{test}");
+        assert!(pins(&["ptrace", "liteinst"]), "{test}");
+        assert!(pins(&["ptrace", "kvm", "liteinst"]), "{test}");
+        // ...and loses it with its last candidate.
+        assert!(!pins(&["ptrace"]), "{test}");
+        // Its candidates, which keep auto's x86-64-v2 and its reason, and a
+        // candidate planned without its reference, name nothing.
+        let compared = context_for(&plan(&["ptrace", "kvm"]));
+        assert!(!names(&compared, &cell("verify", "kvm")), "{test}");
+        assert!(!names(
+            &context_for(&plan(&["kvm"])),
+            &cell("verify", "kvm")
+        ));
+        // Its replay is not compared across backends.
+        assert!(!names(&compared, &cell("replay", "ptrace")), "{test}");
+        // With the post-pass off nothing is retained, and the run is the same:
+        // the profile follows the plan, never a switch that changes only the
+        // report (test-harness's
+        // the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest).
+        let off = run_context(&scratch).with_parity_compared(crate::parity::planned_comparisons(
+            &plan(&["ptrace", "kvm"]),
+        ));
+        assert!(off.parity_retained.is_empty());
+        assert!(names(&off, &ptrace), "{test}");
+        // No plan, no flag.
+        assert!(!names(&run_context(&scratch), &ptrace), "{test}");
+        // At the relaxed level the run presents the host's CPUID: no profile.
+        let mut relaxed = ptrace.clone();
+        relaxed.host_level = relaxed_host();
+        assert!(!names(&compared, &relaxed), "{test}");
     }
 
     /// A replay cell's product failure is a divergence between a recording
@@ -15956,6 +16232,7 @@ esac
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -16897,6 +17174,260 @@ fi
         }
     }
 
+    /// Every Hermit run of a cell writes its manifest into one stage
+    /// directory, named by the same `HERMIT_DATA_DIR` for every attempt: a
+    /// custom cell outside the hermetic lane hands Hermit's environment to its
+    /// guest (no `--base-env=minimal`), and the attempts its assertions compare
+    /// must see byte-identical values. The manifest policy is a flag, so no
+    /// `HERMIT_MANIFEST` reaches any guest; a replay's `record start` writes no
+    /// manifest and gets no flag, and a naked cell gets neither.
+    #[test]
+    fn every_attempt_of_a_cell_names_the_same_hermit_data_directory() {
+        use crate::cpu_profile_record::DATA_DIR_ENV;
+        use crate::cpu_profile_record::MANIFEST_ALWAYS_ARG;
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-data-stage-env-{}",
+            std::process::id()
+        ));
+        let context = run_context(&root);
+        assert!(context.isolated_workdir.is_none());
+        let spec = |cell: &SelectedCell, dir: &str, attempt: &str, seed: Option<i64>| {
+            build_spec(
+                &context,
+                cell,
+                root.join(dir),
+                vec!["/bin/true".into()],
+                attempt,
+                seed,
+                15,
+            )
+            .unwrap()
+        };
+        let flags = |spec: &CellRunSpec| {
+            spec.argv
+                .iter()
+                .filter(|arg| *arg == MANIFEST_ALWAYS_ARG)
+                .count()
+        };
+        let stage = |dir: &str| {
+            crate::cpu_profile_record::stage_dir(&root.join(dir))
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let custom = ptrace_cell("custom");
+        let runs = ["1", "2", "3"].map(|attempt| spec(&custom, "custom", attempt, None));
+        assert!(!runs[0].argv.iter().any(|arg| arg.starts_with("--base-env")));
+        for run in &runs {
+            assert_eq!(run.env.get(DATA_DIR_ENV), Some(&stage("custom")));
+            assert!(!run.env.contains_key("HERMIT_MANIFEST"));
+            assert_eq!(flags(run), 1);
+            assert_eq!(run.env, runs[0].env);
+        }
+        assert_ne!(runs[0].attempt, runs[1].attempt);
+
+        let chaos = ptrace_cell("chaos");
+        let seeds = [1, 2].map(|seed| spec(&chaos, "chaos", &format!("seed-{seed}"), Some(seed)));
+        assert_eq!(seeds[0].env, seeds[1].env);
+        assert_eq!(seeds[0].env.get(DATA_DIR_ENV), Some(&stage("chaos")));
+        assert_eq!(flags(&seeds[0]), 1);
+
+        let verify = spec(&ptrace_cell("verify"), "verify", "1", None);
+        assert_eq!(verify.env.get(DATA_DIR_ENV), Some(&stage("verify")));
+        assert!(!verify.env.contains_key("HERMIT_MANIFEST"));
+        assert_eq!(flags(&verify), 1);
+        let replay = spec(&ptrace_cell("replay"), "replay", "1", None);
+        assert!(
+            replay
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["record", "start"])
+        );
+        assert_eq!(flags(&replay), 0);
+        assert!(!replay.env.contains_key("HERMIT_MANIFEST"));
+        let naked = spec(&ptrace_cell("naked"), "naked", "1", None);
+        assert!(!naked.env.contains_key(DATA_DIR_ENV));
+        assert_eq!(flags(&naked), 0);
+    }
+
+    /// A custom-mode spec of the cell at `root` whose command is `script`,
+    /// run by `/bin/sh` with the cell's Hermit data stage in its environment,
+    /// as `build_spec` gives every Hermit cell.
+    fn data_stage_spec(root: &Path, attempt: &str, script: &str) -> CellRunSpec {
+        CellRunSpec {
+            command_binding: None,
+            id: CellId {
+                test: "fixture/data-stage".into(),
+                mode: "custom".into(),
+                backend: Some("ptrace".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: root.to_path_buf(),
+            env: BTreeMap::from([(
+                crate::cpu_profile_record::DATA_DIR_ENV.to_owned(),
+                crate::cpu_profile_record::stage_dir(root)
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 15,
+            verdict_path: None,
+            verification_log_dir: None,
+            verify_runs: None,
+            single_run_capture: None,
+            sabre_path_evidence: None,
+            cell_dir: root.to_path_buf(),
+            expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
+            expected_stderr: None,
+            comparator: Comparator::Strict,
+            attempt: attempt.into(),
+            fixed_workdir_source: root.join(format!("workdir/{attempt}")),
+        }
+    }
+
+    fn run_data_stage_spec(spec: &CellRunSpec) -> AttemptResult {
+        execute_spec_until(
+            spec,
+            Instant::now() + Duration::from_secs(10),
+            10,
+            10,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// A script that writes a manifest recording `profile`, admitted by the
+    /// host, as Hermit run `id` would, into the directory Hermit is given.
+    fn write_manifest_script(id: &str, profile: &str) -> String {
+        format!(
+            "mkdir -p \"$HERMIT_DATA_DIR/{id}\" && printf '%s' \
+             '{{\"cpu_profile\":{{\"profile\":\"{profile}\",\"reason\":\"admitted\"}}}}' \
+             > \"$HERMIT_DATA_DIR/{id}/manifest.json\""
+        )
+    }
+
+    /// However an attempt's process ends, what it wrote into the cell's stage
+    /// becomes the attempt's own data directory, and the next attempt starts
+    /// with no stage: a stage an interrupted attempt left, and an attempt's
+    /// directory from an earlier run into the same result root, are reset
+    /// first. An attempt that wrote nothing leaves no directory.
+    #[test]
+    fn an_attempts_hermit_data_moves_from_the_cell_stage_to_its_own_directory() {
+        use crate::cpu_profile_record::data_dir;
+        use crate::cpu_profile_record::stage_dir;
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-data-stage-move-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stage = stage_dir(&root);
+        // Leftovers: a stage from an interrupted attempt and attempt 1's
+        // directory from an earlier run.
+        fs::create_dir_all(stage.join("stale")).unwrap();
+        fs::create_dir_all(data_dir(&root, "1").join("old")).unwrap();
+        let first = run_data_stage_spec(&data_stage_spec(
+            &root,
+            "1",
+            &write_manifest_script("a", "x86-64-v3"),
+        ));
+        assert_eq!(first.outcome, "PASS");
+        let listing = |dir: &Path| {
+            let mut names = fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        assert_eq!(listing(&data_dir(&root, "1")), ["a"]);
+        assert!(!stage.exists());
+        // A failing attempt keeps what it wrote too.
+        let second = run_data_stage_spec(&data_stage_spec(
+            &root,
+            "2",
+            &format!("{} && exit 3", write_manifest_script("b", "x86-64-v3")),
+        ));
+        assert_eq!(second.outcome, "FAIL");
+        assert_eq!(listing(&data_dir(&root, "2")), ["b"]);
+        assert!(!stage.exists());
+        // An attempt that wrote nothing (a run refused before it started).
+        let third = run_data_stage_spec(&data_stage_spec(&root, "3", "exit 122"));
+        assert_eq!(third.status, Some(122));
+        assert!(!data_dir(&root, "3").exists());
+        assert!(!stage.exists());
+        assert_eq!(listing(&data_dir(&root, "1")), ["a"]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A row's record reads every attempt the row ran, not only the first,
+    /// whose environment is the row's own copy: three attempts that each left
+    /// a manifest in their own directory give a record naming all three, an
+    /// attempt that disagrees leaves the row unresolved, and a row whose
+    /// attempts name no data directory (a naked cell) has no record.
+    #[test]
+    fn a_rows_record_reads_every_attempt_of_the_row() {
+        use crate::cpu_profile_record::DATA_DIR_ENV;
+        use crate::cpu_profile_record::record_result_row;
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-data-stage-row-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let attempts: Vec<AttemptResult> = ["1", "2", "3"]
+            .iter()
+            .map(|attempt| {
+                run_data_stage_spec(&data_stage_spec(
+                    &root,
+                    attempt,
+                    &write_manifest_script(&format!("m{attempt}"), "x86-64-v3"),
+                ))
+            })
+            .collect();
+        // A row of the fixture's shape carrying these attempts as the runner
+        // leaves them (the fixture rewrites its own attempts' commands).
+        let mut row = verify_row_from_attempts(attempts.clone());
+        row.attempts = attempts;
+        row.mode = "custom".into();
+        let record = record_result_row(&row).unwrap();
+        assert!(record.resolved, "{record:?}");
+        assert_eq!(record.profile.as_deref(), Some("x86-64-v3"));
+        assert_eq!(
+            record.manifests.keys().collect::<Vec<_>>(),
+            [
+                "1/m1/manifest.json",
+                "2/m2/manifest.json",
+                "3/m3/manifest.json"
+            ]
+        );
+        // A fourth attempt on another profile: the row is unresolved.
+        let mut split = row.clone();
+        split.attempts.push(run_data_stage_spec(&data_stage_spec(
+            &root,
+            "4",
+            &write_manifest_script("m4", "x86-64-v2"),
+        )));
+        assert_eq!(
+            record_result_row(&split).unwrap().unresolved.as_deref(),
+            Some("the runs' manifests record different CPU profiles")
+        );
+        let mut naked = row.clone();
+        for attempt in &mut naked.attempts {
+            attempt.env.remove(DATA_DIR_ENV);
+        }
+        assert_eq!(record_result_row(&naked), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn comparison_epoch_is_the_canonical_one_unless_given_explicitly() {
         assert_eq!(resolve_run_epoch(None).unwrap(), CANONICAL_TEST_EPOCH);
@@ -17072,6 +17603,7 @@ fi
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -22458,6 +22990,7 @@ int main(int argc, char **argv) {
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -22539,6 +23072,7 @@ int main(int argc, char **argv) {
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -22670,6 +23204,7 @@ int main(int argc, char **argv) {
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -22953,6 +23488,7 @@ backends_disabled:
                 keep_logs: false,
                 capture_custom_runs: false,
                 parity_retained: BTreeSet::new(),
+                parity_compared: BTreeSet::new(),
                 run_verify_strict: true,
                 record_verify_strict: true,
                 timeout_multipliers: TimeoutMultipliers::default(),
@@ -23035,6 +23571,7 @@ backends_disabled:
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -23099,6 +23636,7 @@ backends_disabled:
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -23522,6 +24060,7 @@ backends_disabled:
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -23883,6 +24422,7 @@ backends_disabled:
             keep_logs: true,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: command_help_contains(
                 &hermit_bin,
                 &["run", "--help"],
@@ -24025,6 +24565,7 @@ backends_disabled:
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -26041,6 +26582,17 @@ exit "$(cat "$PWD/exit-status")"
         let base = verify_row_from_attempts(vec![skid("1")]);
         assert!(has(&base, "--verify-strict") && has_pair(&base, "--backend", "ptrace"));
         accepted_skid("the fixture row", &base, 2);
+        // Runs record their CPU profile (`cpu_profile_record`): the flag sits
+        // right after `run`, and a row written before it carries none.
+        assert!(has(&base, crate::cpu_profile_record::MANIFEST_ALWAYS_ARG));
+        accepted_skid(
+            "a row written before runs recorded their CPU profile",
+            &with_argv(
+                &base,
+                without(crate::cpu_profile_record::MANIFEST_ALWAYS_ARG, 0),
+            ),
+            2,
+        );
         let unprobed = rendered(
             &base,
             &context(&|context| context.run_verify_strict = false),
@@ -26114,6 +26666,82 @@ exit "$(cat "$PWD/exit-status")"
         );
         assert!(has(&parity, "--verify-log-dir"));
         accepted_skid("a row whose logs the parity post-pass kept", &parity, 2);
+        // The parity golden's profile (`names_parity_golden_profile`): a
+        // reference kept with no candidate planned keeps auto; one planned
+        // beside a candidate names x86-64-v2 right after the manifest flag,
+        // and only there, only on the reference, and only in a run that
+        // virtualizes CPUID.
+        assert!(!has(&parity, PARITY_GOLDEN_PROFILE_ARG));
+        let compared = rendered(
+            &base,
+            &context(&|context| {
+                context.parity_retained.extend([
+                    (test.clone(), "ptrace".into()),
+                    (test.clone(), "kvm".into()),
+                ]);
+                context.parity_compared.insert(test.clone());
+            }),
+            &|_| {},
+        );
+        let after = |anchor: &str, token: &str| {
+            let (anchor, token) = (anchor.to_owned(), token.to_owned());
+            move |argv: &mut Vec<String>| {
+                let index = at(argv, &anchor);
+                argv.insert(index + 1, token.clone());
+            }
+        };
+        assert_eq!(
+            compared.argv[at(
+                &compared.argv,
+                crate::cpu_profile_record::MANIFEST_ALWAYS_ARG
+            ) + 1],
+            PARITY_GOLDEN_PROFILE_ARG
+        );
+        accepted_skid("a parity golden naming its CPU profile", &compared, 2);
+        // The token stands only on its anchor. Without the manifest flag the
+        // row is no command line the executor writes; with neither flag it is
+        // a row written before runs recorded their CPU profile, as above.
+        refused(
+            "a parity golden naming its profile without the manifest flag",
+            &with_argv(
+                &compared,
+                without(crate::cpu_profile_record::MANIFEST_ALWAYS_ARG, 0),
+            ),
+            "without `--manifest=always` right before it",
+        );
+        accepted_skid(
+            "a kept golden written before runs recorded their CPU profile",
+            &with_argv(&compared, |argv| {
+                without(crate::cpu_profile_record::MANIFEST_ALWAYS_ARG, 0)(argv);
+                without(PARITY_GOLDEN_PROFILE_ARG, 0)(argv);
+            }),
+            2,
+        );
+        // Out of its place it is refused: the checks read the executor's
+        // order, so the token stands where the next one belongs.
+        refused(
+            "a parity golden naming its profile after the base environment",
+            &with_argv(&compared, |argv| {
+                without(PARITY_GOLDEN_PROFILE_ARG, 0)(argv);
+                after("--base-env=minimal", PARITY_GOLDEN_PROFILE_ARG)(argv);
+            }),
+            "lacks `--strict` where the executor writes it",
+        );
+        let mut kvm = base.clone();
+        kvm.backend = Some("kvm".into());
+        let kvm = with_executor_invocation(kvm);
+        assert!(has_pair(&kvm, "--backend", "kvm"));
+        refused(
+            "a candidate naming the golden's profile",
+            &with_argv(
+                &kvm,
+                after(
+                    crate::cpu_profile_record::MANIFEST_ALWAYS_ARG,
+                    PARITY_GOLDEN_PROFILE_ARG,
+                ),
+            ),
+            "which is not the parity reference",
+        );
         let isolated = rendered(
             &base,
             &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
@@ -26149,6 +26777,17 @@ exit "$(cat "$PWD/exit-status")"
         let relaxed = with_executor_invocation(relaxed);
         assert!(has(&relaxed, "--max-timeslice=1000") && has(&relaxed, "--no-rcb-time"));
         accepted("a row recording every run-flag relaxation", &relaxed);
+        refused(
+            "a golden naming a profile in a run that presents the host's CPUID",
+            &with_argv(
+                &relaxed,
+                after(
+                    crate::cpu_profile_record::MANIFEST_ALWAYS_ARG,
+                    PARITY_GOLDEN_PROFILE_ARG,
+                ),
+            ),
+            "which presents no profile",
+        );
         let mut declared = base.clone();
         declared.expected_guest_exit = Some(expected_exit(Some(7), None));
         let declared = with_executor_invocation(declared);
@@ -31014,6 +31653,7 @@ cp "{}" "$verdict"
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -31077,6 +31717,7 @@ cp "{}" "$verdict"
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -31283,6 +31924,7 @@ cp "{}" "$verdict"
             keep_logs: false,
             capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
+            parity_compared: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),

@@ -204,6 +204,24 @@ pub fn pin_canonical_epoch(command: &mut Command) {
         command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
     }
     isolate_cache_home(command);
+    pin_test_cpu_profile(command);
+}
+
+/// Give a Hermit command `HERMIT_CPU_PROFILE=x86-64-v2`, unless the command
+/// sets or removes `HERMIT_CPU_PROFILE` itself or the test process inherited
+/// one. With no profile named, auto presents x86-64-v3 where the run and host
+/// qualify, which would make each test process qualify the host (seconds,
+/// with a warning) and move the baselines that count retired branches or
+/// size signal frames. A `--cpu-profile` flag still wins over the variable,
+/// so a test of auto names `--cpu-profile auto`, or removes the variable.
+pub fn pin_test_cpu_profile(command: &mut Command) {
+    if std::env::var_os("HERMIT_CPU_PROFILE").is_none()
+        && !command
+            .get_envs()
+            .any(|(key, _)| key == "HERMIT_CPU_PROFILE")
+    {
+        command.env("HERMIT_CPU_PROFILE", "x86-64-v2");
+    }
 }
 
 /// Point a Hermit command's `XDG_CACHE_HOME` at a directory of this test

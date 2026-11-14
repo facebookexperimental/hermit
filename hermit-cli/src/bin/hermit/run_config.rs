@@ -273,6 +273,12 @@ pub(crate) fn from_manifest_at(
 
 /// The run config a manifest's `inputs` and `command` stand for, which
 /// `hermit run --from` loads as `--config` loads a file.
+///
+/// A manifest without a `cpu-profile` reruns x86-64-v2: Hermit has saved the
+/// profile whenever auto resolved it, so a manifest without one is from a run
+/// that presented x86-64-v2 (the default before auto chose by the host) or
+/// launched nothing. Only a manifest is read this way; a run config file
+/// without the key keeps auto.
 pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result<RunConfig, Error> {
     let section = |entries: &BTreeMap<String, serde_json::Value>| {
         entries
@@ -290,6 +296,14 @@ pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result
     config.hermit_version = Some(manifest.hermit.version.clone());
     config.global = section(&manifest.inputs.global)?;
     config.run = section(&manifest.inputs.run)?;
+    config
+        .run
+        .entry(CPU_PROFILE_KEY.to_owned())
+        .or_insert_with(|| {
+            detcore_model::cpu_profile::CpuProfile::X86_64V2
+                .name()
+                .into()
+        });
     config.program = manifest.command.program.clone();
     config.args = manifest.command.args.clone();
     Ok(config)
@@ -1715,10 +1729,21 @@ mod tests {
     /// A manifest stands for the run config `--save-config` would write: for
     /// every option, a manifest made from an invocation that gives it, loaded
     /// with `--from`, reproduces every parsed field, as `--config` does
-    /// (https://github.com/rrnewton/hermit/issues/4271).
+    /// (https://github.com/rrnewton/hermit/issues/4271). The one difference:
+    /// a manifest that names no CPU profile reruns x86-64-v2
+    /// ([`from_manifest`]), so the invocation compared with the rerun names
+    /// it too.
     #[test]
     fn every_option_survives_a_manifest_and_from() {
         for (section, long, tokens) in samples() {
+            let named_v2 = match section {
+                Section::Global => argv(tokens, &["--cpu-profile", "x86-64-v2"], GUEST),
+                Section::Run => argv(
+                    &[],
+                    &[tokens, &["--cpu-profile", "x86-64-v2"][..]].concat(),
+                    GUEST,
+                ),
+            };
             let argv = sample_argv(section, tokens);
             let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
             let config = capture(
@@ -1747,7 +1772,12 @@ mod tests {
                     host_drawn: BTreeMap::new(),
                 },
             );
-            assert_eq!(from_manifest(&manifest).unwrap().run, saved.run, "--{long}");
+            let names_a_profile = saved.run.contains_key(CPU_PROFILE_KEY);
+            let mut expected = saved.run.clone();
+            expected
+                .entry(CPU_PROFILE_KEY.to_owned())
+                .or_insert_with(|| Value::from("x86-64-v2"));
+            assert_eq!(from_manifest(&manifest).unwrap().run, expected, "--{long}");
             let directory = tempfile::tempdir().unwrap();
             let path = directory
                 .path()
@@ -1759,7 +1789,12 @@ mod tests {
                 .unwrap()
                 .expect("--from expands");
             let (reloaded, _) = parse_at(&expanded, LOADING_CLOCK);
-            assert_eq!(parsed(&args), parsed(&reloaded), "--{long}: {manifest:#?}");
+            let invocation = if names_a_profile {
+                parsed(&args)
+            } else {
+                parsed(&parse_at(&named_v2, SAVING_CLOCK).0)
+            };
+            assert_eq!(invocation, parsed(&reloaded), "--{long}: {manifest:#?}");
         }
     }
 
@@ -1770,9 +1805,11 @@ mod tests {
     /// A run whose auto profile resolved saves the resolved profile, so that
     /// `--config` and `--from` a manifest run that named profile rather than
     /// resolving again; a named profile is saved as given, and a run that
-    /// resolved nothing saves no profile. That last case runs in a child
-    /// given no HERMIT_CPU_PROFILE, since the capture keeps a profile the
-    /// environment supplies.
+    /// resolved nothing saves no profile, so that `--config` reloads auto
+    /// while `--from` a manifest reruns x86-64-v2, the profile every run
+    /// presented before auto chose by the host. That last case runs in a
+    /// child given no HERMIT_CPU_PROFILE, since the capture keeps a profile
+    /// the environment supplies.
     #[test]
     fn a_resolved_auto_profile_is_saved_and_reloads_as_named() {
         use detcore_model::cpu_profile::CpuProfile;
@@ -1837,6 +1874,11 @@ mod tests {
             .unwrap()
             .expect("--from expands");
             let by_from = parsed(&parse_at(&expanded, LOADING_CLOCK).0);
+            (by_config, by_from)
+        };
+        // The profile both reloads run, which must otherwise agree too.
+        let reloaded = |saved: &RunConfig| {
+            let (by_config, by_from) = reload(saved);
             assert_eq!(by_config, by_from);
             profile_of(&by_config)
         };
@@ -1845,12 +1887,26 @@ mod tests {
             profile_of(&parsed(&parse_at(&argv, LOADING_CLOCK).0))
         };
         if unset_child {
-            // Nothing resolved, nothing given: no profile is saved, and the
-            // reload is the unset (auto) default again, not a named v2.
+            // Nothing resolved, nothing given: no profile is saved. A run
+            // config reloads the unset (auto) default again, not a named
+            // v2; a manifest reruns the named v2. Everything else agrees.
             assert_eq!(std::env::var_os("HERMIT_CPU_PROFILE"), None);
             let saved = save(&[], None);
             assert_eq!(saved.run.get(CPU_PROFILE_KEY), None);
-            assert_ne!(reload(&saved), named("x86-64-v2"));
+            let (by_config, by_from) = reload(&saved);
+            assert_eq!(profile_of(&by_config), named("auto"));
+            assert_ne!(profile_of(&by_config), named("x86-64-v2"));
+            assert_eq!(profile_of(&by_from), named("x86-64-v2"));
+            assert_eq!(by_config.global, by_from.global);
+            let without_profile = |parsed: &Parsed| {
+                parsed
+                    .run
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("cpu_profile:"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_eq!(without_profile(&by_config), without_profile(&by_from));
             return;
         }
         for (given, resolved) in [
@@ -1864,7 +1920,7 @@ mod tests {
                 Some(&Value::from(resolved.name())),
                 "{given:?}"
             );
-            assert_eq!(reload(&saved), named(resolved.name()), "{given:?}");
+            assert_eq!(reloaded(&saved), named(resolved.name()), "{given:?}");
         }
         // A named profile is saved as given, and reloads as named.
         let saved = save(&["--cpu-profile", "x86-64-v2"], None);
@@ -1872,7 +1928,7 @@ mod tests {
             saved.run.get(CPU_PROFILE_KEY),
             Some(&Value::from("x86-64-v2"))
         );
-        assert_eq!(reload(&saved), named("x86-64-v2"));
+        assert_eq!(reloaded(&saved), named("x86-64-v2"));
         let test = format!(
             "{}::a_resolved_auto_profile_is_saved_and_reloads_as_named",
             module_path!().split_once("::").unwrap().1

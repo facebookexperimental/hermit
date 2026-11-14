@@ -93,6 +93,7 @@ fn prebuilt_context(root: &Path) -> RunContext {
         keep_logs: false,
         capture_custom_runs: false,
         parity_retained: BTreeSet::new(),
+        parity_compared: BTreeSet::new(),
         run_verify_strict: false,
         record_verify_strict: false,
         timeout_multipliers: TimeoutMultipliers::default(),

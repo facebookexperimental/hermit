@@ -54,6 +54,7 @@ pub mod canonical_verdict;
 pub mod ci_selection;
 pub mod cli_help;
 pub mod cpu_evidence;
+pub mod cpu_profile_record;
 pub mod environmental_block;
 pub mod exec_safe_fs;
 pub mod executable_binding;

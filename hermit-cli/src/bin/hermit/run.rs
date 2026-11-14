@@ -2786,6 +2786,17 @@ pub struct RunOpts {
     #[clap(skip)]
     auto_resolution: Option<String>,
 
+    /// What else auto had to say (that it qualified the host, or why a check
+    /// that can change between runs took x86-64-v3 away), logged with
+    /// [`Self::auto_resolution`] and never printed on stderr.
+    #[clap(skip)]
+    auto_log: Vec<String>,
+
+    /// The profile this run presents and why, for its manifest: set when
+    /// the profile is resolved, before admission.
+    #[clap(skip)]
+    cpu_profile_choice: Option<hermit::cpu_profile_admission::ProfileChoice>,
+
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
     /// replace it to reach both on a host whose counters pass.
@@ -10239,6 +10250,85 @@ fn strict_refuses_an_epoch_or_seed_drawn_from_the_host() {
         .unwrap();
 }
 
+/// A CPU profile auto chose by the host (admitted, hypervisor,
+/// qualification-refused) is host-drawn, so the run leaves a manifest; one
+/// it chose by the run's own request, a named one and a recording's are not.
+/// `--strict` refuses none of them, and none puts a line on stderr: the
+/// host-drawn warning never names the profile.
+#[test]
+fn a_profile_auto_chose_by_the_host_is_host_drawn_and_allowed_under_strict() {
+    use detcore_model::cpu_profile::CpuProfile;
+    use hermit::cpu_profile_admission::ProfileChoice;
+    use hermit::cpu_profile_admission::ProfileReason;
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "fakeprog",
+    ]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    for (profile, reason, drawn) in [
+        (CpuProfile::X86_64V3, ProfileReason::Admitted, true),
+        (CpuProfile::X86_64V2, ProfileReason::Hypervisor, true),
+        (
+            CpuProfile::X86_64V2,
+            ProfileReason::QualificationRefused,
+            true,
+        ),
+        (
+            CpuProfile::X86_64V2,
+            ProfileReason::RequestNotAdmissible,
+            false,
+        ),
+        (CpuProfile::X86_64V2, ProfileReason::Explicit, false),
+        (CpuProfile::X86_64V3, ProfileReason::Declared, false),
+    ] {
+        ro.cpu_profile_choice = Some(ProfileChoice {
+            profile,
+            reason,
+            detail: None,
+        });
+        assert_eq!(
+            ro.host_drawn_inputs()
+                .get(crate::app::run_config::CPU_PROFILE_KEY)
+                .map(String::as_str),
+            drawn.then_some(reason.name()),
+            "{reason:?}"
+        );
+        ro.refuse_strict_with_host_drawn_inputs()
+            .unwrap_or_else(|error| panic!("{reason:?}: {error:#}"));
+        // Host-drawn or not, the profile puts no line on stderr: with the
+        // epoch given, nothing else is drawn, so nothing is printed.
+        assert_eq!(ro.host_drawn_warning(None), None, "{reason:?}");
+    }
+    // With the epoch drawn as well, the warning names the epoch alone.
+    let mut drawn_epoch = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    drawn_epoch
+        .capture_default_epoch(|| SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000));
+    drawn_epoch.validate_args_with_perf_support(true).unwrap();
+    drawn_epoch.cpu_profile_choice = Some(ProfileChoice {
+        profile: CpuProfile::X86_64V3,
+        reason: ProfileReason::Admitted,
+        detail: None,
+    });
+    assert!(
+        drawn_epoch
+            .host_drawn_inputs()
+            .contains_key(crate::app::run_config::CPU_PROFILE_KEY)
+    );
+    let warning = drawn_epoch
+        .host_drawn_warning(None)
+        .expect("a drawn epoch is warned of");
+    assert!(
+        warning.starts_with("this run drew its epoch from the host"),
+        "{warning}"
+    );
+    assert!(
+        !warning.contains("cpu-profile") && !warning.contains("CPU"),
+        "{warning}"
+    );
+}
+
 #[test]
 fn strict_rejects_strace_only() {
     // `--strace-only`'s own doc comment says it is shorthand for, among other
@@ -13234,16 +13324,7 @@ impl RunOpts {
         {
             return Ok(());
         }
-        let backend = self.selected_backend();
-        let request = hermit::cpu_profile_admission::AdmissionRequest {
-            backend: self.execution_backend_name(),
-            ptrace: self.application_backend.is_none() && backend == Backend::Ptrace,
-            virtualize_cpuid: config.virtualize_cpuid,
-            virtualize_time: config.virtualize_time,
-            strace_only: self.strace_only,
-            gdbserver: config.gdbserver,
-            namespace_only: self.namespace_only,
-        };
+        let request = self.cpu_profile_request();
         if config.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand {
             // Network traces, like syscall recordings, do not bind this
             // profile's host CPUID state. Refuse before host admission,
@@ -13271,11 +13352,37 @@ impl RunOpts {
             Ok((probe, host)) => {
                 log_v3_admission(&probe);
                 self.det_opts.det_config.cpu_profile_host = Some(host);
-                super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+                // A match states x86-64-v3's residual on stderr where the user
+                // asked for x86-64-v3 (named, or declared by the program). A
+                // v3 that auto chose by the host logs it instead, with the
+                // choice, and the manifest records it: the default puts
+                // nothing on stderr.
+                let auto_chose = self.cpu_profile_choice.as_ref().is_some_and(|choice| {
+                    choice.reason == hermit::cpu_profile_admission::ProfileReason::Admitted
+                });
+                if !auto_chose {
+                    super::verify::CPU_PROFILE_V3_RAN
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             }
             Err(refusal) => Err(Error::new(PolicyRefusal)
                 .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
+        }
+    }
+
+    /// What this run asks of a CPU profile, as far as admission is concerned.
+    fn cpu_profile_request(&self) -> hermit::cpu_profile_admission::AdmissionRequest<'_> {
+        let config = &self.det_opts.det_config;
+        hermit::cpu_profile_admission::AdmissionRequest {
+            backend: self.execution_backend_name(),
+            ptrace: self.application_backend.is_none()
+                && self.selected_backend() == Backend::Ptrace,
+            virtualize_cpuid: config.virtualize_cpuid,
+            virtualize_time: config.virtualize_time,
+            strace_only: self.strace_only,
+            gdbserver: config.gdbserver,
+            namespace_only: self.namespace_only,
         }
     }
 
@@ -13331,16 +13438,26 @@ impl RunOpts {
         )))
     }
 
-    /// Resolve `--cpu-profile auto` to the named profile the guest program
-    /// and its program interpreter need
-    /// (`hermit::cpu_profile_admission::resolve_auto`), before that profile
-    /// is admitted like an explicit one. The configuration, and with it any
-    /// recording and the second run of `--verify`, then holds only the named
-    /// profile. A program auto cannot read or resolve is refused by name at
-    /// the launch.
+    /// Resolve `--cpu-profile auto` to a named profile before it is admitted
+    /// like an explicit one (`hermit::cpu_profile_admission::choose_auto`):
+    /// x86-64-v3 where the guest program or its program interpreter declares
+    /// it (`hermit::cpu_profile_admission::resolve_auto`), or where this run
+    /// and host qualify for it; x86-64-v2 otherwise. The configuration, and
+    /// with it the run's manifest and the second run of `--verify`, then
+    /// holds only the named profile. A program auto cannot read or resolve
+    /// is refused by name at the launch. A named profile is recorded as
+    /// explicit and left as it is.
     fn resolve_auto_cpu_profile(&mut self) -> Result<(), Error> {
         use detcore_model::cpu_profile::CpuProfile;
-        if self.det_opts.det_config.cpu_profile != CpuProfile::Auto {
+        use hermit::cpu_profile_admission::ProfileChoice;
+        use hermit::cpu_profile_admission::ProfileReason;
+        let profile = self.det_opts.det_config.cpu_profile;
+        if profile != CpuProfile::Auto {
+            self.cpu_profile_choice = Some(ProfileChoice {
+                profile,
+                reason: ProfileReason::Explicit,
+                detail: None,
+            });
             return Ok(());
         }
         // A program that cannot run keeps its own fault (127 or 126), which
@@ -13362,22 +13479,45 @@ impl RunOpts {
         // profile presents), it stays auto: the run's own checks keep their
         // place and their refusals, and the launch then refuses auto by name
         // (`resolve_launch_auto`), before any guest runs. Never a guess.
-        let Ok((profile, why)) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
+        let Ok((needs, why)) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
         else {
             return Ok(());
         };
-        self.auto_resolution = Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
+        let auto = hermit::cpu_profile_admission::choose_auto(needs, &self.cpu_profile_request())
+            .map_err(Error::msg)?;
+        let profile = auto.choice.profile;
+        self.auto_resolution = Some(if needs == CpuProfile::X86_64V3 {
+            format!("--cpu-profile auto resolved to {profile}: {why}")
+        } else {
+            format!(
+                "--cpu-profile auto resolved to {profile}: {}; {why}",
+                auto.choice.because()
+            )
+        });
+        // Nothing reaches stderr: the guest owns a default run's stderr, which
+        // scripts and tests compare exactly. The log has the lines, and the
+        // run's manifest the choice.
+        self.auto_log = auto.log;
+        if auto.choice.reason == ProfileReason::Admitted {
+            self.auto_log
+                .push(detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
+        }
+        self.cpu_profile_choice = Some(auto.choice);
         self.det_opts.det_config.cpu_profile = profile;
         Ok(())
     }
 
-    /// Log what `--cpu-profile auto` resolved to, once tracing has started,
-    /// where the run's log goes (`--log=debug` and finer). Not at info: a
-    /// rerun from the run's manifest names the resolved profile, resolves
-    /// nothing, and must log what the original logged at info.
+    /// Log what `--cpu-profile auto` resolved to, and what else auto said,
+    /// once tracing has started, where the run's log goes (`--log=debug` and
+    /// finer). Not at info: a rerun from the run's manifest names the resolved
+    /// profile, resolves nothing, and must log what the original logged at
+    /// info. Never on stderr otherwise: a default run's stderr is its guest's.
     fn log_auto_resolution(&self) {
         if let Some(resolution) = &self.auto_resolution {
             tracing::debug!("{resolution}");
+        }
+        for line in &self.auto_log {
+            tracing::debug!("--cpu-profile auto: {line}");
         }
     }
 
@@ -19857,11 +19997,22 @@ impl RunOpts {
 
     /// The inputs this run drew from the host, by option long name, each
     /// with where it came from: an epoch from the host clock, a seed from
-    /// `--seed-from=SystemRandom`, and the preemption timer turned off
-    /// because this host has no usable performance counter. A seed derived
-    /// from the arguments (`--seed-from=Args`) is not drawn from the host.
+    /// `--seed-from=SystemRandom`, the preemption timer turned off
+    /// because this host has no usable performance counter, and a CPU
+    /// profile auto chose by the host (admitted, hypervisor or
+    /// qualification-refused). A seed derived from the arguments
+    /// (`--seed-from=Args`) is not drawn from the host, nor is a profile
+    /// auto chose by the program or the run's own options.
     fn host_drawn_inputs(&self) -> BTreeMap<String, String> {
         let mut drawn = BTreeMap::new();
+        if let Some(choice) = &self.cpu_profile_choice
+            && choice.reason.host_dependent()
+        {
+            drawn.insert(
+                crate::app::run_config::CPU_PROFILE_KEY.to_owned(),
+                choice.reason.name().to_owned(),
+            );
+        }
         if self.timer_downgrade.is_some() {
             drawn.insert(
                 crate::app::manifest::MAX_TIMESLICE_KEY.to_owned(),
@@ -19904,13 +20055,16 @@ impl RunOpts {
     /// The preemption timer a host without a usable performance counter turns
     /// off is also recorded as host-drawn, but is not refused here: every
     /// strict run on such a host (the hosted CI runners among them) would stop,
-    /// and a run on one host draws the same value every time.
+    /// and a run on one host draws the same value every time. The same holds
+    /// for the CPU profile auto chose by the host: a strict run may run
+    /// x86-64-v3, and names `--cpu-profile` to present one CPU on every host.
     fn refuse_strict_with_host_drawn_inputs(&self) -> Result<(), Error> {
         if !self.strict {
             return Ok(());
         }
         let mut drawn = self.host_drawn_inputs();
         drawn.remove(crate::app::manifest::MAX_TIMESLICE_KEY);
+        drawn.remove(crate::app::run_config::CPU_PROFILE_KEY);
         if drawn.is_empty() {
             return Ok(());
         }
@@ -19946,19 +20100,34 @@ impl RunOpts {
     /// the recording that saved them, or with the options that pass them.
     /// A network recording's own line already names its replay. Nothing is
     /// said of an input the command line gave, such as an explicit epoch, or
-    /// one a replayed recording supplied.
+    /// one a replayed recording supplied. Nor of the CPU profile auto chose:
+    /// the default must not put a line on stderr, which is the guest's and
+    /// which scripts compare exactly, so that choice goes to the log
+    /// ([`Self::log_auto_resolution`]) and the run's manifest only.
     fn warn_of_host_drawn_inputs(
         &self,
         global: &GlobalOpts,
         recording: Option<(hermit::Id, crate::app::manifest::Kind)>,
     ) -> Result<(), Error> {
+        match self.host_drawn_warning(recording) {
+            Some(warning) => global.report_event(::tracing::Level::WARN, format_args!("{warning}")),
+            None => Ok(()),
+        }
+    }
+
+    /// The line [`Self::warn_of_host_drawn_inputs`] prints, if any.
+    fn host_drawn_warning(
+        &self,
+        recording: Option<(hermit::Id, crate::app::manifest::Kind)>,
+    ) -> Option<String> {
         use crate::app::manifest;
         use crate::app::run_config::EPOCH_KEY;
         use crate::app::run_config::SEED_KEY;
 
-        let drawn = self.host_drawn_inputs();
+        let mut drawn = self.host_drawn_inputs();
+        drawn.remove(crate::app::run_config::CPU_PROFILE_KEY);
         let what = match drawn.keys().map(String::as_str).collect::<Vec<_>>()[..] {
-            [] => return Ok(()),
+            [] => return None,
             [EPOCH_KEY] => "its epoch",
             [SEED_KEY] => "its seed",
             [manifest::MAX_TIMESLICE_KEY] => "its preemption timer setting",
@@ -19966,17 +20135,14 @@ impl RunOpts {
             _ => "settings",
         };
         match recording {
-            Some((_, manifest::Kind::Network)) => Ok(()),
-            Some((id, _)) => global.report_event(
-                ::tracing::Level::WARN,
-                format_args!(
-                    // `hermit show` alone shows `last`, which a run manifest does not
-                    // move, so the warning names `last-run`.
-                    "this run drew {what} from the host; its inputs are saved as a recording in \
-                     {}/; rerun it with: hermit replay {id} (hermit show last-run)",
-                    home_relative(&manifest::data_dir())
-                ),
-            ),
+            Some((_, manifest::Kind::Network)) => None,
+            Some((id, _)) => Some(format!(
+                // `hermit show` alone shows `last`, which a run manifest does not
+                // move, so the warning names `last-run`.
+                "this run drew {what} from the host; its inputs are saved as a recording in {}/; \
+                 rerun it with: hermit replay {id} (hermit show last-run)",
+                home_relative(&manifest::data_dir())
+            )),
             None => {
                 let options = drawn
                     .keys()
@@ -19994,13 +20160,10 @@ impl RunOpts {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                global.report_event(
-                    ::tracing::Level::WARN,
-                    format_args!(
-                        "this run drew {what} from the host and saved no recording; rerun it \
-                         with: {options}"
-                    ),
-                )
+                Some(format!(
+                    "this run drew {what} from the host and saved no recording; rerun it with: \
+                     {options}"
+                ))
             }
         }
     }
@@ -20095,6 +20258,9 @@ impl RunOpts {
             self.manifest_image = Some(image.clone());
             document = document.with_image(image);
         }
+        document.cpu_profile = self.cpu_profile_choice.clone();
+        document.cpu_profile_residual =
+            crate::app::manifest::residual_of(self.cpu_profile_choice.as_ref());
         let path = match &network_trace {
             // The trace stays where its user named it, with its manifest
             // beside it (a coordinator default for the design note's open

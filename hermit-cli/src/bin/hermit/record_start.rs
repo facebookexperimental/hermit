@@ -202,9 +202,11 @@ pub struct StartOpts {
     program: Option<PathBuf>,
 
     /// The CPU the recorded guest sees: auto (the default), x86-64-v2 or
-    /// x86-64-v3, offered only on qualified ptrace hosts. auto is resolved
-    /// before recording, and the recording holds what it resolved to. The
-    /// long help states what the qualification leaves uncovered.
+    /// x86-64-v3, offered only on qualified ptrace hosts. Here auto reads
+    /// only the program's declarations: x86-64-v2 unless the program or its
+    /// interpreter declares x86-64-v3. It is resolved before recording, and
+    /// the recording holds what it resolved to. The long help states what
+    /// the qualification leaves uncovered.
     /// HERMIT_CPU_PROFILE supplies it when the flag is absent, as for `hermit
     /// run`; the flag wins.
     #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
@@ -489,6 +491,22 @@ impl StartOpts {
     ) -> Result<Option<RecordOverlay>, Error> {
         let target = self.resolve_record_target(backend)?;
         Ok(prepare(&target)?.map(|source| RecordOverlay { source, target }))
+    }
+
+    /// The profile this recording holds and why, for its manifest: auto
+    /// resolves by the program's declarations alone here (`declared`), never
+    /// by the host.
+    fn cpu_profile_choice(&self) -> hermit::cpu_profile_admission::ProfileChoice {
+        use hermit::cpu_profile_admission::ProfileReason;
+        hermit::cpu_profile_admission::ProfileChoice {
+            profile: self.cpu_profile,
+            reason: if self.auto_resolution.is_some() {
+                ProfileReason::Declared
+            } else {
+                ProfileReason::Explicit
+            },
+            detail: None,
+        }
     }
 
     /// What the recording stores for its replays to honor.
@@ -818,9 +836,12 @@ impl StartOpts {
             // The recording also gets a manifest, the one format every kind of
             // recording shares (https://github.com/rrnewton/hermit/issues/4271).
             // `hermit replay` still reads metadata.json, which stays beside it.
-            if let Err(error) =
-                write_full_record_manifest(&hermit, recording.id, recording.exit_status)
-            {
+            if let Err(error) = write_full_record_manifest(
+                &hermit,
+                recording.id,
+                recording.exit_status,
+                self.cpu_profile_choice(),
+            ) {
                 eprintln!(
                     "hermit record: WARNING: the recording's manifest was not written: {error:#}"
                 );
@@ -1317,13 +1338,15 @@ impl StartOpts {
 /// replay given the same directory, so the directory is repeated in every
 /// command.
 /// Writes `DATA/<id>/manifest.json` for the syscall recording `id`, from its
-/// metadata: the guest command, the recording's `RECORD_VERSION`, and how the
-/// guest ended. A syscall recording draws no input from the host that it
-/// does not record, so its `inputs` are empty.
+/// metadata: the guest command, the recording's `RECORD_VERSION`, how the
+/// guest ended, and the CPU profile it recorded and why (`cpu_profile`). A
+/// syscall recording draws no input from the host that it does not record,
+/// so its `inputs` are empty.
 fn write_full_record_manifest(
     hermit: &HermitData,
     id: hermit::Id,
     exit_status: ExitStatus,
+    cpu_profile: hermit::cpu_profile_admission::ProfileChoice,
 ) -> Result<(), Error> {
     use super::manifest;
     let metadata = hermit.recording_metadata(id)?;
@@ -1342,6 +1365,8 @@ fn write_full_record_manifest(
         },
     );
     document.exit = Some(manifest::Exit::from_status(exit_status));
+    document.cpu_profile_residual = crate::app::manifest::residual_of(Some(&cpu_profile));
+    document.cpu_profile = Some(cpu_profile);
     document.artifacts = Some(manifest::Artifacts {
         network_trace: None,
         syscall_recording: Some(manifest::SyscallRecording {

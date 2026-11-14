@@ -12390,11 +12390,15 @@ fn detcore_renders_its_procfs_files_on(test: &str, among: &[&str]) -> Vec<&'stat
     for backend in backends {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        // Named on every backend: /proc/cpuinfo shows the CPU profile the
+        // run presents, and auto presents x86-64-v3 on a qualifying ptrace
+        // host and x86-64-v2 on KVM, which cannot carry it.
         let mut args = vec![
             "--backend",
             backend,
             "run",
             "--strict",
+            "--cpu-profile=x86-64-v2",
             "--proc=standard",
             "--verify",
             "--verify-strict",
@@ -53946,11 +53950,14 @@ fn run_kvm_cpuid_rows_match_ptrace() {
         .unwrap()
         .to_owned();
     let run = |backend: &str| {
+        // Named: auto presents x86-64-v3 on a qualifying ptrace host, and
+        // x86-64-v2 on KVM, which cannot carry it.
         let args = [
             "--backend",
             backend,
             "run",
             "--strict",
+            "--cpu-profile=x86-64-v2",
             "--base-env=minimal",
             "--",
             guest.as_str(),
@@ -62445,29 +62452,63 @@ fn a_dynamic_programs_own_cpu_message_is_kept() {
     }
 }
 
-/// `--cpu-profile auto` (opt-in, never the default) runs the lowest named
-/// profile that satisfies what the guest's executable and its program
-/// interpreter declare: x86-64-v2 where nothing declares more, named on
-/// stderr. A declaration no profile presents, or an executable auto cannot
-/// read, is refused by policy. HERMIT_CPU_PROFILE=auto selects it too.
+/// The host's answer for auto, forced by Hermit's test-only variable, which
+/// can only take x86-64-v3 away from a program that declares no more than
+/// x86-64-v2.
+const AUTO_HOST_TEST_ENV: &str = "HERMIT_TEST_CPU_PROFILE_AUTO_HOST";
+
+/// The start of the line auto logs (`--log=debug`), and never prints on
+/// stderr, when a check that can change between runs took x86-64-v3 away.
+const AUTO_FALLBACK_LOG: &str = "--cpu-profile auto: x86-64-v3 is unavailable for this run";
+
+/// Words of the qualification's announcement, which an explicit x86-64-v3
+/// prints on stderr and auto only logs.
+const QUALIFYING_THIS_HOST: &str = "qualifying this host for --cpu-profile x86-64-v3";
+
+/// `hermit <args>`, with the host's answer for auto forced to `host`
+/// ([`AUTO_HOST_TEST_ENV`]): its exit status, stdout and stderr.
+fn run_with_auto_host(host: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?} with {AUTO_HOST_TEST_ENV}={host}"),
+        hermit_command(args).env(AUTO_HOST_TEST_ENV, host),
+    );
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Where the host's answer takes x86-64-v3 away (forced here), `--cpu-profile
+/// auto` runs the lowest named profile that satisfies what the guest's
+/// executable and its program interpreter declare: x86-64-v2 where nothing
+/// declares more, named on stderr with why. A declaration no profile
+/// presents, or an executable auto cannot read, is refused by policy.
+/// HERMIT_CPU_PROFILE=auto selects it too.
 #[test]
 fn auto_resolves_the_lowest_profile_the_guest_declares() {
     let auto = |image: &Path| {
-        let (status, stdout, stderr) = isa_run(&[
-            "--log=debug",
-            "run",
-            "--cpu-profile",
-            "auto",
-            "--",
-            image.to_str().unwrap(),
-        ]);
-        (status, stdout, stderr)
+        run_with_auto_host(
+            "qualification-refused",
+            &[
+                "--log=debug",
+                "run",
+                "--cpu-profile",
+                "auto",
+                "--",
+                image.to_str().unwrap(),
+            ],
+        )
     };
     let unmarked = isa_fixture("auto-unmarked", None, 42, IsaLink::Static);
     let (status, stdout, stderr) = auto(&unmarked);
     assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{stderr}");
     assert!(
-        stderr.contains("--cpu-profile auto resolved to x86-64-v2: nothing it execs first"),
+        stderr.contains(&format!(
+            "--cpu-profile auto resolved to x86-64-v2: the host does not qualify for \
+             x86-64-v3: {AUTO_HOST_TEST_ENV}=qualification-refused forced it; nothing it execs \
+             first"
+        )),
         "{stderr}"
     );
     let loader_v2 = isa_fixture("auto-loader-v2", Some(0b11), 43, IsaLink::Interpreter);
@@ -62479,7 +62520,8 @@ fn auto_resolves_the_lowest_profile_the_guest_declares() {
     let output = hermit_test::hermit_output(
         "hermit run",
         hermit_command(&["--log=debug", "run", "--", unmarked.to_str().unwrap()])
-            .env("HERMIT_CPU_PROFILE", "auto"),
+            .env("HERMIT_CPU_PROFILE", "auto")
+            .env(AUTO_HOST_TEST_ENV, "qualification-refused"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(42), "{stderr}");
@@ -62510,16 +62552,19 @@ fn auto_resolves_the_lowest_profile_the_guest_declares() {
 }
 
 /// With no profile named (neither flag nor HERMIT_CPU_PROFILE), a run is
-/// auto: an unmarked guest runs under x86-64-v2 as before, an image
-/// declaring x86-64-v4 is refused by auto's name, and a named profile keeps
-/// its exact meaning (explicit v2 refuses a v3 image by the post-exec check,
-/// never resolving anything).
+/// auto: where the host's answer takes x86-64-v3 away (forced here) an
+/// unmarked guest runs under x86-64-v2, an image declaring x86-64-v4 is
+/// refused by auto's name, and a named profile keeps its exact meaning
+/// (explicit v2 refuses a v3 image by the post-exec check, never resolving
+/// anything).
 #[test]
 fn an_unset_profile_is_auto() {
     let run = |args: &[&str]| {
         let output = hermit_test::hermit_output(
             "hermit run",
-            hermit_command(args).env_remove("HERMIT_CPU_PROFILE"),
+            hermit_command(args)
+                .env_remove("HERMIT_CPU_PROFILE")
+                .env(AUTO_HOST_TEST_ENV, "qualification-refused"),
         );
         (
             output.status.code(),
@@ -62565,23 +62610,27 @@ fn an_unset_profile_is_auto() {
     );
 }
 
-/// auto chooses once, before the run: a later exec of an image needing more
-/// than the profile it chose is refused by policy, naming the profile to
-/// rerun with, and the run is never upgraded midway.
+/// auto chooses once, before the run: where it chose x86-64-v2 (the host's
+/// answer forced here), a later exec of an image needing more is refused by
+/// policy, naming the profile to rerun with, and the run is never upgraded
+/// midway.
 #[test]
 fn auto_does_not_upgrade_for_a_later_exec() {
     let v3 = isa_fixture("auto-later-v3", Some(0b111), 42, IsaLink::Static);
     let v3 = v3.to_str().unwrap();
-    let (status, stdout, stderr) = isa_run(&[
-        "--log=debug",
-        "run",
-        "--cpu-profile",
-        "auto",
-        "--",
-        "/bin/sh",
-        "-c",
-        &format!("echo before; {v3}"),
-    ]);
+    let (status, stdout, stderr) = run_with_auto_host(
+        "qualification-refused",
+        &[
+            "--log=debug",
+            "run",
+            "--cpu-profile",
+            "auto",
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo before; {v3}"),
+        ],
+    );
     let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{context}");
     assert!(
@@ -62597,6 +62646,627 @@ fn auto_does_not_upgrade_for_a_later_exec() {
         stdout.starts_with("before") && !stdout.contains("ran"),
         "{context}"
     );
+}
+
+/// Whether this host reports a hypervisor (CPUID leaf 1, ECX bit 31), where
+/// auto presents x86-64-v2 without qualifying the host.
+#[cfg(target_arch = "x86_64")]
+fn host_reports_a_hypervisor() -> bool {
+    std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+}
+
+/// A run with no CPU profile named (neither flag nor HERMIT_CPU_PROFILE),
+/// whose manifests go to its own data directory under the default policy,
+/// sealed off from the developer's user config, which outranks
+/// HERMIT_MANIFEST. The harness still gives it the canonical epoch, so the
+/// only input it can draw from the host is its CPU profile.
+struct UnpinnedRun {
+    directory: tempfile::TempDir,
+}
+
+impl UnpinnedRun {
+    fn new() -> Self {
+        Self {
+            directory: tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
+        }
+    }
+
+    fn data(&self) -> PathBuf {
+        self.directory.path().join("data")
+    }
+
+    /// `hermit <args>`, with `env` set: its exit status, stdout and stderr.
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        let mut command = hermit_command(args);
+        command
+            .env_remove("HERMIT_CPU_PROFILE")
+            .env_remove("HERMIT_MANIFEST")
+            .env("HERMIT_DATA_DIR", self.data())
+            .env("XDG_CONFIG_HOME", self.directory.path().join("config-home"))
+            .stdin(Stdio::null());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// The manifests the runs wrote, sorted, as JSON with their paths.
+    fn manifests(&self) -> Vec<(PathBuf, serde_json::Value)> {
+        let Ok(entries) = fs::read_dir(self.data()) else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = entries
+            .map(|entry| entry.unwrap().path().join("manifest.json"))
+            .filter(|path| path.is_file())
+            .collect();
+        found.sort();
+        found
+            .into_iter()
+            .map(|path| {
+                let json = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                (path, json)
+            })
+            .collect()
+    }
+}
+
+/// The profile Detcore's debug configuration line shows in `log`, which a
+/// v3 run binds host facts for and a v2 run does not.
+fn logged_profile(log: &str) -> Option<&'static str> {
+    if log.contains("cpu_profile: X86_64V3") && log.contains("cpu_profile_host: Some(") {
+        Some("x86-64-v3")
+    } else if log.contains("cpu_profile: X86_64V2") && log.contains("cpu_profile_host: None") {
+        Some("x86-64-v2")
+    } else {
+        None
+    }
+}
+
+/// With no profile named, an unmarked program runs under x86-64-v3 where
+/// this run and host qualify, and under x86-64-v2 under a hypervisor
+/// (without qualifying the host) or where the host does not qualify. The
+/// choice depends on the host, so the run leaves a manifest that records the
+/// profile and why, and its rerun presents the same profile without choosing
+/// again.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn with_no_profile_named_auto_presents_what_the_run_and_host_qualify_for() {
+    let unmarked = isa_fixture("default-unmarked", None, 42, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    let required = std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() == Ok("1");
+    let (profile, reason, because) = if host_reports_a_hypervisor() {
+        (
+            "x86-64-v2",
+            "hypervisor",
+            "under a hypervisor, auto does not qualify the host for x86-64-v3".to_owned(),
+        )
+    } else {
+        match cpu_profile_v3_qualification() {
+            Ok(()) => (
+                "x86-64-v3",
+                "admitted",
+                "this run and host qualify for x86-64-v3".to_owned(),
+            ),
+            Err(why) if required => {
+                panic!("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify: {why}")
+            }
+            // The run's own refusal may word a probe failure differently
+            // from host-capabilities', so only its start is checked.
+            Err(_) => (
+                "x86-64-v2",
+                "qualification-refused",
+                "the host does not qualify for x86-64-v3: ".to_owned(),
+            ),
+        }
+    };
+    // The qualification fails closed under load: a refusal by a check that
+    // can change between runs, on a host that qualifies, gets one more run.
+    let (run, stderr) = (0..2)
+        .map(|_| {
+            let run = UnpinnedRun::new();
+            let (status, stdout, stderr) = run.run(&["--log=debug", "run", "--", unmarked], &[]);
+            assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{stderr}");
+            (run, stderr)
+        })
+        .find(|(_, stderr)| reason != "admitted" || !stderr.contains(AUTO_FALLBACK_LOG))
+        .expect("a qualifying host refused auto's x86-64-v3 twice");
+    let resolved = stderr
+        .lines()
+        .find(|line| line.contains("--cpu-profile auto resolved to "))
+        .unwrap_or_else(|| panic!("no resolution line: {stderr}"));
+    assert!(
+        resolved.contains(&format!(
+            "--cpu-profile auto resolved to {profile}: {because}"
+        )) && resolved.contains("; nothing it execs first"),
+        "{stderr}"
+    );
+    assert_eq!(logged_profile(&stderr), Some(profile), "{stderr}");
+    if reason == "hypervisor" {
+        assert!(
+            !stderr.contains(QUALIFYING_THIS_HOST),
+            "under a hypervisor auto never qualifies the host: {stderr}"
+        );
+    }
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (path, manifest) = &manifests[0];
+    assert_eq!(manifest["kind"], "inputs-only", "{manifest:#}");
+    assert_eq!(
+        manifest["inputs"]["run"]["cpu-profile"], profile,
+        "{manifest:#}"
+    );
+    assert_eq!(
+        manifest["inputs"]["host_drawn"]["cpu-profile"], reason,
+        "{manifest:#}"
+    );
+    assert_eq!(manifest["cpu_profile"]["profile"], profile, "{manifest:#}");
+    assert_eq!(manifest["cpu_profile"]["reason"], reason, "{manifest:#}");
+    let from = path.parent().unwrap().to_str().unwrap();
+    let (status, stdout, rerun) = run.run(&["--log=debug", "run", "--from", from], &[]);
+    assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{rerun}");
+    assert_eq!(logged_profile(&rerun), Some(profile), "{rerun}");
+    assert!(!rerun.contains("--cpu-profile auto resolved"), "{rerun}");
+}
+
+/// Why auto presented x86-64-v2, with the host's answer forced
+/// (`AUTO_HOST_TEST_ENV`): under a hypervisor; a qualification refusal,
+/// with a log line (`--log=debug`) only for a check that can change between
+/// runs;
+/// and a request that cannot carry x86-64-v3 (`--no-virtualize-cpuid`), for
+/// which the host is never asked. The first three are host-drawn, so the run
+/// leaves an inputs-only manifest; the last, like a named profile, is not:
+/// only `--manifest=always` writes one, a history manifest. A malformed
+/// forced answer is an error, never a silent choice.
+#[test]
+fn auto_records_why_it_presented_x86_64_v2() {
+    let unmarked = isa_fixture("why-v2-unmarked", None, 42, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    let forced = |host: &str| format!("{AUTO_HOST_TEST_ENV}={host} forced it");
+    let notice = |host: &str| {
+        format!(
+            "{AUTO_FALLBACK_LOG} ({}); running x86-64-v2. Name --cpu-profile to choose the \
+             profile.",
+            forced(host)
+        )
+    };
+    for (host, extra, reason, detail, kind, noticed) in [
+        (
+            "hypervisor",
+            &[][..],
+            "hypervisor",
+            None,
+            "inputs-only",
+            false,
+        ),
+        (
+            "qualification-refused",
+            &[][..],
+            "qualification-refused",
+            Some(forced("qualification-refused")),
+            "inputs-only",
+            false,
+        ),
+        (
+            "qualification-refused-dynamic",
+            &[][..],
+            "qualification-refused",
+            Some(forced("qualification-refused-dynamic")),
+            "inputs-only",
+            true,
+        ),
+        (
+            "qualification-refused",
+            &["--no-virtualize-cpuid", "--manifest=always"][..],
+            "request-not-admissible",
+            Some(
+                "the profile is a virtual CPUID table, and this run does not virtualize CPUID"
+                    .to_owned(),
+            ),
+            "history",
+            false,
+        ),
+        (
+            "qualification-refused",
+            &["--cpu-profile=x86-64-v2", "--manifest=always"][..],
+            "explicit",
+            None,
+            "history",
+            false,
+        ),
+    ] {
+        let run = UnpinnedRun::new();
+        // No preemption timer, which a host without a usable counter would
+        // turn off by itself and record as host-drawn too.
+        let mut args = vec!["--log=debug", "run", "--max-timeslice=disabled"];
+        args.extend_from_slice(extra);
+        args.extend(["--", unmarked]);
+        let (status, stdout, stderr) = run.run(&args, &[(AUTO_HOST_TEST_ENV, host)]);
+        let context = format!("{host} {extra:?}:\n{stderr}");
+        assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{context}");
+        assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{context}");
+        assert!(!stderr.contains(QUALIFYING_THIS_HOST), "{context}");
+        assert_eq!(stderr.contains(&notice(host)), noticed, "{context}");
+        assert_eq!(
+            stderr.contains("--cpu-profile auto resolved to x86-64-v2: "),
+            reason != "explicit",
+            "{context}"
+        );
+        let manifests = run.manifests();
+        assert_eq!(manifests.len(), 1, "{context}");
+        let manifest = &manifests[0].1;
+        assert_eq!(manifest["kind"], kind, "{context}\n{manifest:#}");
+        assert_eq!(
+            manifest["cpu_profile"],
+            match &detail {
+                Some(detail) => serde_json::json!({
+                    "profile": "x86-64-v2",
+                    "reason": reason,
+                    "detail": detail,
+                }),
+                None => serde_json::json!({"profile": "x86-64-v2", "reason": reason}),
+            },
+            "{context}\n{manifest:#}"
+        );
+        assert_eq!(
+            manifest["inputs"]["host_drawn"]
+                .get("cpu-profile")
+                .is_some(),
+            kind == "inputs-only",
+            "{context}\n{manifest:#}"
+        );
+    }
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &["run", "--", unmarked],
+        &[(AUTO_HOST_TEST_ENV, "unheard-of")],
+    );
+    assert!(
+        status != Some(0) && status != Some(42) && !stdout.contains("ran"),
+        "{status:?}\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "{AUTO_HOST_TEST_ENV}=\"unheard-of\" is not hypervisor, qualification-refused or \
+             qualification-refused-dynamic"
+        )),
+        "{stderr}"
+    );
+}
+
+/// The default leaves a run's stderr to its guest, which scripts and tests
+/// compare exactly. With no profile named, whatever auto chooses and however
+/// (qualifying the host with nothing cached, under a hypervisor, after a fixed
+/// or a dynamic refusal), Hermit's stderr is what the same run prints with
+/// x86-64-v2 named, and names no profile. The choice is in the log
+/// (`--log=debug`) and in the run's manifest. What a user asked for and
+/// cannot have is still printed: a program that declares x86-64-v3, on a run
+/// that cannot carry it, is refused by name with the policy-refusal status, as
+/// an explicit x86-64-v3 is (`cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify`;
+/// an explicit x86-64-v3 also still announces that it qualifies the host,
+/// `cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict`).
+#[test]
+fn a_default_run_leaves_stderr_to_its_guest() {
+    let unmarked = isa_fixture("quiet-default-unmarked", None, 42, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    // No preemption timer, which a host without a usable counter would turn
+    // off with a warning of its own, and no CPU-placement notice, which a busy
+    // host prints; both are the same with the profile named, but are not
+    // what this test is about.
+    let options = ["--max-timeslice=disabled", "--pinned-cpu-notice=off"];
+    for host in [
+        None,
+        Some("hypervisor"),
+        Some("qualification-refused"),
+        Some("qualification-refused-dynamic"),
+    ] {
+        let run = UnpinnedRun::new();
+        // Nothing cached, so that an unforced run on a qualifying host
+        // qualifies it, which an explicit x86-64-v3 would announce.
+        let cache = run.directory.path().join("cache");
+        let mut env = vec![("XDG_CACHE_HOME", cache.to_str().unwrap())];
+        if let Some(host) = host {
+            env.push((AUTO_HOST_TEST_ENV, host));
+        }
+        let launch = |global: &[&str], named: &[&str]| {
+            let mut args = global.to_vec();
+            args.push("run");
+            args.extend(options);
+            args.extend_from_slice(named);
+            args.extend(["--", unmarked]);
+            run.run(&args, &env)
+        };
+        let (status, stdout, default) = launch(&[], &[]);
+        let context = format!("{host:?}:\n{default}");
+        assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{context}");
+        for words in [
+            "cpu-profile",
+            "CPU profile",
+            "x86-64-v",
+            QUALIFYING_THIS_HOST,
+            "drew",
+        ] {
+            assert!(
+                !default.contains(words),
+                "the default run printed `{words}`: {context}"
+            );
+        }
+        assert!(
+            !default.contains("--cpu-profile auto resolved to"),
+            "the resolution line belongs to the log, at --log=debug: {context}"
+        );
+        let (status, stdout, named) = launch(&[], &["--cpu-profile=x86-64-v2"]);
+        assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{named}");
+        assert_eq!(
+            default, named,
+            "{host:?}: the default added to stderr what a named profile does not"
+        );
+        // The choice is recorded: the default run's manifest (the named run,
+        // which drew nothing from the host, wrote none) ...
+        let manifests = run.manifests();
+        assert_eq!(manifests.len(), 1, "{context}");
+        let (first, manifest) = &manifests[0];
+        let recorded = |manifest: &serde_json::Value| {
+            assert_eq!(
+                manifest["inputs"]["host_drawn"]["cpu-profile"], manifest["cpu_profile"]["reason"],
+                "{context}\n{manifest:#}"
+            );
+            manifest["cpu_profile"]["profile"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let profile = recorded(manifest);
+        if host.is_some() {
+            assert_eq!(profile, "x86-64-v2", "{context}\n{manifest:#}");
+        }
+        // ... and logged, where the log goes: a third run, at --log=debug,
+        // logs the profile its own manifest records, and the fallback's line
+        // after a forced dynamic refusal and no other forced answer.
+        let (status, stdout, log) = launch(&["--log=debug"], &[]);
+        assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{log}");
+        let manifests = run.manifests();
+        assert_eq!(manifests.len(), 2, "{log}");
+        let (_, manifest) = manifests
+            .iter()
+            .find(|(path, _)| path != first)
+            .expect("the logged run wrote a manifest of its own");
+        let profile = recorded(manifest);
+        assert!(
+            log.contains(&format!("--cpu-profile auto resolved to {profile}: ")),
+            "{host:?} chose {profile}, which the log does not say:\n{log}"
+        );
+        // x86-64-v3's residual: in the log and the manifest of a v3 auto
+        // chose, and nowhere for an x86-64-v2.
+        let v3 = profile == "x86-64-v3";
+        assert_eq!(
+            log.contains(
+                "--cpu-profile auto: With --cpu-profile x86-64-v3, Hermit checks at startup"
+            ),
+            v3,
+            "{host:?} chose {profile}:\n{log}"
+        );
+        assert_eq!(
+            manifest["cpu_profile_residual"]
+                .as_str()
+                .is_some_and(|residual| residual.starts_with("With --cpu-profile x86-64-v3")),
+            v3,
+            "{host:?} chose {profile}:\n{manifest:#}"
+        );
+        if host.is_some() {
+            assert_eq!(
+                log.contains(AUTO_FALLBACK_LOG),
+                host == Some("qualification-refused-dynamic"),
+                "{host:?}:\n{log}"
+            );
+        }
+    }
+    // A program that declares x86-64-v3, on a run that cannot carry it, is
+    // refused by name, on stderr, before it runs.
+    let v3 = isa_fixture("quiet-default-needs-v3", Some(0b111), 42, IsaLink::Static);
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &["run", "--no-virtualize-cpuid", "--", v3.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(stdout.is_empty(), "the guest ran: {stdout}");
+    assert!(
+        stderr.contains("x86-64-v3") && stderr.contains("does not virtualize CPUID"),
+        "{stderr}"
+    );
+}
+
+/// A `--verify` match states x86-64-v3's residual on stderr where the user
+/// asked for x86-64-v3, by naming it or by running a program that declares it,
+/// and not where auto chose it by the host: that run's manifest keeps the
+/// residual instead, and its log has it (`a_default_run_leaves_stderr_to_its_guest`).
+/// Where auto does not present x86-64-v3 the contrast cannot be shown, so the
+/// test records a named skip, or fails under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
+#[test]
+fn a_verify_match_states_the_v3_residual_only_where_v3_was_asked_for() {
+    let test = "a_verify_match_states_the_v3_residual_only_where_v3_was_asked_for";
+    const RESIDUAL: &str = "With --cpu-profile x86-64-v3, Hermit checks at startup";
+    let unmarked = isa_fixture("residual-unmarked", None, 0, IsaLink::Static);
+    let declares = isa_fixture("residual-needs-v3", Some(0b111), 0, IsaLink::Static);
+    let verify = |run: &UnpinnedRun, named: &[&str], program: &Path| {
+        let mut args = vec!["run", "--verify", "--pinned-cpu-notice=off"];
+        args.extend_from_slice(named);
+        args.extend(["--", program.to_str().unwrap()]);
+        let (status, stdout, stderr) = run.run(&args, &[]);
+        assert_eq!(
+            (status, stdout.as_str()),
+            (Some(0), "ran\n"),
+            "{named:?}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Success: deterministic"),
+            "{named:?}: no match:\n{stderr}"
+        );
+        stderr
+    };
+    // Auto, by the host: a qualification that fails closed under load gets
+    // one more run.
+    let attempt = || {
+        let run = UnpinnedRun::new();
+        let stderr = verify(&run, &[], &unmarked);
+        let manifests = run.manifests();
+        assert_eq!(manifests.len(), 1, "{stderr}");
+        (stderr, manifests[0].1.clone())
+    };
+    let (mut stderr, mut manifest) = attempt();
+    if manifest["cpu_profile"]["reason"] == "qualification-refused" {
+        (stderr, manifest) = attempt();
+    }
+    if manifest["cpu_profile"]["profile"] != "x86-64-v3" {
+        assert!(
+            std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
+            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but auto did not present x86-64-v3: \
+             {manifest:#}"
+        );
+        record_test_skip(test, &format!("auto presents {}", manifest["cpu_profile"]));
+        return;
+    }
+    assert_eq!(
+        manifest["cpu_profile"]["reason"], "admitted",
+        "{manifest:#}"
+    );
+    assert!(
+        !stderr.contains(RESIDUAL),
+        "a v3 auto chose by the host put its residual on stderr:\n{stderr}"
+    );
+    assert!(
+        manifest["cpu_profile_residual"]
+            .as_str()
+            .is_some_and(|residual| residual.starts_with(RESIDUAL)),
+        "{manifest:#}"
+    );
+    // Named, and declared: stated on stderr after the match.
+    let run = UnpinnedRun::new();
+    let named = verify(&run, &["--cpu-profile=x86-64-v3"], &unmarked);
+    assert!(named.contains(RESIDUAL), "a named x86-64-v3:\n{named}");
+    let declared = verify(&run, &[], &declares);
+    assert!(
+        declared.contains(RESIDUAL),
+        "a declared x86-64-v3:\n{declared}"
+    );
+}
+
+/// On a host where auto presents x86-64-v3, a manifest written before the
+/// profile was saved (no `cpu-profile` key) reruns as x86-64-v2, by `hermit
+/// run --from` and by `hermit replay`, and so does a recording whose metadata
+/// names no profile: both ran x86-64-v2, the only default an older Hermit
+/// had. Elsewhere the contrast cannot be shown, so the test records a named
+/// skip, or fails under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
+#[test]
+fn a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2() {
+    let test = "a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2";
+    let unmarked = isa_fixture("old-inputs-unmarked", None, 0, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    let attempt = || {
+        let run = UnpinnedRun::new();
+        let (status, stdout, stderr) = run.run(&["--log=debug", "run", "--", unmarked], &[]);
+        assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+        (run, stderr)
+    };
+    // The qualification fails closed under load: a refusal by a check that
+    // can change between runs gets one more run.
+    let (mut run, mut stderr) = attempt();
+    if stderr.contains(AUTO_FALLBACK_LOG) {
+        (run, stderr) = attempt();
+    }
+    if logged_profile(&stderr) != Some("x86-64-v3") {
+        let resolved = stderr
+            .lines()
+            .find(|line| line.contains("--cpu-profile auto resolved to"))
+            .unwrap_or("no resolution line")
+            .to_owned();
+        assert!(
+            std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
+            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but auto did not present x86-64-v3: {resolved}"
+        );
+        let reason = resolved
+            .split_once("--cpu-profile auto resolved to ")
+            .map_or(resolved.as_str(), |(_, rest)| rest);
+        record_test_skip(test, &format!("auto presents {reason}"));
+        return;
+    }
+    // An older Hermit's manifest: no profile among the inputs, none drawn,
+    // no record of the choice.
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (path, mut manifest) = manifests.into_iter().next().unwrap();
+    assert_eq!(manifest["inputs"]["run"]["cpu-profile"], "x86-64-v3");
+    manifest["inputs"]["run"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cpu-profile");
+    manifest["inputs"]["host_drawn"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cpu-profile");
+    manifest.as_object_mut().unwrap().remove("cpu_profile");
+    fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    let directory = path.parent().unwrap();
+    let id = directory.file_name().unwrap().to_str().unwrap();
+    for args in [
+        &["--log=debug", "run", "--from", directory.to_str().unwrap()][..],
+        &["--log=debug", "replay", id][..],
+    ] {
+        let (status, stdout, stderr) = run.run(args, &[]);
+        assert_eq!(
+            (status, stdout.as_str()),
+            (Some(0), "ran\n"),
+            "{args:?}:\n{stderr}"
+        );
+        assert_eq!(
+            logged_profile(&stderr),
+            Some("x86-64-v2"),
+            "{args:?}:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("--cpu-profile auto resolved"),
+            "{args:?}:\n{stderr}"
+        );
+    }
+    // An older Hermit's recording: its metadata names no profile.
+    let image = isa_fixture("old-recording-unmarked", None, 0, IsaLink::Static);
+    let image = image.to_str().unwrap();
+    let recorded = UnpinnedRun::new();
+    let (status, stdout, stderr) = recorded.run(
+        &["record", "start", "--cpu-profile", "x86-64-v2", "--", image],
+        &[],
+    );
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    let metadata_path = fs::read_dir(recorded.data())
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("metadata.json"))
+        .find(|path| path.is_file())
+        .expect("no recording metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["cpu_profile"], "x86-64-v2", "{metadata:#}");
+    for key in [
+        "cpu_profile",
+        "cpu_profile_host",
+        "cpu_table_digest",
+        "cpu_profile_residual",
+    ] {
+        metadata.as_object_mut().unwrap().remove(key);
+    }
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    let id = metadata_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap();
+    let (status, _, stderr) = recorded.run(&["--log=debug", "replay", "--autopilot", id], &[]);
+    assert_eq!(status, Some(0), "{stderr}");
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{stderr}");
 }
 
 /// Runs `image` with `--cpu-profile auto`, which `what` makes resolve to
@@ -62654,7 +63324,8 @@ fn auto_resolves_v3_for_an_interpreter_declaring_it() {
 
 /// Records `bits`' fixture (`isa_needed.c`, exit 0) as `name` with
 /// `--cpu-profile auto`, and checks that the recording holds the named
-/// profile auto resolved to and that replay runs that profile without
+/// profile auto resolved to, which its manifest records as `declared`, and
+/// that replay runs that profile without
 /// deriving it again, under any profile its own environment names or none.
 /// A recording claiming auto itself is refused. A v3 recording goes through
 /// `v3_run_or_refusal`: where the host does not qualify, the case ends at the
@@ -62702,6 +63373,17 @@ fn assert_auto_recording_replays_as(test: &str, name: &str, bits: Option<u32>) {
     let original = fs::read_to_string(&metadata_path).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
     assert_eq!(metadata["cpu_profile"], expected, "{metadata:#}");
+    // Its manifest says auto chose by the program's declarations, never by
+    // the host.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(metadata_path.with_file_name("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["cpu_profile"],
+        serde_json::json!({"profile": expected, "reason": "declared"}),
+        "{manifest:#}"
+    );
     // Replay runs the recorded profile whatever this invocation's
     // environment names, and never derives one from the program again.
     let replay_under = |ambient: Option<&str>| {

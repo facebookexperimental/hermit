@@ -330,18 +330,20 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
-    /// The CPU the guest sees: virtual x86-64-v2/v3 or intercepted host
-    /// features without hardware randomness. The long help states each
-    /// profile's host requirements and determinism limits. Like
+    /// The CPU the guest sees: auto, the default, presents x86-64-v3 where
+    /// the run and host qualify for it and x86-64-v2 everywhere else, while
+    /// x86-64-v2, x86-64-v3 and host-no-rdrand (intercepted host features
+    /// without hardware randomness) each name one profile. The long help
+    /// states each profile's host requirements and determinism limits. Like
     /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
     /// absent; an explicit flag wins, and a value that names no profile is
     /// refused. Unset means auto, for the command line and
-    /// [`Config::default`] alike: `hermit run` and `hermit record start`
-    /// resolve it to a named profile before launch, and the library's launch
-    /// functions resolve it from the program they launch. A serialized
-    /// configuration or recording without the field still means x86-64-v2
-    /// (`CpuProfile`'s own default), never auto. Admission is the same either
-    /// way.
+    /// [`Config::default`] alike: `hermit run` resolves it to a named
+    /// profile before launch, `hermit record start` and the library's launch
+    /// functions from what the program they launch declares alone. A
+    /// serialized configuration, recording or manifest without the field
+    /// still means x86-64-v2 (`CpuProfile`'s own default), never auto.
+    /// Admission is the same either way.
     #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,

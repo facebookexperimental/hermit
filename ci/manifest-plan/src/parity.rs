@@ -1872,6 +1872,28 @@ pub fn retention_closure(
         .collect()
 }
 
+/// The tests whose ptrace verify cell and at least one candidate's verify cell
+/// ([`ParityBackend::ALL`]) are both in `planned_verify`: the tests whose
+/// ptrace golden a post-pass of this plan compares with a candidate's log.
+/// Their ptrace verify run names the golden's CPU profile
+/// ([`crate::runner::PARITY_GOLDEN_PROFILE_ARG`]).
+///
+/// It reads the plan alone. The post-pass's own switches
+/// ([`PARITY_POST_PASS_ENV`], [`PARITY_SELECT_ENV`]) change what is reported,
+/// never how a cell runs, so they do not enter it.
+pub fn planned_comparisons(planned_verify: &BTreeSet<(String, String)>) -> BTreeSet<String> {
+    planned_verify
+        .iter()
+        .filter(|(test, backend)| {
+            ParityBackend::ALL
+                .iter()
+                .any(|candidate| candidate.as_str() == backend)
+                && planned_verify.contains(&(test.clone(), PARITY_REFERENCE_BACKEND.to_string()))
+        })
+        .map(|(test, _)| test.clone())
+        .collect()
+}
+
 /// When a post-pass must have finished its comparisons, and which bound that
 /// is, for the reason recorded on a comparison it did not start.
 #[derive(Clone, Debug)]

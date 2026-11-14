@@ -98,6 +98,7 @@ Commands:
   run                              Execute selected cells
   parity <compare|export>          Measure parity from retained logs, or export ledger rows
   sync-cells <--check|--write>     Regenerate the expected plan and optional cells
+  cpu-profile-record <DATA_DIR>    Write and print one attempt's CPU-profile record
   selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
@@ -171,6 +172,17 @@ const RUN_ENVIRONMENT: &str =
                                          with no row is an ERROR. The parity post-pass
                                          reads the verify logs restored in
                                          ROOT/retained-verify-logs/";
+
+const CPU_PROFILE_RECORD_HELP: &str = "\
+Usage: test-harness cpu-profile-record <DATA_DIR>
+
+Write and print the CPU-profile record `run` keeps for one attempt, from the
+run manifests Hermit wrote in DATA_DIR. The record is written to
+DATA_DIR/cpu-profile.json and printed as one JSON line. A DATA_DIR that starts
+with '-' is refused as an unknown option.
+
+Options:
+  -h, --help                       Print this help";
 
 const SYNC_CELLS_HELP: &str = "\
 Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
@@ -400,6 +412,10 @@ fn print_command_help(command: &str) -> bool {
         }
         "sync-cells" => {
             println!("{SYNC_CELLS_HELP}");
+            return true;
+        }
+        "cpu-profile-record" => {
+            println!("{CPU_PROFILE_RECORD_HELP}");
             return true;
         }
         "selftest" => {
@@ -1039,6 +1055,25 @@ fn main() -> ExitCode {
     let values = values.collect::<Vec<_>>();
     if command == "sync-cells" {
         return sync_cells(&values);
+    }
+    if command == "cpu-profile-record" {
+        // The record `run` writes for each attempt, for one data directory:
+        // the same code, so a fixture run can show exactly what CI keeps.
+        let [data_dir] = values.as_slice() else {
+            fail("usage: test-harness cpu-profile-record <DATA_DIR>");
+        };
+        // A mistyped option is not a directory to create.
+        if data_dir.starts_with('-') {
+            fail(format!(
+                "cpu-profile-record: unknown option {data_dir}; usage: test-harness cpu-profile-record <DATA_DIR>"
+            ));
+        }
+        let record = hermit_manifest_plan::cpu_profile_record::record_attempt(Path::new(data_dir));
+        println!(
+            "{}",
+            serde_json::to_string(&record).expect("a record serializes")
+        );
+        return ExitCode::SUCCESS;
     }
     if command == "parity" {
         let request = match parse_parity(values) {
@@ -3411,7 +3446,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     .with_parity_retained(parity::retention_closure(
         &parity_scope.cells,
         &planned_verify,
-    ));
+    ))
+    // From the plan alone, not from the post-pass's scope: its switches
+    // change what is reported, never how a cell runs.
+    .with_parity_compared(parity::planned_comparisons(&planned_verify));
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -4029,7 +4067,93 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         &attempt_results,
         import_root.as_deref(),
     );
+    report_cpu_profiles(
+        &results_path,
+        &context.run_id,
+        &attempt_results,
+        import_root.is_some(),
+    );
     exit
+}
+
+/// Which CPU profile each cell attempt's Hermit runs presented, copied from
+/// their manifests into `cpu-profile.json` in each attempt's data directory
+/// (`cpu_profile_record`); one row per result row in `cpu-profiles.jsonl`,
+/// combining the row's attempts, and the CI image with the final rows' totals
+/// in `ci-environment.json`, beside
+/// `results.jsonl`. The totals are the run's last line, so a validation
+/// summary that shows a node's last line shows them. Like the parity
+/// post-pass, nothing here reaches the exit status.
+fn report_cpu_profiles(
+    results_path: &Path,
+    run_id: &str,
+    attempt_results: &[Vec<CellResult>],
+    imported: bool,
+) {
+    use hermit_manifest_plan::cpu_profile_record as record;
+    let (image, os_release) =
+        record::ci_image(&fs::read_to_string("/etc/os-release").unwrap_or_default());
+    let Some(directory) = results_path.parent() else {
+        return;
+    };
+    if imported {
+        print_best_effort(
+            std::io::stdout(),
+            &format!(
+                "test-harness: cpu profile: not recorded for an imported run; ci image {image}"
+            ),
+        );
+        return;
+    }
+    let mut rows = String::new();
+    let mut totals = record::Totals::default();
+    for attempts in attempt_results {
+        let mut last = None;
+        for result in attempts {
+            // Every attempt of the row: a chaos row runs one per seed and a
+            // custom row one per run, each into its own data directory.
+            let attempt = record::record_result_row(result);
+            rows.push_str(
+                &serde_json::json!({
+                    "test": result.test,
+                    "mode": result.mode,
+                    "backend": result.backend,
+                    "attempt": result.attempt,
+                    "outcome": result.outcome,
+                    "cpu_profile": attempt,
+                })
+                .to_string(),
+            );
+            rows.push('\n');
+            last = Some(attempt);
+        }
+        if let Some(attempt) = last {
+            totals.count(attempt.as_ref());
+        }
+    }
+    let environment = serde_json::json!({
+        "schema": 1,
+        "run_id": run_id,
+        "ci_image": image,
+        "os_release": os_release,
+        "cells_by_profile": totals.cells_by_profile,
+        "cells_by_reason": totals.cells_by_reason,
+        "unresolved": totals.unresolved,
+        "replay_without_manifest": totals.replay_without_manifest,
+        "without_hermit": totals.without_hermit,
+    });
+    for (name, bytes) in [
+        (record::ROWS_FILE, rows.into_bytes()),
+        (
+            record::ENVIRONMENT_FILE,
+            serde_json::to_vec_pretty(&environment).expect("the environment serializes"),
+        ),
+    ] {
+        if let Err(error) = fs::write(directory.join(name), bytes) {
+            eprintln!("test-harness: cannot write {name}: {error}");
+        }
+    }
+    print_best_effort(std::io::stdout(), &totals.summary(&image));
 }
 
 /// The refusal of a run in which every selected cell was host-inapplicable:
