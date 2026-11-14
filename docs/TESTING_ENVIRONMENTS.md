@@ -63,22 +63,22 @@ context.
 
 The `super` tier includes an occasional ptrace matrix that checks every
 meaningful combination from strict deterministic execution through the
-passthrough endpoints. The 60-state cross-product is:
+passthrough endpoints. The 56-state cross-product is:
 
 | Axis | States |
 | --- | --- |
-| Policy | relaxed; strict (which requires sequentialization and deterministic I/O) |
+| Policy | relaxed; strict (which requires sequentialization, deterministic I/O and virtual time) |
 | Thread scheduling | sequentialized; non-sequentialized (relaxed only) |
 | I/O | deterministic; host behavior (relaxed only) |
-| Time and metadata | both virtualized; time only; neither (metadata cannot be virtualized without time) |
+| Time and metadata | both virtualized; time only; neither (relaxed only: metadata cannot be virtualized without time, and `--strict` refuses `--no-virtualize-time`) |
 | CPUID | virtualized; host behavior |
 | Verification | off; two-run verification on |
 
 Three endpoint configurations add `--strace-only`, `--strace-only --verify`,
 and `--namespace-only`. Verification is invalid with `--namespace-only` and is
-therefore not presented as a runnable state. Each of the 63 configurations runs
+therefore not presented as a runnable state. Each of the 59 configurations runs
 `/bin/true`, fixed stdio, and a threaded workload that observes clocks, file
-metadata, CPUID, and randomness: 189 bounded cases in total.
+metadata, CPUID, and randomness: 177 bounded cases in total.
 
 Run the matrix directly with:
 

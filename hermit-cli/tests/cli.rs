@@ -61926,6 +61926,40 @@ fn cpu_profile_host_no_rdrand_refuses_bypass_modes_and_recording() {
     }
 }
 
+/// `--strict --cpu-profile=host-no-rdrand --no-virtualize-time` is refused by
+/// the profile's admission, with the profile's own message and status, before
+/// argument validation could give `--strict`'s refusal of host time
+/// (<https://github.com/rrnewton/hermit/issues/5461>). The profile
+/// needs virtual time for any run, strict or not, so its refusal is the one
+/// that names the cause.
+#[test]
+fn cpu_profile_host_no_rdrand_refuses_host_time_by_its_own_message_under_strict() {
+    let args = [
+        "run",
+        "--strict",
+        "--cpu-profile=host-no-rdrand",
+        "--no-virtualize-time",
+        "--no-virtualize-metadata",
+        "--",
+        "/bin/echo",
+        "guest must not run",
+    ];
+    let output = hermit(&args);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Policy,
+        &[
+            "--cpu-profile host-no-rdrand refused:",
+            "RDTSC/RDTSCP features require Hermit's virtual time",
+        ],
+    );
+    assert!(
+        !stderr(&output).contains("--strict refuses --no-virtualize-time"),
+        "{args:?}: refused by --strict instead of the profile: {output:?}"
+    );
+    assert!(output.stdout.is_empty(), "{args:?}: guest ran: {output:?}");
+}
+
 /// The x86-64-v3 CPU profile refuses by name every run it cannot qualify,
 /// before any host probe, and never falls back to v2
 /// (https://github.com/rrnewton/hermit/issues/4243).

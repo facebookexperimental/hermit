@@ -169,7 +169,13 @@ Hermit uses strict deterministic execution by default. The explicit
 `--strict` option also requires every input of the run on the command line: a
 run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
 the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
-starts instead of drawing that input from the host.
+starts instead of drawing that input from the host. `--strict` also refuses
+`--no-virtualize-time`, whether it is given on the command line, in a
+`--config` file or by a `--from` manifest: clock syscalls would return host
+time, which nothing records for a rerun to reproduce. That refusal is a policy
+refusal (exit 122, with the stderr line
+`HERMIT_POLICY_REFUSAL class=policy-refusal`). `hermit record` reproduces a
+host-time run.
 
 A run on a backend with precise timer events (ptrace, e9patch preprocessing on
 it, or KVM) whose precise timers preempted a thread late (a skid overshoot: the
@@ -1378,7 +1384,7 @@ that their order decides the failure.
 
 | Option | Effect |
 | --- | --- |
-| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. |
+| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), do not use `--seed-from=SystemRandom`, and keep virtual time (`--no-virtualize-time` is refused). |
 | `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--untrap-passthrough-syscalls` | Off by default. Lets `getppid`, `umask`, `getgroups`, `capget`, `sched_get_priority_max`, `sched_get_priority_min` and `get_robust_list`, which Detcore always passes through unchanged and which never wait, run without a tracer stop. They then charge no virtual time, log no DETLOG line, are not counted in the run summary (its syscall histogram says so) and end no timeslice, so the clock, schedule, turn numbers and log differ from a run without the flag, the same way in every run with it. Ptrace backend only; refused with `--strict`, `--namespace-only`, without RCB time (`--max-timeslice=disabled`, `--no-rcb-time`, or a host without usable performance counters), with a preemption record to write or replay (`--record-preemptions`, `--record-preemptions-to`, `--replay-preemptions-from`, `--replay-schedule-from`, whether given on the command line, in a `--config` file or by a `--from` manifest), `--happens-before`, `--verify-run` and in `hermit analyze`. |
@@ -1573,7 +1579,7 @@ tmpfs), with the capability, or with the overlay.
 | `--rng-seed=N` | Sets only guest random-data generation. |
 | `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. A guest that checks TLS certificates over the host network (`--network=host` or `--record-networking`) checks them against this clock, so an epoch outside a server certificate's validity fails the HTTPS connections to that server (curl exits 60 with "SSL certificate problem: certificate is not yet valid" or "certificate has expired"; a libcurl caller sees "SSL peer certificate or SSH remote key was not OK"). For those runs omit `--epoch`: the run then starts the clock at the current time and saves it in its manifest, and `hermit run --from last-run` repeats it with that epoch. |
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
-| `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
+| `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. Refused with `--strict`, because host time would reach the guest unbound. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
 | `--cpu-profile PROFILE` | `auto` (the default) gives the guest x86-64-v3 where the run and host qualify and x86-64-v2 elsewhere; `x86-64-v2` and `x86-64-v3` name one profile on every host; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |

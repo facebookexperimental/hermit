@@ -2038,12 +2038,12 @@ pub struct RunOpts {
     pub(crate) det_opts: DetOptions,
 
     /// Require Hermit's deterministic defaults and reject incompatible opt-outs. Unsupported
-    /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is still accepted:
-    /// clock syscalls then return host time, so the run is not reproducible; record it with
-    /// `hermit record` to reproduce it. `--verify --verify-strict` reports the difference; plain
-    /// `--verify` reports it only when host time reaches the guest's output. On the ptrace
-    /// backend, `--strict` also refuses to run when the host's performance counters fail
-    /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact;
+    /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is refused before
+    /// the guest starts: clock syscalls would return host time, which reaches the guest unbound,
+    /// so the run could not be reproduced from its command line (`hermit record` reproduces a
+    /// host-time run). On the ptrace backend, `--strict` also refuses to run when the host's
+    /// performance counters fail Reverie's validation, because the virtual clock counts retired
+    /// branches and cannot be exact;
     /// with `--max-timeslice=disabled` Detcore uses no branch count, so that run is not refused
     /// (Reverie still sets up, calibrates and incidentally reads the counters, but none of
     /// those reads reaches the virtual clock, a preemption point or the guest). Every input must be
@@ -6315,6 +6315,134 @@ fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
     let (with, without) = (manifest(&with, "untrapped"), manifest(&without, "trapped"));
     validate(&["--from", without.as_str()]).expect("the manifest replays without the flag");
     refused(&["--from", with.as_str()], "--from");
+}
+
+/// `--strict` refuses `--no-virtualize-time` by name
+/// (<https://github.com/rrnewton/hermit/issues/5461>): without virtual time
+/// host time reaches the guest unbound. Validation refuses it whether the
+/// options come from the command line, a `--config` file or a `--from`
+/// manifest, as a policy refusal: the CLI exits `HERMIT_POLICY_REFUSAL_EXIT`
+/// (122) with the `HERMIT_POLICY_REFUSAL class=policy-refusal` line. Each route
+/// accepts host time without `--strict`, and `--strict` with virtual time, so
+/// the refusal is the combination's.
+#[test]
+fn strict_refuses_host_time_by_every_route() {
+    use clap::CommandFactory as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    // Validates `hermit run ARGS -- /bin/true`, expanded as `main` expands a
+    // `--config` or `--from` before parsing.
+    let validate = |run: &[&str]| -> Result<(), Error> {
+        let argv: Vec<std::ffi::OsString> = ["hermit", "run"]
+            .iter()
+            .chain(run)
+            .chain(&["--", "/bin/true"])
+            .map(std::ffi::OsString::from)
+            .collect();
+        let argv = crate::app::run_config::expand_argv(&crate::app::Args::command(), &argv)?
+            .unwrap_or(argv);
+        let matches = crate::app::Args::command().try_get_matches_from(&argv)?;
+        let mut args = crate::app::args_from_matches_with_clock(&matches, || {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600)
+        })?;
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
+            panic!("{argv:?} is not a `run` command");
+        };
+        run.validate_args_with_perf_support(true)
+    };
+    let refused = |run: &[&str], route: &str| {
+        let error = validate(run).expect_err(route);
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("--strict refuses --no-virtualize-time:")
+                && message.contains("host time")
+                && message.contains("unbound"),
+            "{route}: {message}"
+        );
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{route}: not a policy refusal: {message}"
+        );
+        // What the CLI reports for it: the status and the stderr class line.
+        assert_eq!(
+            crate::app::failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            "{route}: {message}"
+        );
+        assert_eq!(
+            crate::app::classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal",
+            "{route}: {message}"
+        );
+    };
+
+    // The command line: only the combination is refused.
+    validate(&[]).expect("the default run validates");
+    validate(&["--strict"]).expect("--strict with virtual time validates");
+    validate(&["--no-virtualize-time", "--no-virtualize-metadata"])
+        .expect("host time without --strict validates");
+    refused(
+        &[
+            "--strict",
+            "--no-virtualize-time",
+            "--no-virtualize-metadata",
+        ],
+        "command line",
+    );
+
+    // A `--config` file, alone and with `--strict` from the command line.
+    let config = |name: &str, strict: bool| {
+        let path = directory.path().join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "schema: {}\nrun:\n  strict: {strict}\n  no-virtualize-time: true\n  \
+                 no-virtualize-metadata: true\n",
+                crate::app::run_config::SCHEMA
+            ),
+        )
+        .unwrap();
+        path.to_str().expect("config path is UTF-8").to_owned()
+    };
+    let (strict, host_time) = (config("strict", true), config("host-time", false));
+    validate(&["--config", host_time.as_str()]).expect("the config validates without --strict");
+    refused(&["--config", strict.as_str()], "--config");
+    refused(
+        &["--strict", "--config", host_time.as_str()],
+        "--strict on the command line, --no-virtualize-time in --config",
+    );
+
+    // A `--from` manifest holding the same options.
+    let manifest = |config: &str, name: &str| {
+        let loaded = crate::app::run_config::read(Path::new(config)).unwrap();
+        let (global, run) = crate::app::run_config::to_manifest_parts(&loaded).unwrap();
+        let manifest = crate::app::manifest::Manifest::new(
+            hermit::Id::unique(),
+            crate::app::manifest::Kind::InputsOnly,
+            crate::app::manifest::Command {
+                program: Some("/bin/true".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            crate::app::manifest::Inputs {
+                global,
+                run,
+                host_drawn: Default::default(),
+            },
+        );
+        let at = directory
+            .path()
+            .join(name)
+            .join(crate::app::manifest::MANIFEST_NAME);
+        crate::app::manifest::write(&at, &manifest).unwrap();
+        at.parent().unwrap().to_str().unwrap().to_owned()
+    };
+    let (strict, host_time) = (
+        manifest(&strict, "strict-manifest"),
+        manifest(&host_time, "host-time-manifest"),
+    );
+    validate(&["--from", host_time.as_str()]).expect("the manifest validates without --strict");
+    refused(&["--from", strict.as_str()], "--from");
 }
 
 #[test]
@@ -14593,6 +14721,10 @@ impl RunOpts {
         // Callers other than `main` (analyze, oci, tests) reach validation
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
+        // First: it needs only the resolved options, and every caller
+        // (`validate_args`, and the tests that validate without the timer
+        // probe) reaches it here.
+        self.refuse_strict_with_host_time()?;
         // Before the image is resolved, which this refusal does not need.
         self.refuse_exclusive_rewrite_in_an_image()?;
         self.resolve_image_default_program()?;
@@ -20095,6 +20227,34 @@ impl RunOpts {
             "--strict requires every input of the run on the command line, but this run would \
              draw {remedies}"
         )
+    }
+
+    /// `--strict` refuses `--no-virtualize-time`
+    /// (<https://github.com/rrnewton/hermit/issues/5461>). Without virtual
+    /// time, clock syscalls return host time: an input from the host that is
+    /// neither refused, replaced from Hermit's configuration, nor bound to the
+    /// run, so a rerun of the same command line observes other times. No option
+    /// overrides the refusal; a run that needs host time drops `--strict`.
+    ///
+    /// It reads the resolved configuration, so the flag, a `--config` key and a
+    /// `--from` manifest are refused alike, before anything is launched.
+    /// `hermit record start --strict` is a separate flag and is not refused: a
+    /// recording always runs without virtual time and binds the clock results
+    /// it saw, which its replay returns.
+    ///
+    /// A [`PolicyRefusal`]: Hermit worked and stopped the run on purpose, so it
+    /// exits `HERMIT_POLICY_REFUSAL_EXIT` (122) with the
+    /// `HERMIT_POLICY_REFUSAL class=policy-refusal` line, not as a failure.
+    fn refuse_strict_with_host_time(&self) -> Result<(), Error> {
+        if self.strict && !self.det_opts.det_config.virtualize_time {
+            return Err(Error::new(PolicyRefusal).context(
+                "--strict refuses --no-virtualize-time: clock syscalls would return host time, \
+                 which reaches the guest unbound (nothing records it for a rerun to reproduce). \
+                 Remove --no-virtualize-time, or run without --strict; hermit record can \
+                 reproduce a host-time run.",
+            ));
+        }
+        Ok(())
     }
 
     /// Warns, in one line, that this run drew inputs from the host and so

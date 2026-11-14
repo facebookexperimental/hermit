@@ -168,14 +168,50 @@ fn record_captures_host_clock_reads_and_replay_returns_them() {
 #[test]
 fn run_without_virtual_time_reads_the_host_clock() {
     let guest = build_guest();
-    for strict in [false, true] {
-        let mut args = vec!["run", "--no-virtualize-time", "--no-virtualize-metadata"];
-        if strict {
-            args.push("--strict");
-        }
-        let output = hermit(&args, Some(&guest));
-        let label = format!("{args:?}");
-        assert_success(&label, &output);
-        assert_host_realtime(&label, &output);
-    }
+    let args = ["run", "--no-virtualize-time", "--no-virtualize-metadata"];
+    let output = hermit(&args, Some(&guest));
+    let label = format!("{args:?}");
+    assert_success(&label, &output);
+    assert_host_realtime(&label, &output);
+}
+
+/// `--strict` refuses a run without virtual time before the guest starts
+/// (<https://github.com/rrnewton/hermit/issues/5461>), as a policy refusal:
+/// exit `HERMIT_POLICY_REFUSAL_EXIT` (122) and the
+/// `HERMIT_POLICY_REFUSAL class=policy-refusal` line. This was the strict
+/// iteration of `run_without_virtual_time_reads_the_host_clock`, which
+/// expected the strict run to succeed and read the host clock: host time then
+/// reached the guest unbound, which `--strict` does not allow.
+#[test]
+fn strict_refuses_a_run_without_virtual_time_by_name() {
+    let guest = build_guest();
+    let args = [
+        "run",
+        "--no-virtualize-time",
+        "--no-virtualize-metadata",
+        "--strict",
+    ];
+    let output = hermit(&args, Some(&guest));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{args:?} was accepted:\n{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{args:?}: no policy-refusal class line:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--strict refuses --no-virtualize-time:")
+            && stderr.contains("host time")
+            && stderr.contains("unbound"),
+        "{args:?} was not refused by name:\n{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "{args:?}: the refused guest ran: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

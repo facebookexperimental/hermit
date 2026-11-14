@@ -8,14 +8,16 @@
 
 //! Occasional end-to-end coverage for meaningful relaxed-mode flag combinations.
 //!
-//! The valid cross-product contains 60 configurations: relaxed mode varies
-//! thread sequentialization and deterministic I/O, strict mode keeps both on,
-//! and both modes vary the three valid time/metadata states, CPUID
-//! virtualization, and verification. `--strace-only` (with and without
-//! verification) and `--namespace-only` add three explicit passthrough
-//! endpoints. Every configuration runs an exec/exit program, a fixed-output
-//! program, and a threaded observation program that exercises clocks,
-//! metadata, CPUID, and randomness.
+//! The valid cross-product contains 56 configurations: relaxed mode varies
+//! thread sequentialization and deterministic I/O and the three valid
+//! time/metadata states; strict mode keeps both on and varies only the two
+//! time/metadata states that keep virtual time, because `--strict` refuses
+//! `--no-virtualize-time` (<https://github.com/rrnewton/hermit/issues/5461>);
+//! both modes vary CPUID virtualization and verification. `--strace-only`
+//! (with and without verification) and `--namespace-only` add three explicit
+//! passthrough endpoints. Every configuration runs an exec/exit program, a
+//! fixed-output program, and a threaded observation program that exercises
+//! clocks, metadata, CPUID, and randomness.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -84,18 +86,25 @@ impl TimeMetadata {
 
 fn matrix_configurations() -> Vec<Configuration> {
     let mut configurations = Vec::new();
-    let time_metadata_states = [
-        TimeMetadata::Both,
-        TimeMetadata::TimeOnly,
-        TimeMetadata::Neither,
-    ];
 
     for strict in [false, true] {
         let sequentialization_states: &[bool] = if strict { &[true] } else { &[true, false] };
         let deterministic_io_states: &[bool] = if strict { &[true] } else { &[true, false] };
+        // `--strict` refuses `--no-virtualize-time`, so the strict states keep
+        // virtual time; `invalid_matrix_states_are_rejected_without_panicking`
+        // checks the refusal.
+        let time_metadata_states: &[TimeMetadata] = if strict {
+            &[TimeMetadata::Both, TimeMetadata::TimeOnly]
+        } else {
+            &[
+                TimeMetadata::Both,
+                TimeMetadata::TimeOnly,
+                TimeMetadata::Neither,
+            ]
+        };
         for &sequentialize in sequentialization_states {
             for &deterministic_io in deterministic_io_states {
-                for &time_metadata in &time_metadata_states {
+                for &time_metadata in time_metadata_states {
                     for virtualize_cpuid in [true, false] {
                         for verify in [false, true] {
                             let mut args = vec![
@@ -328,13 +337,20 @@ fn run_case(configuration: &Configuration, program: Program<'_>) -> (String, u12
 #[test]
 fn matrix_shape_covers_valid_and_passthrough_states() {
     let configurations = matrix_configurations();
-    assert_eq!(configurations.len(), 63);
+    assert_eq!(configurations.len(), 59);
     assert_eq!(
         configurations
             .iter()
             .filter(|configuration| configuration.name.starts_with("strict_"))
             .count(),
-        12,
+        8,
+    );
+    assert!(
+        !configurations.iter().any(|configuration| {
+            configuration.args.contains(&"--strict")
+                && configuration.args.contains(&"--no-virtualize-time")
+        }),
+        "a valid configuration combines --strict with --no-virtualize-time"
     );
     assert_eq!(
         configurations
@@ -347,26 +363,49 @@ fn matrix_shape_covers_valid_and_passthrough_states() {
 
 #[test]
 fn invalid_matrix_states_are_rejected_without_panicking() {
-    let cases: &[(&[&str], &[&str])] = &[
+    // Each state, the diagnostics its refusal must contain, and the exit status
+    // where the test pins one.
+    let cases: &[(&[&str], &[&str], Option<i32>)] = &[
         (
             &["--strict", "--no-sequentialize-threads"],
             &["--strict", "--no-sequentialize-threads"],
+            None,
         ),
         (
             &["--strict", "--no-deterministic-io"],
             &["--strict", "--no-deterministic-io"],
+            None,
         ),
         (
             &["--no-virtualize-time"],
             &["also requires --no-virtualize-metadata"],
+            None,
         ),
         (
             &["--namespace-only", "--verify"],
             &["--namespace-only", "--verify"],
+            None,
+        ),
+        // https://github.com/rrnewton/hermit/issues/5461: host time would reach
+        // the guest unbound. Argument validation refuses it as a policy
+        // refusal.
+        (
+            &[
+                "--strict",
+                "--no-virtualize-time",
+                "--no-virtualize-metadata",
+            ],
+            &[
+                "--strict refuses --no-virtualize-time:",
+                "host time",
+                "unbound",
+                "HERMIT_POLICY_REFUSAL class=policy-refusal",
+            ],
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         ),
     ];
 
-    for &(args, expected_diagnostics) in cases {
+    for &(args, expected_diagnostics, expected_exit) in cases {
         let mut command = Command::new("timeout");
         command
             .args(["--kill-after", KILL_AFTER, "5s"])
@@ -391,6 +430,14 @@ fn invalid_matrix_states_are_rejected_without_panicking() {
             "invalid state {args:?} panicked\n{}",
             bounded_output(&output),
         );
+        if let Some(expected_exit) = expected_exit {
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "invalid state {args:?} exited with another status\n{}",
+                bounded_output(&output),
+            );
+        }
         for &expected in expected_diagnostics {
             assert!(
                 combined.contains(expected),
