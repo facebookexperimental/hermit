@@ -64327,6 +64327,170 @@ fn replay_only_ignores_an_unused_requested_cpu_profile() {
     }
 }
 
+/// One half of `record start --verify-strict` under `--cpu-profile x86-64-v3`
+/// into the new directory `run`, replaying `first`'s recording when given:
+/// its exit code, stdout and stderr. With `host_state`, Hermit's
+/// `XDG_CACHE_HOME` is `host_state/cache` and its `TMPDIR` is
+/// `host_state/tmp`, so it finds neither a cached x86-64-v3 qualification nor
+/// one another process published, and measures the XINUSE probe itself.
+fn v3_verify_half(
+    run: &Path,
+    first: Option<&Path>,
+    image: &str,
+    host_state: Option<&Path>,
+) -> (Option<i32>, String, String) {
+    let mut args = vec![
+        "--log",
+        "info",
+        "record",
+        "start",
+        "--strict",
+        "--verify-strict",
+        "--verify-run",
+        run.to_str().unwrap(),
+    ];
+    if let Some(first) = first {
+        args.extend(["--verify-replay-of", first.to_str().unwrap()]);
+    }
+    args.extend(["--cpu-profile", "x86-64-v3", "--", image]);
+    let mut command = hermit_command(&args);
+    if let Some(host_state) = host_state {
+        for (variable, name) in [("XDG_CACHE_HOME", "cache"), ("TMPDIR", "tmp")] {
+            let directory = host_state.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            command.env(variable, directory);
+        }
+    }
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+    (output.status.code(), stdout(&output), stderr(&output))
+}
+
+/// A `--verify-replay-of` half of an x86-64-v3 recording qualifies the host
+/// before its container, as the recording does, so a host qualification that
+/// has to measure changes nothing its guest or its log sees. The replay finds
+/// no qualification to reuse ([`v3_verify_half`]'s `host_state`), so it
+/// measures the XINUSE probe (it says so, and publishes its verdict), and its
+/// log still matches the recording's under the canonical comparison, with no
+/// probe line in it and the guest's thread ids where the recording had them
+/// (https://github.com/facebookexperimental/hermit/issues/118). The same
+/// qualification refuses a recording whose bound host facts this host does
+/// not match, by name and before the replay's container: nothing replays.
+/// That includes the qualification the recording passed (the probe's case
+/// count), which no other check before the container compares: the replay's
+/// precheck takes it from the recording, and the CPUID table digest leaves it
+/// out. The replay repeats the comparison inside its container, too late. A
+/// host that does not qualify skips the test.
+#[test]
+fn replay_only_qualifies_a_v3_recording_before_its_container() {
+    let test = "replay_only_qualifies_a_v3_recording_before_its_container";
+    let image = isa_fixture("replay-only-v3", Some(0b111), 0, IsaLink::Static);
+    let image = image.to_str().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // A `--verify-run` directory must be new, so each attempt gets its own.
+    let mut attempts = 0;
+    let mut fresh = || {
+        attempts += 1;
+        directory.path().join(format!("half-{attempts}"))
+    };
+    let Some((_, _, first)) = v3_run_or_refusal(test, || {
+        let run = fresh();
+        let (status, out, err) = v3_verify_half(&run, None, image, None);
+        (status, out, err, run)
+    }) else {
+        return;
+    };
+    let host_state = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (_, replay_stderr, second) =
+        v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || {
+            let run = fresh();
+            let (status, out, err) =
+                v3_verify_half(&run, Some(&first), image, Some(host_state.path()));
+            (status, out, err, run)
+        })
+        .expect("unreachable: the qualification panics first");
+    assert!(
+        replay_stderr.contains("WARNING: qualifying this host for --cpu-profile x86-64-v3"),
+        "the replay found a cached pass, so it tested nothing:\n{replay_stderr}"
+    );
+    let report = directory.path().join("verify.json");
+    let output = hermit(&[
+        "log-diff",
+        "--verify-json",
+        report.to_str().unwrap(),
+        "--verify-allow=both",
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ]);
+    let verdict: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report)
+            .unwrap_or_else(|error| panic!("no report: {error}\n{}", stderr(&output))),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            &verdict["verdict"],
+            &verdict["bitwise_parity"]
+        ),
+        (
+            Some(0),
+            &serde_json::json!("matched"),
+            &serde_json::json!(true)
+        ),
+        "{verdict:#}\n{}",
+        stderr(&output)
+    );
+    let published = fs::read_dir(host_state.path().join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .any(|name| name.starts_with("hermit-xinuse-probe-") && name.ends_with(".json"));
+    assert!(
+        published,
+        "the replay reused a verdict instead of measuring:\n{replay_stderr}"
+    );
+    let log = fs::read_to_string(second.join("run.log")).unwrap();
+    assert!(
+        !log.contains("xinuse probe"),
+        "the probe ran inside the replay:\n{log}"
+    );
+    // A first half whose recording binds another XCR0, and one whose
+    // recording passed a qualification with one more probe case.
+    let metadata_path = first.join("recording").join("metadata.json");
+    let recorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let probe_cases = recorded["cpu_profile_host"]["probe_cases"]
+        .as_u64()
+        .expect("the recording binds its probe's case count");
+    for (fact, value, named) in [
+        ("xcr0", serde_json::json!(0x207), "XCR0"),
+        (
+            "probe_cases",
+            serde_json::json!(probe_cases + 1),
+            "the qualification it passed",
+        ),
+    ] {
+        let mut metadata = recorded.clone();
+        metadata["cpu_profile_host"][fact] = value;
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        let (status, _, refused) =
+            v3_verify_half(&fresh(), Some(&first), image, Some(host_state.path()));
+        assert_eq!(
+            status,
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{fact}: {refused}"
+        );
+        assert!(
+            refused.contains("--cpu-profile x86-64-v3 refused:")
+                && refused.contains(&format!("differs from the recording's in {named}")),
+            "{fact}: {refused}"
+        );
+        assert!(
+            !refused.contains("Replaying..."),
+            "{fact}: the refusal came from inside the replay's container:\n{refused}"
+        );
+    }
+}
+
 /// Launches `image` through the library under `profile` (`None`: the
 /// ordinary default configuration's), by `run` or, with `output`,
 /// `run_with_output`, on a thread with room for a real run: the exit code,

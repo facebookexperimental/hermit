@@ -684,6 +684,7 @@ pub use ptrace_completion::HermitPtraceFailure;
 pub use ptrace_completion::RecoveryRefusal;
 use record::Record;
 use replay::Replay;
+pub use replay::qualify_host_for_replay;
 pub use reverie::ExitStatus;
 pub use reverie::process;
 pub use reverie::process::Command;

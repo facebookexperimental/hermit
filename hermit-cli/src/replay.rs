@@ -41,6 +41,51 @@ use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
+/// Qualifies this host for replaying the recording in `dir`, in the calling
+/// process ([`qualified_host_facts`]). A caller that runs the replay in a
+/// container calls this before it forks the container, as `hermit replay` and
+/// a recording qualify: [`Replay::spawn`]'s own qualification then reuses this
+/// process's ([`crate::cpu_profile_admission::admit`] qualifies once per
+/// process). Without it a host qualification cache miss runs the XINUSE probe
+/// inside the replay, whose log then holds the probe's lines and whose guest
+/// thread ids move by the probe's threads
+/// (https://github.com/facebookexperimental/hermit/issues/118).
+pub fn qualify_host_for_replay(dir: &Path, gdbserver: bool) -> Result<(), Error> {
+    qualified_host_facts(&Metadata::load(dir)?, gdbserver).map(drop)
+}
+
+/// A v3 recording replays only on a host that qualifies with the same host
+/// facts, under the same table
+/// (https://github.com/rrnewton/hermit/issues/4243): the recorded facts, once
+/// this host qualifies with them. Any other profile needs no qualification
+/// (`None`).
+fn qualified_host_facts(
+    metadata: &Metadata,
+    gdbserver: bool,
+) -> Result<Option<detcore_model::cpu_profile::HostXstate>, Error> {
+    if metadata.cpu_profile != detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+        return Ok(None);
+    }
+    let refuse = |why: String| {
+        crate::cpu_profile_admission::CpuProfileRefusal::new(metadata.cpu_profile, why)
+    };
+    let recorded = crate::cpu_profile_admission::precheck_replay(
+        metadata.cpu_profile,
+        metadata.cpu_profile_host.as_ref(),
+        metadata.cpu_table_digest.as_deref(),
+    )?;
+    let request = crate::cpu_profile_admission::record_or_replay_request(gdbserver);
+    let (_probe, host) = crate::cpu_profile_admission::admit(&request).map_err(refuse)?;
+    if let Some(fact) = crate::cpu_profile_admission::first_difference(&recorded, &host) {
+        return Err(refuse(format!(
+            "this host differs from the recording's in {fact}, so the guest would see a \
+             different CPU"
+        ))
+        .into());
+    }
+    Ok(Some(recorded))
+}
+
 /// Represents a replay that is currently running.
 pub struct Replay {
     // The running tracee.
@@ -97,28 +142,7 @@ impl Replay {
         // this invocation would choose, and never derived again from the
         // program: a replay runs the CPU its recording saw.
         config.cpu_profile = metadata.cpu_profile;
-        // A v3 recording replays only on a host that qualifies with the same
-        // host facts, under the same table
-        // (https://github.com/rrnewton/hermit/issues/4243).
-        if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
-            let refuse = |why: String| {
-                crate::cpu_profile_admission::CpuProfileRefusal::new(metadata.cpu_profile, why)
-            };
-            let recorded = crate::cpu_profile_admission::precheck_replay(
-                metadata.cpu_profile,
-                metadata.cpu_profile_host.as_ref(),
-                metadata.cpu_table_digest.as_deref(),
-            )?;
-            let request =
-                crate::cpu_profile_admission::record_or_replay_request(gdbserver.is_some());
-            let (_probe, host) = crate::cpu_profile_admission::admit(&request).map_err(refuse)?;
-            if let Some(fact) = crate::cpu_profile_admission::first_difference(&recorded, &host) {
-                return Err(refuse(format!(
-                    "this host differs from the recording's in {fact}, so the guest would see a \
-                     different CPU"
-                ))
-                .into());
-            }
+        if let Some(recorded) = qualified_host_facts(&metadata, gdbserver.is_some())? {
             config.cpu_profile_host = Some(recorded);
         }
         // Recorder events contain the raw bytes from the recording namespace.

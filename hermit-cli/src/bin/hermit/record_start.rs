@@ -854,9 +854,10 @@ impl StartOpts {
         }
         // A replay-only run likewise never qualifies this invocation's
         // requested v3: the recording's own profile is selected and, if v3,
-        // qualified from its metadata in `Replay::spawn`. An unused ambient
-        // request must not refuse a replayable v2 recording on a host that
-        // cannot qualify for v3 (revcodex on PR 4709).
+        // qualified from its metadata before the replay's container
+        // (`replay_from`). An unused ambient request must not refuse a
+        // replayable v2 recording on a host that cannot qualify for v3
+        // (https://github.com/rrnewton/hermit/pull/4709).
         if !replay_only && self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             if self.states_v3_residual() {
                 super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1259,6 +1260,23 @@ impl StartOpts {
         data: &Path,
         global: &GlobalOpts,
     ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
+        // A v3 recording's host qualification runs here, before the
+        // container, as the recording's did: inside it, a cache miss would
+        // put the probe's lines in the replay's log and its threads among the
+        // guest's thread ids
+        // (https://github.com/facebookexperimental/hermit/issues/118). Its
+        // refusal is a policy refusal, as `hermit replay` reports it and as it
+        // was from inside the container.
+        hermit::qualify_host_for_replay(data, false).map_err(|error| {
+            if error
+                .chain()
+                .any(|cause| cause.is::<hermit::cpu_profile_admission::CpuProfileRefusal>())
+            {
+                Error::new(crate::app::container::PolicyRefusal).context(error.to_string())
+            } else {
+                error
+            }
+        })?;
         eprintln!(":: {}", "Replaying...".yellow().bold());
         let (mut container, identity) = self.configured_container(self.network(), Vec::new())?;
         let mounts = self.mount.clone();
