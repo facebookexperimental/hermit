@@ -1,0 +1,122 @@
+# Exact demangled symbols whose above-x86-64-v2 instructions are
+# runtime-dispatched (reached only after CPU feature detection) or,
+# for hermit_xinuse_*, gated by the v3 host qualification documented
+# in scripts/check-no-v3.rs. One exact symbol per line; matching is
+# exact, never substring. Regenerate the candidate set with
+# `check-no-v3.rs --hit-symbols <binary>` and review every addition:
+# a new symbol here is a claim that its code cannot run its v3
+# instructions on a v2 host.
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<1> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<1>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<2> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<2>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<3> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<3>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<4> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<4>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<1> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<1>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<2> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<2>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<3> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<3>>::new_unchecked
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<4> as aho_corasick::packed::teddy::builder::SearcherT>::find
+<aho_corasick::packed::teddy::builder::x86_64::SlimAVX2<4>>::new_unchecked
+chacha20::backends::avx2::add_xor_rot
+chacha20::backends::avx2::cols_to_rows
+chacha20::backends::avx2::rng_inner::<chacha20::R12, chacha20::variants::Legacy>
+chacha20::backends::avx2::rounds::<chacha20::R12>
+chacha20::backends::avx2::rows_to_cols
+core::core_arch::x86::avx2::_mm256_add_epi32
+core::core_arch::x86::avx2::_mm256_add_epi64
+core::core_arch::x86::avx2::_mm256_alignr_epi8::<13>
+core::core_arch::x86::avx2::_mm256_alignr_epi8::<14>
+core::core_arch::x86::avx2::_mm256_alignr_epi8::<15>
+core::core_arch::x86::avx2::_mm256_alignr_epi8::<8>
+core::core_arch::x86::avx2::_mm256_and_si256
+core::core_arch::x86::avx2::_mm256_broadcastsi128_si256
+core::core_arch::x86::avx2::_mm256_cmpeq_epi8
+core::core_arch::x86::avx2::_mm256_extracti128_si256::<0>
+core::core_arch::x86::avx2::_mm256_extracti128_si256::<1>
+core::core_arch::x86::avx2::_mm256_madd_epi16
+core::core_arch::x86::avx2::_mm256_maddubs_epi16
+core::core_arch::x86::avx2::_mm256_movemask_epi8
+core::core_arch::x86::avx2::_mm256_mul_epu32
+core::core_arch::x86::avx2::_mm256_or_si256
+core::core_arch::x86::avx2::_mm256_permute2x128_si256::<33>
+core::core_arch::x86::avx2::_mm256_permute4x64_epi64::<78>
+core::core_arch::x86::avx2::_mm256_permutevar8x32_epi32
+core::core_arch::x86::avx2::_mm256_sad_epu8
+core::core_arch::x86::avx2::_mm256_shuffle_epi32::<147>
+core::core_arch::x86::avx2::_mm256_shuffle_epi32::<57>
+core::core_arch::x86::avx2::_mm256_shuffle_epi32::<78>
+core::core_arch::x86::avx2::_mm256_shuffle_epi8
+core::core_arch::x86::avx2::_mm256_slli_epi32::<12>
+core::core_arch::x86::avx2::_mm256_slli_epi32::<5>
+core::core_arch::x86::avx2::_mm256_slli_epi32::<7>
+core::core_arch::x86::avx2::_mm256_slli_epi64::<3>
+core::core_arch::x86::avx2::_mm256_slli_epi64::<42>
+core::core_arch::x86::avx2::_mm256_slli_epi64::<56>
+core::core_arch::x86::avx2::_mm256_slli_epi64::<7>
+core::core_arch::x86::avx2::_mm256_srli_epi16::<4>
+core::core_arch::x86::avx2::_mm256_srli_epi32::<20>
+core::core_arch::x86::avx2::_mm256_srli_epi32::<25>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<1>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<19>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<32>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<42>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<6>
+core::core_arch::x86::avx2::_mm256_srli_epi64::<7>
+core::core_arch::x86::avx2::_mm256_unpackhi_epi8
+core::core_arch::x86::avx2::_mm256_unpacklo_epi8
+core::core_arch::x86::avx2::_mm256_xor_si256
+core::core_arch::x86::avx::_mm256_castsi128_si256
+core::core_arch::x86::avx::_mm256_castsi256_si128
+core::core_arch::x86::avx::_mm256_extract_epi32::<0>
+core::core_arch::x86::avx::_mm256_extract_epi32::<1>
+core::core_arch::x86::avx::_mm256_insertf128_si256::<0>
+core::core_arch::x86::avx::_mm256_insertf128_si256::<1>
+core::core_arch::x86::avx::_mm256_load_si256
+core::core_arch::x86::avx::_mm256_loadu_si256
+core::core_arch::x86::avx::_mm256_permute2f128_si256::<33>
+core::core_arch::x86::avx::_mm256_set1_epi16
+core::core_arch::x86::avx::_mm256_set1_epi8
+core::core_arch::x86::avx::_mm256_set_epi32
+core::core_arch::x86::avx::_mm256_set_epi64x
+core::core_arch::x86::avx::_mm256_set_epi8
+core::core_arch::x86::avx::_mm256_set_m128i
+core::core_arch::x86::avx::_mm256_setzero_si256
+core::core_arch::x86::avx::_mm256_storeu_si256
+core::core_arch::x86::avx::_mm256_zextsi128_si256
+hermit_xinuse_arm
+hermit_xinuse_peer_loop
+hermit_xinuse_save_restore_cycles
+<memchr::arch::x86_64::avx2::memchr::One>::count_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::One>::count_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::One>::find_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::One>::find_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::One>::new_unchecked
+<memchr::arch::x86_64::avx2::memchr::One>::rfind_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::One>::rfind_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::Three>::find_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::Three>::find_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::Three>::new_unchecked
+<memchr::arch::x86_64::avx2::memchr::Three>::rfind_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::Three>::rfind_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::Two>::find_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::Two>::find_raw_sse2
+<memchr::arch::x86_64::avx2::memchr::Two>::new_unchecked
+<memchr::arch::x86_64::avx2::memchr::Two>::rfind_raw_avx2
+<memchr::arch::x86_64::avx2::memchr::Two>::rfind_raw_sse2
+<memchr::arch::x86_64::avx2::packedpair::Finder>::find_impl
+<memchr::arch::x86_64::avx2::packedpair::Finder>::find_prefilter_impl
+<memchr::arch::x86_64::avx2::packedpair::Finder>::with_pair_impl
+memchr::arch::x86_64::memchr::count_raw::find_avx2
+memchr::arch::x86_64::memchr::memchr2_raw::find_avx2
+memchr::arch::x86_64::memchr::memchr3_raw::find_avx2
+memchr::arch::x86_64::memchr::memchr_raw::find_avx2
+memchr::arch::x86_64::memchr::memrchr2_raw::find_avx2
+memchr::arch::x86_64::memchr::memrchr3_raw::find_avx2
+memchr::arch::x86_64::memchr::memrchr_raw::find_avx2
+memchr::memmem::searcher::prefilter_kind_avx2
+memchr::memmem::searcher::searcher_kind_avx2
