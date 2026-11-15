@@ -37,6 +37,13 @@ use artifact::Result;
 use artifact::Runner;
 use artifact::RuntimeReceipt;
 use artifact::VerifiedCompiledSources;
+
+const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
+
+fn reverie_repository() -> artifact::private_static::CargoGitRepository<'static> {
+    artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
+        .expect("the named Reverie repository is a valid https URL")
+}
 use contract::CapturedRun;
 use contract::HeldInputs;
 use m1_bundle::Leaf;
@@ -164,7 +171,7 @@ fn qualify(
         Duration::from_secs(60),
         64 * 1024 * 1024,
     )?;
-    let (receipt, compiled_sources) = VerifiedCompiledSources::with_resolved(
+    let (receipt, compiled_sources) = VerifiedCompiledSources::with_resolved_with_repository(
         &CompiledSourceExpectation {
             layout: CompiledSourceLayout::HermitGit,
             image_kind: if standalone {
@@ -176,13 +183,15 @@ fn qualify(
             manifest: &source_manifest,
             reverie_pin: pin,
         },
+        reverie_repository(),
         &mut runner,
         |compiled_sources| {
             let receipt: RuntimeReceipt = serde_json::from_slice(
                 &fs::read(artifact::real_file(&leaf.receipt)?).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+            let source =
+                format!("git+https://github.com/facebookexperimental/reverie.git?rev={pin}#{pin}");
             let (name, target, manifest, package_source, id, initializer) = if standalone {
                 require(
                     fs::read_to_string(format!("{}.revision", leaf.runtime.display()))
@@ -210,7 +219,7 @@ fn qualify(
                     manifest,
                     Some(source.clone()),
                     format!(
-                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.7"
+                        "git+https://github.com/facebookexperimental/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.7"
                     ),
                     artifact::STANDALONE_ROOT,
                 )

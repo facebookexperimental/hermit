@@ -54,8 +54,17 @@ fn text(path: &Path) -> Result<String> {
     Ok(path.to_str().ok_or("fixture path is not UTF-8")?.into())
 }
 
+/// The one named Reverie repository these Hermit source-copy
+/// qualifications expect (see the same-named constant in
+/// liteinst-runtime-build).
+const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
+
+fn reverie_repository() -> reverie_liteinst_artifact::private_static::CargoGitRepository<'static> {
+    reverie_liteinst_artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
+        .expect("the named Reverie repository is a valid https URL")
+}
 fn resolve(root: &Path, runner: &mut Runner) -> Result<VerifiedCompiledSources> {
-    VerifiedCompiledSources::resolve_content(
+    VerifiedCompiledSources::resolve_content_with_repository(
         &CompiledSourceExpectation {
             layout: CompiledSourceLayout::HermitGit,
             image_kind: FixedImageKind::Standalone,
@@ -63,6 +72,7 @@ fn resolve(root: &Path, runner: &mut Runner) -> Result<VerifiedCompiledSources> 
             manifest: &root.join("liteinst-runtime-build/Cargo.toml"),
             reverie_pin: env!("HERMIT_REVERIE_PIN"),
         },
+        reverie_repository(),
         runner,
     )
 }

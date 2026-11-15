@@ -11,17 +11,20 @@ The pin has two distinct purposes. For an old checkout it is an archival record:
 testing it is a pointer into Reverie's **linear main history**, judged by
 **ancestry and monotonic advance** rather than by equality with a live tip:
 
-1. **Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.
+1. **Ancestry** — the pin must be an ancestor of `facebookexperimental/reverie:main`.
    **Lagging is legitimate.** A pin behind the tip is a pin; a pin required to
    equal the tip is not.
 2. **Monotonic** — relative to the landing-base pin it may only advance forward
    or remain unchanged. Ancestry alone would accept a pin walked *backwards*,
    because an ancient commit is also an ancestor. The floor is the pin recorded
    at the base the change would land on (`--base-ref`, default `origin/main`).
+
 3. **A conflict resolves to the newer pin** — and this is enforced *by* rule 2
    rather than by a separate mechanism. Resolving a `Cargo.lock` conflict to the
    older side regresses the pin below the base, which rule 2 refuses. Conflict
    resolution is exactly where a silent regression would otherwise land.
+
+The rule's intent is unchanged: the pin must be an ancestor of the canonical published Reverie main. That repository is now facebookexperimental/reverie: it is where Reverie is exported and published (Reverie 0.5.7 on crates.io was published from it), and Reverie's own Cargo.toml names it as its repository. This applies the existing rule to the now-canonical repository; it does not loosen it.
 
 An off-history, backward, or sideways pin cannot produce current validation
 evidence.
@@ -52,7 +55,7 @@ pins, always choose the newer side.
 scope from `git ls-files`, and checks every tracked `Cargo.toml` and
 `Cargo.lock`. Every Reverie revision in that tracked Cargo dependency metadata
 must be identical to the others, must be an **ancestor** of
-`rrnewton/reverie:main`, and must not regress below the base's pin.
+`facebookexperimental/reverie:main`, and must not regress below the base's pin.
 The checker reports the manifest, lockfile, pinned-file, revision-entry, and
 main-history relationship on every run so a green result states its coverage.
 Tracked vendored Cargo metadata is included. Untracked/generated files and

@@ -721,12 +721,13 @@ fn exact_provenance(root: &Path, cargo_build_info: &BuildInfo) -> Result<Provena
     }
     let lock = fs::read_to_string(root.join("Cargo.lock"))
         .map_err(|error| format!("failed to read Cargo.lock: {error}"))?;
-    let expected_source =
-        format!("git+https://github.com/rrnewton/reverie.git?rev={reverie_sha}#{reverie_sha}");
+    let expected_source = format!(
+        "git+https://github.com/facebookexperimental/reverie.git?rev={reverie_sha}#{reverie_sha}"
+    );
     let reverie_sources = lock
         .lines()
         .filter_map(|line| line.trim().strip_prefix("source = \"")?.strip_suffix('"'))
-        .filter(|source| source.contains("github.com/rrnewton/reverie.git"))
+        .filter(|source| source.contains("github.com/facebookexperimental/reverie.git"))
         .collect::<Vec<_>>();
     if reverie_sources.is_empty()
         || reverie_sources
@@ -7251,11 +7252,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
-        fs::write(
-            install.join("README.txt"),
-            b"mutated-during-copy\n",
-        )
-        .unwrap();
+        fs::write(install.join("README.txt"), b"mutated-during-copy\n").unwrap();
         fs::write(&cp_release, b"release\n").unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(
@@ -7408,11 +7405,7 @@ mod tests {
 
         let help_path = fixture.join("buck-help.txt");
         let original_help = fs::read(&help_path).unwrap();
-        fs::write(
-            &help_path,
-            b"ptrace liteinst in-guest-trap kvm changed\n",
-        )
-        .unwrap();
+        fs::write(&help_path, b"ptrace liteinst in-guest-trap kvm changed\n").unwrap();
         assert!(
             verify_retained_candidate_evidence(&fixture, "0.2.0", "0123456789ab", &cargo_info)
                 .is_err()
@@ -8353,9 +8346,7 @@ esac
         }
         let buck = fs::read_to_string(source_root().join(alias)).unwrap();
         assert!(buck.contains("\"fbsource//third-party/xz:lzma\""));
-        assert!(
-            buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\"")
-        );
+        assert!(buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\""));
         assert!(buck.contains(
             "deps = [\n            release_lzma_target,\n            release_unwind_target,\n"
         ));

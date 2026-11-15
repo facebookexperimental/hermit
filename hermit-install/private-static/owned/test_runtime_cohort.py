@@ -162,7 +162,7 @@ def live_reverie_object(path):
 
 def lock_text(pin):
     return ('[[package]]\nname = "reverie"\nversion = "0.1.0"\n'
-            'source = "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}"\n'.format(pin))
+            'source = "git+https://github.com/facebookexperimental/reverie.git?rev={0}#{0}"\n'.format(pin))
 
 
 class PinnedTree:
@@ -239,7 +239,7 @@ class PinnedTree:
 def manifest_tree(directory):
     """A PinnedTree whose root Cargo.toml also names the pin, as full_pins requires."""
     tree = PinnedTree(Path(directory))
-    tree.write(tree.root / 'Cargo.toml', ('[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", '
+    tree.write(tree.root / 'Cargo.toml', ('[dependencies]\nreverie = { git = "https://github.com/facebookexperimental/reverie", '
                                          'rev = "%s" }\n' % tree.rpin).encode())
     tree.h_head = tree.commit(tree.root)
     return tree
@@ -586,7 +586,7 @@ class DerivedCohort(unittest.TestCase):
             tree = PinnedTree(Path(directory))
             self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
             (tree.root / 'Cargo.lock').write_text(
-                '[[package]]\nname = "reverie"\nsource = "git+https://github.com/rrnewton/reverie.git?branch=main"\n')
+                '[[package]]\nname = "reverie"\nsource = "git+https://github.com/facebookexperimental/reverie.git?branch=main"\n')
             tree.h_head = tree.commit(tree.root)
             with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: Cargo.lock:3 names reverie without a 40-hex pin'):
                 cohort.bind(tree.root, tree.h_head)
@@ -955,7 +955,7 @@ class RunModeSourceClose(unittest.TestCase):
             tree = manifest_tree(root / 'H')
             original, other = tree.h_head, 'f' * 40
             tree.write(tree.root / 'Cargo.toml', (
-                '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", rev = "%s" }\n'
+                '[dependencies]\nreverie = { git = "https://github.com/facebookexperimental/reverie", rev = "%s" }\n'
                 % other).encode())
             tree.locks(other)
             replacement = tree.commit(tree.root)
@@ -1263,7 +1263,7 @@ class ActivePinsFromObjects(unittest.TestCase):
         rows = []
         for name in ['Cargo.lock', 'Cargo.toml', 'liteinst-runtime-build/Cargo.lock']:
             text = fixture_git_bytes(tree.root, 'cat-file', 'blob', head + ':' + name).decode()
-            rows += [[name, n, line] for n, line in enumerate(text.splitlines(), 1) if 'github.com/rrnewton/reverie' in line]
+            rows += [[name, n, line] for n, line in enumerate(text.splitlines(), 1) if 'github.com/facebookexperimental/reverie' in line]
         return rows
 
     def test_replace_refs_are_ignored(self):

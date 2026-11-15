@@ -36,7 +36,7 @@ for manifest in "$root_dir/liteinst-runtime-build/Cargo.toml" \
     "$root_dir/liteinst-runtime-build/runtime/Cargo.toml"; do
     revisions=$(
         {
-            grep 'rrnewton/reverie' "$manifest" |
+            grep 'facebookexperimental/reverie' "$manifest" |
                 grep -oE 'rev = "[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}' || true
         } | sort -u
     )
@@ -49,7 +49,7 @@ for manifest in "$root_dir/liteinst-runtime-build/Cargo.toml" \
 done
 lock_revisions=$(
     {
-        grep -h '^source = "git+https://github.com/rrnewton/reverie' \
+        grep -h '^source = "git+https://github.com/facebookexperimental/reverie' \
             "$root_dir/liteinst-runtime-build/Cargo.lock" |
             grep -oE '[0-9a-f]{40}' || true
     } | sort -u

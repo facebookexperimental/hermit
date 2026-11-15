@@ -2,13 +2,12 @@
 
 Hermit is a deterministic execution environment for x86-64 Linux programs. It
 runs an unmodified guest under the
-[Reverie](https://github.com/rrnewton/reverie) ptrace backend and controls
+[Reverie](https://github.com/facebookexperimental/reverie) ptrace backend and controls
 sources of nondeterminism including thread scheduling, time, random data,
-CPUID results, and selected file metadata. That is the fork this repository
-builds against — both the Cargo git dependency and the workspace submodule pin
-`https://github.com/rrnewton/reverie.git`. Reverie's upstream reference
-repository is
-[facebookexperimental/reverie](https://github.com/facebookexperimental/reverie).
+CPUID results, and selected file metadata. That is the repository this
+repository builds against — both the Cargo git dependency and the workspace submodule pin
+`https://github.com/facebookexperimental/reverie.git`, where Reverie is
+exported and published.
 
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.

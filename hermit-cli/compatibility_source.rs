@@ -553,9 +553,10 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
         let Some(value) = package.source.as_deref() else {
             continue;
         };
-        let Some(value) = value.strip_prefix("git+https://github.com/rrnewton/reverie.git?rev=")
+        let Some(value) =
+            value.strip_prefix("git+https://github.com/facebookexperimental/reverie.git?rev=")
         else {
-            if value.contains("github.com/rrnewton/reverie") {
+            if value.contains("github.com/facebookexperimental/reverie") {
                 return Err("source snapshot has a noncanonical Reverie source".to_owned());
             }
             continue;

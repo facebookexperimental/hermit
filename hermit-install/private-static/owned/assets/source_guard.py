@@ -88,7 +88,7 @@ def full_pins(h,rpin,head):
             if 'budget' in name.lower() and re.match(r'expected_pin\s*=',s):
                 pins=re.findall(r'[0-9a-f]{40}',s)
                 need(pins==[rpin],'budget pin differs: '+name+':'+str(n));rows.append([name,n,line])
-            if 'github.com/rrnewton/reverie' in line:
+            if 'github.com/facebookexperimental/reverie' in line or 'github.com/rrnewton/reverie' in line:
                 pins=re.findall(r'(?:rev[=\s"\x27:]+|#)([0-9a-f]{40})',line)
                 need(pins and all(p==rpin for p in pins),'active Reverie pin differs/missing: '+name+':'+str(n))
                 rows.append([name,n,line])

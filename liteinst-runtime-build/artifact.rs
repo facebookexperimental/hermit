@@ -2,7 +2,24 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(not(test))]
+use reverie_liteinst_artifact as qualifier;
 use serde_json::Value;
+
+/// The one named Reverie repository this build's compiled-source
+/// qualification expects: Hermit's Cargo manifests and locks spell
+/// their Reverie git dependencies with this URL, so the qualifier
+/// derives its expected Cargo source string from it. It is an
+/// explicit constant of this build, not an environment default.
+pub(crate) const REVERIE_GIT_REPOSITORY: &str =
+    "https://github.com/facebookexperimental/reverie.git";
+
+/// The compiled-source repository selection for this build.
+#[cfg(not(test))]
+pub(crate) fn reverie_repository() -> qualifier::private_static::CargoGitRepository<'static> {
+    qualifier::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
+        .expect("the named Reverie repository is a valid https URL")
+}
 
 /// Bind the host proof implementation to the same Cargo-resolved checkout as
 /// the preload. No populated Hermit gitlink or installed helper is consulted.
@@ -25,11 +42,10 @@ pub(crate) fn constructor_qualifier_source(
     let version = helper["version"]
         .as_str()
         .ok_or("constructor qualifier has no version")?;
-    if helper["source"]
-        != format!("git+https://github.com/rrnewton/reverie.git?rev={revision}#{revision}")
+    if helper["source"] != format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#{revision}")
         || helper["id"]
             != format!(
-                "git+https://github.com/rrnewton/reverie.git?rev={revision}#reverie-liteinst-artifact@{version}"
+                "git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-artifact@{version}"
             )
     {
         return Err("constructor qualifier differs from the exact preload Git source".into());
@@ -241,7 +257,11 @@ pub(crate) fn native_cdylib_from_cargo_messages(
 mod tests {
     use super::*;
 
-    const PACKAGE: &str = "git+https://github.com/rrnewton/reverie.git?rev=0123456789012345678901234567890123456789#reverie-liteinst-preload@0.4.1";
+    static PACKAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "git+{REVERIE_GIT_REPOSITORY}?rev=0123456789012345678901234567890123456789#reverie-liteinst-preload@0.4.1"
+        )
+    });
     const MANIFEST: &str = "/git/reverie/reverie-liteinst-preload/Cargo.toml";
 
     struct QualifierMetadataFixture {
@@ -460,8 +480,8 @@ mod tests {
         let source = root.join("reverie-liteinst-artifact/src/lib.rs");
         let helper = serde_json::json!({
             "name": "reverie-liteinst-artifact", "version": "0.4.1",
-            "source": format!("git+https://github.com/rrnewton/reverie.git?rev={REVISION}#{REVISION}"),
-            "id": format!("git+https://github.com/rrnewton/reverie.git?rev={REVISION}#reverie-liteinst-artifact@0.4.1"),
+            "source": format!("git+{REVERIE_GIT_REPOSITORY}?rev={REVISION}#{REVISION}"),
+            "id": format!("git+{REVERIE_GIT_REPOSITORY}?rev={REVISION}#reverie-liteinst-artifact@0.4.1"),
             "manifest_path": root.join("reverie-liteinst-artifact/Cargo.toml"),
             "targets": [{"name": "reverie_liteinst_artifact", "kind": ["lib"],
                 "crate_types": ["lib"], "src_path": source}],
@@ -495,10 +515,10 @@ mod tests {
             (
                 "source",
                 serde_json::json!(format!(
-                    "git+https://github.com/rrnewton/reverie.git?rev={REVISION}#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    "git+{REVERIE_GIT_REPOSITORY}?rev={REVISION}#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 )),
             ),
-            ("id", serde_json::json!(PACKAGE)),
+            ("id", serde_json::json!(PACKAGE.as_str())),
             (
                 "manifest_path",
                 serde_json::json!(root.join("other-checkout/reverie-liteinst-artifact/Cargo.toml")),
@@ -532,7 +552,7 @@ mod tests {
 
     fn artifact() -> Value {
         serde_json::json!({
-            "reason": "compiler-artifact", "package_id": PACKAGE,
+            "reason": "compiler-artifact", "package_id": PACKAGE.as_str(),
             "manifest_path": MANIFEST,
             "target": {"name":"reverie_liteinst_preload", "kind":["cdylib"], "crate_types":["cdylib"]},
             "features": ["liteinst"],
@@ -541,7 +561,7 @@ mod tests {
     }
 
     fn select(messages: &str) -> Result<PathBuf, String> {
-        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST), false)
+        liteinst_cdylib_from_cargo_messages(messages, &PACKAGE, Path::new(MANIFEST), false)
     }
 
     #[test]
@@ -705,9 +725,9 @@ mod tests {
         for (field, value) in [
             (
                 "package_id",
-                serde_json::json!(
-                    "git+https://github.com/rrnewton/reverie.git?rev=1111111111111111111111111111111111111111#reverie-liteinst-preload@0.4.1"
-                ),
+                serde_json::json!(format!(
+                    "git+{REVERIE_GIT_REPOSITORY}?rev=1111111111111111111111111111111111111111#reverie-liteinst-preload@0.4.1"
+                )),
             ),
             ("manifest_path", serde_json::json!("/lookalike/Cargo.toml")),
             ("features", serde_json::json!(["allocator-fixture"])),
@@ -760,7 +780,7 @@ mod tests {
     #[test]
     fn selects_only_the_explicit_allocator_fixture_feature_mode() {
         let select_fixture = |message: &str| {
-            liteinst_cdylib_from_cargo_messages(message, PACKAGE, Path::new(MANIFEST), true)
+            liteinst_cdylib_from_cargo_messages(message, &PACKAGE, Path::new(MANIFEST), true)
         };
         assert!(select_fixture(&artifact().to_string()).is_err());
         let mut message = artifact();
@@ -824,6 +844,7 @@ mod tests {
 }
 
 #[cfg(all(feature = "native-exec", not(test)))]
+#[cfg(not(test))]
 pub(crate) mod native {
     use std::env;
     use std::time::Duration;
@@ -832,6 +853,7 @@ pub(crate) mod native {
 
     use goblin::elf::Elf;
     use goblin::elf::program_header;
+    #[cfg(not(test))]
     use reverie_liteinst_artifact as qualifier;
     use sha2::Digest;
     use sha2::Sha256;
@@ -1067,7 +1089,7 @@ pub(crate) mod native {
         // lock, then independently selects this exact runtime leaf. The
         // standalone producer has its own manifest/lock and qualifier source.
         let qualification_manifest = root.join("Cargo.toml");
-        let sources = qualifier::VerifiedCompiledSources::resolve_content(
+        let sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
             &qualifier::CompiledSourceExpectation {
                 layout: qualifier::CompiledSourceLayout::HermitGit,
                 image_kind: qualifier::FixedImageKind::Detcore,
@@ -1075,6 +1097,7 @@ pub(crate) mod native {
                 manifest: &qualification_manifest,
                 reverie_pin: &pin,
             },
+            reverie_repository(),
             &mut runner,
         )
         .unwrap_or_else(|e| panic!("native compiled-source qualification refused: {e}"));
@@ -1112,8 +1135,7 @@ pub(crate) mod native {
             .collect();
         assert_eq!(rv_packages.len(), 1);
         let rv_package = rv_packages[0];
-        let expected_source =
-            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+        let expected_source = format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}");
         assert_eq!(rv_package["source"], expected_source);
         let rv_manifest = fs::canonicalize(rv_package["manifest_path"].as_str().unwrap()).unwrap();
         let rv = rv_manifest.parent().unwrap().parent().unwrap();

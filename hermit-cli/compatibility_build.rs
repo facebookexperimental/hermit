@@ -149,9 +149,10 @@ fn resolved_build(
     for (id, units) in &graph.units {
         let package = &graph.packages[id];
         let source = package.source.as_deref().unwrap_or("");
-        let Some(rest) = source.strip_prefix("git+https://github.com/rrnewton/reverie.git?rev=")
+        let Some(rest) =
+            source.strip_prefix("git+https://github.com/facebookexperimental/reverie.git?rev=")
         else {
-            if source.contains("github.com/rrnewton/reverie")
+            if source.contains("github.com/facebookexperimental/reverie")
                 || package.name.starts_with("reverie-")
                 || package.name == "safeptrace"
             {

@@ -9925,7 +9925,7 @@ mod tests {
 
         fn dep(rev: &str) -> String {
             format!(
-                "reverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+                "reverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{rev}\" }}\n"
             )
         }
 
@@ -9971,7 +9971,7 @@ mod tests {
         #[test]
         fn an_unparseable_revision_is_ambiguous() {
             let text = format!(
-                "{}reverie-x = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"beef\" }}\n",
+                "{}reverie-x = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"beef\" }}\n",
                 dep(A)
             );
             assert_eq!(parse_reverie_pin(&text), None);

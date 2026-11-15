@@ -10,7 +10,7 @@
 //!
 //! OWNER-APPROVED RULE, 2026-08-08, replacing equality-to-the-tip:
 //!
-//!   1. ANCESTRY   -- the pin must be an ancestor of `rrnewton/reverie:main`,
+//!   1. ANCESTRY   -- the pin must be an ancestor of `facebookexperimental/reverie:main`,
 //!                    and tip equality is allowed but not required. A lagging
 //!                    ancestor is legitimate; requiring the tip made the
 //!                    verdict a property of WHEN you looked rather than of
@@ -24,6 +24,14 @@
 //!                    base, which rule 2 refuses. Conflict resolution is
 //!                    exactly where a silent regression would otherwise land.
 //!
+//!
+//! The rule's intent is unchanged: the pin must be an ancestor of the
+//! canonical published Reverie main. That repository is now
+//! facebookexperimental/reverie: it is where Reverie is exported and
+//! published (Reverie 0.5.7 on crates.io was published from it), and
+//! Reverie's own Cargo.toml names it as its repository. This applies
+//! the existing rule to the now-canonical repository; it does not
+//! loosen it.
 //! All Reverie revisions across tracked Cargo dependency metadata must also be
 //! identical to each other; that is decided offline and always blocks.
 //!
@@ -114,7 +122,7 @@ use std::sync::OnceLock;
 /// (https://github.com/rrnewton/hermit/issues/3499). The spelling is not the
 /// guarantee: `refuse_config_rewritten_authority_url` proves that Git contacts
 /// exactly this URL, and refuses a rewrite of it from any config scope.
-const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie";
+const DEFAULT_REMOTE: &str = "https://github.com/facebookexperimental/reverie";
 
 /// The landing branches a run judges against (ci/landing-branches.env, or the
 /// environment). Reverie's is the history the pin must be on; Hermit's
@@ -1189,7 +1197,7 @@ fn rewritten_remote(remote: &str, rewrites: &[(String, String)]) -> Option<Strin
 /// isolation because they carry the caller's configuration -- on this fleet the
 /// forward-proxy wrapper's rewrites -- and dropping them breaks the fetch. But
 /// the same variables can carry `url.<attacker>.insteadOf =
-/// https://github.com/rrnewton/reverie.git`, and then `ls-remote` answers with
+/// https://github.com/facebookexperimental/reverie.git`, and then `ls-remote` answers with
 /// the attacker's tip while every message in this script still names the real
 /// remote. Measured: that redirection works, silently, and the checker then
 /// validates the pin against a repository the attacker controls.
@@ -1944,7 +1952,7 @@ fn loud_header(title: &str) {
 fn blocked_instructions() {
     eprintln!();
     eprintln!(
-        "BLOCKED. The pin must be on rrnewton/reverie:main history and must not regress the landing base."
+        "BLOCKED. The pin must be on facebookexperimental/reverie:main history and must not regress the landing base."
     );
     eprintln!("Update every derived manifest and lockfile site with:");
     eprintln!("  with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
@@ -2458,6 +2466,68 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Lines in the compiled-source qualification trees that name a Reverie
+/// git repository outside the one named constant per crate. The compiled
+/// expectation must derive from `REVERIE_GIT_REPOSITORY`; a fresh literal
+/// would silently re-split the pin across two repositories.
+fn reverie_url_literal_violations(text: &str) -> Vec<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| {
+            (line.contains("github.com/facebookexperimental/reverie.git")
+                || line.contains("github.com/rrnewton/reverie.git"))
+                && !line.trim_start().starts_with("//")
+                && !line.trim_start().starts_with('*')
+                && !line.contains("REVERIE_GIT_REPOSITORY")
+                && !(*index > 0 && lines[index - 1].contains("const REVERIE_GIT_REPOSITORY"))
+        })
+        .map(|(index, _)| index + 1)
+        .collect()
+}
+
+fn check_reverie_repository_literals(root: &Path) -> Result<i32, String> {
+    const TREES: [&str; 4] = [
+        "liteinst-runtime-build",
+        "hermit-install/src",
+        "ci",
+        "hermit-cli/tests/common",
+    ];
+    let mut violations: Vec<String> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = TREES.iter().map(|tree| root.join(tree)).collect();
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "target") {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                for line in reverie_url_literal_violations(&text) {
+                    violations.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+    }
+    if violations.is_empty() {
+        return Ok(0);
+    }
+    loud_header("REVERIE REPOSITORY LITERAL OUTSIDE THE NAMED CONSTANT - BLOCKED");
+    for violation in &violations {
+        eprintln!("  {violation}");
+    }
+    eprintln!(
+        "Name the repository once per crate as `const REVERIE_GIT_REPOSITORY` and pass it to CargoGitRepository::new; a second spelling would split the compiled-source expectation from the pin."
+    );
+    Ok(1)
+}
+
 /// Bind Buck-built Hermit's reported version to hermit-cli's package version.
 ///
 /// Not a Reverie pin, but the other value of [`BUCK_RELEASE_VALUES_SITE`], so it
@@ -2678,6 +2748,10 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if version_code != 0 {
         return Ok(version_code);
     }
+    let literal_code = check_reverie_repository_literals(&root)?;
+    if literal_code != 0 {
+        return Ok(literal_code);
+    }
 
     let entries = pins.len();
     let pin_files = pinned_file_count.len();
@@ -2732,7 +2806,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         eprintln!("Hermit pin:  {pin}");
         eprintln!("Reverie main: {main}");
         eprintln!(
-            "The pin is not reachable from rrnewton/reverie:{reverie_branch}. It names a commit that was\n\
+            "The pin is not reachable from facebookexperimental/reverie:{reverie_branch}. It names a commit that was\n\
              abandoned, rewritten, or never merged -- so nothing on {reverie_branch} contains it and no\n\
              amount of waiting will put it on {reverie_branch} history."
         );
@@ -3003,7 +3077,7 @@ mod tests {
         init_fixture_repo(&root);
         let manifest = |rev: &str| {
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{rev}\" }}\n"
             )
         };
         let (pin, other) = ("a".repeat(40), "b".repeat(40));
@@ -3221,11 +3295,22 @@ mod tests {
 
     #[test]
     fn extracts_rev_key_not_reverie_prefix() {
-        let line = r#"reverie = { git = "https://github.com/rrnewton/reverie.git", rev = "0123456789abcdef0123456789abcdef01234567" }"#;
+        let line = r#"reverie = { git = "https://github.com/facebookexperimental/reverie.git", rev = "0123456789abcdef0123456789abcdef01234567" }"#;
         assert_eq!(
             extract_rev(line).as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+    }
+
+    #[test]
+    fn reverie_url_literals_must_sit_on_the_named_constant() {
+        let allowed = "const REVERIE_GIT_REPOSITORY: &str = \"https://github.com/facebookexperimental/reverie.git\";\nCargoGitRepository::new(REVERIE_GIT_REPOSITORY)\n";
+        assert!(reverie_url_literal_violations(allowed).is_empty());
+        let stray =
+            "let r = CargoGitRepository::new(\"https://github.com/rrnewton/reverie.git\");\n";
+        assert_eq!(reverie_url_literal_violations(stray), vec![1]);
+        let link = "// see https://github.com/rrnewton/reverie/issues/1063\n";
+        assert!(reverie_url_literal_violations(link).is_empty());
     }
 
     #[test]
@@ -3446,7 +3531,7 @@ mod tests {
 
     #[test]
     fn extracts_rev_from_lock_source() {
-        let line = r#"source = "git+https://github.com/rrnewton/reverie.git?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567""#;
+        let line = r#"source = "git+https://github.com/facebookexperimental/reverie.git?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567""#;
         assert_eq!(
             extract_lock_rev(line).as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
@@ -3878,7 +3963,7 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{current}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{current}\" }}\n"
             ),
         )
         .expect("write fixture manifest");
@@ -3957,7 +4042,7 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{old}\" }}\n"
             ),
         )
         .expect("write stale Hermit fixture");
@@ -3994,7 +4079,7 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{pin}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{pin}\" }}\n"
             ),
         )
         .expect("write fixture manifest");
@@ -4134,7 +4219,7 @@ mod tests {
         init_fixture_repo(&root);
         let manifest = |rev: &str| {
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{rev}\" }}\n"
             )
         };
         fs::write(root.join("Cargo.toml"), manifest(base_pin)).expect("write base manifest");
@@ -4179,7 +4264,7 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{old}\" }}\n"
             ),
         )
         .expect("write manifest");
@@ -4270,7 +4355,7 @@ mod tests {
         };
         assert_eq!(run(&floor), 0, "early admitted invocation");
         fs::write(origin.join("Cargo.toml"), format!(
-            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{latest}\" }}\n"
+            "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{latest}\" }}\n"
         )).unwrap();
         assert!(
             git_in(&origin, &["add", "Cargo.toml"])
@@ -4441,7 +4526,7 @@ mod tests {
         init_fixture_repo(&root);
         let manifest = |rev: &str| {
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{rev}\" }}\n"
             )
         };
         fs::write(root.join("Cargo.toml"), manifest(head_pin)).expect("write HEAD manifest");
@@ -4579,7 +4664,7 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{old}\" }}\n"
             ),
         )
         .expect("write stale fixture manifest");
@@ -4614,7 +4699,7 @@ mod tests {
         let old = "0123456789abcdef0123456789abcdef01234567";
         let latest = "89abcdef0123456789abcdef0123456789abcdef";
         let manifest = format!(
-            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+            "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{old}\" }}\n"
         );
         fs::create_dir_all(root.join("sub")).expect("create nested manifest dir");
         fs::write(root.join("Cargo.toml"), &manifest).expect("write first manifest");
@@ -4690,14 +4775,14 @@ mod tests {
         fs::write(
             root.join("Cargo.toml"),
             format!(
-                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{current}\" }}\n"
+                "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{current}\" }}\n"
             ),
         )
         .expect("write fixture manifest");
         fs::write(
             runtime.join("Cargo.lock"),
             format!(
-                "[[package]]\nname = \"reverie-core\"\nsource = \"git+https://github.com/rrnewton/reverie.git?rev={stale}#{stale}\"\n"
+                "[[package]]\nname = \"reverie-core\"\nsource = \"git+https://github.com/facebookexperimental/reverie.git?rev={stale}#{stale}\"\n"
             ),
         )
         .expect("write planted stale lockfile");
@@ -5793,11 +5878,11 @@ mod tests {
     /// are about to ask is an attack.
     #[test]
     fn only_a_rewrite_that_changes_the_authority_url_is_detected() {
-        let remote = "https://github.com/rrnewton/reverie.git";
+        let remote = "https://github.com/facebookexperimental/reverie.git";
 
         // The attack, reproduced from the shell probe: redirect the whole URL.
         let attack = vec![(
-            "https://github.com/rrnewton/reverie.git".to_string(),
+            "https://github.com/facebookexperimental/reverie.git".to_string(),
             "/tmp/evil.git".to_string(),
         )];
         assert_eq!(
@@ -5813,7 +5898,7 @@ mod tests {
         )];
         assert_eq!(
             rewritten_remote(remote, &prefix).as_deref(),
-            Some("https://evil.example/rrnewton/reverie.git")
+            Some("https://evil.example/facebookexperimental/reverie.git")
         );
 
         // The proxy's shape: rewrites that map OTHER spellings INTO the
@@ -5848,7 +5933,7 @@ mod tests {
                 "https://short.example/".to_string(),
             ),
             (
-                "https://github.com/rrnewton/".to_string(),
+                "https://github.com/facebookexperimental/".to_string(),
                 "https://long.example/".to_string(),
             ),
         ];
@@ -5863,7 +5948,7 @@ mod tests {
     /// out of `GIT_CONFIG_*` and refused by name.
     #[test]
     fn an_inherited_url_rewrite_of_the_authority_is_refused() {
-        let remote = "https://github.com/rrnewton/reverie.git";
+        let remote = "https://github.com/facebookexperimental/reverie.git";
         let error = with_config_override(&[("url./tmp/evil.git.insteadOf", remote)], || {
             refuse_rewritten_authority_url(remote)
                 .expect_err("a redirected authority URL must be refused")
@@ -5903,7 +5988,7 @@ mod tests {
         let dir = temp_path("global-rewrite");
         fs::create_dir_all(&dir).expect("create the config fixture directory");
         let global = dir.join("gitconfig");
-        let dotted = "https://github.com/rrnewton/reverie.git";
+        let dotted = "https://github.com/facebookexperimental/reverie.git";
         fs::write(
             &global,
             format!("[url \"/tmp/local-mirror/reverie\"]\n\tinsteadOf = {dotted}\n"),

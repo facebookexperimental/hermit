@@ -53,6 +53,16 @@ use m1_artifact::Runner;
 use m1_artifact::RuntimeReceipt;
 use m1_artifact::SourceIdentity;
 use m1_artifact::VerifiedCompiledSources;
+
+/// The one named Reverie repository this fixture build's
+/// compiled-source qualification expects (see the same-named
+/// constant in liteinst-runtime-build).
+const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
+
+fn reverie_repository() -> m1_artifact::private_static::CargoGitRepository<'static> {
+    m1_artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
+        .expect("the named Reverie repository is a valid https URL")
+}
 use m1_bundle::Bundle;
 use m1_bundle::Leaf;
 use serde_json::Value;
@@ -78,7 +88,6 @@ fn leaf_features(standalone: bool) -> Vec<String> {
         .map(|feature| (*feature).to_owned())
         .collect()
 }
-
 
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(message.to_owned()) }
@@ -115,7 +124,10 @@ fn record_compiler_crash_retry(record: &mut Option<PathBuf>, leaf: &str, line: &
             .map_or(0, |elapsed| elapsed.as_secs());
         PathBuf::from(state)
             .join("compiler-crash-retries")
-            .join(format!("m1-producer-{leaf}-{seconds}-{}.txt", std::process::id()))
+            .join(format!(
+                "m1-producer-{leaf}-{seconds}-{}.txt",
+                std::process::id()
+            ))
     });
     let appended = path
         .parent()
@@ -170,7 +182,10 @@ fn run_cargo_build(
     let Some(crash) = compiler_crash_line(&stdout, &stderr) else {
         return Err(error);
     };
-    let failed = runner.commands.pop().expect("the failed build's evidence is present");
+    let failed = runner
+        .commands
+        .pop()
+        .expect("the failed build's evidence is present");
     let mut record = None;
     let command = format!("cargo {}", arguments.join(" "));
     for line in [
@@ -180,8 +195,12 @@ fn run_cargo_build(
         ),
         "retry-on-compiler-crash: first run's crash lines:".to_owned(),
         crash.clone(),
-        format!("retry-on-compiler-crash: first run's logs: {}", failed.stderr.path.display()),
-        "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node".to_owned(),
+        format!(
+            "retry-on-compiler-crash: first run's logs: {}",
+            failed.stderr.path.display()
+        ),
+        "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node"
+            .to_owned(),
     ] {
         record_compiler_crash_retry(&mut record, leaf, &line);
     }
@@ -264,7 +283,7 @@ fn build_leaf(
     } else {
         manifest.clone()
     };
-    let compiled_sources = VerifiedCompiledSources::resolve(
+    let compiled_sources = VerifiedCompiledSources::resolve_with_repository(
         &CompiledSourceExpectation {
             layout: CompiledSourceLayout::HermitGit,
             image_kind: if standalone {
@@ -276,6 +295,7 @@ fn build_leaf(
             manifest: &source_manifest,
             reverie_pin: &pin,
         },
+        reverie_repository(),
         &mut runner,
     )?;
     let (package_name, target_name, initializer, filename) = if standalone {
@@ -293,7 +313,7 @@ fn build_leaf(
             "libdetcore_liteinst.so",
         )
     };
-    let expected_source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+    let expected_source = format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}");
     let package = compiled_sources.package().clone();
     require(
         package.name == package_name
@@ -305,7 +325,11 @@ fn build_leaf(
     )?;
     let target = own.join("target");
     fs::create_dir(&target).map_err(|e| format!("new dedicated target: {e}"))?;
-    let profile_name = if standalone { "release" } else { "liteinst-runtime" };
+    let profile_name = if standalone {
+        "release"
+    } else {
+        "liteinst-runtime"
+    };
     let profile = cargo_profile(!standalone);
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let rustc_verbose = runner.text(&rustc, &["--version", "--verbose"], root)?;

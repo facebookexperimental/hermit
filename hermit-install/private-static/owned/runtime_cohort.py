@@ -250,7 +250,7 @@ CONSUMER_SOURCE = 'reverie-liteinst-artifact/src/private_static/selected_initial
 CONSUMER_DESCRIPTOR = 'DETCORE'
 CONSUMER_TYPE = 'MappedConsumerSource'
 CONSUMER_FIELDS = ('entry_source_relative', 'accepted_entry_sources')
-LOCK_REVERIE = 'github.com/rrnewton/reverie'
+LOCK_REVERIE = 'github.com/facebookexperimental/reverie'
 # The gate shape the ordinary provider's DedicatedFunction cohort depends on.
 # ordinary_gate.rs compiles the other half: a 44-byte input section of exactly
 # this name (DEDICATED_SECTION, Cohort::text_size). The x86_64 global_asm!
@@ -358,7 +358,7 @@ def lock_pins(workspace, h_head, rpin):
     for name in names:
         text = blobs[h_head + ':' + name].decode('utf-8', errors='replace')
         for number, line in enumerate(text.splitlines(), 1):
-            if not re.search(r'github\.com/rrnewton/reverie(?![-\w])', line):
+            if not re.search(r'github\.com/facebookexperimental/reverie(?![-\w])', line):
                 continue
             where = 'runtime cohort derivation: ' + name + ':' + str(number)
             pins = re.findall(r'(?:rev=|#)([0-9a-f]{40})', line)

@@ -144,7 +144,11 @@ fn run() -> Result<ExitCode, String> {
         let mut in_cargo_header = false;
         for (index, line) in contents.lines().enumerate() {
             if is_rust_source {
-                let doc_line = line.trim().trim_start_matches('/').trim_start_matches('!').trim();
+                let doc_line = line
+                    .trim()
+                    .trim_start_matches('/')
+                    .trim_start_matches('!')
+                    .trim();
                 if doc_line == "```cargo" {
                     in_cargo_header = true;
                     continue;
@@ -558,9 +562,17 @@ fn quoted_after(haystack: &str, key: &str) -> Option<String> {
 /// of one, so the gate would report OK for a genuinely split pin while looking
 /// like it checked.
 fn normalise(url: &str) -> String {
-    url.trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_string()
+    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
+    // The two published spellings of the one Reverie repository are the
+    // same dependency: the historical rrnewton/reverie and the canonical
+    // facebookexperimental/reverie it is now exported and published at.
+    // Bucketing them apart would let a gitlink/Cargo split pass unseen.
+    if trimmed == "https://github.com/rrnewton/reverie"
+        || trimmed == "https://github.com/facebookexperimental/reverie"
+    {
+        return "reverie".to_string();
+    }
+    trimmed.to_string()
 }
 
 fn git_root() -> Result<PathBuf, String> {
@@ -620,6 +632,31 @@ mod tests {
         // lands in two single-revision buckets and reports OK.
         assert_eq!(manifest.0, lock.0);
         assert_eq!(manifest.1, lock.1);
+    }
+
+    #[test]
+    fn a_split_across_the_two_reverie_spellings_is_one_bucket_with_two_revisions() {
+        // The historical and canonical spellings of the one Reverie
+        // repository must bucket together, so a pin split across them
+        // (two revisions under one bucket) is what run() refuses.
+        let a = extract(
+            r#"reverie = { git = "https://github.com/rrnewton/reverie.git", rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }"#,
+        )
+        .expect("historical spelling pin");
+        let b = extract(
+            r#"reverie = { git = "https://github.com/facebookexperimental/reverie.git", rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }"#,
+        )
+        .expect("canonical spelling pin");
+        assert_eq!(a.0, b.0, "both spellings must land in one bucket");
+        assert_ne!(a.1, b.1, "the planted pins are two different revisions");
+        let mut by_dep: std::collections::BTreeMap<String, std::collections::BTreeMap<Pin, usize>> =
+            std::collections::BTreeMap::new();
+        for (url, pin) in [a, b] {
+            *by_dep.entry(url).or_default().entry(pin).or_default() += 1;
+        }
+        assert_eq!(by_dep.len(), 1, "one dependency bucket, not two");
+        let revisions = by_dep.values().next().expect("bucket").len();
+        assert_eq!(revisions, 2, "run() refuses a bucket with two revisions");
     }
 
     #[test]

@@ -448,7 +448,7 @@ fn write_reverie_pin(tree: &Path, rev: &str) {
     fs::write(
         tree.join("detcore/Cargo.toml"),
         format!(
-            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie\", rev = \"{rev}\" }}\n"
+            "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie\", rev = \"{rev}\" }}\n"
         ),
     )
     .expect("failed to write fixture pin");

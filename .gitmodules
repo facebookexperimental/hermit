@@ -6,4 +6,4 @@
 	url = https://github.com/rrnewton/agent-utils.git
 [submodule "reverie"]
 	path = reverie
-	url = https://github.com/rrnewton/reverie.git
+	url = https://github.com/facebookexperimental/reverie.git

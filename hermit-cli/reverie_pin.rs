@@ -45,7 +45,7 @@ fn parse_reverie_pin(text: &str) -> Option<String> {
         if line.trim_start().starts_with('#') {
             continue;
         }
-        if !line.contains("rrnewton/reverie") {
+        if !line.contains("facebookexperimental/reverie") {
             continue;
         }
         let rev = line

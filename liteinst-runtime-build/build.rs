@@ -46,6 +46,8 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
     destination_file.sync_all()
 }
 
+const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
+
 fn main() {
     #[cfg(feature = "native-exec")]
     if env::var_os("CARGO_FEATURE_NATIVE_EXEC").is_some() {
@@ -116,7 +118,7 @@ fn main() {
         64 * 1024 * 1024,
     )
     .expect("failed to create bounded compiled-source runner");
-    let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content(
+    let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
         &qualifier::CompiledSourceExpectation {
             layout: qualifier::CompiledSourceLayout::HermitGit,
             image_kind: qualifier::FixedImageKind::Standalone,
@@ -124,6 +126,7 @@ fn main() {
             manifest: &source_manifest,
             reverie_pin: &requested_pin,
         },
+        artifact::reverie_repository(),
         &mut source_runner,
     )
     .unwrap_or_else(|error| panic!("unbound standalone compiler sources: {error}"));
@@ -159,7 +162,7 @@ fn main() {
         .as_str()
         .expect("preload leaf must have a Git source");
     let revision = source
-        .strip_prefix("git+https://github.com/rrnewton/reverie.git?rev=")
+        .strip_prefix(&format!("git+{REVERIE_GIT_REPOSITORY}?rev="))
         .and_then(|suffix| suffix.split_once('#'))
         .filter(|(pin, commit)| {
             pin == commit
@@ -182,9 +185,7 @@ fn main() {
         .expect("preload leaf has no version");
     assert_eq!(
         package_id,
-        format!(
-            "git+https://github.com/rrnewton/reverie.git?rev={revision}#reverie-liteinst-preload@{version}"
-        )
+        format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-preload@{version}")
     );
     let package_manifest = PathBuf::from(
         package["manifest_path"]

@@ -41,7 +41,7 @@ pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
 /// The x86_64 syscalls a host kernel may implement beyond the pinned table,
 /// in ascending, contiguous order from `Sysno::last().id() + 1`.
 ///
-/// The pinned `syscalls` table ends at 461 (`lsm_list_modules`), so none of
+/// The pinned `syscalls` table ends at 469 (`file_setattr`), so none of
 /// these has a `Sysno` and no `Syscall` can be built for them; they reach
 /// Detcore only as raw unknown numbers (`Tool::handle_unknown_syscall`).
 /// This list is what lets a refusal or a log line name such a number
@@ -51,18 +51,8 @@ pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
 /// which is the prompt to extend this list (or bump the pin and move the
 /// absorbed prefix into the classification below).
 #[cfg(target_arch = "x86_64")]
-pub(crate) const KNOWN_BEYOND_PINNED_TABLE: &[(i32, &str)] = &[
-    (462, "mseal"),
-    (463, "setxattrat"),
-    (464, "getxattrat"),
-    (465, "listxattrat"),
-    (466, "removexattrat"),
-    (467, "open_tree_attr"),
-    (468, "file_getattr"),
-    (469, "file_setattr"),
-    (470, "listns"),
-    (471, "rseq_slice_yield"),
-];
+pub(crate) const KNOWN_BEYOND_PINNED_TABLE: &[(i32, &str)] =
+    &[(470, "listns"), (471, "rseq_slice_yield")];
 
 /// No aarch64 number beyond its pinned table is curated here yet; the
 /// architecture shares the raw-number policy but names nothing past its
@@ -93,7 +83,7 @@ pub(crate) const KNOWN_BEYOND_PINNED_TABLE: &[(i32, &str)] = &[];
 /// gap), and so a future syscalls-crate bump that names them forces
 /// their classification.
 #[cfg(target_arch = "x86_64")]
-pub(crate) const KNOWN_TABLE_GAPS: &[(i32, &str)] = &[(335, "uretprobe"), (336, "uprobe")];
+pub(crate) const KNOWN_TABLE_GAPS: &[(i32, &str)] = &[];
 
 /// No in-range aarch64 gap is curated here yet.
 #[cfg(target_arch = "aarch64")]
@@ -104,6 +94,9 @@ pub(crate) const KNOWN_TABLE_GAPS: &[(i32, &str)] = &[];
 /// [`KNOWN_TABLE_GAPS`]) when listed, else `syscall_<number>`, the
 /// histogram summary's fallback for the same key.
 pub(crate) fn unknown_syscall_name(nr: i32) -> String {
+    if let Some(sysno) = usize::try_from(nr).ok().and_then(Sysno::new) {
+        return sysno.name().to_owned();
+    }
     KNOWN_BEYOND_PINNED_TABLE
         .iter()
         .chain(KNOWN_TABLE_GAPS.iter())

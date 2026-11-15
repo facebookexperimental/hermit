@@ -11,6 +11,16 @@ use serde_json::json;
 
 include!("../../../hermit-cli/reverie_pin.rs");
 
+/// The one named Reverie repository this staging build's
+/// compiled-source qualification expects (see the same-named
+/// constant in liteinst-runtime-build).
+const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
+
+fn reverie_repository() -> proof::private_static::CargoGitRepository<'static> {
+    proof::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
+        .expect("the named Reverie repository is a valid https URL")
+}
+
 fn require(ok: bool, message: &str) -> proof::Result<()> {
     if ok { Ok(()) } else { Err(message.into()) }
 }
@@ -79,9 +89,17 @@ fn run() -> proof::Result<()> {
     };
     // Explicit authority; a failed Git resolution never downgrades to content.
     let sources = if authority == "--git" {
-        proof::VerifiedCompiledSources::resolve(&expectation, &mut runner)?
+        proof::VerifiedCompiledSources::resolve_with_repository(
+            &expectation,
+            reverie_repository(),
+            &mut runner,
+        )?
     } else {
-        proof::VerifiedCompiledSources::resolve_content(&expectation, &mut runner)?
+        proof::VerifiedCompiledSources::resolve_content_with_repository(
+            &expectation,
+            reverie_repository(),
+            &mut runner,
+        )?
     };
     let pending = resources.join(format!(".libdetcore_liteinst.so.{serial}"));
     let result = (|| {

@@ -1010,7 +1010,7 @@ dependencies = [
 [[package]]
 name = "reverie-core"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1039,7 +1039,7 @@ dependencies = [
 [[package]]
 name = "reverie-inguest"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "bincode",
  "libc",
@@ -1057,7 +1057,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "bincode",
  "iced-x86",
@@ -1077,7 +1077,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst-artifact"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "goblin",
  "libc",
@@ -1089,7 +1089,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst-preload"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "libc",
  "reverie-core",
@@ -1099,7 +1099,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "syscalls",
 ]
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1124,7 +1124,7 @@ dependencies = [
 [[package]]
 name = "reverie-procfs"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "libc",
  "serde",
@@ -1133,7 +1133,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1148,7 +1148,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie.git?rev=10c4c1b7266819bb55c00d18603f62ff82c9acb0#10c4c1b7266819bb55c00d18603f62ff82c9acb0"
+source = "git+https://github.com/facebookexperimental/reverie.git?rev=12351ff8d674287a5ac3761a7d83e7b2b418393e#12351ff8d674287a5ac3761a7d83e7b2b418393e"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -1381,9 +1381,9 @@ dependencies = [
 
 [[package]]
 name = "syscalls"
-version = "0.6.18"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d0e35dc7d73976a53c7e6d7d177ef804a0c0ee774ec77bcc520c2216fd7cbe"
+checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
 dependencies = [
  "serde",
  "serde_repr",
