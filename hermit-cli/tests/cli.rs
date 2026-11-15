@@ -517,18 +517,20 @@ fn append_hermit_args_with_execution_root_mode(
     Ok(())
 }
 
+// Both append the arguments before pinning: the CPU-profile pin reads the
+// guest after the command's `--` (`hermit_test::guest_needs_above_v2`).
 fn append_hermit_args(command: &mut Command, args: &[&str]) {
-    hermit_test::pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     append_hermit_args_with_execution_root(command, args, requested.as_deref())
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    hermit_test::pin_canonical_epoch(command);
 }
 
 fn append_hermit_args_using_outer_mount(command: &mut Command, args: &[&str]) {
-    hermit_test::pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     append_hermit_args_with_execution_root_mode(command, args, requested.as_deref(), false)
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    hermit_test::pin_canonical_epoch(command);
 }
 
 /// `path` as Hermit's warnings print it, with the home directory as `~`.
@@ -19264,11 +19266,20 @@ fn inherited_container_output_does_not_expose_capture_offset() {
     let guest_file_path = directory.path().join("guest-output");
     let combined_log = fs::File::create(&combined_log_path)
         .expect("failed to create combined Hermit/guest output log");
-    let args = ["--log", "info", "run", "--strict", "--"];
+    // The guest goes in with Hermit's arguments, where the tests' CPU-profile
+    // pin reads it: this command is started directly, with no later pin.
+    let guest = stdio_lseek_identity_guest();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest.to_str().unwrap(),
+        report_path.to_str().unwrap(),
+        guest_file_path.to_str().unwrap(),
+    ];
     let status = hermit_command(&args)
-        .arg(stdio_lseek_identity_guest())
-        .arg(&report_path)
-        .arg(&guest_file_path)
         .stdout(Stdio::from(
             combined_log
                 .try_clone()
@@ -23584,8 +23595,17 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     // Sealed off from the developer's own user config, which outranks
     // HERMIT_MANIFEST.
     let config_home = temp.path().join("config-home");
+    // Every command gets the CPU profile the tests' pin gives the first run
+    // (`pin_cpu_profile_like`), so that each run and each rerun from the
+    // manifest sees the same environment. Alone, the pin would name x86-64-v2
+    // for `run --from` and `replay`, whose guest it cannot see, while leaving
+    // the first run to auto where the host's compiler marks the guest
+    // x86-64-v3, and Hermit passes the variable on into the guest's
+    // environment.
+    let first_run = hermit_command(&["run", "--seed-from=SystemRandom", "--", guest]);
     let run = |args: &[&str], data: &Path| {
         let mut command = hermit_command(args);
+        hermit_test::pin_cpu_profile_like(&mut command, &first_run);
         command
             .env("HERMIT_DATA_DIR", data)
             .env("XDG_CONFIG_HOME", &config_home)
@@ -23850,6 +23870,7 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert!(manifests(&explicit).is_empty());
     let mut always = hermit_command(&["run", "--epoch=2026-01-01T00:00:00Z", "--", guest]);
+    hermit_test::pin_cpu_profile_like(&mut always, &first_run);
     always
         .env("HERMIT_DATA_DIR", &explicit)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -38663,9 +38684,10 @@ fn run_config_saved_by_one_run_reproduces_it() {
         .chain([save_config.as_str()])
         .chain(guest)
         .collect();
+    let mut first_command = hermit_command(&first_args);
     let first = hermit_test::hermit_output(
         "hermit run",
-        without_implicit_hermit_inputs(&mut hermit_command(&first_args)),
+        without_implicit_hermit_inputs(&mut first_command),
     );
     assert_success(&first, &first_args);
 
@@ -38680,9 +38702,16 @@ fn run_config_saved_by_one_run_reproduces_it() {
 
     let second_log_arg = format!("--log-file={second_log}");
     let second_args = [second_log_arg.as_str(), "run", "--config", config.as_str()];
+    // The CPU profile the tests' pin gave the first run, so that its guest
+    // and the reloaded one see the same environment
+    // (`hermit_test::pin_cpu_profile_like`): alone, the pin would name
+    // x86-64-v2 for this command, whose guest it cannot see, while leaving a
+    // first run whose guest declares x86-64-v3 to auto.
+    let mut second_command = hermit_command(&second_args);
+    hermit_test::pin_cpu_profile_like(&mut second_command, &first_command);
     let second = hermit_test::hermit_output(
         "hermit run",
-        without_implicit_hermit_inputs(&mut hermit_command(&second_args)),
+        without_implicit_hermit_inputs(&mut second_command),
     );
     assert_success(&second, &second_args);
     assert_eq!(stdout(&first).lines().count(), 2, "{}", stdout(&first));
@@ -38691,9 +38720,11 @@ fn run_config_saved_by_one_run_reproduces_it() {
     assert_eq!(diff.status.code(), Some(0), "{}", stderr(&diff));
 
     let third_args: Vec<&str> = ["run"].into_iter().chain(options).chain(guest).collect();
+    let mut third_command = hermit_command(&third_args);
+    hermit_test::pin_cpu_profile_like(&mut third_command, &first_command);
     let third = hermit_test::hermit_output(
         "hermit run",
-        without_implicit_hermit_inputs(&mut hermit_command(&third_args)),
+        without_implicit_hermit_inputs(&mut third_command),
     );
     assert_success(&third, &third_args);
     assert_ne!(stdout(&third), stdout(&first));
@@ -46132,9 +46163,12 @@ fn run_timeout_pids_in_session(session: i32) -> Vec<i32> {
 /// parent-child check cannot see.
 fn spawn_timed_run(secs: u64, argv: &[&str]) -> std::process::Child {
     let secs = secs.to_string();
-    let mut command = hermit_command(&["run", "--timeout", &secs, "--"]);
+    // The guest goes in with Hermit's arguments, where the tests' CPU-profile
+    // pin reads it: this command is spawned directly, with no later pin.
+    let mut args = vec!["run", "--timeout", &secs, "--"];
+    args.extend_from_slice(argv);
+    let mut command = hermit_command(&args);
     command
-        .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -63765,6 +63799,400 @@ fn a_default_run_of_a_program_that_declares_v3_logs_the_qualification() {
     assert!(
         named.contains(&format!("WARNING: {QUALIFYING_THIS_HOST}")),
         "a named x86-64-v3 no longer announces the qualification on stderr:\n{named}"
+    );
+}
+
+/// The tests' CPU-profile pin (`hermit_test::pin_test_cpu_profile`) names
+/// x86-64-v2 only for a guest that can run there. A guest that declares it
+/// needs more, in its executable, in the interpreter of the script that runs
+/// it, or in the C library beside its glibc interpreter, is left to auto,
+/// which presents the x86-64-v3 it declares where the host qualifies. Under
+/// the pin, Hermit refused such a guest (exit 122), as it refused every
+/// program a CentOS 10 host builds or ships. The same guests declaring
+/// x86-64-v2 or less, or nothing, keep the pin, as does a guest on another
+/// backend, one whose CPUID Detcore does not answer (`--namespace-only`,
+/// `--strace-only`, `--no-virtualize-cpuid`), one served to gdb
+/// (`--gdbserver`, `--dap-listen`, `--verify-with-gdbex`), and `hermit
+/// analyze`'s: Hermit admits no x86-64-v3 there. A command pinned before its
+/// guest was added is decided again by the next pin, and a rerun that names
+/// no guest can take its first run's profile (`pin_cpu_profile_like`).
+#[test]
+fn the_test_cpu_profile_pin_leaves_a_guest_that_needs_more_than_v2_to_auto() {
+    let test = "the_test_cpu_profile_pin_leaves_a_guest_that_needs_more_than_v2_to_auto";
+    if std::env::var_os("HERMIT_CPU_PROFILE").is_some() {
+        record_test_skip(
+            test,
+            "this test process inherited HERMIT_CPU_PROFILE, which the pin keeps for every guest",
+        );
+        return;
+    }
+    // The pin reads only the arguments, so each command names Hermit and is
+    // never started.
+    let profile = |command: &Command| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "HERMIT_CPU_PROFILE")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    let pin = |guest: &Path| {
+        let mut command = Command::new("hermit");
+        command.args(["run", "--"]).arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        profile(&command)
+    };
+    let root = process_build_root("test-cpu-profile-pin");
+    fs::create_dir_all(&root).expect("failed to create the pin's fixture directory");
+    let script = |name: &str, interpreter: &Path| {
+        let path = root.join(name);
+        fs::write(&path, format!("#!{}\n", interpreter.display()))
+            .expect("failed to write a script fixture");
+        path
+    };
+    // glibc's layout: a program naming an interpreter called
+    // ld-linux-x86-64.so.2, beside a libc.so.6 declaring `library_bits`.
+    let glibc = |name: &str, library_bits: Option<u32>| {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).expect("failed to create a glibc layout");
+        let interpreter = directory.join("ld-linux-x86-64.so.2");
+        let loader = isa_fixture(&format!("{name}-loader"), None, 0, IsaLink::Interpreter);
+        fs::copy(loader, &interpreter).expect("failed to place the interpreter");
+        let library = isa_fixture(&format!("{name}-libc"), library_bits, 0, IsaLink::Static);
+        fs::copy(library, directory.join("libc.so.6")).expect("failed to place libc.so.6");
+        isa_fixture(
+            &format!("{name}-program"),
+            None,
+            0,
+            IsaLink::Interpreted(&interpreter),
+        )
+    };
+    let v3 = isa_fixture("pin-needs-v3", Some(0b111), 0, IsaLink::Static);
+    let unmarked = isa_fixture("pin-unmarked", None, 0, IsaLink::Static);
+    let auto = None;
+    let pinned = Some("x86-64-v2".to_owned());
+    for (what, guest, expected) in [
+        ("an executable declaring x86-64-v3", v3.clone(), &auto),
+        (
+            "an executable declaring x86-64-v4",
+            isa_fixture("pin-needs-v4", Some(0b1111), 0, IsaLink::Static),
+            &auto,
+        ),
+        (
+            "a script whose interpreter declares x86-64-v3",
+            script("pin-v3-script", &v3),
+            &auto,
+        ),
+        (
+            "an unmarked program whose glibc C library declares x86-64-v3",
+            glibc("pin-glibc-v3", Some(0b111)),
+            &auto,
+        ),
+        (
+            "an executable declaring x86-64-v2",
+            isa_fixture("pin-needs-v2", Some(0b11), 0, IsaLink::Static),
+            &pinned,
+        ),
+        ("an unmarked executable", unmarked.clone(), &pinned),
+        (
+            "a script whose interpreter is unmarked",
+            script("pin-unmarked-script", &unmarked),
+            &pinned,
+        ),
+        (
+            "an unmarked program whose glibc C library is unmarked",
+            glibc("pin-glibc-unmarked", None),
+            &pinned,
+        ),
+    ] {
+        assert_eq!(&pin(&guest), expected, "{what}: {}", guest.display());
+    }
+    // Pinned before its guest was added, as a builder that returns a command
+    // without one leaves it: x86-64-v2 then. The next pin decides again from
+    // the guest, unless the test named a profile in between.
+    let pinned_first = |guest: &Path, named: Option<&str>| {
+        let mut command = Command::new("hermit");
+        command.args(["run", "--"]);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        assert_eq!(profile(&command), pinned, "a command with no guest yet");
+        if let Some(named) = named {
+            command.env("HERMIT_CPU_PROFILE", named);
+        }
+        command.arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        profile(&command)
+    };
+    assert_eq!(
+        pinned_first(&v3, None),
+        auto,
+        "an x86-64-v3 guest added after the pin"
+    );
+    assert_eq!(
+        pinned_first(&unmarked, None),
+        pinned,
+        "an unmarked guest added after the pin"
+    );
+    assert_eq!(
+        pinned_first(&v3, Some("x86-64-v3")),
+        Some("x86-64-v3".to_owned()),
+        "a profile the test named after the pin"
+    );
+    // On another backend the pin stays, before and after the guest is added:
+    // Hermit admits x86-64-v3 on the ptrace backend alone.
+    let on_backend = |backend: &[&str], guest: &Path| {
+        let mut command = Command::new("hermit");
+        command.args(backend).args(["run", "--"]).arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        let mut later = Command::new("hermit");
+        later.args(backend).args(["run", "--"]);
+        hermit_test::pin_test_cpu_profile(&mut later);
+        later.arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut later);
+        (profile(&command), profile(&later))
+    };
+    for backend in [&["--backend", "liteinst"][..], &["--backend=kvm"]] {
+        assert_eq!(
+            on_backend(backend, &v3),
+            (pinned.clone(), pinned.clone()),
+            "an x86-64-v3 guest on {backend:?}"
+        );
+    }
+    assert_eq!(
+        on_backend(&["--backend", "ptrace"], &v3),
+        (auto.clone(), auto.clone()),
+        "an x86-64-v3 guest on the named ptrace backend"
+    );
+    // Where Detcore does not answer the guest's CPUID, Hermit refuses
+    // x86-64-v3 and admits the pin, which presents nothing there: under
+    // `--namespace-only` (alias `--lite`), which runs no Detcore, and under
+    // `--strace-only` and `--no-virtualize-cpuid`. The pin stays, before and
+    // after the guest is added.
+    let in_mode = |mode: &str, guest: &Path| {
+        let mut command = Command::new("hermit");
+        command.args(["run", mode, "--"]).arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        let mut later = Command::new("hermit");
+        later.args(["run", mode, "--"]);
+        hermit_test::pin_test_cpu_profile(&mut later);
+        later.arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut later);
+        (profile(&command), profile(&later))
+    };
+    for mode in [
+        "--namespace-only",
+        "--lite",
+        "--strace-only",
+        "--no-virtualize-cpuid",
+    ] {
+        assert_eq!(
+            in_mode(mode, &v3),
+            (pinned.clone(), pinned.clone()),
+            "an x86-64-v3 guest under {mode}"
+        );
+    }
+    // Whether `args`, followed by `--` and the guest, keep the pin, decided
+    // with the guest in the arguments and again after it is added.
+    let decided = |args: &[&str], guest: &Path| {
+        let mut command = Command::new("hermit");
+        command.args(args).arg("--").arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        let mut later = Command::new("hermit");
+        later.args(args).arg("--");
+        hermit_test::pin_test_cpu_profile(&mut later);
+        later.arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut later);
+        (profile(&command), profile(&later))
+    };
+    // A command that serves its guest to gdb keeps the pin too, in every
+    // spelling of the flag that asks for the gdbserver: Hermit refuses
+    // x86-64-v3 for a gdbserver, whose writes to the guest's FP registers
+    // change XSAVE header bits the qualification binds. Each command names
+    // one flag, so each is checked on its own. `--gdbserver-port` alone asks
+    // for no gdbserver, so it leaves the guest to auto.
+    for (args, expected) in [
+        (&["run", "--gdbserver"][..], &pinned),
+        (&["run", "--dap-listen", "127.0.0.1:0"], &pinned),
+        (&["run", "--dap-listen=127.0.0.1:0"], &pinned),
+        (
+            &["record", "start", "--verify-with-gdbex", "b main;c"],
+            &pinned,
+        ),
+        (&["record", "start", "--verify-with-gdbex=c"], &pinned),
+        (&["run", "--gdbserver-port=0"], &auto),
+    ] {
+        assert_eq!(
+            decided(args, &v3),
+            (expected.clone(), expected.clone()),
+            "an x86-64-v3 guest under {args:?}"
+        );
+    }
+    // A command that never has a guest keeps the pin through every pin.
+    let mut replay = Command::new("hermit");
+    replay.args(["replay", "recording", "--autopilot", "1"]);
+    hermit_test::pin_test_cpu_profile(&mut replay);
+    hermit_test::pin_test_cpu_profile(&mut replay);
+    assert_eq!(profile(&replay), pinned, "a command with no guest");
+    // `hermit analyze` keeps the pin for every program, the one after its
+    // second `--`: its runs carry no host qualification, so Hermit refuses
+    // x86-64-v3 there ("the configuration carries no qualified host facts").
+    // `analyze` counts as the subcommand only: after a global option's value,
+    // but not as that value.
+    for (args, expected) in [
+        (
+            &["analyze", "--", "--chaos", "--max-timeslice=400000"][..],
+            &pinned,
+        ),
+        (&["--log", "info", "analyze", "--"], &pinned),
+        (&["--log-file", "analyze", "run"], &auto),
+    ] {
+        assert_eq!(
+            decided(args, &v3),
+            (expected.clone(), expected.clone()),
+            "an x86-64-v3 guest under {args:?}"
+        );
+    }
+    assert_eq!(
+        decided(&["analyze", "--"], &unmarked),
+        (pinned.clone(), pinned.clone()),
+        "analyze of an unmarked guest"
+    );
+    // A test that compares a rerun with its first run gives the rerun the
+    // first run's profile (`hermit_test::pin_cpu_profile_like`), which holds
+    // through the rerun's later pin: `run --config`, `run --from` and
+    // `replay` name no guest, so the pin alone would give them x86-64-v2
+    // beside a first run it left to auto. The guest sees the variable, so
+    // both guests then see the same environment, whichever the host.
+    let seen = |command: &Command| match command
+        .get_envs()
+        .find(|(key, _)| *key == "HERMIT_CPU_PROFILE")
+    {
+        Some((_, value)) => value.map(OsStr::to_os_string),
+        None => std::env::var_os("HERMIT_CPU_PROFILE"),
+    };
+    let like_first = |guest: &Path, rerun: &[&str]| {
+        let mut first = Command::new("hermit");
+        first.args(["run", "--"]).arg(guest);
+        hermit_test::pin_test_cpu_profile(&mut first);
+        let mut command = Command::new("hermit");
+        command.args(rerun);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        hermit_test::pin_cpu_profile_like(&mut command, &first);
+        hermit_test::pin_test_cpu_profile(&mut command);
+        (seen(&first), seen(&command))
+    };
+    let pinned_seen = Some(OsString::from("x86-64-v2"));
+    for rerun in [
+        &["run", "--config", "run.yaml"][..],
+        &["run", "--from", "recording"],
+        &["replay", "last-run"],
+    ] {
+        assert_eq!(
+            like_first(&v3, rerun),
+            (None, None),
+            "{rerun:?} after the run of an x86-64-v3 guest"
+        );
+        assert_eq!(
+            like_first(&unmarked, rerun),
+            (pinned_seen.clone(), pinned_seen.clone()),
+            "{rerun:?} after the run of an unmarked guest"
+        );
+    }
+}
+
+/// Through the tests' own launch path (`hermit_test::hermit_output`, which
+/// applies the CPU-profile pin), a guest that declares it needs x86-64-v3
+/// runs under the x86-64-v3 auto resolves for it, on a host that qualifies,
+/// as the guests a CentOS 10 host compiles do. Under the pin Hermit refused
+/// it before its first instruction. So does a command whose guest is
+/// appended after `hermit_command` pinned it, which the launch helper's pin
+/// decides again, and a `hermit_command` started directly, as
+/// `spawn_timed_run` starts its runs, whose only pin is the one
+/// `append_hermit_args` applies after the arguments. A host that does not
+/// qualify records a named skip.
+#[test]
+fn a_test_launch_runs_a_guest_that_declares_v3_under_auto() {
+    let test = "a_test_launch_runs_a_guest_that_declares_v3_under_auto";
+    if std::env::var_os("HERMIT_CPU_PROFILE").is_some() {
+        record_test_skip(
+            test,
+            "this test process inherited HERMIT_CPU_PROFILE, which the pin keeps for every guest",
+        );
+        return;
+    }
+    let declares = isa_fixture("test-launch-needs-v3", Some(0b111), 0, IsaLink::Static);
+    let declares = declares.to_str().unwrap();
+    // Checked before the qualification's checks, and named without the run's
+    // long log, so that a failure's last line says which launch kept the pin.
+    let kept_no_pin = |launch: &str, stderr: &str| {
+        assert!(
+            !stderr.contains("--cpu-profile x86-64-v2 refused:"),
+            "{launch}: the command kept the x86-64-v2 pin for a guest that declares x86-64-v3"
+        );
+    };
+    let Some((stdout, stderr, ())) = v3_run_or_refusal(test, || {
+        let (status, stdout, stderr) = isa_run(&["--log=debug", "run", "--", declares]);
+        kept_no_pin("through hermit_output, the guest in its arguments", &stderr);
+        (status, stdout, stderr, ())
+    }) else {
+        return;
+    };
+    assert_eq!(stdout, "ran\n", "{stderr}");
+    let resolved = format!(
+        "--cpu-profile auto resolved to x86-64-v3: the executable {declares} declares that it \
+         needs x86-64-v3"
+    );
+    assert!(
+        stderr.contains(&resolved),
+        "the guest did not run under auto's x86-64-v3:\n{stderr}"
+    );
+    let (stdout, stderr, ()) =
+        v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || {
+            let output = hermit_test::hermit_output(
+                "hermit run, guest appended after the pin",
+                hermit_command(&["--log=debug", "run", "--"]).arg(declares),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            kept_no_pin(
+                "through hermit_output, the guest appended after the pin",
+                &stderr,
+            );
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr,
+                (),
+            )
+        })
+        .expect("unreachable: the qualification panics first");
+    assert_eq!(stdout, "ran\n", "guest appended after the pin: {stderr}");
+    assert!(
+        stderr.contains(&resolved),
+        "a guest appended after the pin did not run under auto's x86-64-v3:\n{stderr}"
+    );
+    // Started directly, not through `hermit_output`: no later pin decides
+    // again, so the guest runs under auto only because `append_hermit_args`
+    // pins after appending the arguments.
+    let (stdout, stderr, ()) =
+        v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || {
+            let output = hermit_command(&["--log=debug", "run", "--", declares])
+                .output()
+                .expect("failed to start hermit");
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            kept_no_pin(
+                "started directly, the guest in its arguments, pinned by append_hermit_args alone",
+                &stderr,
+            );
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr,
+                (),
+            )
+        })
+        .expect("unreachable: the qualification panics first");
+    assert_eq!(stdout, "ran\n", "started directly: {stderr}");
+    assert!(
+        stderr.contains(&resolved),
+        "a command started directly did not run under auto's x86-64-v3:\n{stderr}"
     );
 }
 

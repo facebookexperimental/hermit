@@ -260,7 +260,15 @@ fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
         Some(epoch) => {
             command.arg(format!("--epoch={epoch}"));
         }
-        // `--strict` refuses an epoch drawn from the host clock.
+        // `--strict` refuses an epoch drawn from the host clock. The CPU
+        // profile pin keeps x86-64-v2 for every guest of this backend, even
+        // one that declares more, here and when a launch helper pins again
+        // after the caller adds the guest: Hermit admits x86-64-v3 on the
+        // ptrace backend alone (`cpu_profile_admission::check_request`: "this
+        // backend does not trap CPUID"), so leaving such a guest to auto
+        // would only trade the x86-64-v2 refusal for that one. On a host
+        // whose programs declare x86-64-v3, these cases need a guest that
+        // runs within x86-64-v2.
         None => super::hermit_test::pin_canonical_epoch(&mut command),
     }
     command.args([

@@ -208,20 +208,322 @@ pub fn pin_canonical_epoch(command: &mut Command) {
 }
 
 /// Give a Hermit command `HERMIT_CPU_PROFILE=x86-64-v2`, unless the command
-/// sets or removes `HERMIT_CPU_PROFILE` itself or the test process inherited
-/// one. With no profile named, auto presents x86-64-v3 where the run and host
-/// qualify, which would make each test process qualify the host (seconds,
-/// with a warning) and move the baselines that count retired branches or
-/// size signal frames. A `--cpu-profile` flag still wins over the variable,
-/// so a test of auto names `--cpu-profile auto`, or removes the variable.
+/// sets or removes `HERMIT_CPU_PROFILE` itself, the test process inherited
+/// one, or the command runs a guest that declares it needs more than
+/// x86-64-v2 in a launch where Hermit can present x86-64-v3
+/// ([`guest_needs_above_v2`], [`admits_x86_64_v3`]). With no profile named,
+/// auto presents x86-64-v3 where the run and host qualify, which would make
+/// each test process qualify the host (seconds) and move the baselines that
+/// count retired branches or size signal frames. A guest that needs more
+/// cannot run under the pin: Hermit refuses an image that declares it, and
+/// glibc a C library that declares it. Where Hermit can present x86-64-v3,
+/// such a guest's command is left to auto, which presents the x86-64-v3 the
+/// guest declares where the host qualifies and refuses the run by name where
+/// it does not. Everywhere else Hermit refuses x86-64-v3 by name: on any other
+/// backend, where Detcore does not answer the guest's CPUID, for a gdbserver,
+/// and in `hermit analyze`. There auto would only trade the x86-64-v2 refusal
+/// for that one, and the pin stays. A `--cpu-profile` flag still wins over
+/// the variable, so a test of auto names `--cpu-profile auto`, or removes the
+/// variable, and a test that wants x86-64-v2 for such a guest names
+/// `--cpu-profile x86-64-v2`.
+///
+/// A command pinned before its guest was added (a builder that returns it
+/// without one, or a caller that appends the guest to `hermit_command`'s
+/// result) gets x86-64-v2 as before, marked [`PINNED_BEFORE_ITS_GUEST`]. The
+/// next pin, which the launch helpers (`hermit_output`,
+/// `configure_guest_execution`) apply, decides again from the guest, unless
+/// the test changed the variable in between.
 pub fn pin_test_cpu_profile(command: &mut Command) {
-    if std::env::var_os("HERMIT_CPU_PROFILE").is_none()
-        && !command
-            .get_envs()
-            .any(|(key, _)| key == "HERMIT_CPU_PROFILE")
-    {
-        command.env("HERMIT_CPU_PROFILE", "x86-64-v2");
+    if std::env::var_os("HERMIT_CPU_PROFILE").is_some() {
+        return;
     }
+    let named = command
+        .get_envs()
+        .find(|(key, _)| *key == "HERMIT_CPU_PROFILE")
+        .map(|(_, value)| value.map(OsStr::to_os_string));
+    match named {
+        None => match guest_program(command) {
+            Some(program) => {
+                if !(admits_x86_64_v3(command) && needs_above_v2(&program)) {
+                    command.env("HERMIT_CPU_PROFILE", "x86-64-v2");
+                }
+            }
+            None => {
+                command
+                    .env("HERMIT_CPU_PROFILE", "x86-64-v2")
+                    .env_remove(PINNED_BEFORE_ITS_GUEST);
+            }
+        },
+        Some(Some(profile))
+            if profile == "x86-64-v2"
+                && command
+                    .get_envs()
+                    .any(|(key, value)| key == PINNED_BEFORE_ITS_GUEST && value.is_none())
+                && admits_x86_64_v3(command)
+                && guest_needs_above_v2(command) =>
+        {
+            command.env_remove("HERMIT_CPU_PROFILE");
+        }
+        // Set or removed by the test, or pinned for a guest already read.
+        Some(_) => {}
+    }
+}
+
+/// Give `command` the `HERMIT_CPU_PROFILE` its guest would see under `first`,
+/// the first run of a test that compares later runs with it: the value
+/// `first` names or removes, or else the one this process passes on. Hermit
+/// passes the variable on into the guest's environment, and
+/// [`pin_test_cpu_profile`] decides each command from its own guest, while
+/// a rerun from a run config, a manifest or a recording names none: alone,
+/// the pin would name x86-64-v2 for the rerun of a first run it left to auto.
+/// A later pin keeps the copy, unless the copy is x86-64-v2 on a command
+/// pinned before its guest was added, which that pin decides again from the
+/// guest.
+#[allow(dead_code)]
+pub fn pin_cpu_profile_like(command: &mut Command, first: &Command) {
+    let profile = match first
+        .get_envs()
+        .find(|(key, _)| *key == "HERMIT_CPU_PROFILE")
+    {
+        Some((_, value)) => value.map(OsStr::to_os_string),
+        None => std::env::var_os("HERMIT_CPU_PROFILE"),
+    };
+    match profile {
+        Some(profile) => command.env("HERMIT_CPU_PROFILE", profile),
+        None => command.env_remove("HERMIT_CPU_PROFILE"),
+    };
+}
+
+/// Whether Hermit can present x86-64-v3 to the guest of the Hermit
+/// `command`. It does so on the ptrace backend alone, where Detcore answers
+/// the guest's CPUID and no gdbserver writes the guest's registers
+/// (`hermit::cpu_profile_admission::check_request`), in a launch that carries
+/// the host's qualification, which a `hermit analyze` run does not ("the
+/// configuration carries no qualified host facts"). So before its first `--`
+/// the command names no other `--backend` and none of [`NO_VIRTUAL_CPUID`]
+/// and [`SERVES_A_GDBSERVER`], and its subcommand is not `analyze`
+/// ([`hermit_subcommand`]).
+fn admits_x86_64_v3(command: &Command) -> bool {
+    if hermit_subcommand(command).is_some_and(|subcommand| subcommand == "analyze") {
+        return false;
+    }
+    let args = command.get_args().collect::<Vec<_>>();
+    let end = args
+        .iter()
+        .position(|arg| *arg == "--")
+        .unwrap_or(args.len());
+    let options = &args[..end];
+    let mut backend = None;
+    for (index, option) in options.iter().enumerate() {
+        if NO_VIRTUAL_CPUID.iter().any(|flag| *option == *flag)
+            || SERVES_A_GDBSERVER
+                .iter()
+                .any(|flag| names_flag(option, flag))
+        {
+            return false;
+        }
+        if *option == "--backend" {
+            backend = options.get(index + 1).copied();
+        } else if let Some(name) = option.to_str().and_then(|o| o.strip_prefix("--backend=")) {
+            backend = Some(OsStr::new(name));
+        }
+    }
+    backend.is_none_or(|backend| backend == "ptrace")
+}
+
+/// The `hermit run` flags with which Detcore does not answer the guest's
+/// CPUID. Hermit refuses x86-64-v3 under each of them by name, because the
+/// profile is a virtual CPUID table, while the pin's x86-64-v2 presents
+/// nothing and is admitted: Detcore checks a guest's declared ISA level only
+/// where it virtualizes CPUID. So a command naming one keeps the pin.
+const NO_VIRTUAL_CPUID: &[&str] = &[
+    // Runs the guest without Detcore on any backend.
+    "--namespace-only",
+    // `--namespace-only`'s alias.
+    "--lite",
+    // Shorthand that includes `--no-virtualize-cpuid` (`lower_strace_only`).
+    "--strace-only",
+    // Detcore's own switch (`Config::virtualize_cpuid`).
+    "--no-virtualize-cpuid",
+];
+
+/// The flags with which a Hermit command serves its guest to gdb, each alone
+/// or with its value after `=` ([`names_flag`]); a value given as the next
+/// argument follows the flag alone. Hermit refuses x86-64-v3 for a gdbserver
+/// by name ("--gdbserver writes the guest's FP registers, and the kernel's
+/// regset write forces XSAVE header bits the qualification binds"), and
+/// admits the pin's x86-64-v2. So a command naming one keeps the pin.
+/// `--gdbserver-port` is not among them: it only chooses the port of a
+/// gdbserver one of these asks for.
+const SERVES_A_GDBSERVER: &[&str] = &[
+    // `hermit run` and `hermit replay` (`Config::gdbserver`).
+    "--gdbserver",
+    // `hermit run`: sets `Config::gdbserver` for the run it supervises.
+    "--dap-listen",
+    // `hermit record start`: replays the recording with a gdbserver, which
+    // `hermit::replay` admits as a gdbserver's replay.
+    "--verify-with-gdbex",
+];
+
+/// Whether the argument `option` is the flag `flag`, alone or with its value
+/// after `=`.
+fn names_flag(option: &OsStr, flag: &str) -> bool {
+    option
+        .to_str()
+        .and_then(|option| option.strip_prefix(flag))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+}
+
+/// The subcommand of the Hermit `command`: the first argument after the
+/// Hermit binary that is not one of Hermit's global options or the value of
+/// one. The binary is the command's program, or, after a wrapper such as
+/// `timeout`, the first argument whose file name is `hermit`. `None` where
+/// there is no such argument before the first `--`.
+fn hermit_subcommand(command: &Command) -> Option<&OsStr> {
+    let is_hermit = |path: &OsStr| Path::new(path).file_name() == Some(OsStr::new("hermit"));
+    let mut args = command.get_args();
+    if !is_hermit(command.get_program()) {
+        args.find(|&arg| is_hermit(arg))?;
+    }
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if GLOBAL_OPTIONS_WITH_A_VALUE
+            .iter()
+            .any(|option| arg == *option)
+        {
+            args.next();
+        } else if !arg.as_encoded_bytes().starts_with(b"-") {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// Hermit's global options that take a value, spelled with the value as the
+/// next argument (`GlobalOpts` in `bin/hermit/global_opts.rs`). With `=`, the
+/// value is part of the option's own argument.
+const GLOBAL_OPTIONS_WITH_A_VALUE: &[&str] = &[
+    "-l",
+    "--log",
+    "--log-file",
+    "--max-log-bytes",
+    "--log-ring",
+    "--log-ring-file",
+    "--backend",
+];
+
+/// The variable whose removal marks a command that [`pin_test_cpu_profile`]
+/// pinned before it had a guest. Nothing sets it, so removing it changes no
+/// environment Hermit or its guest sees, while `Command::get_envs` still
+/// lists the removal for a later pin to read.
+const PINNED_BEFORE_ITS_GUEST: &str = "HERMIT_TEST_CPU_PROFILE_PINNED_BEFORE_ITS_GUEST";
+
+/// Whether the guest of the Hermit `command` declares that it needs more than
+/// x86-64-v2, in the declarations `--cpu-profile auto` reads
+/// (`hermit::cpu_profile_admission::resolve_auto` and `libc_needs_v3`): those
+/// of the image the kernel would exec first for it, through a bounded chain
+/// of scripts; of that image's program interpreter; and of glibc's C library
+/// beside a glibc interpreter, where CentOS 10's glibc declares x86-64-v3
+/// alone. The guest is the first argument after a `--` that is not an option
+/// ([`guest_program`]). Paths are read on the host, as the test spells them.
+/// A guest this cannot find, or whose declarations it cannot read, declares
+/// nothing here.
+pub fn guest_needs_above_v2(command: &Command) -> bool {
+    guest_program(command).is_some_and(|program| needs_above_v2(&program))
+}
+
+/// The guest program of the Hermit `command`: the first argument after a
+/// `--` that is not itself an option. In a Hermit command, direct or after a
+/// wrapper such as `timeout`, the first `--` ends Hermit's own arguments;
+/// `hermit analyze` puts its run's options after a first `--` and the
+/// program after a second. A name with no directory is found on the
+/// command's `PATH`, or else this process's; a relative path is taken from
+/// the command's directory.
+fn guest_program(command: &Command) -> Option<PathBuf> {
+    let args = command.get_args().collect::<Vec<_>>();
+    let program = args
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| **arg == "--")
+        .find_map(|(separator, _)| {
+            args.get(separator + 1)
+                .filter(|next| !next.as_encoded_bytes().starts_with(b"-"))
+        })
+        .map(Path::new)?;
+    if program
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return Some(match command.get_current_dir() {
+            Some(directory) => directory.join(program),
+            None => program.to_path_buf(),
+        });
+    }
+    let path = match command.get_envs().find(|(key, _)| *key == "PATH") {
+        Some((_, value)) => value?.to_os_string(),
+        None => std::env::var_os("PATH")?,
+    };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether the guest at host path `program` declares that it needs more than
+/// x86-64-v2 ([`guest_needs_above_v2`]).
+fn needs_above_v2(program: &Path) -> bool {
+    use detcore::exec_record::IsaNeeds;
+    let above_v2 = |path: &Path| {
+        matches!(
+            IsaNeeds::read_path_strict(path),
+            Some(IsaNeeds::Level(level)) if level > 2
+        )
+    };
+    let Some(image) = exec_image(program) else {
+        return false;
+    };
+    let interpreter = detcore::exec_record::program_interpreter(&image)
+        .ok()
+        .flatten();
+    above_v2(&image)
+        || interpreter.as_deref().is_some_and(|interpreter| {
+            above_v2(interpreter) || glibc_c_library(interpreter).is_some_and(|c| above_v2(&c))
+        })
+}
+
+/// The image the kernel would exec first for `program`: `program` itself, or
+/// the interpreter of each script in turn (Detcore's `script_interpreter`),
+/// through at most four scripts. `None` for a script the kernel would not
+/// run, an unreadable one, and a longer chain.
+fn exec_image(program: &Path) -> Option<PathBuf> {
+    use detcore::exec_record::Script;
+    let mut image = program.to_path_buf();
+    for _ in 0..=4 {
+        match detcore::exec_record::script_interpreter(&image) {
+            Script::Not => return Some(image),
+            Script::Interpreter(interpreter) => image = interpreter,
+            Script::Unread | Script::Declined => return None,
+        }
+    }
+    None
+}
+
+/// glibc's C library for the program interpreter `interpreter`, where it is
+/// glibc's (`ld-linux-x86-64.so.2`): the regular file `libc.so.6` in the
+/// directory the interpreter's path leads to, as `libc_needs_v3` reads it.
+fn glibc_c_library(interpreter: &Path) -> Option<PathBuf> {
+    if interpreter.file_name()? != "ld-linux-x86-64.so.2" {
+        return None;
+    }
+    let library = std::fs::canonicalize(interpreter)
+        .ok()?
+        .parent()?
+        .join("libc.so.6");
+    std::fs::metadata(&library)
+        .ok()?
+        .is_file()
+        .then_some(library)
 }
 
 /// Point a Hermit command's `XDG_CACHE_HOME` at a directory of this test
