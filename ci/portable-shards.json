@@ -16,6 +16,7 @@
   "preflight_nodes": [
     "pre.submodules",
     "pre.reverie_pin",
+    "pre.cargo_lock",
     "build.rust_scripts",
     "setup.manifest_plan",
     "gate.manifest"

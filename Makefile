@@ -239,6 +239,8 @@ LINT_CHECK_TARGETS := \
     lint-check-private-static-pipeline \
     lint-check-musl-detcore \
     lint-check-nested-lockfiles \
+    lint-check-cargo-lock-freshness \
+    lint-check-cargo-lock-cochange \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
@@ -396,6 +398,22 @@ lint-check-musl-detcore:
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+# Tier 1 of the two-tier Cargo.lock gate: full `cargo metadata --locked`
+# (never --no-deps) on every OSS Cargo root. Also runs fail-fast as the
+# pre.cargo_lock DAG node via ci/run-cargo-lock-check.sh; this target is
+# the `make lint-checks` path.
+lint-check-cargo-lock-freshness:
+	$(SUBMODULE_PROXY) ./scripts/check-cargo-lock-freshness.rs
+
+# Tier 2 (omission lint): a Cargo.toml change without its owning
+# Cargo.lock is refused. The base is the change's PARENT (HEAD^ at the
+# commit under test): against HEAD itself a clean CI checkout diffs
+# empty and the lint could never fire (seat review of the first
+# version). Locally HEAD^ also covers uncommitted work. There is no
+# attach-a-signal escape; Tier 1 proves freshness separately.
+lint-check-cargo-lock-cochange:
+	./scripts/check-cargo-lock-cochange.rs --changed-from-git HEAD^
 
 lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)

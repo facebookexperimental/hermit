@@ -211,6 +211,10 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
+/// The Cargo.lock freshness preflight node's tag (Tier 1 lock gate).
+/// Focused selections force-include it with the pin gate so no focused
+/// run compiles over a stale lockfile either.
+const CARGO_LOCK_GATE_TAG: &str = "pre.cargo_lock";
 const MANIFEST_AUDIT_COMMAND: &str = validate_plan::MANIFEST_AUDIT_COMMAND;
 const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
@@ -15238,11 +15242,12 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         // is a partial, explicitly-selected run; the full profile still
         // gates every product node on it.
         let preflight: &[&str] = if args.allow_local_off_the_record_run {
-            &["pre.submodules", PIN_GATE_TAG]
+            &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG]
         } else {
             &[
                 "pre.submodules",
                 PIN_GATE_TAG,
+                CARGO_LOCK_GATE_TAG,
                 RUST_SCRIPT_PRODUCER_TAG,
                 validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
             ]
@@ -15335,16 +15340,24 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 "setup.manifest_plan_on_host",
                 "gate.manifest_on_host",
             ],
-            (_, true) => &["pre.submodules", PIN_GATE_TAG],
+            (_, true) => &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG],
             (_, false) => &[
                 "pre.submodules",
                 PIN_GATE_TAG,
+                CARGO_LOCK_GATE_TAG,
                 RUST_SCRIPT_PRODUCER_TAG,
                 validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
                 "gate.manifest",
             ],
         };
-        tags.extend(preflight.iter().map(|tag| {
+        tags.extend(preflight.iter().filter_map(|tag| {
+            // pre.cargo_lock carries no quick/super label yet (admitting a
+            // new quick node also needs the quick dependency-closed source
+            // table), so a focused quick/super selection must not request
+            // a tag its lane graph does not contain.
+            if matches!(lane.as_str(), "quick" | "super") && *tag == CARGO_LOCK_GATE_TAG {
+                return None;
+            }
             if matches!(lane.as_str(), "quick" | "super")
                 && matches!(
                     *tag,
@@ -15353,9 +15366,9 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                         | "gate.manifest"
                 )
             {
-                format!("quick-super-{tag}")
+                Some(format!("quick-super-{tag}"))
             } else {
-                (*tag).to_string()
+                Some((*tag).to_string())
             }
         }));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);

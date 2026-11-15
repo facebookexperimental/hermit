@@ -85,6 +85,43 @@
       "fail_fast_family": "pre.reverie_pin"
     },
     {
+      "group": "pre",
+      "job": "cargo_lock",
+      "desc": "Cargo.lock freshness on every OSS Cargo root",
+      "description": "Tier 1 of the two-tier Cargo.lock gate. Runs ci/run-cargo-lock-check.sh: scripts/check-cargo-lock-freshness.rs probes the Hermit root, the reverie submodule root and liteinst-runtime-build with the full `cargo metadata --locked` — never `--no-deps`, which exits 0 on a stale lock while the full probe exits 101 (measured at the design head and re-verified on facebookexperimental/hermit 262fa517 with cargo 1.97.1). A planted stale Reverie lock at that head (reverie version bumped without regenerating reverie/Cargo.lock) is refused by name with \"CARGO LOCK GATE: Cargo.lock IS STALE - BLOCKED\"; the green run on the same trees passes all three roots offline in seconds. scripts/check-nested-lockfiles.rs still covers only the nested root for the staged LiteInst build; this node is the all-roots gate whose absence let a stale Reverie Cargo.lock reach export on 2026-11-14/15. It depends on pre.submodules because the Reverie probe reads the pinned submodule checkout. Build nodes do not yet wait on it, so a red lock can waste parallel build work, but no lane carrying its labels can go green over a stale lock. It carries full, portable and hosted-portable only for now: admitting a new quick/super node also needs the quick dependency-closed source table, which is a named follow-up rather than part of this gate; its unit tests still run under check.script_unit_tests.",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_lock_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy \"$@\"; else \"$@\"; fi; }; hermit_run_lock_check ./ci/run-cargo-lock-check.sh --repo \"$PWD\"",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "pre.submodules"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 300,
+      "priority": 50,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 0.0,
+        "rss_baseline_bytes": 2147483648,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "pre.cargo_lock"
+    },
+    {
       "group": "setup",
       "job": "manifest_plan",
       "desc": "Build the manifest-plan binaries the metadata validation runs",

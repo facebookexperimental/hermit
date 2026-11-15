@@ -61,6 +61,10 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
         "also runs on GitHub-hosted runners, whose wall is unmeasured, so its wall was not lowered (local: 684 runs, largest wall 27 s)",
     ),
     (
+        "pre.cargo_lock",
+        "also runs on GitHub-hosted runners, whose wall is unmeasured, so its wall matches the other preflight nodes at introduction (local green run at 262fa517: seconds warm; cold-cache source fetch through the proxy is unbounded by the probe itself)",
+    ),
+    (
         "gate.manifest",
         "also runs on GitHub-hosted runners, whose wall is unmeasured, so its wall was not lowered (local: 667 runs, largest wall 9 s)",
     ),
