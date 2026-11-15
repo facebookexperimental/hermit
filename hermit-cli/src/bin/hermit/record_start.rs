@@ -865,10 +865,29 @@ impl StartOpts {
             // Qualify here, before any container: a refusal ends the command at
             // once, and the recorder and replayer reuse the result.
             let request = hermit::cpu_profile_admission::record_or_replay_request(false);
-            hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
+            let refuse = |refusal| {
                 Error::new(crate::app::container::PolicyRefusal)
                     .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
-            })?;
+            };
+            if self.cpu_profile_choice().reason
+                == hermit::cpu_profile_admission::ProfileReason::Explicit
+            {
+                hermit::cpu_profile_admission::admit(&request).map_err(refuse)?;
+            } else {
+                // As for `hermit run`: auto's x86-64-v3 logs the qualification's
+                // announcement, which only a run that finds no cached pass
+                // makes, with auto's other lines (`log_auto_choice`), never on
+                // stderr. This process has admitted the host now, so the same
+                // path admits it again without probing or announcing.
+                let mut announced = Vec::new();
+                hermit::cpu_profile_admission::admit_into_log(&request, &mut announced)
+                    .map_err(refuse)?;
+                if !announced.is_empty() {
+                    let mut logged = self.clone();
+                    logged.auto_log.extend(announced);
+                    return logged.main_with_preparation(global, preparation);
+                }
+            }
         }
         if self.verify {
             validate_log_level(global)?;

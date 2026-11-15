@@ -13476,7 +13476,22 @@ impl RunOpts {
             eprintln!("{}", detcore_model::cpu_profile::HOST_NO_RDRAND_RESIDUAL);
             return Ok(());
         }
-        match hermit::cpu_profile_admission::admit(&request) {
+        // The qualification's announcement, which only a run that finds no
+        // cached pass makes, goes on stderr for a named x86-64-v3 and to the
+        // log, with auto's other lines (`log_auto_resolution`), for one auto
+        // resolved: on a default run's stderr it would make two runs of one
+        // command differ.
+        let named = self.cpu_profile_choice.as_ref().is_none_or(|choice| {
+            choice.reason == hermit::cpu_profile_admission::ProfileReason::Explicit
+        });
+        let mut announced = Vec::new();
+        let admitted = if named {
+            hermit::cpu_profile_admission::admit(&request)
+        } else {
+            hermit::cpu_profile_admission::admit_into_log(&request, &mut announced)
+        };
+        self.auto_log.extend(announced);
+        match admitted {
             Ok((probe, host)) => {
                 log_v3_admission(&probe);
                 self.det_opts.det_config.cpu_profile_host = Some(host);

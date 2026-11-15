@@ -918,16 +918,21 @@ pub fn choose_auto(
         if let Some(host) = AUTO_HOST.get() {
             return Ok(host.clone());
         }
-        // The announcement is the line an explicit x86-64-v3 prints on stderr;
-        // in the log its level says what "WARNING: " says there.
         let host = measure_auto_host(request, forced_auto_host()?, &mut |line: &str| {
-            let line = line.trim_end();
-            announced.push(line.strip_prefix("WARNING: ").unwrap_or(line).to_owned())
+            announced.push(announcement_for_log(line))
         });
         Ok(AUTO_HOST.get_or_init(|| host).clone())
     })?;
     auto.log.splice(0..0, announced);
     Ok(auto)
+}
+
+/// A line of the qualification's announcement as auto keeps it in the run's
+/// log. The announcement is the line an explicit x86-64-v3 prints on stderr;
+/// in the log its level says what "WARNING: " says there.
+fn announcement_for_log(line: &str) -> String {
+    let line = line.trim_end();
+    line.strip_prefix("WARNING: ").unwrap_or(line).to_owned()
 }
 
 /// [`choose_auto`] with the host's answer as a parameter, for the tests. It
@@ -1405,6 +1410,21 @@ pub fn admit_announcing_to(
     announce: &mut dyn FnMut(&str),
 ) -> Result<Qualification, AdmissionRefusal> {
     admit_with(request, || qualify_host_cached_announcing(announce))
+}
+
+/// [`admit`] for an x86-64-v3 that `--cpu-profile auto` resolved because the
+/// program declares it: the qualification's announcement goes to `log`, as
+/// auto keeps it ([`choose_auto`]), and never to stderr. Only a run that
+/// finds no cached pass makes the announcement, so on stderr it would make
+/// two runs of one default command differ, and a default run's stderr is its
+/// guest's. A named x86-64-v3 still announces it on stderr ([`admit`]).
+pub fn admit_into_log(
+    request: &AdmissionRequest<'_>,
+    log: &mut Vec<String>,
+) -> Result<Qualification, AdmissionRefusal> {
+    admit_announcing_to(request, &mut |line: &str| {
+        log.push(announcement_for_log(line))
+    })
 }
 
 /// [`admit`] with its host qualification as a parameter, so that a test can

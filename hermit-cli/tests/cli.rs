@@ -63695,6 +63695,79 @@ fn a_default_run_leaves_stderr_to_its_guest() {
     );
 }
 
+/// A default `hermit run` or `hermit record start` of a program that declares
+/// x86-64-v3 runs it under x86-64-v3, as a named profile would, but puts the
+/// qualification's announcement in its log, with auto's other lines, and not
+/// on stderr. Only a run that finds no cached pass makes the announcement, so
+/// on stderr it would make two runs of one command differ, and a default
+/// run's stderr is its guest's (`a_default_run_leaves_stderr_to_its_guest`).
+/// A named x86-64-v3 still announces it on stderr. Each run here has a cache
+/// of its own, so each one qualifies the host. A host that does not qualify
+/// records a named skip.
+#[test]
+fn a_default_run_of_a_program_that_declares_v3_logs_the_qualification() {
+    let test = "a_default_run_of_a_program_that_declares_v3_logs_the_qualification";
+    let declares = isa_fixture(
+        "logged-qualification-needs-v3",
+        Some(0b111),
+        0,
+        IsaLink::Static,
+    );
+    let declares = declares.to_str().unwrap();
+    let launch = |args: &[&str]| {
+        let run = UnpinnedRun::new();
+        let cache = run.directory.path().join("cache");
+        let (status, stdout, stderr) =
+            run.run(args, &[("XDG_CACHE_HOME", cache.to_str().unwrap())]);
+        (status, stdout, stderr, ())
+    };
+    fn program<'a>(global: &[&'a str], command: &[&'a str], program: &'a str) -> Vec<&'a str> {
+        let mut args = global.to_vec();
+        args.extend_from_slice(command);
+        args.extend(["--", program]);
+        args
+    }
+    let run = ["run", "--pinned-cpu-notice=off", "--max-timeslice=disabled"];
+    let Some((stdout, default, ())) =
+        v3_run_or_refusal(test, || launch(&program(&[], &run, declares)))
+    else {
+        return;
+    };
+    assert_eq!(stdout, "ran\n", "{default}");
+    assert!(
+        !default.contains(QUALIFYING_THIS_HOST),
+        "a default run announced the qualification on stderr:\n{default}"
+    );
+    let ran = |global: &[&str], command: &[&str]| {
+        v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || {
+            launch(&program(global, command, declares))
+        })
+        .expect("unreachable: the qualification panics first")
+        .1
+    };
+    let logged = ran(&["--log=debug"], &run);
+    assert!(
+        logged.contains("--cpu-profile auto resolved to x86-64-v3")
+            && logged.contains(&format!("--cpu-profile auto: {QUALIFYING_THIS_HOST}")),
+        "a default run's log does not say that it qualified the host:\n{logged}"
+    );
+    let recorded = ran(&[], &["record", "start"]);
+    assert!(
+        !recorded.contains(QUALIFYING_THIS_HOST),
+        "a default recording announced the qualification on stderr:\n{recorded}"
+    );
+    let recorded_log = ran(&["--log=debug"], &["record", "start"]);
+    assert!(
+        recorded_log.contains(&format!("--cpu-profile auto: {QUALIFYING_THIS_HOST}")),
+        "a default recording's log does not say that it qualified the host:\n{recorded_log}"
+    );
+    let named = ran(&[], &[&run[..], &["--cpu-profile=x86-64-v3"][..]].concat());
+    assert!(
+        named.contains(&format!("WARNING: {QUALIFYING_THIS_HOST}")),
+        "a named x86-64-v3 no longer announces the qualification on stderr:\n{named}"
+    );
+}
+
 /// A `--verify` match states x86-64-v3's residual on stderr where the user
 /// asked for x86-64-v3, by naming it or by running a program that declares it,
 /// and not where auto chose it by the host: that run's manifest keeps the
