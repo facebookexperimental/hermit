@@ -40,7 +40,8 @@
     "selftest.validate_rs",
     "selftest.manifest_cli",
     "selftest.core_build",
-    "check.gvisor_vendoring"
+    "check.gvisor_vendoring",
+    "check.linuxemu_graph"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",

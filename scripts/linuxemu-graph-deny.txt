@@ -1,0 +1,30 @@
+# LinuxEmu extension deny-list for Hermit's build graph.
+#
+# Rule (ai_docs/plans/2026-11-05-linuxemu-core-optional-extensions.md;
+# re-baseline 2026-11-15-linuxemu-modularity-rebaseline.md, Slice 1):
+# Hermit builds only the LinuxEmu CORE (reverie-linuxemu). Optional
+# standalone extensions live in separate reverie-linuxemu-ext-* crates
+# behind the reverie-linuxemu-full umbrella, selected only by standalone
+# composition roots. No extension package may ever appear in Hermit's
+# dependency graph: with no extension crate in the graph the code does
+# not exist in the Hermit build — zero build time, zero code size, zero
+# behavior surface. scripts/check-linuxemu-graph.rs enforces this list
+# against every tracked Cargo.lock, Cargo.toml and BUCK file.
+#
+# Grammar (strict; anything else is a checker error, rc=2):
+#   deny <name-or-prefix-glob>     e.g. deny reverie-linuxemu-ext-*
+#   allow-until <name> <YYYY-MM-DD> <reason...>
+# An allow-until entry makes a denied package a flagged, expiring debt:
+# the audit names it on every run and refuses once the date passes.
+# Extending a date is a reviewed change to this file, never a default.
+
+deny reverie-linuxemu-ext-*
+deny reverie-linuxemu-full
+
+# reverie-procfs is denied from day one (owner 6463: "keeping the extra
+# things like minimal proc optional and turned off for hermit use").
+# It is in the graph today only because reverie-linuxemu depends on it
+# unconditionally; Slice 2 of the modularity restart moves it behind
+# the extension seam and DELETES this allow-until line.
+deny reverie-procfs
+allow-until reverie-procfs 2026-12-31 owner 6463 not ratified as core; removed by Slice 2 (extension seam)

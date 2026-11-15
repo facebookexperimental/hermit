@@ -225,6 +225,15 @@
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
+      "paths": [
+        "scripts/check-linuxemu-graph.rs",
+        "scripts/check-linuxemu-graph-test.sh",
+        "scripts/linuxemu-graph-deny.txt"
+      ],
+      "nodes": ["check.linuxemu_graph"]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
       "paths": ["scripts/check-portable-paths.sh"],
       "nodes": ["check.portability_paths"]
     },
