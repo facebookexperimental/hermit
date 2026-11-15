@@ -709,9 +709,9 @@ mod tests {
 
     /// Reversing 200,000 events takes 19,999,900,000 adjacent swaps, which a
     /// record of every swap held in 320 GB. The sort runs alone in a process
-    /// of its own, which caps its data at 1 GiB so that a regression fails
-    /// here instead of exhausting the host, and must peak below 256 MiB
-    /// resident.
+    /// of its own, which caps its data growth at 1 GiB above its own baseline
+    /// so that a regression fails here instead of exhausting the host, and
+    /// must peak below 256 MiB resident.
     #[test]
     fn a_long_reversal_sorts_in_bounded_memory() {
         // The harness names a test by its path below the crate.
@@ -747,6 +747,74 @@ mod tests {
         );
     }
 
+    /// The data cap for the bounded-memory child: the process's current
+    /// data size, read before the sort, plus the 1 GiB the sort may grow it
+    /// by, clamped to the hard limit. The cap therefore always means "grow
+    /// by at most 1 GiB", in a plain build (a small baseline, about 55 MiB
+    /// of VmData measured on 2026-11-15) and in a sanitized build alike,
+    /// where the sanitizer's own reservations are part of the baseline
+    /// (about 14 TiB of VmData measured, its high_shadow reservation) and a
+    /// flat 1 GiB cap refuses the sanitizer's internal maps before the sort
+    /// can run.
+    fn data_cap_for_baseline(baseline_bytes: u64, data_hard: u64) -> u64 {
+        data_hard.min(baseline_bytes.saturating_add(1 << 30))
+    }
+
+    #[test]
+    fn data_cap_is_the_baseline_plus_one_gib() {
+        let gib = 1 << 30;
+        let tib = 1 << 40;
+        // A plain baseline keeps a 1 GiB growth allowance (plus baseline).
+        assert_eq!(data_cap_for_baseline(55 << 20, u64::MAX), (55 << 20) + gib);
+        // A sanitized baseline (14 TiB of shadow reservations) is allowed
+        // the same growth, not refused.
+        assert_eq!(data_cap_for_baseline(14 * tib, u64::MAX), 14 * tib + gib);
+        // The hard limit still clamps, and overflow cannot wrap.
+        assert_eq!(data_cap_for_baseline(14 * tib, 2 * gib), 2 * gib);
+        assert_eq!(data_cap_for_baseline(u64::MAX - 1, u64::MAX), u64::MAX);
+    }
+
+    /// Raw-map `size` bytes, private writable and anonymous, or fail.
+    /// MAP_NORESERVE, and the pages are never touched, so a mapping the cap
+    /// lets through costs no memory.
+    fn raw_map(size: usize) -> *mut libc::c_void {
+        unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        }
+    }
+
+    /// After the child's cap is set, it must still refuse growth past the
+    /// 1 GiB allowance: a raw 1 GiB + 64 MiB mapping fails with ENOMEM,
+    /// while a 64 MiB one succeeds. Raw mmap bypasses the allocator, so
+    /// both builds behave the same. Called with the cap in force.
+    fn assert_the_data_cap_still_refuses_growth() {
+        let refused = raw_map((1 << 30) + (64 << 20));
+        assert_eq!(
+            refused,
+            libc::MAP_FAILED,
+            "a 1 GiB + 64 MiB mapping past the data cap must be refused"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOMEM),
+            "a mapping past the data cap must fail with ENOMEM"
+        );
+        let allowed = raw_map(64 << 20);
+        assert_ne!(
+            allowed,
+            libc::MAP_FAILED,
+            "a 64 MiB mapping inside the data cap must succeed"
+        );
+        unsafe { libc::munmap(allowed, 64 << 20) };
+    }
+
     /// The body of [`a_long_reversal_sorts_in_bounded_memory`]'s own process.
     fn sort_a_long_reversal_under_a_data_cap() {
         use nix::sys::resource::Resource;
@@ -759,8 +827,21 @@ mod tests {
         let (_, core_hard) = getrlimit(Resource::RLIMIT_CORE).unwrap();
         setrlimit(Resource::RLIMIT_CORE, core_hard.min(1), core_hard.min(1)).unwrap();
         let (_, data_hard) = getrlimit(Resource::RLIMIT_DATA).unwrap();
-        let data_cap = data_hard.min(1 << 30);
+        // Read the baseline before the sort and allow 1 GiB of growth past
+        // it, so the cap limits the sort's growth in every build, instead
+        // of refusing a sanitizer's pre-sort reservations.
+        let before = std::fs::read_to_string("/proc/self/status").unwrap();
+        let baseline_kib: u64 = before
+            .lines()
+            .find_map(|line| line.strip_prefix("VmData:"))
+            .and_then(|kib| kib.trim().strip_suffix("kB"))
+            .expect("/proc/self/status reports VmData")
+            .trim()
+            .parse()
+            .unwrap();
+        let data_cap = data_cap_for_baseline(baseline_kib << 10, data_hard);
         setrlimit(Resource::RLIMIT_DATA, data_cap, data_cap).unwrap();
+        assert_the_data_cap_still_refuses_growth();
         let len = 200_000;
         let source: Vec<usize> = (0..len).collect();
         let target: Vec<usize> = source.iter().rev().copied().collect();
