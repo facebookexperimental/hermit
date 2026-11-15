@@ -143,6 +143,12 @@ fi
 # record runs as before. Both are unset first, so a caller's values never leak in.
 bundle_env=()
 [[ -f $B/BUNDLE_RECORD.json ]] && bundle_env+=(HERMIT_E2E_BUNDLE_RECORD="$B/BUNDLE_RECORD.json")
+# The bundle's v2 rootfs, when it carries one: an oci-dir the harness retries
+# a loader-rejected verify or chaos cell (KVM or ptrace) under (issue 5476).
+# From the bundle alone, like the record: a caller's HERMIT_E2E_V2_OCI_DIR
+# never leaks in (both harness invocations below unset it first), and a
+# bundle whose v2-rootfs has no oci-layout names none.
+[[ -f $B/v2-rootfs/oci-layout ]] && bundle_env+=(HERMIT_E2E_V2_OCI_DIR="$B/v2-rootfs")
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
@@ -236,7 +242,7 @@ case $container in
     # logger per call, it asks the git behind the wrapper.
     [[ -x /usr/local/bin/git.meta.real ]] && bundle_env+=(HERMIT_E2E_SNAPSHOT_GIT=/usr/local/bin/git.meta.real)
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
@@ -404,9 +410,10 @@ exec "$@"'
     deadline=$((outer - 15))
     # Inside the container the record is the private copy's (paths under /src/bundle).
     inner_bundle_env=()
-    ((${#bundle_env[@]})) && inner_bundle_env=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
+    [[ -f $B/BUNDLE_RECORD.json ]] && inner_bundle_env+=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
+    [[ -f $B/v2-rootfs/oci-layout ]] && inner_bundle_env+=(HERMIT_E2E_V2_OCI_DIR=/src/bundle/v2-rootfs)
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \

@@ -11889,7 +11889,12 @@ fn retained_typed_no_comparison_kind(
 fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<RepetitionClassification> {
     // This precedence is the runner's exact non_product_failure_class mapping.
     match attempt.error_kind.as_deref() {
-        Some("guest-launch-refused" | "backend-unavailable") => {
+        Some(
+            "guest-launch-refused"
+            | "backend-unavailable"
+            | "rootfs-missing-symbol"
+            | "rootfs-unchecked",
+        ) => {
             return Some(RepetitionClassification::PrerequisiteFailure);
         }
         Some("infrastructure" | "result-publication") => {

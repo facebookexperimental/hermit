@@ -100,6 +100,7 @@ fn prebuilt_context(root: &Path) -> RunContext {
         scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         isolated_workdir: None,
         shares_ld_so_cache: false,
+        v2_retry_oci_dir: None,
     }
 }
 

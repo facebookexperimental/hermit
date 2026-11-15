@@ -38,6 +38,7 @@ use hermit_manifest_plan::runner::STRICTNESS_LEVEL_ENV;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
+use hermit_manifest_plan::runner::V2_OCI_DIR_ENV;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::backend_capability;
 use hermit_manifest_plan::runner::cell_declared_stdout;
@@ -58,6 +59,7 @@ use hermit_manifest_plan::runner::row_records_cell_relaxations;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::skid_infra_reports;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
+use hermit_manifest_plan::runner::v2_oci_dir_from_env;
 use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
@@ -158,6 +160,9 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
   HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
                                          repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
+  HERMIT_E2E_V2_OCI_DIR=<PATH>           Bundle-shipped x86-64-v2 guest rootfs (oci-dir);
+                                         a loader-rejected verify or chaos cell (KVM or
+                                         ptrace) retries inside it once
   E2E_KEEP_VERIFY_LOGS=1                 Retain verify logs (one golden log after a match)
   E2E_CAPTURE_CUSTOM_RUNS=1             Opt in to canonical single-run custom captures (changes invocation)
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
@@ -3086,7 +3091,10 @@ enum Retries {
 
 /// Why a finished attempt is retried. Classification labels the retry for
 /// diagnosis; it does not gate it (owner policy, 2026-10-30): every failing
-/// test earns the bounded retry at the innermost cell.
+/// test earns the bounded retry at the innermost cell. The one exception
+/// is [`RetryCause::LoaderV2`], which also selects the retry attempt's
+/// configuration (the v2 rootfs); launch of that retry additionally
+/// requires the run to have been given a rootfs (see the run loop).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetryCause {
     /// A measured product failure ([`cell_result_is_retryable`]).
@@ -3105,6 +3113,12 @@ enum RetryCause {
     /// retried even when the cell declares `no_retry_reason`, which keeps
     /// only a product failure final, and reported as a HOST-INPUT-RETRY.
     HostInputChanged,
+    /// A verify or chaos cell, on KVM or ptrace, whose guest loader refused
+    /// the x86-64-v2 CPU Hermit presents
+    /// ([`hermit_manifest_plan::runner::loader_v2_rejected`], issue 5476):
+    /// the retry runs inside the bundle-shipped v2 rootfs instead of
+    /// repeating the refused configuration. Reported as a V2-RETRY.
+    LoaderV2,
 }
 
 /// Why this finished attempt of `cell` is retried, or `None` when it is not.
@@ -3126,6 +3140,30 @@ fn attempt_retry_cause(
     // A passing or host-inapplicable attempt is not a failing test.
     if result.outcome != "FAIL" && result.outcome != "ERROR" {
         return None;
+    }
+    // A loader rejection is a property of the host userspace, not of the
+    // guest: retrying the same configuration cannot pass, so this cause is
+    // classified before the generic product cause and the attempt loop gives
+    // that retry the v2 rootfs (issue 5476). A cell that already runs inside
+    // a bucket image never earns it: its loader is the image's, and
+    // overriding that image would change the cell's declared execution root.
+    // Its evidence is the attempt's own typed report and the loader's line,
+    // or Hermit's typed refusal of the loader's abort where Hermit watches
+    // the program interpreter (`loader_v2_rejection`), not a stdout
+    // assertion, so it is decided before the
+    // declaration check below, which could never admit it: the runner
+    // records a row's stdout declaration only beside an infrastructure
+    // report, so a refused first run records none. Verify and chaos cells
+    // both run `hermit run --verify`, so both carry that evidence, on KVM
+    // and on ptrace alike: a ptrace host with CPUID faulting presents the
+    // same v2 CPU. A replay cell records through `hermit record start`,
+    // which takes no image, and a custom cell writes no verify report.
+    if matches!(cell.id.mode.as_str(), "verify" | "chaos")
+        && matches!(cell.id.backend.as_deref(), Some("kvm" | "ptrace"))
+        && cell.image.is_none()
+        && hermit_manifest_plan::runner::loader_v2_rejected(result)
+    {
+        return Some(RetryCause::LoaderV2);
     }
     // The host-input and skid rules check the stdout assertions the row
     // records, and the skid rule also admits the guest disposition and applies
@@ -3450,6 +3488,19 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     // From the plan alone, not from the post-pass's scope: its switches
     // change what is reported, never how a cell runs.
     .with_parity_compared(parity::planned_comparisons(&planned_verify));
+    // The v2 rootfs a loader-rejected verify or chaos cell retries inside
+    // (issue 5476). An import launches nothing, so it reads none.
+    let v2_oci_dir = if import_root.is_some() {
+        None
+    } else {
+        v2_oci_dir_from_env(std::env::var_os(V2_OCI_DIR_ENV)).unwrap_or_else(|e| fail(e))
+    };
+    if let Some(dir) = &v2_oci_dir {
+        eprintln!(
+            "test-harness: v2 rootfs for loader-rejected retries: {}",
+            dir.display()
+        );
+    }
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -3574,11 +3625,35 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             // the attempts seen so far, exactly as the import policy
             // applies it to an imported history.
             let mut history: Vec<CellResult> = Vec::new();
+            // Set by the retryable closure when the finished attempt is a
+            // loader rejection: the next attempt runs inside the v2 rootfs.
+            // A Cell because both closures below share it.
+            let v2_next = std::cell::Cell::new(false);
             run_with_retry(
                 context.attempt,
                 MAX_SKID_ATTEMPTS_PER_CELL,
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
+                    // The rootfs's fixture verdict decides whether the v2
+                    // retry launches at all: a fixture it cannot load, or a
+                    // rootfs with no usable verdict, gets a typed refusal
+                    // row for this attempt instead of an unexplained exit
+                    // 127 inside the image.
+                    let attempt_context = if v2_next.get() {
+                        let oci_dir = v2_oci_dir
+                            .as_deref()
+                            .expect("a v2 retry launches only with a rootfs");
+                        match hermit_manifest_plan::runner::v2_retry_context(
+                            &attempt_context,
+                            cell,
+                            oci_dir,
+                        ) {
+                            Ok(retry_context) => retry_context,
+                            Err(refusal) => return *refusal,
+                        }
+                    } else {
+                        attempt_context
+                    };
                     match run_cell(&attempt_context, cell) {
                         Ok(result) => result,
                         Err(error) => error.into_result(&attempt_context, cell),
@@ -3586,6 +3661,24 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 },
                 |result| {
                     history.push(result.clone());
+                    // A v2 retry refused before launch would meet the same
+                    // verdict again, so it ends the cell.
+                    if hermit_manifest_plan::runner::is_v2_retry_refusal(result) {
+                        return false;
+                    }
+                    // A loader rejection earns its retry only where a
+                    // rootfs was given: repeating the refused
+                    // configuration cannot pass, and without one there is
+                    // no second configuration to try. The classification
+                    // itself stays environment-independent, so imported
+                    // histories re-decide the same way.
+                    if attempt_retry_cause(args.retries, cell, result) == Some(RetryCause::LoaderV2)
+                    {
+                        if v2_oci_dir.is_none() {
+                            return false;
+                        }
+                        v2_next.set(true);
+                    }
                     history_earns_retry(args.retries, cell, &history)
                 },
                 emit,
@@ -3664,6 +3757,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 ),
                 (true, Some(RetryCause::HostInputChanged)) => format!(
                     " [HOST-INPUT-RETRY: attempt {} of at most {} diverged because a host file changed during a run, which is not a product failure; retrying this cell once, and a second divergence stays a failure]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                ),
+                (true, Some(RetryCause::LoaderV2)) => format!(
+                    " [V2-RETRY: attempt {} of at most {} was refused by the guest loader on the x86-64-v2 CPU, which is a host-userspace property, not a product failure; retrying this cell once inside the v2 rootfs]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
                 ),
                 (true, _) => format!(
@@ -3914,9 +4011,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .iter()
         .filter(|retried| retried.cause == RetryCause::HostInputChanged)
         .collect::<Vec<_>>();
+    let v2_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::LoaderV2)
+        .collect::<Vec<_>>();
     if expected > 0 {
         println!(
-            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}; FAILURE-RETRY count {} ({} final PASS)",
+            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}; FAILURE-RETRY count {} ({} final PASS); V2-RETRY count {} ({} final PASS)",
             product_retried.len(),
             product_retried
                 .iter()
@@ -3925,6 +4026,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             host_input_retried.len(),
             failure_retried.len(),
             failure_retried
+                .iter()
+                .filter(|retried| retried.final_outcome == "PASS")
+                .count(),
+            v2_retried.len(),
+            v2_retried
                 .iter()
                 .filter(|retried| retried.final_outcome == "PASS")
                 .count()
@@ -3938,6 +4044,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     }
     for retried in &host_input_retried {
         println!("{}", retried_attempt_line("HOST-INPUT-RETRY", retried));
+    }
+    for retried in &v2_retried {
+        println!("{}", retried_attempt_line("V2-RETRY", retried));
     }
     let host_inapplicable = results
         .iter()
@@ -4011,6 +4120,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             .collect::<Vec<_>>(),
         "host_input_retries": host_input_retried.len(),
         "host_input_retry_cells": host_input_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
+            .collect::<Vec<_>>(),
+        // Loader-rejected verify and chaos cells retried inside the v2
+        // rootfs; see the V2-RETRY lines above.
+        "v2_retries": v2_retried.len(),
+        "v2_retry_cells": v2_retried
             .iter()
             .map(|retried| retried_attempt_json(retried))
             .collect::<Vec<_>>(),
@@ -5581,7 +5697,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             assert_eq!(summary["host_input_retries"], json!(0), "{scenario}");
             assert!(
                 stdout.contains(&format!(
-                    "test-harness: PRODUCT-RETRY count {want_product} ({} final PASS); HOST-INPUT-RETRY count 0; FAILURE-RETRY count {want_failure} (0 final PASS)\n",
+                    "test-harness: PRODUCT-RETRY count {want_product} ({} final PASS); HOST-INPUT-RETRY count 0; FAILURE-RETRY count {want_failure} (0 final PASS); V2-RETRY count 0 (0 final PASS)\n",
                     usize::from(scenario == "unmarked-diverged-then-match")
                 )),
                 "{scenario}: the summary must carry the retry counts: {stdout}"
@@ -11537,7 +11653,10 @@ sys.exit(1 if failed else 0)
     /// declaration or relaxations other than its cell's, retaining a
     /// comparison the cell's comparator does not accept, or retaining a stderr
     /// whose first line is a failure class the executor decides before it
-    /// reads any report.
+    /// reads any report. On a KVM verify cell, where the v2 retry is decided
+    /// before the declaration check, the row keeps its label, and a copy
+    /// recording no stdout declaration earns neither that label nor the v2
+    /// retry.
     #[test]
     fn a_host_input_change_earns_one_retry_even_on_a_no_retry_cell() {
         use sha2::Digest;
@@ -11677,6 +11796,51 @@ sys.exit(1 if failed else 0)
                 "{row:#?}"
             );
         }
+        // A KVM verify cell admits the v2 retry, which is decided before the
+        // declaration check (issue 5476). There the same host-input row keeps
+        // its label while it records the cell's declarations, and a copy that
+        // records none earns neither that label nor the v2 retry, even beside
+        // the loader's line: the v2 rule reads only a typed first-run
+        // rejection, which a host-input report is not.
+        let kvm_cell = manifests
+            .select(&hermit_manifest_plan::runner::Selection {
+                test: Some("c-programs/memfd-create".into()),
+                mode: Some("verify".into()),
+                backend: Some("kvm".into()),
+                population: Some(hermit_manifest_plan::runner::Population::Required),
+                ..hermit_manifest_plan::runner::Selection::default()
+            })
+            .unwrap()
+            .remove(0);
+        assert!(kvm_cell.image.is_none());
+        let mut on_kvm = changed.clone();
+        on_kvm.test = kvm_cell.id.test.clone();
+        on_kvm.category = "c-programs".into();
+        on_kvm.backend = Some("kvm".into());
+        on_kvm.declared_stdout = Some(hermit_manifest_plan::runner::cell_declared_stdout(
+            &kvm_cell,
+        ));
+        on_kvm.relaxations = hermit_manifest_plan::runner::cell_relaxations(&kvm_cell);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &kvm_cell, &on_kvm),
+            Some(super::RetryCause::HostInputChanged)
+        );
+        let mut undeclared = on_kvm.clone();
+        undeclared.declared_stdout = None;
+        let mut beside_the_line = undeclared.clone();
+        beside_the_line.attempts[0].stderr =
+            "Fatal glibc error: CPU does not support x86-64-v3\n".into();
+        for row in [&undeclared, &beside_the_line] {
+            assert!(
+                !hermit_manifest_plan::runner::loader_v2_rejected(row),
+                "{row:#?}"
+            );
+            assert_eq!(
+                super::attempt_retry_cause(super::Retries::Framework, &kvm_cell, row),
+                Some(super::RetryCause::Failure),
+                "{row:#?}"
+            );
+        }
         // A report whose comparison the cell's comparator does not accept (one
         // that compared no log messages, or another comparator's comparison),
         // correctly hashed and with the plain host-input reason, is not a host
@@ -11725,6 +11889,473 @@ sys.exit(1 if failed else 0)
                 super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &refused),
                 Some(super::RetryCause::Failure),
                 "{line}"
+            );
+        }
+    }
+
+    /// A KVM or ptrace verify attempt Hermit typed as a first-run rejection
+    /// at guest exit 127, with the guest loader's fatal ISA line in its
+    /// retained stderr, is classified LoaderV2 (issue 5476): the retry runs
+    /// inside the v2 rootfs. The row is shaped as the runner writes one:
+    /// verify's own exit status 125 on the attempt, Hermit's first-run
+    /// message around the guest's stderr, and no stdout declaration, which
+    /// the runner records only beside an infrastructure report. The same row
+    /// recording the cell's declaration is classified the same way. The same
+    /// evidence at another guest exit status, without the line, on a cell
+    /// with a bucket image, or under --no-retry earns no such cause.
+    #[test]
+    fn a_loader_rejected_verify_attempt_earns_the_v2_retry() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |backend: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some("c-programs/memfd-create".into()),
+                    mode: Some("verify".into()),
+                    backend: Some(backend.into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let kvm_cell = cell("kvm");
+        assert!(kvm_cell.image.is_none());
+        let row = |exit_code: i32, guest_stderr: &str| -> CellResult {
+            let mut report =
+                hermit_manifest_plan::canonical_verdict::VerificationReport::no_result();
+            report.no_result_reason = Some(
+                hermit_manifest_plan::canonical_verdict::NoResultReason::FirstRunRejected {
+                    exit_code: Some(exit_code),
+                    signal: None,
+                    stdout_bytes: 0,
+                    stderr_bytes: guest_stderr.len() as u64,
+                },
+            );
+            let report = serde_json::to_string(&report).unwrap();
+            let digest = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(report.as_bytes()))
+            };
+            let stderr = format!(
+                "First run errored during --verify, not continuing to a second.\n\
+                 Exit status: exited with code {exit_code}\nStdout:\n\nStderr:\n{guest_stderr}\n"
+            );
+            let reason = "verify exited with status 125 before producing a terminal comparison";
+            let attempt = serde_json::json!({"index": "1", "outcome": "FAIL",
+                "error_kind": null, "status": 125, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "",
+                "stderr": stderr, "reason": reason, "verification_report": report,
+                "verification_report_sha256": digest});
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "c-programs/memfd-create", "category": "c-programs", "lane": "portable",
+                "mode": "verify", "backend": "kvm", "classification": "required",
+                "outcome": "FAIL", "result": "crash-error", "failure_class": "product_failure",
+                "attempt": 1, "reason": reason, "argv": [], "guest_argv": [], "env": {},
+                "cwd": "/repo", "shell_command": "", "artifact_dir": "/repo/a",
+            });
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&kvm_cell));
+            row["attempts"] = serde_json::json!([attempt]);
+            serde_json::from_value(row).unwrap()
+        };
+        let line = "Fatal glibc error: CPU does not support x86-64-v3\n";
+        let rejected = row(127, line);
+        assert!(rejected.declared_stdout.is_none());
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &kvm_cell, &rejected),
+            Some(super::RetryCause::LoaderV2)
+        );
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Off, &kvm_cell, &rejected),
+            None
+        );
+        let mut declared = rejected.clone();
+        declared.declared_stdout = Some(hermit_manifest_plan::runner::cell_declared_stdout(
+            &kvm_cell,
+        ));
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &kvm_cell, &declared),
+            Some(super::RetryCause::LoaderV2)
+        );
+        // On ptrace too: a ptrace host with CPUID faulting presents the same
+        // v2 CPU, and its retry runs in the same rootfs.
+        let ptrace_cell = cell("ptrace");
+        assert!(ptrace_cell.image.is_none());
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &ptrace_cell, &rejected),
+            Some(super::RetryCause::LoaderV2)
+        );
+        // Not at another status, not without the line.
+        assert_ne!(
+            super::attempt_retry_cause(super::Retries::Framework, &kvm_cell, &row(1, line)),
+            Some(super::RetryCause::LoaderV2)
+        );
+        assert_ne!(
+            super::attempt_retry_cause(
+                super::Retries::Framework,
+                &kvm_cell,
+                &row(127, "guest: command not found\n")
+            ),
+            Some(super::RetryCause::LoaderV2)
+        );
+        // Not on a cell that runs inside a bucket image: its loader is the
+        // image's, and the retry would replace the cell's declared root.
+        let mut imaged = kvm_cell.clone();
+        imaged.image = Some("oci-dir:/images/bucket".into());
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &imaged, &rejected),
+            Some(super::RetryCause::ProductFailure)
+        );
+    }
+
+    /// A cell that declares a non-zero guest disposition runs verify with
+    /// --verify-allow=failure, so the loader's refusal reaches a matched
+    /// comparison of two runs at exit 127 instead of first_run_rejected (issue
+    /// 5476). c-programs/nanosleep-threads-simple, which declares signal 11,
+    /// ended that way on KVM in D131946467's third CI run. Such a row, with
+    /// the loader's line in its attempt's stderr, is classified LoaderV2 on a
+    /// KVM or ptrace verify cell with no bucket image. Without the line, with
+    /// one run at another status, or on a cell with a bucket image it is not.
+    #[test]
+    fn a_matched_pair_of_loader_refused_runs_earns_the_v2_retry() {
+        use sha2::Digest;
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |backend: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some("c-programs/nanosleep-threads-simple".into()),
+                    mode: Some("verify".into()),
+                    backend: Some(backend.into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let kvm_cell = cell("kvm");
+        assert!(kvm_cell.image.is_none());
+        let canonical = serde_json::json!({"strictness": "canonical",
+            "display_name": "BitwiseInfoV1",
+            "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+            "record_envelope": "all_records_v1", "virtualize_time": true,
+            "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+            "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines": false, "skip_commit": false, "skip_detlog": false});
+        // The row as the runner writes it for that cell: the attempt exits
+        // with the guest's status, and its stderr carries the guest's.
+        let row = |left: i32, right: i32, guest_stderr: &str| -> CellResult {
+            let output = |exit_code: i32| {
+                serde_json::json!({"exit_code": exit_code, "signal": null,
+                    "stdout_sha256": format!("{:x}", sha2::Sha256::digest(b"")),
+                    "stdout_bytes": 0,
+                    "stderr_sha256": format!("{:x}", sha2::Sha256::digest(guest_stderr.as_bytes())),
+                    "stderr_bytes": guest_stderr.len()})
+            };
+            let mut report = serde_json::to_value(
+                hermit_manifest_plan::canonical_verdict::VerificationReport::no_result(),
+            )
+            .unwrap();
+            report["verified"] = true.into();
+            report["bitwise_parity"] = true.into();
+            report["verdict"] = "matched".into();
+            report["no_result_reason"] = serde_json::Value::Null;
+            report["comparison"] = canonical.clone();
+            report["compared_log_messages"] = serde_json::json!({"left": 29, "right": 29});
+            report["compared_outputs"] =
+                serde_json::json!({"left": output(left), "right": output(right)});
+            report["guest_exit_code"] = left.into();
+            let report = serde_json::to_string(&report).unwrap();
+            let digest = format!("{:x}", sha2::Sha256::digest(report.as_bytes()));
+            let stderr = format!(
+                ":: Comparing captured verification logs...\n\
+                 :: Backend: KVM (reverie-kvm KvmGuest<Detcore>)\n{guest_stderr}"
+            );
+            let reason =
+                format!("guest ended with exit code {left}, but the manifest expects signal 11");
+            let attempt = serde_json::json!({"index": "1", "outcome": "FAIL",
+                "error_kind": null, "status": left, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "",
+                "stderr": stderr, "reason": reason, "verification_report": report,
+                "verification_report_sha256": digest});
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "c-programs/nanosleep-threads-simple", "category": "c-programs",
+                "lane": "portable", "mode": "verify", "backend": "kvm",
+                "classification": "required", "outcome": "FAIL", "result": "crash-error",
+                "failure_class": "product_failure", "attempt": 1, "reason": reason,
+                "argv": [], "guest_argv": [], "env": {}, "cwd": "/repo",
+                "shell_command": "", "artifact_dir": "/repo/a",
+            });
+            row["expected_guest_exit"] = serde_json::to_value(
+                hermit_manifest_plan::runner::cell_expected_guest_exit(&kvm_cell),
+            )
+            .unwrap();
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&kvm_cell));
+            row["attempts"] = serde_json::json!([attempt]);
+            serde_json::from_value(row).unwrap()
+        };
+        let cause = |cell: &SelectedCell, row: &CellResult| {
+            super::attempt_retry_cause(super::Retries::Framework, cell, row)
+        };
+        let line = "Fatal glibc error: CPU does not support x86-64-v3\n";
+        let refused = row(127, 127, line);
+        assert!(refused.declared_stdout.is_none());
+        assert!(refused.expected_guest_exit.is_some());
+        assert_eq!(
+            cause(&kvm_cell, &refused),
+            Some(super::RetryCause::LoaderV2)
+        );
+        // Without the line, or with one run at another status, it is the
+        // ordinary product failure the cell already is.
+        for (label, other) in [
+            ("no line", row(127, 127, "guest: command not found\n")),
+            ("127 then 0", row(127, 0, line)),
+            ("0 then 127", row(0, 127, line)),
+        ] {
+            assert_eq!(
+                cause(&kvm_cell, &other),
+                Some(super::RetryCause::ProductFailure),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            cause(&cell("ptrace"), &refused),
+            Some(super::RetryCause::LoaderV2)
+        );
+        let mut imaged = kvm_cell.clone();
+        imaged.image = Some("oci-dir:/images/bucket".into());
+        assert_eq!(
+            cause(&imaged, &refused),
+            Some(super::RetryCause::ProductFailure)
+        );
+    }
+
+    /// A chaos cell runs `hermit run --verify --chaos` once per seed, so its
+    /// row holds one inner attempt per seed, and the loader refuses both runs
+    /// of every seed alike: each report is a matched comparison of two runs
+    /// at exit 127, with the loader's line in that attempt's stderr.
+    /// c-programs/thread-sync-determinism ended that way on ptrace, in all 32
+    /// seeds, in D131946467's fourth CI run (issue 5476). Such a row is
+    /// classified LoaderV2 on a chaos cell with no bucket image. The same row
+    /// on the test's replay cell, which records through `hermit record start`
+    /// and so has no image to retry in, is not; nor is a row without the
+    /// line, one on a cell with a bucket image, or any row under --no-retry.
+    #[test]
+    fn a_loader_refused_chaos_attempt_earns_the_v2_retry() {
+        use sha2::Digest;
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |mode: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some("c-programs/thread-sync-determinism".into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let chaos_cell = cell("chaos");
+        assert!(chaos_cell.image.is_none());
+        let canonical = serde_json::json!({"strictness": "canonical",
+            "display_name": "BitwiseInfoV1",
+            "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+            "record_envelope": "all_records_v1", "virtualize_time": true,
+            "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+            "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines": false, "skip_commit": false, "skip_detlog": false});
+        // One seed's attempt as the runner writes it: both runs at exit 127.
+        let seed_attempt = |seed: usize, guest_stderr: &str| {
+            let output = serde_json::json!({"exit_code": 127, "signal": null,
+                "stdout_sha256": format!("{:x}", sha2::Sha256::digest(b"")),
+                "stdout_bytes": 0,
+                "stderr_sha256": format!("{:x}", sha2::Sha256::digest(guest_stderr.as_bytes())),
+                "stderr_bytes": guest_stderr.len()});
+            let mut report = serde_json::to_value(
+                hermit_manifest_plan::canonical_verdict::VerificationReport::no_result(),
+            )
+            .unwrap();
+            report["verified"] = true.into();
+            report["bitwise_parity"] = true.into();
+            report["verdict"] = "matched".into();
+            report["no_result_reason"] = serde_json::Value::Null;
+            report["comparison"] = canonical.clone();
+            report["compared_log_messages"] = serde_json::json!({"left": 29, "right": 29});
+            report["compared_outputs"] = serde_json::json!({"left": output, "right": output});
+            report["guest_exit_code"] = 127.into();
+            let report = serde_json::to_string(&report).unwrap();
+            let digest = format!("{:x}", sha2::Sha256::digest(report.as_bytes()));
+            serde_json::json!({"index": format!("seed-{seed}"), "outcome": "FAIL",
+                "error_kind": null, "status": 127, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "",
+                "stderr": format!(":: Comparing captured verification logs...\n{guest_stderr}"),
+                "reason": "guest ended with exit code 127",
+                "verification_report": report, "verification_report_sha256": digest})
+        };
+        let row = |seeds: usize, guest_stderr: &str| -> CellResult {
+            let reason = format!(
+                "chaos distinct=1 passes=0 failures={seeds} timed_out=0 normalized_entropy=0.0000"
+            );
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "c-programs/thread-sync-determinism", "category": "c-programs",
+                "lane": "portable", "mode": "chaos", "backend": "ptrace",
+                "classification": "required", "outcome": "FAIL", "result": "crash-error",
+                "failure_class": "product_failure", "attempt": 1, "reason": reason,
+                "argv": [], "guest_argv": [], "env": {}, "cwd": "/repo",
+                "shell_command": "", "artifact_dir": "/repo/a",
+            });
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&chaos_cell));
+            row["attempts"] = (0..seeds)
+                .map(|seed| seed_attempt(seed, guest_stderr))
+                .collect::<Vec<_>>()
+                .into();
+            serde_json::from_value(row).unwrap()
+        };
+        let cause = |cell: &SelectedCell, row: &CellResult| {
+            super::attempt_retry_cause(super::Retries::Framework, cell, row)
+        };
+        let line = "Fatal glibc error: CPU does not support x86-64-v3\n";
+        let refused = row(32, line);
+        assert!(hermit_manifest_plan::runner::loader_v2_rejected(&refused));
+        assert_eq!(
+            cause(&chaos_cell, &refused),
+            Some(super::RetryCause::LoaderV2)
+        );
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Off, &chaos_cell, &refused),
+            None
+        );
+        assert_ne!(
+            cause(&chaos_cell, &row(32, "guest: command not found\n")),
+            Some(super::RetryCause::LoaderV2)
+        );
+        assert_ne!(
+            cause(&cell("replay"), &refused),
+            Some(super::RetryCause::LoaderV2)
+        );
+        let mut imaged = chaos_cell.clone();
+        imaged.image = Some("oci-dir:/images/bucket".into());
+        assert_ne!(cause(&imaged, &refused), Some(super::RetryCause::LoaderV2));
+    }
+
+    /// Where Hermit watches the program interpreter (the ptrace backend), a
+    /// CentOS 10 loader's refusal of the x86-64-v2 CPU ends as Hermit's typed
+    /// refusal, exit 122, instead of the loader's exit 127
+    /// (detcore/src/loader_cpu_abort.rs). A ptrace verify attempt whose report
+    /// is run 1's `policy_refusal`, with that refusal as a line of its stderr,
+    /// is classified LoaderV2. The same report beside another policy refusal
+    /// (an x86-64-v3 admission refused for the host's XCR0) or beside an
+    /// interpreter refusal that quotes another level is the ordinary product
+    /// failure, and --no-retry gives no cause. The row is shaped as the runner
+    /// writes one: the paired comparison's exit 125 on the attempt, the
+    /// runner's reason for a typed run failure, and run 1's stderr as the
+    /// pair passes it on, as measured.
+    #[test]
+    fn a_policy_refused_v3_interpreter_earns_the_v2_retry() {
+        use sha2::Digest;
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let ptrace_cell = manifests
+            .select(&hermit_manifest_plan::runner::Selection {
+                test: Some("c-programs/vforkexec".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                population: Some(hermit_manifest_plan::runner::Population::Required),
+                ..hermit_manifest_plan::runner::Selection::default()
+            })
+            .unwrap()
+            .remove(0);
+        assert!(ptrace_cell.image.is_none());
+        let detail = "Hermit refused the run: a fail-closed policy stopped it before completion. \
+                      This is not a hermit failure; the refusal reason is above.";
+        let row = |refusal: &str| -> CellResult {
+            let mut report =
+                hermit_manifest_plan::canonical_verdict::VerificationReport::no_result();
+            report.no_result_reason = Some(
+                hermit_manifest_plan::canonical_verdict::NoResultReason::RunFailed {
+                    run: hermit_manifest_plan::canonical_verdict::VerificationRun::Run1,
+                    failure: hermit_manifest_plan::canonical_verdict::RunFailure::PolicyRefusal,
+                    detail: detail.into(),
+                },
+            );
+            let report = serde_json::to_string(&report).unwrap();
+            let digest = format!("{:x}", sha2::Sha256::digest(report.as_bytes()));
+            let stderr =
+                format!("{refusal}\nHERMIT_POLICY_REFUSAL class=policy-refusal\nError: {detail}\n");
+            let reason = format!("Run1 failed (policy_refusal): {detail}");
+            let attempt = serde_json::json!({"index": "1", "outcome": "FAIL",
+                "error_kind": null, "status": 125, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "",
+                "stderr": stderr, "reason": reason, "verification_report": report,
+                "verification_report_sha256": digest});
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "c-programs/vforkexec", "category": "c-programs", "lane": "portable",
+                "mode": "verify", "backend": "ptrace", "classification": "required",
+                "outcome": "FAIL", "result": "crash-error", "failure_class": "product_failure",
+                "attempt": 1, "reason": reason, "argv": [], "guest_argv": [], "env": {},
+                "cwd": "/repo", "shell_command": "", "artifact_dir": "/repo/a",
+            });
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&ptrace_cell));
+            row["attempts"] = serde_json::json!([attempt]);
+            serde_json::from_value(row).unwrap()
+        };
+        let interpreter = |profile: &str, level: &str, why: &str| {
+            format!(
+                "--cpu-profile {profile} refused: the program interpreter \
+                 /usr/lib64/ld-linux-x86-64.so.2 of /work/program stopped before the program \
+                 started, printing \"Fatal glibc error: CPU does not support {level}\" and \
+                 exiting 127; {why}"
+            )
+        };
+        let refused = row(&interpreter(
+            "x86-64-v2",
+            "x86-64-v3",
+            "the x86-64-v2 CPU this profile presents is below the x86-64-v3 it was built for; \
+             rerun with --cpu-profile x86-64-v3, on a host that qualifies for it",
+        ));
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &ptrace_cell, &refused),
+            Some(super::RetryCause::LoaderV2)
+        );
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Off, &ptrace_cell, &refused),
+            None
+        );
+        for (label, other) in [
+            (
+                "an x86-64-v3 admission refused for the host's XCR0",
+                row(
+                    "Error: --cpu-profile x86-64-v3 refused: XCR0 0x2ff enables components the \
+                     XINUSE probe does not cover (it covers 0x2e7)",
+                ),
+            ),
+            (
+                "an x86-64-v2 interpreter on the x86-64-v2 CPU",
+                row(&interpreter(
+                    "x86-64-v2",
+                    "x86-64-v2",
+                    "although this profile presents x86-64-v2, which satisfies x86-64-v2: \
+                     Hermit's CPU table lacks a feature the loader checks, so please report \
+                     this message",
+                )),
+            ),
+        ] {
+            assert_eq!(
+                super::attempt_retry_cause(super::Retries::Framework, &ptrace_cell, &other),
+                Some(super::RetryCause::ProductFailure),
+                "{label}"
             );
         }
     }

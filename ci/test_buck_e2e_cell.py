@@ -90,7 +90,8 @@ def host(path):
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
         "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH", "HERMIT_E2E_BUNDLE_RECORD",
-        "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS", "HERMIT_E2E_SNAPSHOT_GIT")
+        "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS", "HERMIT_E2E_SNAPSHOT_GIT",
+        "HERMIT_E2E_V2_OCI_DIR")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -753,6 +754,33 @@ class CellTest(unittest.TestCase):
         [harness] = self.calls_by("harness")
         real = "/usr/local/bin/git.meta.real"
         self.assertEqual(harness["env"]["HERMIT_E2E_SNAPSHOT_GIT"], real if os.access(real, os.X_OK) else None)
+
+    # The bundle's v2 rootfs (an oci-dir the harness retries a loader-rejected
+    # verify or chaos cell under, KVM or ptrace, issue 5476) reaches the
+    # harness as HERMIT_E2E_V2_OCI_DIR, from the bundle alone: a caller's
+    # value never leaks in, and a bundle without an oci-layout names none.
+    def test_a_bundle_v2_rootfs_reaches_a_host_cell(self) -> None:
+        (self.bundle / "v2-rootfs").mkdir()
+        (self.bundle / "v2-rootfs" / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}\n')
+        done, _ = self.run_cell(HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_V2_OCI_DIR"], str(self.bundle / "v2-rootfs"))
+
+    def test_a_bundle_without_a_v2_rootfs_names_none(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_V2_OCI_DIR"])
+
+    def test_a_pinned_root_cell_gets_the_v2_rootfs_inside_the_bundle(self) -> None:
+        (self.bundle / "v2-rootfs").mkdir()
+        (self.bundle / "v2-rootfs" / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}\n')
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_V2_OCI_DIR"], "/src/bundle/v2-rootfs")
 
     def test_a_bundle_without_a_record_names_none(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"))

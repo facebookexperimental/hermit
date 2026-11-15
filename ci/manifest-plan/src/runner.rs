@@ -4125,6 +4125,17 @@ pub struct RunContext {
     /// `/etc/ld.so.cache` (`shared_inputs_argv`). Decided once per run:
     /// true where the host has the cache.
     pub shares_ld_so_cache: bool,
+    /// The bundle-shipped x86-64-v2 guest rootfs (an oci-dir) active for
+    /// this attempt only: the harness retry of a loader-rejected verify or
+    /// chaos cell on the KVM or ptrace backend (issue 5476). The base
+    /// context never carries one; the attempt loop sets it on the retry
+    /// attempt's context ([`RunContext::with_v2_retry`]) when the previous
+    /// attempt is a typed loader rejection ([`loader_v2_rejected`]) and the
+    /// run was given a rootfs. An attempt with one runs inside it via
+    /// `hermit run --image`; a KVM attempt also binds the host's
+    /// `/sys/module` in so strict KVM binder admission can inspect the host
+    /// kernel.
+    pub v2_retry_oci_dir: Option<PathBuf>,
 }
 
 /// The epoch a cell gets when `HERMIT_EPOCH` is unset, re-exported for the
@@ -4135,6 +4146,38 @@ pub use detcore_model::config::CANONICAL_TEST_EPOCH;
 /// canonical test epoch. Never the host clock: a run whose epoch came from the
 /// host could be reproduced only from a recording, and `hermit run --strict`
 /// refuses it.
+/// The environment variable naming the bundle-shipped x86-64-v2 guest
+/// rootfs (an oci-dir) a loader-rejected verify or chaos cell, on KVM or
+/// ptrace, is retried under (issue 5476). `cell.sh` sets it from the
+/// bundle alone when the bundle carries `v2-rootfs/oci-layout`; unset, no
+/// v2 retry is launched.
+pub const V2_OCI_DIR_ENV: &str = "HERMIT_E2E_V2_OCI_DIR";
+
+/// The v2 rootfs a run may retry loader-rejected verify and chaos cells under,
+/// from [`V2_OCI_DIR_ENV`]: `None` when unset, else the absolute path it
+/// names, which must hold an OCI layout (`oci-layout` file) as
+/// `hermit run --image=oci-dir:` reads it. Anything else refuses the run
+/// by name rather than silently disabling the retry.
+pub fn v2_oci_dir_from_env(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(value);
+    if !dir.is_absolute() {
+        return Err(format!(
+            "{V2_OCI_DIR_ENV} must be an absolute oci-dir path, got {}",
+            dir.display()
+        ));
+    }
+    if !dir.join("oci-layout").is_file() {
+        return Err(format!(
+            "{V2_OCI_DIR_ENV}={} holds no oci-layout file, so it is not an oci-dir",
+            dir.display()
+        ));
+    }
+    Ok(Some(dir))
+}
+
 fn capture_custom_runs_from_env(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(false),
@@ -4172,6 +4215,15 @@ impl RunContext {
             attempt,
             ..self.clone()
         }
+    }
+
+    /// A copy of this context whose verify and chaos attempts run inside the
+    /// bundle-shipped v2 rootfs at `oci_dir` (see
+    /// [`RunContext::v2_retry_oci_dir`]). Only the harness attempt loop
+    /// calls this, for the one retry attempt a loader rejection earns.
+    pub fn with_v2_retry(mut self, oci_dir: PathBuf) -> Self {
+        self.v2_retry_oci_dir = Some(oci_dir);
+        self
     }
 
     /// `source_sha` names the commit a Git-less source snapshot at `root` was
@@ -4347,6 +4399,7 @@ impl RunContext {
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
             shares_ld_so_cache: Path::new(LD_SO_CACHE_PATH).exists(),
+            v2_retry_oci_dir: None,
         })
     }
 
@@ -6797,13 +6850,41 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     // A bucket with a hermetic image runs the cell inside it: Hermit is the
     // container, the cell workdir is bound at /work, and the image root
     // stays read-only. Native cells keep the host execution.
+    // A v2 retry attempt (RunContext::v2_retry_oci_dir) runs inside the
+    // bundle-shipped v2 rootfs instead of any bucket image: the retry
+    // exists because the host userspace's loader refused the v2 CPU, and
+    // the bucket image, where a cell has one, is not that rootfs. The
+    // attempt loop sets it only on a verify or chaos retry, on KVM or
+    // ptrace, of a cell with no bucket image, so the two never compete in an
+    // executed run.
+    let v2_image = context
+        .v2_retry_oci_dir
+        .as_ref()
+        .map(|dir| format!("oci-dir:{}", dir.display()));
+    debug_assert!(
+        v2_image.is_none() || cell.image.is_none(),
+        "a v2 retry is never given to a cell with a bucket image ({:?})",
+        cell.image
+    );
     let cell_image = if backend == "native" {
         None
+    } else if let Some(image) = v2_image.as_deref() {
+        Some(image)
     } else {
         cell.image.as_deref()
     };
     if let Some(image) = cell_image {
         argv.extend(["--image".into(), image.to_owned()]);
+    }
+    if v2_image.is_some() && backend == "kvm" {
+        // Strict KVM binder admission inspects the host kernel through
+        // /sys/module from inside the image rootfs, where no sysfs is
+        // mounted; bind the host's in read-only so the inspection reads
+        // the kernel it exists to read. The guest can then list host
+        // module names under /sys/module; that visibility is the named
+        // cost of the KVM retry (issue 5476, E-b item 4). A ptrace retry
+        // has no such admission, so it gets no host sysfs.
+        argv.push("--bind=/sys/module:/sys/module:ro".into());
     }
     argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
     if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
@@ -6844,9 +6925,14 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         VerifiedInvocation::Verify => None,
     };
     // A `record start` takes no shared inputs, and a host without a cache has
-    // none to seal.
-    let shares_ld_so_cache =
-        !matches!(invocation, VerifiedInvocation::Replay { .. }) && context.shares_ld_so_cache;
+    // none to seal. Nor does a run inside an image, a bucket image or the v2
+    // retry rootfs (issue 5476): its loader reads the image's own
+    // /etc/ld.so.cache, or none. Hermit's image container binds no host file
+    // there, so a sealed host cache would be a host input that nothing in the
+    // guest reads.
+    let shares_ld_so_cache = !matches!(invocation, VerifiedInvocation::Replay { .. })
+        && context.shares_ld_so_cache
+        && cell_image.is_none();
     match invocation {
         VerifiedInvocation::Replay {
             record_timeout_seconds,
@@ -9631,6 +9717,219 @@ pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool 
         .is_some_and(|report| report.require_canonical_match().is_ok())
 }
 
+/// The guest loader's refusal line a v2 retry keys on: glibc's fatal
+/// ISA-level check, printed by the loader itself when the CPU it was
+/// built for is not the CPU presented. The level digit is not part of
+/// the signature: a v4-demanding loader on the v2 CPU is the same
+/// rejection (its retry under the v2 rootfs then decides the cell).
+pub const LOADER_V2_SIGNATURE: &str = "Fatal glibc error: CPU does not support x86-64-v";
+
+/// The start of the line Hermit prints to stderr when it refuses a run whose
+/// program interpreter aborted because the CPU presented is below the
+/// x86-64 level the interpreter was built for, in the one case the v2 retry
+/// exists for: a loader built for x86-64-v3, as CentOS Stream 10's is, on
+/// the x86-64-v2 CPU (detcore/src/loader_cpu_abort.rs, `Watch::refusal`;
+/// <https://github.com/rrnewton/hermit/issues/4695>). The interpreter and
+/// the executable follow, then [`LOADER_V3_ON_V2_REFUSAL_CAUSE`].
+pub const LOADER_V3_ON_V2_REFUSAL_PREFIX: &str =
+    "--cpu-profile x86-64-v2 refused: the program interpreter ";
+
+/// The rest of the refusal [`LOADER_V3_ON_V2_REFUSAL_PREFIX`] starts: it
+/// quotes the loader's own message and says the CPU presented is below the
+/// level the loader was built for. The same refusal of a loader that names
+/// another level, or under another profile, says something else here.
+pub const LOADER_V3_ON_V2_REFUSAL_CAUSE: &str = " stopped before the program started, printing \
+     \"Fatal glibc error: CPU does not support x86-64-v3\" and exiting 127; the x86-64-v2 \
+     CPU this profile presents is below the x86-64-v3 it was built for;";
+
+/// Whether `line` is Hermit's refusal of an x86-64-v3 program interpreter's
+/// abort on the x86-64-v2 CPU ([`LOADER_V3_ON_V2_REFUSAL_PREFIX`]).
+fn is_loader_v3_on_v2_refusal(line: &str) -> bool {
+    line.strip_prefix(LOADER_V3_ON_V2_REFUSAL_PREFIX)
+        .is_some_and(|rest| rest.contains(LOADER_V3_ON_V2_REFUSAL_CAUSE))
+}
+
+/// Whether `attempt` is a loader rejection the v2 retry exists for (issue
+/// 5476): the guest loader refused the x86-64-v2 CPU before the guest ran.
+/// Three shapes of retained verification report show it. In the first two
+/// the run ends with the loader's own exit 127, beside the loader's fatal
+/// ISA line ([`LOADER_V2_SIGNATURE`]) in this attempt's own captured output:
+/// - a typed `first_run_rejected` with guest exit 127, with the line in the
+///   attempt's stdout or stderr: verify stopped after a first run whose
+///   disposition its `--verify-allow` refused;
+/// - a `matched` comparison in which both compared runs exited 127, with the
+///   line in the attempt's stderr: a cell that declares a non-zero guest
+///   disposition runs with `--verify-allow=failure`, which admits the
+///   loader's exit, so verify ran the guest twice and compared the runs.
+///   Only a match counts. Two refused runs that diverged differ in Hermit's
+///   own work before exec, a determinism failure the retry must not hide.
+///
+/// The third is Hermit's typed refusal in place of that exit. Where Hermit
+/// watches the program interpreter (the ptrace backend; not KVM, where guest
+/// threads are not host tasks), it refuses the run at the loader's
+/// `exit_group(127)` and exits 122 itself:
+/// - a typed `run_failed` of run 1 with failure `policy_refusal`, with
+///   Hermit's refusal of an x86-64-v3 program interpreter's abort on the
+///   x86-64-v2 CPU as a line of the attempt's stderr
+///   ([`LOADER_V3_ON_V2_REFUSAL_PREFIX`]). The report's own detail names no
+///   cause, so the line is the evidence of which refusal it was. Only that
+///   refusal counts: another policy refusal (an x86-64-v3 admission refused
+///   for the host's XCR0, say), an interpreter that names another level, or
+///   one refused under another profile is no loader rejection of the v2 CPU.
+///   A chaos pair admits its second run whatever the first exited, and the
+///   report is still run 1's refusal.
+///
+/// Both halves come from retained typed evidence, never from the row's
+/// reason text, and from the same attempt: a guest that merely prints the
+/// line without such a report earns no retry, and such a report without the
+/// line is an ordinary guest failure.
+pub fn loader_v2_rejection(attempt: &AttemptResult) -> bool {
+    let Some(report) = attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+    else {
+        return false;
+    };
+    let first_run_rejected = matches!(
+        report.no_result_reason,
+        Some(crate::canonical_verdict::NoResultReason::FirstRunRejected {
+            exit_code: Some(127),
+            ..
+        })
+    );
+    let both_runs_refused = report.verdict == Verdict::Matched
+        && report.compared_outputs.as_ref().is_some_and(|outputs| {
+            outputs.left.exit_code == Some(127) && outputs.right.exit_code == Some(127)
+        });
+    let run1_policy_refused = matches!(
+        report.no_result_reason,
+        Some(crate::canonical_verdict::NoResultReason::RunFailed {
+            run: crate::canonical_verdict::VerificationRun::Run1,
+            failure: crate::canonical_verdict::RunFailure::PolicyRefusal,
+            ..
+        })
+    );
+    (first_run_rejected
+        && (attempt.stdout.contains(LOADER_V2_SIGNATURE)
+            || attempt.stderr.contains(LOADER_V2_SIGNATURE)))
+        || (both_runs_refused && attempt.stderr.contains(LOADER_V2_SIGNATURE))
+        || (run1_policy_refused && attempt.stderr.lines().any(is_loader_v3_on_v2_refusal))
+}
+
+/// Whether any inner attempt of `result` is a loader rejection
+/// ([`loader_v2_rejection`]), each decided from that attempt's own report and
+/// output: the harness retry gate for the v2 retry.
+pub fn loader_v2_rejected(result: &CellResult) -> bool {
+    result.attempts.iter().any(loader_v2_rejection)
+}
+
+/// The fixture loadability verdict the v2 rootfs carries
+/// (fb-only/v2_rootfs/fixture_glibc_check.sh, issue 5476). It is
+/// tab-separated: `schema 1`, then `status checked`, or `status unchecked
+/// REASON` where the check could not run, then one `missing PATH ITEM` line
+/// per symbol version or library that a fixture file needs and the rootfs
+/// lacks, PATH relative to the prebuilt fixtures root (`build_root`).
+pub const V2_ROOTFS_VERDICT_FILE: &str = "fixtures-glibc-check.tsv";
+
+/// The error kind of a v2 retry refused before launch because the rootfs
+/// cannot load the cell's fixture ([`v2_retry_context`]).
+pub const ROOTFS_MISSING_SYMBOL: &str = "rootfs-missing-symbol";
+
+/// The error kind of a v2 retry refused before launch because the rootfs
+/// carries no usable fixture verdict ([`v2_retry_context`]).
+pub const ROOTFS_UNCHECKED: &str = "rootfs-unchecked";
+
+/// What the v2 rootfs at `oci_dir` lacks for the files of `cell`'s prebuilt
+/// fixture directory, by its verdict ([`V2_ROOTFS_VERDICT_FILE`]): `Ok` with
+/// one "PATH needs ITEM" entry per lacking item, empty where the rootfs can
+/// load every file (and for a cell with no prebuilt fixture), or `Err` with
+/// why the verdict is unusable: absent, unreadable, malformed, or written
+/// by a check that did not run.
+pub fn v2_rootfs_missing(oci_dir: &Path, cell: &SelectedCell) -> Result<Vec<String>, String> {
+    let path = oci_dir.join(V2_ROOTFS_VERDICT_FILE);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("schema\t1") {
+        return Err(format!("{} does not start with schema 1", path.display()));
+    }
+    let status = lines.next().unwrap_or_default();
+    match status.split('\t').collect::<Vec<_>>().as_slice() {
+        ["status", "checked"] => {}
+        ["status", "unchecked", why] => {
+            return Err(format!("the fixture check did not run: {why}"));
+        }
+        _ => {
+            return Err(format!("{} has no status line: {status:?}", path.display()));
+        }
+    }
+    // The prebuilt fixture directory of a test (`prepare_test_until`); the
+    // slash keeps `c-programs-a/` from matching `c-programs-ab/`.
+    let prefix = format!("{}/", cell.test.id.replace('/', "-"));
+    let mut missing = Vec::new();
+    for line in lines {
+        match line.split('\t').collect::<Vec<_>>().as_slice() {
+            ["missing", file, item] => {
+                if file.starts_with(&prefix) {
+                    missing.push(format!("{file} needs {item}"));
+                }
+            }
+            _ => {
+                return Err(format!("{} has a malformed line: {line:?}", path.display()));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// The context of `cell`'s v2 retry attempt inside the rootfs at `oci_dir`,
+/// or the typed refusal that stands for that attempt where the rootfs's
+/// fixture verdict ([`v2_rootfs_missing`]) says it cannot load the cell's
+/// fixture, or gives no usable verdict. A refusal launches nothing: its row
+/// is an ERROR with `understood_prerequisite_failure`, its error kind is
+/// [`ROOTFS_MISSING_SYMBOL`] or [`ROOTFS_UNCHECKED`], and its reason names
+/// what the rootfs lacks, or why there is no verdict. Only the v2 retry
+/// consults the verdict; a host cell never does.
+pub fn v2_retry_context(
+    context: &RunContext,
+    cell: &SelectedCell,
+    oci_dir: &Path,
+) -> Result<RunContext, Box<CellResult>> {
+    let (kind, reason) = match v2_rootfs_missing(oci_dir, cell) {
+        Ok(missing) if missing.is_empty() => {
+            return Ok(context.clone().with_v2_retry(oci_dir.to_path_buf()));
+        }
+        Ok(missing) => (
+            ROOTFS_MISSING_SYMBOL,
+            format!(
+                "v2 retry refused before launch: the v2 rootfs cannot load this cell's fixture: {} (issue 5476)",
+                missing.join("; ")
+            ),
+        ),
+        Err(why) => (
+            ROOTFS_UNCHECKED,
+            format!(
+                "v2 retry refused before launch: the v2 rootfs has no usable fixture verdict: {why} (issue 5476)"
+            ),
+        ),
+    };
+    let mut result = infrastructure_error_result(context, cell, reason);
+    result.failure_class = Some(FailureClass::UnderstoodPrerequisiteFailure);
+    result.error_kind = Some(kind.into());
+    Err(Box::new(result))
+}
+
+/// Whether `result` is a v2 retry refused before launch
+/// ([`v2_retry_context`]). Another attempt would meet the same verdict, so
+/// the harness gives it none.
+pub fn is_v2_retry_refusal(result: &CellResult) -> bool {
+    matches!(
+        result.error_kind.as_deref(),
+        Some(ROOTFS_MISSING_SYMBOL | ROOTFS_UNCHECKED)
+    )
+}
+
 /// Whether `attempt` retains a current verification report in which Hermit
 /// rejected the guest's first verify run (`first_run_rejected`): the guest ran
 /// and failed, so no comparison was made. A typed failure of a run Hermit had
@@ -9774,9 +10073,12 @@ fn observed_result_from_typed_evidence(
 
 fn non_product_failure_class(error_kind: Option<&str>) -> Option<FailureClass> {
     match error_kind {
-        Some("guest-launch-refused" | "backend-unavailable") => {
-            Some(FailureClass::UnderstoodPrerequisiteFailure)
-        }
+        Some(
+            "guest-launch-refused"
+            | "backend-unavailable"
+            | ROOTFS_MISSING_SYMBOL
+            | ROOTFS_UNCHECKED,
+        ) => Some(FailureClass::UnderstoodPrerequisiteFailure),
         Some("infrastructure" | "result-publication") => {
             Some(FailureClass::UnderstoodInfrastructureFailure)
         }
@@ -14685,6 +14987,7 @@ corpus:
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         if let Some(held) = selected_executable(&context, &cell) {
             let error = infrastructure_error_result(&context, &cell, "fixture".into());
@@ -15389,6 +15692,7 @@ esac
             isolated_workdir: Some(PathBuf::from("/test")),
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let spec_on = |cell: &SelectedCell| {
             build_spec(
@@ -16240,6 +16544,7 @@ esac
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         }
     }
 
@@ -17505,6 +17810,246 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// An image cell's runs never seal the host's dynamic-linker cache (issue
+    /// 5476). Inside an image, a bucket image or the v2 retry rootfs, the
+    /// loader reads the image's own /etc/ld.so.cache, or none: Hermit's image
+    /// container binds no host file there. The same cell rooted on the host
+    /// keeps the one sealed copy both of its runs bind. The v2 retry runs in
+    /// the rootfs on ptrace as on KVM, verify and chaos alike, and only the
+    /// KVM retry binds the host's /sys/module.
+    #[test]
+    fn image_cells_seal_no_host_linker_cache() {
+        let root = PathBuf::from("/tmp/hermit-image-linker-cache-fixture");
+        let mut context = run_context(&root);
+        context.shares_ld_so_cache = true;
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = Some("kvm".into());
+        let argv = |context: &RunContext, cell: &SelectedCell| {
+            build_spec(
+                context,
+                cell,
+                root.join("cell"),
+                vec![
+                    root.join("build/c-programs/fixture/program")
+                        .display()
+                        .to_string(),
+                ],
+                "1",
+                None,
+                15,
+            )
+            .unwrap()
+            .argv
+        };
+        let seals = |argv: &[String]| {
+            argv.iter().any(|arg| arg == SHARED_INPUTS_FLAG)
+                || argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--input" && pair[1] == LD_SO_CACHE_INPUT)
+        };
+        let image_flag = |argv: &[String], image: &str| {
+            let want = ["--image".to_string(), image.to_string()];
+            argv.windows(2).any(|pair| pair == want)
+        };
+
+        let host = argv(&context, &cell);
+        assert!(
+            seals(&host),
+            "the host-rooted cell seals the cache: {host:?}"
+        );
+        assert!(!host.iter().any(|arg| arg == "--image"), "{host:?}");
+
+        let rootfs = root.join("bundle/v2-rootfs");
+        let retry = argv(&context.clone().with_v2_retry(rootfs.clone()), &cell);
+        assert!(
+            image_flag(&retry, &format!("oci-dir:{}", rootfs.display())),
+            "{retry:?}"
+        );
+        assert!(
+            !seals(&retry),
+            "the v2 retry runs in its rootfs and seals no host cache: {retry:?}"
+        );
+        // Only the retry binds the host's /sys/module, read-only, for strict
+        // KVM binder admission inside the rootfs.
+        let binds_sys_module = |argv: &[String]| {
+            argv.iter()
+                .any(|arg| arg == "--bind=/sys/module:/sys/module:ro")
+        };
+        assert!(binds_sys_module(&retry), "{retry:?}");
+        assert!(!binds_sys_module(&host), "{host:?}");
+
+        let mut imaged = cell.clone();
+        imaged.image = Some("oci-dir:/images/bucket".into());
+        let bucket = argv(&context, &imaged);
+        assert!(image_flag(&bucket, "oci-dir:/images/bucket"), "{bucket:?}");
+        assert!(
+            !seals(&bucket),
+            "a bucket-image cell seals no host cache: {bucket:?}"
+        );
+        assert!(!binds_sys_module(&bucket), "{bucket:?}");
+
+        // The ptrace retry, of a verify or a chaos cell, runs in the same
+        // rootfs and seals no host cache, but binds no host sysfs: only KVM's
+        // binder admission reads /sys/module.
+        let retry_context = context.clone().with_v2_retry(rootfs.clone());
+        let ptrace_verify = ptrace_cell("verify");
+        let ptrace_chaos = ptrace_cell("chaos");
+        let chaos_argv = |context: &RunContext| {
+            build_spec(
+                context,
+                &ptrace_chaos,
+                root.join("cell"),
+                vec![
+                    root.join("build/c-programs/fixture/program")
+                        .display()
+                        .to_string(),
+                ],
+                "1",
+                Some(7),
+                15,
+            )
+            .unwrap()
+            .argv
+        };
+        for (label, host, retry) in [
+            (
+                "ptrace verify",
+                argv(&context, &ptrace_verify),
+                argv(&retry_context, &ptrace_verify),
+            ),
+            (
+                "ptrace chaos",
+                chaos_argv(&context),
+                chaos_argv(&retry_context),
+            ),
+        ] {
+            assert!(seals(&host), "{label}: {host:?}");
+            assert!(
+                !host.iter().any(|arg| arg == "--image"),
+                "{label}: {host:?}"
+            );
+            assert!(
+                image_flag(&retry, &format!("oci-dir:{}", rootfs.display())),
+                "{label}: {retry:?}"
+            );
+            assert!(!seals(&retry), "{label}: {retry:?}");
+            assert!(!binds_sys_module(&retry), "{label}: {retry:?}");
+            assert!(!binds_sys_module(&host), "{label}: {host:?}");
+        }
+    }
+
+    /// A v2 retry consults the rootfs's fixture verdict before it launches
+    /// (issue 5476). A cell whose fixture files the verdict clears gets the
+    /// retry context. One whose files lack a symbol version or a library
+    /// gets a typed refusal that names each item. A verdict that is absent,
+    /// malformed, or written by a check that did not run refuses as
+    /// unchecked. Only lines under the cell's own prebuilt directory count,
+    /// and either refusal ends the cell's retries.
+    #[test]
+    fn v2_retry_reads_the_rootfs_fixture_verdict() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-v2-rootfs-verdict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let context = run_context(&root);
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = Some("kvm".into());
+        let verdict = |text: &str| fs::write(root.join(V2_ROOTFS_VERDICT_FILE), text).unwrap();
+        // RunContext has no Debug, so a refusal is taken apart by hand.
+        let refusal = || match v2_retry_context(&context, &cell, &root) {
+            Ok(_) => panic!("the v2 retry was not refused"),
+            Err(row) => *row,
+        };
+
+        // recipe() names the test fixture/test, so its prebuilt directory is
+        // fixture-test/; fixture-tests/ is another test's.
+        verdict(
+            "schema\t1\nstatus\tchecked\n\
+             missing\tfixture-tests/fixtures/program\tlibgomp.so.1 (library)\n\
+             missing\tother-test/fixtures/program\t__isoc23_strtol@GLIBC_2.38\n",
+        );
+        let cleared = v2_retry_context(&context, &cell, &root).unwrap();
+        assert_eq!(cleared.v2_retry_oci_dir.as_deref(), Some(root.as_path()));
+
+        verdict(
+            "schema\t1\nstatus\tchecked\n\
+             missing\tfixture-test/fixtures/program\tlibgomp.so.1 (library)\n\
+             missing\tfixture-test/fixtures/program\tGOMP_parallel@GOMP_4.0\n",
+        );
+        let refused = refusal();
+        assert_eq!(refused.outcome, "ERROR");
+        assert_eq!(refused.error_kind.as_deref(), Some(ROOTFS_MISSING_SYMBOL));
+        assert_eq!(
+            refused.failure_class,
+            Some(FailureClass::UnderstoodPrerequisiteFailure)
+        );
+        assert_eq!(
+            failure_class(
+                &refused.outcome,
+                refused.result,
+                refused.error_kind.as_deref()
+            ),
+            refused.failure_class,
+            "the class the row carries is the one its error kind derives"
+        );
+        refused.require_current_classification().unwrap();
+        let reason = refused.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("fixture-test/fixtures/program needs libgomp.so.1 (library)")
+                && reason.contains("fixture-test/fixtures/program needs GOMP_parallel@GOMP_4.0"),
+            "{reason}"
+        );
+        assert!(
+            refused.argv.is_empty() && refused.attempts.is_empty(),
+            "a refused retry launches nothing"
+        );
+        assert!(is_v2_retry_refusal(&refused));
+
+        for (text, want) in [
+            (
+                "schema\t1\nstatus\tunchecked\tno objdump on PATH\n",
+                "the fixture check did not run: no objdump on PATH",
+            ),
+            (
+                "schema\t2\nstatus\tchecked\n",
+                "does not start with schema 1",
+            ),
+            ("schema\t1\n", "has no status line"),
+            (
+                "schema\t1\nstatus\tchecked\nmissing\tfixture-test/fixtures/program\n",
+                "has a malformed line",
+            ),
+        ] {
+            verdict(text);
+            let refused = refusal();
+            assert_eq!(
+                refused.error_kind.as_deref(),
+                Some(ROOTFS_UNCHECKED),
+                "{text:?}"
+            );
+            refused.require_current_classification().unwrap();
+            let reason = refused.reason.as_deref().unwrap();
+            assert!(reason.contains(want), "{text:?}: {reason}");
+            assert!(is_v2_retry_refusal(&refused));
+        }
+        fs::remove_file(root.join(V2_ROOTFS_VERDICT_FILE)).unwrap();
+        let absent = refusal();
+        assert_eq!(absent.error_kind.as_deref(), Some(ROOTFS_UNCHECKED));
+        let reason = absent.reason.as_deref().unwrap();
+        assert!(reason.contains("cannot read"), "{reason}");
+
+        // An ordinary infrastructure row is no v2 refusal.
+        assert!(!is_v2_retry_refusal(&infrastructure_error_result(
+            &context,
+            &cell,
+            "spawn failed".into()
+        )));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn cell_retry_attempts_use_distinct_artifact_directories() {
         let root = PathBuf::from("/tmp/hermit-cell-retry-artifact-fixture");
@@ -17611,6 +18156,7 @@ fi
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         assert_eq!(
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
@@ -22998,6 +23544,7 @@ int main(int argc, char **argv) {
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
 
         let result = run_cell(&context, &cell).unwrap();
@@ -23080,6 +23627,7 @@ int main(int argc, char **argv) {
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let result = host_inapplicable_result(
             &context,
@@ -23212,6 +23760,7 @@ int main(int argc, char **argv) {
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let path = root.join("results.jsonl");
         prepare_result_path(&path).unwrap();
@@ -23496,6 +24045,7 @@ backends_disabled:
                 isolated_workdir: None,
                 shares_ld_so_cache: false,
                 exact_branch_counter: None,
+                v2_retry_oci_dir: None,
             };
             let spec = build_spec(
                 &context,
@@ -23579,6 +24129,7 @@ backends_disabled:
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let spec = build_spec(
             &context,
@@ -23644,6 +24195,7 @@ backends_disabled:
             isolated_workdir: Some(PathBuf::from("/test")),
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let spec = build_spec(
             &context,
@@ -24068,6 +24620,7 @@ backends_disabled:
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let spec = build_spec(
             &context,
@@ -24435,6 +24988,7 @@ backends_disabled:
             isolated_workdir,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let manifests = ManifestSet::load(&root).unwrap();
         let [cell] = manifests
@@ -24573,6 +25127,7 @@ backends_disabled:
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let spec = build_spec(
             &context,
@@ -25171,6 +25726,303 @@ backends_disabled:
             sabre_path_evidence_sha256: Some("b".into()),
             reason: None,
         }
+    }
+
+    fn loader_rejected_attempt(exit_code: i32, stderr: &str) -> AttemptResult {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason =
+            Some(crate::canonical_verdict::NoResultReason::FirstRunRejected {
+                exit_code: Some(exit_code),
+                signal: None,
+                stdout_bytes: 0,
+                stderr_bytes: stderr.len() as u64,
+            });
+        let mut attempt = attempt_with_sabre_evidence("unused");
+        attempt.verification_report = Some(serde_json::to_string(&report).unwrap());
+        attempt.stderr = stderr.into();
+        attempt
+    }
+
+    #[test]
+    fn loader_v2_rejection_needs_the_typed_127_and_the_loader_line() {
+        let line = "Fatal glibc error: CPU does not support x86-64-v3\n";
+        assert!(loader_v2_rejection(&loader_rejected_attempt(127, line)));
+        // The level digit is not part of the signature.
+        assert!(loader_v2_rejection(&loader_rejected_attempt(
+            127,
+            "Fatal glibc error: CPU does not support x86-64-v4\n"
+        )));
+        // A typed rejection at another status is an ordinary guest failure.
+        assert!(!loader_v2_rejection(&loader_rejected_attempt(1, line)));
+        // Exit 127 without the loader line is not a loader rejection.
+        assert!(!loader_v2_rejection(&loader_rejected_attempt(
+            127,
+            "guest: command not found\n"
+        )));
+        // The line without the typed report earns nothing.
+        let mut untyped = loader_rejected_attempt(127, line);
+        untyped.verification_report = None;
+        assert!(!loader_v2_rejection(&untyped));
+    }
+
+    /// An attempt whose retained report compared two runs under `verdict`,
+    /// the left run exiting `left` and the right `right`, with `stderr`
+    /// captured.
+    fn compared_runs_attempt(
+        verdict: Verdict,
+        left: i32,
+        right: i32,
+        stderr: &str,
+    ) -> AttemptResult {
+        let mut report = canonical_verification_report();
+        report.verdict = verdict;
+        report.verified = verdict == Verdict::Matched;
+        report.bitwise_parity = verdict == Verdict::Matched;
+        let outputs = report.compared_outputs.as_mut().unwrap();
+        outputs.left.exit_code = Some(left);
+        outputs.right.exit_code = Some(right);
+        report.guest_exit_code = Some(left);
+        let mut attempt = attempt_with_sabre_evidence("unused");
+        attempt.verification_report = Some(serde_json::to_string(&report).unwrap());
+        attempt.stderr = stderr.into();
+        attempt
+    }
+
+    /// A cell that declares a non-zero guest disposition runs with
+    /// `--verify-allow=failure`, so a loader rejection reaches a comparison of
+    /// two runs that both exited 127 instead of `first_run_rejected` (issue
+    /// 5476; c-programs/nanosleep-threads-simple, which declares signal 11).
+    /// A matched comparison of two runs at 127, with the loader's line in the
+    /// attempt's stderr, is a loader rejection. It is not one without the
+    /// line, with one run at another status, with the line only in stdout,
+    /// or when the runs diverged. Each inner attempt is decided from its own
+    /// report and output: one qualifying attempt is enough, and halves from
+    /// two attempts never combine.
+    #[test]
+    fn loader_v2_rejection_takes_a_matched_pair_of_refused_runs() {
+        let line = "Fatal glibc error: CPU does not support x86-64-v3\n";
+        let refused = compared_runs_attempt(Verdict::Matched, 127, 127, line);
+        assert!(loader_v2_rejection(&refused));
+        assert!(!loader_v2_rejection(&compared_runs_attempt(
+            Verdict::Matched,
+            127,
+            127,
+            "guest: command not found\n"
+        )));
+        for (left, right) in [(127, 0), (0, 127), (127, 1)] {
+            assert!(
+                !loader_v2_rejection(&compared_runs_attempt(Verdict::Matched, left, right, line)),
+                "runs exited {left} and {right}"
+            );
+        }
+        let mut in_stdout = compared_runs_attempt(Verdict::Matched, 127, 127, "");
+        in_stdout.stdout = line.into();
+        assert!(!loader_v2_rejection(&in_stdout));
+        // Two refused runs that diverged differ in Hermit's own work before
+        // exec: a determinism failure, which stays visible.
+        assert!(!loader_v2_rejection(&compared_runs_attempt(
+            Verdict::Diverged,
+            127,
+            127,
+            line
+        )));
+
+        let mut row = cell_result_that_located_nothing();
+        row.attempts = vec![
+            compared_runs_attempt(Verdict::Matched, 0, 0, ""),
+            refused.clone(),
+        ];
+        assert!(loader_v2_rejected(&row));
+        // One attempt has both runs at 127 but no line, the other the line
+        // beside runs that exited 0: neither is a rejection on its own.
+        row.attempts = vec![
+            compared_runs_attempt(Verdict::Matched, 127, 127, ""),
+            compared_runs_attempt(Verdict::Matched, 0, 0, line),
+        ];
+        assert!(!loader_v2_rejected(&row));
+    }
+
+    /// An attempt whose retained report is a typed `run_failed` of `run` with
+    /// `failure`, as `hermit log-diff` writes one from a `--verify-run` record,
+    /// with `stderr` captured. The detail is Hermit's own words for a policy
+    /// refusal, which name no cause.
+    fn run_failed_attempt(
+        run: crate::canonical_verdict::VerificationRun,
+        failure: crate::canonical_verdict::RunFailure,
+        stderr: &str,
+    ) -> AttemptResult {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(crate::canonical_verdict::NoResultReason::RunFailed {
+            run,
+            failure,
+            detail: "Hermit refused the run: a fail-closed policy stopped it before completion. \
+                     This is not a hermit failure; the refusal reason is above."
+                .into(),
+        });
+        let mut attempt = attempt_with_sabre_evidence("unused");
+        attempt.verification_report = Some(serde_json::to_string(&report).unwrap());
+        attempt.stderr = stderr.into();
+        attempt
+    }
+
+    /// The stderr of a run Hermit refused with `refusal` on the ptrace
+    /// backend, as measured: the refusal line, the policy-refusal class line,
+    /// then Hermit's error.
+    fn refused_run_stderr(refusal: &str) -> String {
+        format!(
+            "{refusal}\nHERMIT_POLICY_REFUSAL class=policy-refusal\nError: Hermit refused the \
+             run: a fail-closed policy stopped it before completion. This is not a hermit \
+             failure; the refusal reason is above.\n"
+        )
+    }
+
+    /// Hermit's refusal of a program interpreter's CPU-level abort under
+    /// `profile`, the interpreter having printed glibc's message for `level`,
+    /// followed by `why` (detcore/src/loader_cpu_abort.rs, `Watch::refusal`).
+    fn interpreter_refusal(profile: &str, level: &str, why: &str) -> String {
+        format!(
+            "--cpu-profile {profile} refused: the program interpreter \
+             /usr/lib64/ld-linux-x86-64.so.2 of /work/program stopped before the program \
+             started, printing \"Fatal glibc error: CPU does not support {level}\" and exiting \
+             127; {why}"
+        )
+    }
+
+    /// Where Hermit watches the program interpreter (the ptrace backend), it
+    /// replaces the loader's exit 127 with a typed refusal and exits 122
+    /// itself (detcore/src/loader_cpu_abort.rs). A typed `run_failed` of run 1
+    /// with failure `policy_refusal`, beside Hermit's refusal of an x86-64-v3
+    /// interpreter on the x86-64-v2 CPU as a line of the attempt's stderr, is
+    /// a loader rejection, whether or not a chaos pair ran its second run.
+    /// Another policy refusal is not, nor an interpreter refusal that quotes
+    /// another level or comes under another profile (Hermit's CPU table would
+    /// then lack a feature, a defect to report, not a host's loader), nor the
+    /// refusal line beside another failure, a refusal of run 2, in stdout,
+    /// inside another line, or without a report. Each inner attempt is decided
+    /// from its own report and output. The refusal texts are the ones Hermit
+    /// printed in the measured runs, with the paths replaced.
+    #[test]
+    fn loader_v2_rejection_takes_the_typed_interpreter_refusal() {
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        let v3_on_v2 = interpreter_refusal(
+            "x86-64-v2",
+            "x86-64-v3",
+            "the x86-64-v2 CPU this profile presents is below the x86-64-v3 it was built for; \
+             rerun with --cpu-profile x86-64-v3, on a host that qualifies for it",
+        );
+        let policy_refused = |stderr: &str| {
+            run_failed_attempt(VerificationRun::Run1, RunFailure::PolicyRefusal, stderr)
+        };
+        let refused = policy_refused(&refused_run_stderr(&v3_on_v2));
+        assert!(loader_v2_rejection(&refused));
+        // A chaos pair admits its second run, which is refused the same way;
+        // the report is still run 1's refusal.
+        let twice = refused_run_stderr(&v3_on_v2).repeat(2);
+        assert!(loader_v2_rejection(&policy_refused(&twice)));
+
+        let defect = "Hermit's CPU table lacks a feature the loader checks, so please report this \
+                      message";
+        for (label, stderr) in [
+            (
+                "an x86-64-v3 admission refused for the host's XCR0",
+                "HERMIT_POLICY_REFUSAL class=policy-refusal\nError: --cpu-profile x86-64-v3 \
+                 refused: XCR0 0x2ff enables components the XINUSE probe does not cover (it \
+                 covers 0x2e7)\n     > Hermit refused the run: a fail-closed policy stopped it \
+                 before completion. This is not a hermit failure; the refusal reason is above.\n"
+                    .to_string(),
+            ),
+            (
+                "an x86-64-v2 interpreter on the x86-64-v2 CPU",
+                refused_run_stderr(&interpreter_refusal(
+                    "x86-64-v2",
+                    "x86-64-v2",
+                    &format!(
+                        "although this profile presents x86-64-v2, which satisfies x86-64-v2: {defect}"
+                    ),
+                )),
+            ),
+            (
+                "an x86-64-v3 interpreter under the x86-64-v3 profile",
+                refused_run_stderr(&interpreter_refusal(
+                    "x86-64-v3",
+                    "x86-64-v3",
+                    &format!(
+                        "although this profile presents x86-64-v3, which satisfies x86-64-v3: {defect}"
+                    ),
+                )),
+            ),
+            (
+                "the loader's own line alone",
+                "Fatal glibc error: CPU does not support x86-64-v3\n".to_string(),
+            ),
+            (
+                "the refusal inside another line",
+                format!("guest: {v3_on_v2}\n"),
+            ),
+        ] {
+            assert!(!loader_v2_rejection(&policy_refused(&stderr)), "{label}");
+        }
+        for (run, failure) in [
+            (VerificationRun::Run1, RunFailure::BackendFailure),
+            (VerificationRun::Run2, RunFailure::PolicyRefusal),
+        ] {
+            assert!(
+                !loader_v2_rejection(&run_failed_attempt(
+                    run,
+                    failure,
+                    &refused_run_stderr(&v3_on_v2)
+                )),
+                "{run:?} {failure:?}"
+            );
+        }
+        let mut in_stdout = policy_refused("");
+        in_stdout.stdout = refused_run_stderr(&v3_on_v2);
+        assert!(!loader_v2_rejection(&in_stdout));
+        let mut untyped = refused.clone();
+        untyped.verification_report = None;
+        assert!(!loader_v2_rejection(&untyped));
+
+        // One attempt has run 1's policy refusal without the line, the other
+        // the line beside runs that exited 0: neither is a rejection on its
+        // own, and together they are not one.
+        let mut row = cell_result_that_located_nothing();
+        row.attempts = vec![
+            policy_refused("HERMIT_POLICY_REFUSAL class=policy-refusal\n"),
+            compared_runs_attempt(Verdict::Matched, 0, 0, &refused_run_stderr(&v3_on_v2)),
+        ];
+        assert!(!loader_v2_rejected(&row));
+        row.attempts.push(refused);
+        assert!(loader_v2_rejected(&row));
+    }
+
+    #[test]
+    fn v2_oci_dir_env_must_name_an_absolute_oci_layout() {
+        assert_eq!(v2_oci_dir_from_env(None).unwrap(), None);
+        assert!(
+            v2_oci_dir_from_env(Some("relative/rootfs".into()))
+                .unwrap_err()
+                .contains("must be an absolute oci-dir path")
+        );
+        let dir =
+            std::env::temp_dir().join(format!("hermit-runner-v2-rootfs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            v2_oci_dir_from_env(Some(dir.clone().into_os_string()))
+                .unwrap_err()
+                .contains("holds no oci-layout file")
+        );
+        fs::write(
+            dir.join("oci-layout"),
+            b"{\"imageLayoutVersion\": \"1.0.0\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            v2_oci_dir_from_env(Some(dir.clone().into_os_string())).unwrap(),
+            Some(dir.clone())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -31661,6 +32513,7 @@ cp "{}" "$verdict"
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let error = run_preparation(
             &context,
@@ -31725,6 +32578,7 @@ cp "{}" "$verdict"
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
         let test = recipe(true);
         let cell = SelectedCell {
@@ -31932,6 +32786,7 @@ cp "{}" "$verdict"
             isolated_workdir: None,
             shares_ld_so_cache: false,
             exact_branch_counter: None,
+            v2_retry_oci_dir: None,
         };
 
         fs::create_dir_all(cell_dir.join("fixtures")).unwrap();
