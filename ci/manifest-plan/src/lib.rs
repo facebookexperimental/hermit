@@ -65,6 +65,7 @@ pub mod invocation_cgroup;
 pub mod known_gaps;
 pub mod landing_branch;
 pub mod ledger;
+pub mod libc_isa;
 #[cfg_attr(not(buck_build), path = "../../../hermit-cli/src/logdiff_report.rs")]
 #[cfg_attr(buck_build, path = "../mapped/hermit-cli/logdiff_report.rs")]
 pub mod logdiff_report;

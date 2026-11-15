@@ -6368,6 +6368,7 @@ pub fn build_spec(
                 equalized_roots: &named_roots,
                 env: &env,
                 guest_argv: &guest_argv,
+                replay_cpu_profile: replay_cpu_profile(cell, backend, &dir, &guest_argv),
             });
             (argv, Some(verdict))
         }
@@ -6486,6 +6487,9 @@ struct VerifiedInvocationArgs<'a> {
     equalized_roots: &'a [EqualizedRoot],
     env: &'a BTreeMap<String, String>,
     guest_argv: &'a [String],
+    /// The CPU profile a replay attempt's `record start` names
+    /// ([`replay_cpu_profile`]); `None` for every other attempt.
+    replay_cpu_profile: Option<&'static str>,
 }
 
 /// The backends that run Detcore inside the guest process with in-guest
@@ -6743,6 +6747,48 @@ fn names_parity_golden_profile(
             .any(|arg| arg == NO_VIRTUALIZE_CPUID_ARG)
 }
 
+/// The CPU profile a replay cell's `record start` names: x86-64-v3 where the
+/// C library of the cell's program needs it ([`crate::libc_isa`]), and none
+/// elsewhere, where auto keeps choosing. `record start` resolves auto from
+/// what the program and its interpreter declare, and reads no shared
+/// library. So on a host whose glibc declares its need only in `libc.so.6`
+/// (CentOS 10), auto would present x86-64-v2 and the loader would refuse the
+/// guest before it starts. A host that cannot qualify x86-64-v3 refuses the
+/// named profile by name instead.
+///
+/// It applies only to a replay cell on the ptrace backend, the one backend
+/// that carries x86-64-v3, with no image, whose recipe names no profile and
+/// keeps CPUID virtualized. The program must be the cell's own build output
+/// under the attempt directory `dir`, as every compiled (C or Rust) program
+/// is; a script, a command or a host program elsewhere keeps auto, and on a
+/// CentOS 10 host such a cell stays red at the loader.
+///
+/// So on a CentOS 10 host the cells this names a profile for no longer
+/// exercise `record start`'s own automatic choice. Once Hermit's auto reads
+/// the C library itself (a planned Hermit change), remove this so that they
+/// do again.
+fn replay_cpu_profile(
+    cell: &SelectedCell,
+    backend: &str,
+    dir: &Path,
+    guest_argv: &[String],
+) -> Option<&'static str> {
+    if cell.id.mode != "replay" || backend != "ptrace" || cell.image.is_some() {
+        return None;
+    }
+    if cell_hermit_args(&cell.test.modes[&cell.id.mode], backend)
+        .iter()
+        .any(|arg| arg.starts_with("--cpu-profile") || arg == NO_VIRTUALIZE_CPUID_ARG)
+    {
+        return None;
+    }
+    let program = Path::new(guest_argv.first()?);
+    if !program.starts_with(dir) {
+        return None;
+    }
+    crate::libc_isa::replay_profile_arg(program)
+}
+
 /// The one argv builder for verify, replay and chaos cells.
 ///
 /// The three modes run the same guest under the same base environment,
@@ -6765,6 +6811,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         equalized_roots,
         env,
         guest_argv,
+        replay_cpu_profile,
     } = args;
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let hermit = context.hermit_bin.to_string_lossy().into_owned();
@@ -6778,6 +6825,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     let verify_strict = match invocation {
         VerifiedInvocation::Replay { .. } => {
             argv.extend(["record".into(), "start".into()]);
+            argv.extend(replay_cpu_profile.map(str::to_string));
             context.record_verify_strict
         }
         VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
@@ -30101,6 +30149,117 @@ cp "{}" "$verdict"
             "{:?}",
             spec.argv
         );
+    }
+
+    /// A replay cell's `record start` names x86-64-v3, right after the
+    /// subcommand, where the C library beside its program's glibc
+    /// interpreter needs x86-64-v3 (`replay_cpu_profile`). These keep auto:
+    /// a verify cell of the same program, a replay cell whose libc needs
+    /// x86-64-v2, one whose program lies outside its attempt directory, one
+    /// with an image, and one whose recipe names a profile.
+    #[test]
+    fn a_replay_cell_names_x86_64_v3_where_its_programs_libc_needs_it() {
+        use crate::libc_isa::LIBC_V3_PROFILE_ARG;
+        use crate::libc_isa::tests::glibc_layout;
+        let context = run_context(Path::new("/repo"));
+        let root = std::env::temp_dir().join(format!("runner-libc-v3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let attempt = root.join("v3");
+        fs::create_dir_all(attempt.join("fixtures")).unwrap();
+        let program = glibc_layout(&attempt.join("fixtures"), Some(0b111));
+        let spec = |cell: &SelectedCell, dir: &Path, program: &Path| {
+            build_spec(
+                &context,
+                cell,
+                dir.to_path_buf(),
+                vec![program.to_string_lossy().into_owned()],
+                "1",
+                None,
+                15,
+            )
+            .unwrap()
+            .argv
+        };
+        let names_v3 = |argv: &[String]| argv.iter().any(|arg| arg == LIBC_V3_PROFILE_ARG);
+
+        let replay = spec(&ptrace_cell("replay"), &attempt, &program);
+        let start = replay
+            .windows(2)
+            .position(|pair| pair == ["record", "start"])
+            .unwrap();
+        assert_eq!(replay[start + 2], LIBC_V3_PROFILE_ARG, "{replay:?}");
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|arg| arg.starts_with("--cpu-profile"))
+                .count(),
+            1,
+            "{replay:?}"
+        );
+
+        let verify = spec(&ptrace_cell("verify"), &attempt, &program);
+        assert!(!names_v3(&verify), "{verify:?}");
+
+        let v2 = root.join("v2");
+        fs::create_dir_all(v2.join("fixtures")).unwrap();
+        let program_v2 = glibc_layout(&v2.join("fixtures"), Some(0b11));
+        let replay_v2 = spec(&ptrace_cell("replay"), &v2, &program_v2);
+        assert!(!names_v3(&replay_v2), "{replay_v2:?}");
+
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let outside = spec(&ptrace_cell("replay"), &elsewhere, &program);
+        assert!(!names_v3(&outside), "{outside:?}");
+
+        let guest = [program.to_string_lossy().into_owned()];
+        assert_eq!(
+            replay_cpu_profile(&ptrace_cell("replay"), "ptrace", &attempt, &guest),
+            Some(LIBC_V3_PROFILE_ARG)
+        );
+        // Only a replay cell reads its program's C library.
+        assert_eq!(
+            replay_cpu_profile(&ptrace_cell("verify"), "ptrace", &attempt, &guest),
+            None
+        );
+        // And only on ptrace, the one backend that carries x86-64-v3.
+        for backend in [
+            "native",
+            "e9patch",
+            "kvm",
+            "dbt",
+            "sabre",
+            "liteinst",
+            "in-guest-trap",
+        ] {
+            assert_eq!(
+                replay_cpu_profile(&ptrace_cell("replay"), backend, &attempt, &guest),
+                None,
+                "{backend}"
+            );
+        }
+        let mut imaged = ptrace_cell("replay");
+        imaged.image = Some("oci-dir:/images/fixture".into());
+        assert_eq!(
+            replay_cpu_profile(&imaged, "ptrace", &attempt, &guest),
+            None
+        );
+        for named in ["--cpu-profile=x86-64-v2", NO_VIRTUALIZE_CPUID_ARG] {
+            let mut cell = ptrace_cell("replay");
+            cell.test
+                .modes
+                .get_mut("replay")
+                .unwrap()
+                .hermit_args
+                .entry("ptrace".into())
+                .or_default()
+                .push(named.into());
+            assert_eq!(
+                replay_cpu_profile(&cell, "ptrace", &attempt, &guest),
+                None,
+                "{named}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// Verify, replay and chaos argv come from one builder: replay runs the
