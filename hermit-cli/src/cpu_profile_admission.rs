@@ -525,6 +525,47 @@ fn resolve_auto_on(
     to_host: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(CpuProfile, String), String> {
     use detcore::exec_record::IsaNeeds;
+    let image = exec_image(program, &to_host)?;
+    let needs = isa_needs_on(host, &image);
+    let mut objects = vec![(format!("the executable {}", image.display()), needs)];
+    if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
+        // Refused as unreadable or malformed, before its interpreter.
+        return auto_profile_on(host, &objects);
+    }
+    // An image built for this host's own machine, on a host that is not
+    // x86-64, names its interpreter in the same `PT_INTERP`.
+    let machine = elf64_machine(&image)
+        .filter(|&machine| host != EM_X86_64 && machine == host)
+        .unwrap_or(EM_X86_64);
+    match detcore::exec_record::program_interpreter_of(&image, machine) {
+        Ok(None) => {}
+        Ok(Some(interpreter)) => {
+            let Some(interpreter_on_host) = to_host(&interpreter) else {
+                return Err(format!(
+                    "its program interpreter {} is hidden by a mount",
+                    interpreter.display()
+                ));
+            };
+            objects.push((
+                format!("its program interpreter {}", interpreter.display()),
+                interpreter_isa_needs_on(host, &interpreter_on_host),
+            ));
+        }
+        Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
+    }
+    auto_profile_on(host, &objects)
+}
+
+/// The image the kernel would exec for `program`, a host path in the
+/// launch's completed view: `program` itself, or the interpreter of each
+/// script in turn, as the kernel follows it (Detcore's `script_interpreter`),
+/// each mapped through `to_host`, through at most [`MAX_SCRIPT_HOPS`]
+/// scripts. A script whose interpreter a mount hides, one the kernel would
+/// not run, an unreadable one and a longer chain refuse, by name.
+fn exec_image(
+    program: &Path,
+    to_host: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
     use detcore::exec_record::Script;
     let mut image = program.to_path_buf();
     for _ in 0..=MAX_SCRIPT_HOPS {
@@ -554,34 +595,105 @@ fn resolve_auto_on(
             program.display()
         ));
     }
-    let needs = isa_needs_on(host, &image);
-    let mut objects = vec![(format!("the executable {}", image.display()), needs)];
-    if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
-        // Refused as unreadable or malformed, before its interpreter.
-        return auto_profile_on(host, &objects);
+    Ok(image)
+}
+
+/// The file name of glibc's x86-64 program interpreter.
+const GLIBC_X86_64_INTERPRETER: &str = "ld-linux-x86-64.so.2";
+
+/// The file name of glibc's C library, which [`libc_needs_v3`] reads beside
+/// glibc's program interpreter. The loader does not search its own
+/// directory; that file is read because the loader and its C library come
+/// from one glibc build.
+const GLIBC_C_LIBRARY: &str = "libc.so.6";
+
+/// How many symlinks of one file's own name [`libc_needs_v3`] follows (the
+/// interpreter's, then the C library's), as many as the kernel follows in one
+/// path walk (`MAXSYMLINKS`).
+const MAX_FOLLOWED_LINKS: usize = 40;
+
+/// What an `admitted` choice says where the program's C library declares
+/// x86-64-v3 ([`name_libc_need`]).
+pub const LIBC_V3_DETAIL: &str =
+    "the C library beside the program interpreter declares that it needs x86-64-v3";
+
+/// Whether the C library of the image `program` execs first declares that it
+/// needs x86-64-v3, where its own and its interpreter's declarations do not
+/// need to say so ([`resolve_auto`]). This is the `libc.so.6` in the
+/// directory of that image's glibc program interpreter, after the symlinks
+/// of the interpreter's own name, and then after the symlinks of its own.
+///
+/// glibc's loader and its C library come from one build (they share
+/// `GLIBC_PRIVATE`), so that file declares what the C library the loader
+/// maps declares, and auto does not repeat the loader's search. CentOS 10's
+/// glibc declares x86-64-v3 in `libc.so.6` alone; its loader declares no
+/// need.
+///
+/// Paths are read in the launch's view, as [`resolve_auto`] reads them:
+/// `program` is a host path, a script's interpreter and an absolute symlink
+/// target are guest paths mapped through `to_host`, and a relative target
+/// stays in its link's directory ([`followed_in_view`]). The C library is
+/// opened without blocking and without following a final link, and only a
+/// regular file is read, so a FIFO or a device there never makes auto wait.
+/// Nothing here refuses. A library that is absent, hidden, unreadable, not a
+/// regular file, unmarked, malformed, or declaring another level gives
+/// `false`, and glibc's own check still refuses a guest that needs more than
+/// its profile presents.
+pub fn libc_needs_v3(program: &Path, to_host: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+    use detcore::exec_record::IsaNeeds;
+    if host_machine() != EM_X86_64 {
+        return false;
     }
-    // An image built for this host's own machine, on a host that is not
-    // x86-64, names its interpreter in the same `PT_INTERP`.
-    let machine = elf64_machine(&image)
-        .filter(|&machine| host != EM_X86_64 && machine == host)
-        .unwrap_or(EM_X86_64);
-    match detcore::exec_record::program_interpreter_of(&image, machine) {
-        Ok(None) => {}
-        Ok(Some(interpreter)) => {
-            let Some(interpreter_on_host) = to_host(&interpreter) else {
-                return Err(format!(
-                    "its program interpreter {} is hidden by a mount",
-                    interpreter.display()
-                ));
-            };
-            objects.push((
-                format!("its program interpreter {}", interpreter.display()),
-                interpreter_isa_needs_on(host, &interpreter_on_host),
-            ));
+    let read = || -> Option<bool> {
+        let image = exec_image(program, &to_host).ok()?;
+        let interpreter =
+            detcore::exec_record::program_interpreter_of(&image, EM_X86_64).ok()??;
+        if interpreter.file_name()? != std::ffi::OsStr::new(GLIBC_X86_64_INTERPRETER) {
+            return None;
         }
-        Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
+        let loader = followed_in_view(to_host(&interpreter)?, &to_host)?;
+        let library = followed_in_view(loader.parent()?.join(GLIBC_C_LIBRARY), &to_host)?;
+        let file = detcore::util::RawFd::open(
+            &library,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW,
+        )
+        .ok()?;
+        if file.stat().ok()?.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return None;
+        }
+        Some(matches!(
+            IsaNeeds::read_file_strict(&file),
+            Some(IsaNeeds::Level(3))
+        ))
+    };
+    read().unwrap_or(false)
+}
+
+/// The host path `path` leads to after the symlinks of its own name, as the
+/// kernel follows them in the launch's view: an absolute target is a guest
+/// path mapped through `to_host`, and a relative one stays in its link's
+/// directory. `None` for a path that is absent or hidden, and past
+/// [`MAX_FOLLOWED_LINKS`] links, as for a loop.
+fn followed_in_view(
+    mut path: PathBuf,
+    to_host: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    for _ in 0..=MAX_FOLLOWED_LINKS {
+        if !std::fs::symlink_metadata(&path)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return Some(path);
+        }
+        let target = std::fs::read_link(&path).ok()?;
+        path = if target.is_absolute() {
+            to_host(&target)?
+        } else {
+            path.parent()?.join(target)
+        };
     }
-    auto_profile_on(host, &objects)
+    None
 }
 
 /// [`detcore::exec_record::auto_profile`] of `objects` on a host of ELF
@@ -668,8 +780,9 @@ pub enum ProfileReason {
     Explicit,
     /// auto, from what the program and its interpreter declare: x86-64-v3
     /// where one declares it, admitted afterwards as an explicit x86-64-v3
-    /// is; and for `hermit record start`, which never qualifies the host for
-    /// auto, x86-64-v2 otherwise.
+    /// is; and for `hermit record start`, which qualifies the host for auto
+    /// only where the program's C library needs x86-64-v3
+    /// ([`choose_record_auto`]), x86-64-v2 otherwise.
     Declared,
     /// auto: this run's x86-64-v3 admission passed.
     Admitted,
@@ -715,7 +828,8 @@ pub struct ProfileChoice {
     pub profile: CpuProfile,
     pub reason: ProfileReason,
     /// For `qualification-refused` and `request-not-admissible`, the
-    /// refusal's own words.
+    /// refusal's own words; for an `admitted` choice whose program's C
+    /// library declares x86-64-v3 ([`name_libc_need`]), [`LIBC_V3_DETAIL`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -727,6 +841,9 @@ impl ProfileChoice {
         match self.reason {
             ProfileReason::Explicit => "named".to_owned(),
             ProfileReason::Declared => "from the program's declarations".to_owned(),
+            ProfileReason::Admitted if self.detail.is_some() => {
+                format!("{detail}, and this run and host qualify for x86-64-v3")
+            }
             ProfileReason::Admitted => "this run and host qualify for x86-64-v3".to_owned(),
             ProfileReason::Hypervisor => {
                 "under a hypervisor, auto does not qualify the host for x86-64-v3".to_owned()
@@ -868,6 +985,60 @@ fn choose_auto_with(
             ),
         },
     })
+}
+
+/// The profile `hermit record start` records under `--cpu-profile auto`,
+/// for a program whose own and interpreter's declarations ask for `needs`
+/// ([`resolve_auto`]) and whose C library does or does not declare x86-64-v3
+/// (`libc_v3`, [`libc_needs_v3`]):
+/// - `needs`, from the declarations alone (`declared`), wherever the C
+///   library asks no more, so that the recording does not depend on the host;
+/// - where only the C library declares x86-64-v3, a program that runs at
+///   x86-64-v2 on no host, the answer [`choose_auto`] gives `hermit run` for
+///   this recording's request: x86-64-v3 where the recording and host
+///   qualify (`admitted`, with [`LIBC_V3_DETAIL`]), and x86-64-v2 elsewhere,
+///   where glibc then refuses the guest, as it would without this read.
+///
+/// An `Err` is a malformed [`AUTO_HOST_TEST_ENV`].
+pub fn choose_record_auto(needs: CpuProfile, libc_v3: bool) -> Result<AutoChoice, String> {
+    choose_record_auto_with(needs, libc_v3, |request| choose_auto(needs, request))
+}
+
+/// [`choose_record_auto`] with auto's choice for a request as a parameter,
+/// for the tests. It is asked only where the C library alone declares
+/// x86-64-v3.
+fn choose_record_auto_with(
+    needs: CpuProfile,
+    libc_v3: bool,
+    choose: impl FnOnce(&AdmissionRequest<'_>) -> Result<AutoChoice, String>,
+) -> Result<AutoChoice, String> {
+    if needs == CpuProfile::X86_64V3 || !libc_v3 {
+        return Ok(AutoChoice {
+            choice: ProfileChoice {
+                profile: needs,
+                reason: ProfileReason::Declared,
+                detail: None,
+            },
+            log: Vec::new(),
+        });
+    }
+    Ok(name_libc_need(
+        choose(&record_or_replay_request(false))?,
+        true,
+    ))
+}
+
+/// Names the C library in an x86-64-v3 the host admitted (`admitted`) for a
+/// program whose C library declares that it needs x86-64-v3 (`libc_v3`,
+/// [`libc_needs_v3`]), with [`LIBC_V3_DETAIL`]: that declaration is why the
+/// program runs at x86-64-v2 on no host. `hermit run` and `hermit record
+/// start` both name it, so the two record the same choice for one program and
+/// host. Every other choice is left as it is.
+pub fn name_libc_need(mut auto: AutoChoice, libc_v3: bool) -> AutoChoice {
+    if libc_v3 && auto.choice.reason == ProfileReason::Admitted {
+        auto.choice.detail = Some(LIBC_V3_DETAIL.to_owned());
+    }
+    auto
 }
 
 /// What [`AUTO_HOST_TEST_ENV`] forces: the hypervisor bit, or a refusal.
@@ -1569,7 +1740,7 @@ fn non_x86_refusal() -> AdmissionRefusal {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     /// A report the default probe could produce for `xcr0`.
@@ -2729,5 +2900,484 @@ mod tests {
         // than classifying the host file its target shadows.
         let why = super::resolve_auto(&a, |_| None).unwrap_err();
         assert!(why.contains("is hidden by a mount"), "{why}");
+    }
+
+    /// A little-endian x86-64 ELF64 image naming `interpreter` in its
+    /// `PT_INTERP`, and declaring `needed` (`GNU_PROPERTY_X86_ISA_1_NEEDED`
+    /// bits) in the `NT_GNU_PROPERTY_TYPE_0` note of a `PT_GNU_PROPERTY`
+    /// segment; with `malformed`, that segment ends in a truncated note
+    /// header, which a strict read cannot decide.
+    pub(crate) fn isa_image(
+        interpreter: Option<&std::path::Path>,
+        needed: Option<u32>,
+        malformed: bool,
+    ) -> Vec<u8> {
+        let mut segments = Vec::new();
+        if let Some(interpreter) = interpreter {
+            let mut name = interpreter.as_os_str().as_encoded_bytes().to_vec();
+            name.push(0);
+            segments.push((3_u32, name, 1_u64)); // PT_INTERP
+        }
+        if let Some(bits) = needed {
+            let mut note = Vec::new();
+            note.extend_from_slice(&4_u32.to_le_bytes()); // n_namesz
+            note.extend_from_slice(&16_u32.to_le_bytes()); // n_descsz
+            note.extend_from_slice(&5_u32.to_le_bytes()); // NT_GNU_PROPERTY_TYPE_0
+            note.extend_from_slice(b"GNU\0");
+            note.extend_from_slice(&0xc000_8002_u32.to_le_bytes()); // GNU_PROPERTY_X86_ISA_1_NEEDED
+            note.extend_from_slice(&4_u32.to_le_bytes()); // pr_datasz
+            note.extend_from_slice(&bits.to_le_bytes());
+            note.extend_from_slice(&[0; 4]); // ELF64 pads a property to 8 bytes.
+            if malformed {
+                note.extend_from_slice(&[0; 8]);
+            }
+            segments.push((0x6474_e553, note, 8)); // PT_GNU_PROPERTY
+        }
+        let mut file = vec![0_u8; 64];
+        file[..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2; // ELFCLASS64
+        file[5] = 1; // ELFDATA2LSB
+        file[6] = 1; // EV_CURRENT
+        file[16..18].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN
+        file[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        file[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        file[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+        file[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        file[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        file[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        // The contents follow the program headers, each segment 8-aligned.
+        let start = 64 + 56 * segments.len();
+        let mut data = Vec::new();
+        for (kind, contents, align) in &segments {
+            let offset = (start + data.len()) as u64;
+            let size = (contents.len() as u64).to_le_bytes();
+            let mut entry = [0_u8; 56];
+            entry[..4].copy_from_slice(&kind.to_le_bytes());
+            entry[8..16].copy_from_slice(&offset.to_le_bytes()); // p_offset
+            entry[16..24].copy_from_slice(&offset.to_le_bytes()); // p_vaddr
+            entry[32..40].copy_from_slice(&size); // p_filesz
+            entry[40..48].copy_from_slice(&size); // p_memsz
+            entry[48..56].copy_from_slice(&align.to_le_bytes());
+            file.extend_from_slice(&entry);
+            data.extend_from_slice(contents);
+            data.resize(data.len().next_multiple_of(8), 0);
+        }
+        file.extend(data);
+        file
+    }
+
+    /// Writes `bytes` at `path`, making its directory.
+    pub(crate) fn put(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The C library beside glibc's program interpreter decides: one whose
+    /// highest needed level is x86-64-v3 gives `true`; any other level, no
+    /// declaration, one beside a note a strict read cannot decide, a file
+    /// that is no image and no file give `false`. The interpreter declares
+    /// nothing, as CentOS Stream 10's does.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_reads_the_c_library_beside_glibcs_interpreter() {
+        use detcore::exec_record::IsaNeeds;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        put(&loader, &isa_image(None, None, false));
+        let program = root.join("program");
+        put(&program, &isa_image(Some(&loader), None, false));
+        let libc = root.join("lib64").join(GLIBC_C_LIBRARY);
+        for (needed, v3) in [
+            (Some(0b111), true),
+            (Some(0b100), true),
+            (Some(0b11), false),
+            (Some(0b1), false),
+            (Some(0), false),
+            (Some(0b1111), false),
+            (None, false),
+        ] {
+            put(&libc, &isa_image(None, needed, false));
+            assert_eq!(libc_needs_v3(&program, same), v3, "{needed:?}");
+        }
+        // Read strictly, as the program's own declaration is: a lenient read
+        // would take this x86-64-v3.
+        put(&libc, &isa_image(None, Some(0b111), true));
+        assert!(
+            matches!(
+                IsaNeeds::read_path_strict(&libc),
+                Some(IsaNeeds::Malformed(_))
+            ),
+            "{:?}",
+            IsaNeeds::read_path_strict(&libc)
+        );
+        assert!(!libc_needs_v3(&program, same));
+        put(&libc, b"not an image\n");
+        assert!(!libc_needs_v3(&program, same));
+        std::fs::remove_file(&libc).unwrap();
+        assert!(!libc_needs_v3(&program, same));
+    }
+
+    /// Only glibc's x86-64 program interpreter has a C library read beside
+    /// it. Beside musl's interpreter (which is musl's C library, and which
+    /// [`resolve_auto`] already reads), beside a static program, and beside
+    /// an interpreter the launch's view hides, a C library needing
+    /// x86-64-v3 decides nothing; nor does a program that is no image.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_reads_only_beside_glibcs_interpreter() {
+        let directory = tempfile::tempdir().unwrap();
+        let lib = directory.path().join("lib");
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        put(
+            &lib.join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b111), false),
+        );
+        let glibc = lib.join(GLIBC_X86_64_INTERPRETER);
+        put(&glibc, &isa_image(None, None, false));
+        let program = directory.path().join("glibc-program");
+        put(&program, &isa_image(Some(&glibc), None, false));
+        assert!(libc_needs_v3(&program, same));
+        let hidden = |path: &std::path::Path| (path != glibc).then(|| path.to_path_buf());
+        assert!(!libc_needs_v3(&program, hidden));
+        let musl = lib.join("ld-musl-x86_64.so.1");
+        put(&musl, &isa_image(None, None, false));
+        let program = directory.path().join("musl-program");
+        put(&program, &isa_image(Some(&musl), None, false));
+        assert!(!libc_needs_v3(&program, same));
+        let program = lib.join("static-program");
+        put(&program, &isa_image(None, None, false));
+        assert!(!libc_needs_v3(&program, same));
+        let program = directory.path().join("text");
+        put(&program, b"not an image\n");
+        assert!(!libc_needs_v3(&program, same));
+    }
+
+    /// The C library read is the one beside the interpreter that the
+    /// symlinks of its own name lead to, as the kernel opens it: a relative
+    /// link stays in its own directory, an absolute one is a guest path read
+    /// where the launch's view maps it, and a loop decides nothing.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_reads_beside_the_interpreter_its_links_lead_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        // The loader and a C library needing x86-64-v3 in `real`; beside the
+        // link, one needing only x86-64-v2, which must not be the one read.
+        put(
+            &root.join("real").join(GLIBC_X86_64_INTERPRETER),
+            &isa_image(None, None, false),
+        );
+        put(
+            &root.join("real").join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b111), false),
+        );
+        put(
+            &root.join("lib64").join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b11), false),
+        );
+        let link = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        std::os::unix::fs::symlink(
+            std::path::Path::new("../real").join(GLIBC_X86_64_INTERPRETER),
+            &link,
+        )
+        .unwrap();
+        let program = root.join("program");
+        put(&program, &isa_image(Some(&link), None, false));
+        assert!(libc_needs_v3(&program, same));
+        // An absolute target, a guest path that only the view maps.
+        std::fs::remove_file(&link).unwrap();
+        let guest = std::path::Path::new("/hermit-guest-only/real").join(GLIBC_X86_64_INTERPRETER);
+        std::os::unix::fs::symlink(&guest, &link).unwrap();
+        let view = |path: &std::path::Path| match path.strip_prefix("/hermit-guest-only") {
+            Ok(rest) => Some(root.join(rest)),
+            Err(_) => Some(path.to_path_buf()),
+        };
+        assert!(libc_needs_v3(&program, view));
+        assert!(!libc_needs_v3(&program, same));
+        let hidden = |path: &std::path::Path| {
+            (!path.starts_with("/hermit-guest-only")).then(|| path.to_path_buf())
+        };
+        assert!(!libc_needs_v3(&program, hidden));
+        // A link to itself.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        assert!(!libc_needs_v3(&program, same));
+    }
+
+    /// A script is followed, through the launch's view, to the image the
+    /// kernel would exec, and that image's interpreter has its C library
+    /// read.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_follows_a_script_to_its_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        put(&loader, &isa_image(None, None, false));
+        put(
+            &root.join("lib64").join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b111), false),
+        );
+        let image = root.join("image");
+        put(&image, &isa_image(Some(&loader), None, false));
+        let script = root.join("script");
+        put(&script, format!("#!{}\n", image.display()).as_bytes());
+        assert!(libc_needs_v3(&script, same));
+        // The script names a guest path, read where the view maps it.
+        let guest = root.join("guest-script");
+        put(&guest, b"#!/hermit-guest-only/image\n");
+        let view = |path: &std::path::Path| match path.strip_prefix("/hermit-guest-only") {
+            Ok(rest) => Some(root.join(rest)),
+            Err(_) => Some(path.to_path_buf()),
+        };
+        assert!(libc_needs_v3(&guest, view));
+        assert!(!libc_needs_v3(&guest, same));
+    }
+
+    /// The C library's own symlinks are followed in the launch's view too: a
+    /// relative link stays in its own directory, an absolute one is a guest
+    /// path read where the view maps it (never at the host path it names),
+    /// one the view hides decides nothing, and so does a loop.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_follows_the_c_librarys_own_links_in_the_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        put(&loader, &isa_image(None, None, false));
+        let program = root.join("program");
+        put(&program, &isa_image(Some(&loader), None, false));
+        put(
+            &root.join("real").join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b111), false),
+        );
+        let link = root.join("lib64").join(GLIBC_C_LIBRARY);
+        std::os::unix::fs::symlink(std::path::Path::new("../real").join(GLIBC_C_LIBRARY), &link)
+            .unwrap();
+        assert!(libc_needs_v3(&program, same));
+        // An absolute target, a guest path that only the view maps.
+        std::fs::remove_file(&link).unwrap();
+        let guest = std::path::Path::new("/hermit-guest-only/real").join(GLIBC_C_LIBRARY);
+        std::os::unix::fs::symlink(&guest, &link).unwrap();
+        let view = |path: &std::path::Path| match path.strip_prefix("/hermit-guest-only") {
+            Ok(rest) => Some(root.join(rest)),
+            Err(_) => Some(path.to_path_buf()),
+        };
+        assert!(libc_needs_v3(&program, view));
+        assert!(!libc_needs_v3(&program, same));
+        let hidden = |path: &std::path::Path| {
+            (!path.starts_with("/hermit-guest-only")).then(|| path.to_path_buf())
+        };
+        assert!(!libc_needs_v3(&program, hidden));
+        // A link to itself.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        assert!(!libc_needs_v3(&program, same));
+    }
+
+    /// A C library that is not a regular file decides nothing, and reading
+    /// it never waits: a FIFO there (which a blocking open would wait on for
+    /// a writer forever) gives `false` at once. Each read runs on its own
+    /// thread under a 30-second guard.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn libc_needs_v3_never_waits_on_a_c_library_that_is_not_a_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let loader = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        put(&loader, &isa_image(None, None, false));
+        let program = root.join("program");
+        put(&program, &isa_image(Some(&loader), None, false));
+        let library = root.join("lib64").join(GLIBC_C_LIBRARY);
+        let fifo = root.join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let directory_too = root.join("a-directory");
+        std::fs::create_dir(&directory_too).unwrap();
+        for target in [&fifo, &directory_too] {
+            // The C library itself, and a link that leads to it.
+            for linked in [false, true] {
+                let _ = std::fs::remove_file(&library);
+                if linked {
+                    std::os::unix::fs::symlink(target, &library).unwrap();
+                } else if target == &fifo {
+                    nix::unistd::mkfifo(&library, nix::sys::stat::Mode::S_IRWXU).unwrap();
+                } else {
+                    continue;
+                }
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let program = program.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(libc_needs_v3(&program, |path: &std::path::Path| {
+                        Some(path.to_path_buf())
+                    }));
+                });
+                assert_eq!(
+                    receiver.recv_timeout(std::time::Duration::from_secs(30)),
+                    Ok(false),
+                    "{target:?} linked={linked}"
+                );
+            }
+        }
+    }
+
+    /// `hermit record start`'s auto asks the host only where the C library
+    /// alone declares x86-64-v3, and then with the recording's request;
+    /// every other program records what its declarations need (`declared`),
+    /// whatever the host. A malformed forced answer is an error, as for
+    /// `hermit run`.
+    #[test]
+    fn record_auto_asks_the_host_only_where_the_c_library_alone_needs_v3() {
+        let unasked = |_: &AdmissionRequest<'_>| -> Result<AutoChoice, String> {
+            panic!("the host was asked")
+        };
+        for (needs, libc_v3) in [
+            (CpuProfile::X86_64V2, false),
+            (CpuProfile::X86_64V3, false),
+            (CpuProfile::X86_64V3, true),
+        ] {
+            assert_eq!(
+                choose_record_auto_with(needs, libc_v3, unasked).unwrap(),
+                AutoChoice {
+                    choice: ProfileChoice {
+                        profile: needs,
+                        reason: ProfileReason::Declared,
+                        detail: None,
+                    },
+                    log: Vec::new(),
+                },
+                "{needs} {libc_v3}"
+            );
+        }
+        let why = format!("{AUTO_HOST_TEST_ENV}=forced");
+        let unavailable = format!(
+            "x86-64-v3 is unavailable for this run ({why}); running x86-64-v2. Name \
+             --cpu-profile to choose the profile."
+        );
+        for (host, profile, reason, detail, log) in [
+            (
+                AutoHost::Admitted,
+                CpuProfile::X86_64V3,
+                ProfileReason::Admitted,
+                Some(LIBC_V3_DETAIL.to_owned()),
+                Vec::new(),
+            ),
+            (
+                AutoHost::Hypervisor,
+                CpuProfile::X86_64V2,
+                ProfileReason::Hypervisor,
+                None,
+                Vec::new(),
+            ),
+            (
+                AutoHost::Refused {
+                    why: why.clone(),
+                    dynamic: false,
+                },
+                CpuProfile::X86_64V2,
+                ProfileReason::QualificationRefused,
+                Some(why.clone()),
+                Vec::new(),
+            ),
+            (
+                AutoHost::Refused {
+                    why: why.clone(),
+                    dynamic: true,
+                },
+                CpuProfile::X86_64V2,
+                ProfileReason::QualificationRefused,
+                Some(why.clone()),
+                vec![unavailable.clone()],
+            ),
+        ] {
+            let auto = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
+                assert_eq!(check_request(request), Ok(()));
+                assert!(!request.gdbserver, "a recording's request has no gdbserver");
+                choose_auto_with(CpuProfile::X86_64V2, request, || Ok(host.clone()))
+            })
+            .unwrap();
+            assert_eq!(
+                auto,
+                AutoChoice {
+                    choice: ProfileChoice {
+                        profile,
+                        reason,
+                        detail,
+                    },
+                    log,
+                },
+                "{host:?}"
+            );
+        }
+        let admitted = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
+            choose_auto_with(CpuProfile::X86_64V2, request, || Ok(AutoHost::Admitted))
+        })
+        .unwrap();
+        assert_eq!(
+            admitted.choice.because(),
+            format!("{LIBC_V3_DETAIL}, and this run and host qualify for x86-64-v3")
+        );
+        assert!(
+            choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
+                choose_auto_with(CpuProfile::X86_64V2, request, || Err("bad".into()))
+            })
+            .is_err()
+        );
+    }
+
+    /// `hermit run` and `hermit record start` record the same choice (the
+    /// profile, the reason and its detail) for a program whose C library
+    /// alone declares x86-64-v3, whatever the host answers; and the C
+    /// library is named only in an x86-64-v3 the host admitted.
+    #[test]
+    fn run_and_record_choose_alike_where_the_c_library_alone_needs_v3() {
+        let why = format!("{AUTO_HOST_TEST_ENV}=forced");
+        for host in [
+            AutoHost::Admitted,
+            AutoHost::Hypervisor,
+            AutoHost::Refused {
+                why: why.clone(),
+                dynamic: false,
+            },
+            AutoHost::Refused {
+                why: why.clone(),
+                dynamic: true,
+            },
+        ] {
+            let run =
+                choose_auto_with(
+                    CpuProfile::X86_64V2,
+                    &request("ptrace"),
+                    || Ok(host.clone()),
+                )
+                .unwrap();
+            let record = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
+                choose_auto_with(CpuProfile::X86_64V2, request, || Ok(host.clone()))
+            })
+            .unwrap();
+            assert_eq!(name_libc_need(run.clone(), true), record, "{host:?}");
+            assert_eq!(name_libc_need(run.clone(), false), run, "{host:?}");
+        }
+        for reason in [
+            ProfileReason::Explicit,
+            ProfileReason::Declared,
+            ProfileReason::Hypervisor,
+            ProfileReason::QualificationRefused,
+            ProfileReason::RequestNotAdmissible,
+        ] {
+            let auto = AutoChoice {
+                choice: ProfileChoice {
+                    profile: CpuProfile::X86_64V3,
+                    reason,
+                    detail: None,
+                },
+                log: Vec::new(),
+            };
+            assert_eq!(name_libc_need(auto.clone(), true), auto, "{reason:?}");
+        }
     }
 }

@@ -1633,15 +1633,25 @@ log says so. None of this reaches stderr, which a run leaves to its guest:
 the chosen profile and why are logged at `--log=debug` and recorded in the
 run's manifest, and the warning about inputs drawn from the host does not name
 the profile. A refusal (a profile you named, or the program declares, that the
-run or host cannot carry) is still printed. A `--verify` match states the
-x86-64-v3 residual below on stderr only for an x86-64-v3 you named or the
-program declares; for one auto chose, the log has it and the manifest records
-it as `cpu_profile_residual`. `hermit record start` chooses by what the program
-declares alone: x86-64-v2 unless the program or its interpreter declares
-x86-64-v3. The run's manifest records the profile and why, as `cpu_profile`
-with the reason `admitted`, `hypervisor`, `qualification-refused`,
-`request-not-admissible`, `declared` (the program declares x86-64-v3, or a
-recording) or `explicit`; its rerun (`hermit run --from`)
+run or host cannot carry) is still printed. A `hermit run --verify` match
+states the x86-64-v3 residual below on stderr only for an x86-64-v3 you named
+or the program declares; for one auto chose, the log has it and the manifest
+records it as `cpu_profile_residual`. `hermit record start --verify` keeps no
+recording, and so no manifest, so its match states the residual for every
+x86-64-v3. `hermit record start` chooses by what the program
+declares, so that the recording of a program that runs at x86-64-v2 does not
+depend on the host: x86-64-v2 unless the program or its interpreter declares
+x86-64-v3. The exception is a program whose glibc C library, the `libc.so.6`
+beside its program interpreter, declares x86-64-v3 (CentOS Stream 10's does),
+which runs at x86-64-v2 on no host: record start presents x86-64-v3 for it
+where the recording and host qualify, as `hermit run` does, and x86-64-v2
+elsewhere, where glibc refuses the guest as described below. Hermit's library
+launch reads the declarations alone. The run's manifest, and a recording's,
+records the profile and why, as `cpu_profile` with the reason `admitted`
+(with a `detail` naming the C library where it declares x86-64-v3), `hypervisor`,
+`qualification-refused`, `request-not-admissible`, `declared` (the program
+declares x86-64-v3, or a recording chose by the declarations) or `explicit`;
+its rerun (`hermit run --from`)
 presents the same profile. A manifest or recording that names no profile
 presents x86-64-v2, the profile every older run presented.
 

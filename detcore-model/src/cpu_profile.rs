@@ -45,12 +45,15 @@ pub enum CpuProfile {
     /// The command line's default where no profile is named. For `hermit
     /// run`: x86-64-v3 where the guest's image or its program interpreter
     /// declares it (`GNU_PROPERTY_X86_ISA_1_NEEDED`), or where the run and
-    /// host qualify for it; x86-64-v2 otherwise. `hermit record start` and
-    /// the library's launch read the declarations alone: x86-64-v2 unless
-    /// one declares v3. Each resolves it to that named profile before
-    /// qualification and launch, so a run's configuration, its manifest and
-    /// a recording only ever hold the named profile, and replay uses it
-    /// without deriving it again.
+    /// host qualify for it; x86-64-v2 otherwise. `hermit record start` reads
+    /// the declarations: x86-64-v2 unless one declares v3, except where the
+    /// glibc C library beside the program interpreter declares v3, which
+    /// gets x86-64-v3 where the recording and host qualify for it, as
+    /// `hermit run` does. The library's launch reads the declarations alone.
+    /// Each resolves it to that named profile before qualification and
+    /// launch, so a run's configuration, its manifest and a recording only
+    /// ever hold the named profile, and replay uses it without deriving it
+    /// again.
     #[value(name = "auto")]
     #[serde(rename = "auto")]
     Auto,
@@ -201,13 +204,18 @@ pub const CPU_PROFILE_LONG_HELP: &str = concat!(
      need (GNU_PROPERTY_X86_ISA_1_NEEDED): a program declaring x86-64-v3 runs under it, \
      admitted as an explicit x86-64-v3 is, or is refused (exit 122) where it cannot run; one \
      declaring x86-64-v4, or one auto cannot read, is refused rather than guessed. \
-     `hermit record start` resolves auto by those declarations alone: x86-64-v2 unless one \
-     declares x86-64-v3. The chosen profile and why are logged at debug level and written to \
+     `hermit record start` resolves auto by those declarations, so that the recording of a \
+     program that runs at x86-64-v2 does not depend on the host: x86-64-v2 unless one declares \
+     x86-64-v3. The exception is a program whose glibc C library (the libc.so.6 beside its \
+     program interpreter) declares x86-64-v3, which runs at x86-64-v2 on no host: record start \
+     presents x86-64-v3 for it where the recording and host qualify, as `hermit run` does, and \
+     x86-64-v2 elsewhere, where glibc refuses it. Hermit's library launch reads the \
+     declarations alone. The chosen profile and why are logged at debug level and written to \
      the run's manifest, and a recording holds the profile; replays and reruns use it and \
      never choose again. A later exec of an image needing more is refused where each exec is checked \
      (the ptrace backend), never upgraded; KVM checks only the first image, so a later KVM \
-     exec gets no such refusal. auto reads no shared library: where only a library such as \
-     libc declares its need (as on distributions whose loader is unmarked), name the profile. \
+     exec gets no such refusal. Apart from that C library, auto reads no shared library: where \
+     only another library declares its need, name the profile. \
      A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \
      allowing native CPUID. RDRAND and RDSEED are hidden. Check availability with \

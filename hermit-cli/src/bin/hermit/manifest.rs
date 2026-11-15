@@ -607,6 +607,24 @@ pub(crate) fn residual_of(
         .map(|_| detcore_model::cpu_profile::V3_RESIDUAL.to_owned())
 }
 
+/// What a manifest's `inputs.host_drawn` says of `choice`: the reason, under
+/// the CPU profile's key, for a profile auto chose by the host (admitted,
+/// hypervisor or qualification-refused), so that `hermit run` and `hermit
+/// record start` name it alike; nothing for a profile the command line or the
+/// program decided.
+pub(crate) fn host_drawn_cpu_profile(
+    choice: Option<&hermit::cpu_profile_admission::ProfileChoice>,
+) -> Option<(String, String)> {
+    choice
+        .filter(|choice| choice.reason.host_dependent())
+        .map(|choice| {
+            (
+                crate::app::run_config::CPU_PROFILE_KEY.to_owned(),
+                choice.reason.name().to_owned(),
+            )
+        })
+}
+
 /// Where a network recording's manifest goes: beside its trace, named after
 /// it, `TRACE.manifest.json`. The trace stays at the path its user named.
 pub(crate) fn network_manifest_path(trace: &Path) -> PathBuf {

@@ -217,6 +217,16 @@ pub struct StartOpts {
     #[clap(skip)]
     auto_resolution: Option<String>,
 
+    /// The choice `--cpu-profile auto` made, where it asked the host
+    /// ([`hermit::cpu_profile_admission::choose_record_auto`]); `None` for a
+    /// named profile and for one resolved from declarations alone.
+    #[clap(skip)]
+    auto_choice: Option<hermit::cpu_profile_admission::ProfileChoice>,
+
+    /// What else auto said, logged after [`Self::auto_resolution`].
+    #[clap(skip)]
+    auto_log: Vec<String>,
+
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
     /// ptrace record runtime reads its virtual clock and preemption points from that
@@ -494,10 +504,14 @@ impl StartOpts {
     }
 
     /// The profile this recording holds and why, for its manifest: auto
-    /// resolves by the program's declarations alone here (`declared`), never
-    /// by the host.
+    /// resolves by the program's declarations (`declared`), and by the host
+    /// only where the program's C library needs x86-64-v3
+    /// ([`hermit::cpu_profile_admission::choose_record_auto`]).
     fn cpu_profile_choice(&self) -> hermit::cpu_profile_admission::ProfileChoice {
         use hermit::cpu_profile_admission::ProfileReason;
+        if let Some(choice) = &self.auto_choice {
+            return choice.clone();
+        }
         hermit::cpu_profile_admission::ProfileChoice {
             profile: self.cpu_profile,
             reason: if self.auto_resolution.is_some() {
@@ -506,6 +520,83 @@ impl StartOpts {
                 ProfileReason::Explicit
             },
             detail: None,
+        }
+    }
+
+    /// This command with `--cpu-profile auto` resolved for `program`, a host
+    /// path in this launch's completed view: `needs` and `why` from what the
+    /// program and its interpreter declare
+    /// ([`hermit::cpu_profile_admission::resolve_auto`]), and the answer of
+    /// `choose` ([`hermit::cpu_profile_admission::choose_record_auto`]) for
+    /// whether the program's C library needs x86-64-v3. That C library is
+    /// read, through the same view, only for an `image`: a program that is
+    /// not one keeps its own fault under the declarations' profile.
+    fn with_auto_resolved(
+        &self,
+        program: &Path,
+        image: bool,
+        needs: detcore_model::cpu_profile::CpuProfile,
+        why: String,
+        choose: impl FnOnce(
+            detcore_model::cpu_profile::CpuProfile,
+            bool,
+        ) -> Result<hermit::cpu_profile_admission::AutoChoice, String>,
+    ) -> Result<Self, Error> {
+        use hermit::cpu_profile_admission::ProfileReason;
+        let libc_v3 = image
+            && hermit::cpu_profile_admission::libc_needs_v3(program, |guest| {
+                self.mapped_launch_path(guest)
+            });
+        let auto = choose(needs, libc_v3).map_err(Error::msg)?;
+        let mut resolved = self.clone();
+        resolved.cpu_profile = auto.choice.profile;
+        resolved.auto_resolution = Some(if auto.choice.reason == ProfileReason::Declared {
+            format!("--cpu-profile auto resolved to {needs}: {why}")
+        } else {
+            format!(
+                "--cpu-profile auto resolved to {}: {}; {why}",
+                auto.choice.profile,
+                auto.choice.because()
+            )
+        });
+        if auto.choice.reason != ProfileReason::Declared {
+            resolved.auto_log = auto.log;
+            // As for `hermit run`: an x86-64-v3 auto chose by the host logs
+            // its residual here, and the manifest keeps it, in place of a
+            // line on stderr.
+            if auto.choice.reason == ProfileReason::Admitted {
+                resolved
+                    .auto_log
+                    .push(detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
+            }
+            resolved.auto_choice = Some(auto.choice);
+        }
+        Ok(resolved)
+    }
+
+    /// Whether a verify match states x86-64-v3's residual for this recording.
+    /// As `hermit run` decides it: yes where the user asked for x86-64-v3
+    /// (named, or declared by the program), and no where auto chose it
+    /// because the host qualifies, whose residual goes to the debug log and
+    /// the recording's manifest instead. `--verify` keeps neither (it records
+    /// into a directory it removes and writes no manifest), so its match
+    /// states the residual of every x86-64-v3.
+    fn states_v3_residual(&self) -> bool {
+        self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3
+            && (self.verify
+                || self.cpu_profile_choice().reason
+                    != hermit::cpu_profile_admission::ProfileReason::Admitted)
+    }
+
+    /// Logs what `--cpu-profile auto` resolved to, and what else auto said,
+    /// at debug level, once the recording's tracing has started, as `hermit
+    /// run` logs its choice.
+    fn log_auto_choice(&self) {
+        if let Some(resolution) = &self.auto_resolution {
+            tracing::debug!("{resolution}");
+        }
+        for line in &self.auto_log {
+            tracing::debug!("--cpu-profile auto: {line}");
         }
     }
 
@@ -692,11 +783,13 @@ impl StartOpts {
         // Auto is resolved only for a run that records.
         let replay_only = self.verify_replay_of.is_some();
         // `--cpu-profile auto` records the named profile it resolves to
-        // (`hermit::cpu_profile_admission::resolve_auto`), so replay uses
-        // that profile and never derives it again. The program and every
-        // interpreter hop are read in this launch's completed view: a
-        // path under a `--mount` target is read at its source, as the
-        // guest sees it, never at the host file the target shadows.
+        // (`hermit::cpu_profile_admission::resolve_auto`, and the host's
+        // answer where the program's C library needs x86-64-v3:
+        // `choose_record_auto`), so replay uses that profile and never
+        // derives it again. The program, every interpreter hop and that C
+        // library are read in this launch's completed view: a path under a
+        // `--mount` target is read at its source, as the guest sees it,
+        // never at the host file the target shadows.
         if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto && !replay_only {
             let found = self.guest_command()?.find_program().with_context(|| {
                 format!("Could not resolve program {:?} in PATH", self.program())
@@ -708,6 +801,7 @@ impl StartOpts {
             let program = self
                 .mapped_launch_path(&found)
                 .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
+            let mut image = true;
             let (profile, why) =
                 match hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
                     self.mapped_launch_path(guest)
@@ -733,6 +827,7 @@ impl StartOpts {
                         if !not_an_image {
                             return Err(refuse(why));
                         }
+                        image = false;
                         (
                         detcore_model::cpu_profile::CpuProfile::X86_64V2,
                         "the initial executable is not an ELF image; its exec keeps its own fault"
@@ -740,11 +835,15 @@ impl StartOpts {
                     )
                     }
                 };
-            let mut resolved = self.clone();
-            resolved.cpu_profile = profile;
-            resolved.auto_resolution =
-                Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
-            return resolved.main_with_preparation(global, preparation);
+            return self
+                .with_auto_resolved(
+                    &program,
+                    image,
+                    profile,
+                    why,
+                    hermit::cpu_profile_admission::choose_record_auto,
+                )?
+                .main_with_preparation(global, preparation);
         }
         if !replay_only {
             hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
@@ -759,7 +858,9 @@ impl StartOpts {
         // request must not refuse a replayable v2 recording on a host that
         // cannot qualify for v3 (revcodex on PR 4709).
         if !replay_only && self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
-            super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.states_v3_residual() {
+                super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             // Qualify here, before any container: a refusal ends the command at
             // once, and the recorder and replayer reuse the result.
             let request = hermit::cpu_profile_admission::record_or_replay_request(false);
@@ -804,9 +905,7 @@ impl StartOpts {
                 None,
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
-                    if let Some(resolution) = &options.auto_resolution {
-                        tracing::debug!("{resolution}");
-                    }
+                    options.log_auto_choice();
                     identity.record_plan()?;
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
@@ -946,6 +1045,7 @@ impl StartOpts {
                 None,
                 move |(data, identity, _, _)| {
                     let _guard = record_global.init_tracing();
+                    options.log_auto_choice();
                     identity.record_plan()?;
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
@@ -1340,8 +1440,9 @@ impl StartOpts {
 /// Writes `DATA/<id>/manifest.json` for the syscall recording `id`, from its
 /// metadata: the guest command, the recording's `RECORD_VERSION`, how the
 /// guest ended, and the CPU profile it recorded and why (`cpu_profile`). A
-/// syscall recording draws no input from the host that it does not record,
-/// so its `inputs` are empty.
+/// syscall recording draws no input from the host that it does not record.
+/// Its `inputs` name only a CPU profile auto chose by the host, which the
+/// recording holds, in `host_drawn` as `hermit run`'s manifest names it.
 fn write_full_record_manifest(
     hermit: &HermitData,
     id: hermit::Id,
@@ -1361,7 +1462,9 @@ fn write_full_record_manifest(
         manifest::Inputs {
             global: Default::default(),
             run: Default::default(),
-            host_drawn: Default::default(),
+            host_drawn: manifest::host_drawn_cpu_profile(Some(&cpu_profile))
+                .into_iter()
+                .collect(),
         },
     );
     document.exit = Some(manifest::Exit::from_status(exit_status));
@@ -1557,6 +1660,8 @@ mod tests {
             program: Some(PathBuf::from("/bin/true")),
             cpu_profile: Default::default(),
             auto_resolution: None,
+            auto_choice: None,
+            auto_log: Vec::new(),
             strict: false,
             args: Vec::new(),
             env,
@@ -2091,6 +2196,8 @@ mod tests {
             program: Some(PathBuf::from("/proc/self/exe")),
             cpu_profile: Default::default(),
             auto_resolution: None,
+            auto_choice: None,
+            auto_log: Vec::new(),
             strict: false,
             args: Vec::new(),
             env: Vec::new(),
@@ -2169,6 +2276,195 @@ mod tests {
         assert_eq!(
             options.mapped_launch_path(Path::new("/bin/true")),
             Some(PathBuf::from("/bin/true"))
+        );
+    }
+
+    /// Auto's resolution reads an image's C library, beside its glibc
+    /// interpreter and through this launch's view, and asks the chooser with
+    /// what it found. A program that is not an image has no C library read.
+    /// An x86-64-v3 the host admitted for that C library is recorded with its
+    /// reason, names the C library, and logs the residual instead of stating
+    /// it.
+    #[test]
+    fn auto_resolution_reads_the_c_library_of_an_image() {
+        use detcore_model::cpu_profile::CpuProfile;
+        use hermit::cpu_profile_admission::AutoChoice;
+        use hermit::cpu_profile_admission::LIBC_V3_DETAIL;
+        use hermit::cpu_profile_admission::ProfileChoice;
+        use hermit::cpu_profile_admission::ProfileReason;
+        use hermit::cpu_profile_admission::tests::isa_image;
+        use hermit::cpu_profile_admission::tests::put;
+        let directory = tempfile::tempdir().unwrap();
+        let lib = directory.path().join("lib64");
+        put(
+            &lib.join("ld-linux-x86-64.so.2"),
+            &isa_image(None, None, false),
+        );
+        put(&lib.join("libc.so.6"), &isa_image(None, Some(0b111), false));
+        let program = directory.path().join("program");
+        put(
+            &program,
+            &isa_image(Some(&lib.join("ld-linux-x86-64.so.2")), None, false),
+        );
+        let admitted = ProfileChoice {
+            profile: CpuProfile::X86_64V3,
+            reason: ProfileReason::Admitted,
+            detail: Some(LIBC_V3_DETAIL.to_owned()),
+        };
+        let declared = |needs| AutoChoice {
+            choice: ProfileChoice {
+                profile: needs,
+                reason: ProfileReason::Declared,
+                detail: None,
+            },
+            log: Vec::new(),
+        };
+        let options = start_options(Vec::new());
+        let mut asked = None;
+        let resolved = options
+            .with_auto_resolved(
+                &program,
+                true,
+                CpuProfile::X86_64V2,
+                "declarations".to_owned(),
+                |needs, libc_v3| {
+                    asked = Some((needs, libc_v3));
+                    Ok(AutoChoice {
+                        choice: admitted.clone(),
+                        log: vec!["announced".to_owned()],
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(asked, Some((CpuProfile::X86_64V2, true)));
+        assert_eq!(resolved.cpu_profile, CpuProfile::X86_64V3);
+        assert_eq!(resolved.cpu_profile_choice(), admitted);
+        assert!(!resolved.states_v3_residual());
+        assert_eq!(
+            resolved.auto_log,
+            [
+                "announced".to_owned(),
+                detcore_model::cpu_profile::V3_RESIDUAL.to_owned()
+            ]
+        );
+        assert_eq!(
+            resolved.auto_resolution.as_deref(),
+            Some(
+                format!(
+                    "--cpu-profile auto resolved to x86-64-v3: {LIBC_V3_DETAIL}, and this run \
+                     and host qualify for x86-64-v3; declarations"
+                )
+                .as_str()
+            )
+        );
+        // A program that is not an image: its C library is not read.
+        let mut asked = None;
+        let resolved = options
+            .with_auto_resolved(
+                &program,
+                false,
+                CpuProfile::X86_64V2,
+                "not an image".to_owned(),
+                |needs, libc_v3| {
+                    asked = Some((needs, libc_v3));
+                    Ok(declared(needs))
+                },
+            )
+            .unwrap();
+        assert_eq!(asked, Some((CpuProfile::X86_64V2, false)));
+        assert_eq!(resolved.cpu_profile, CpuProfile::X86_64V2);
+        assert_eq!(resolved.auto_choice, None);
+        assert!(resolved.auto_log.is_empty());
+        assert_eq!(
+            resolved.cpu_profile_choice().reason,
+            ProfileReason::Declared
+        );
+        assert_eq!(
+            resolved.auto_resolution.as_deref(),
+            Some("--cpu-profile auto resolved to x86-64-v2: not an image")
+        );
+        // An interpreter named by a guest path is read where a --mount maps
+        // it, and not at the host path the guest path names.
+        let guest = Path::new("/hermit-test-guest-libc-view/lib64");
+        let viewed = directory.path().join("viewed");
+        put(
+            &viewed,
+            &isa_image(Some(&guest.join("ld-linux-x86-64.so.2")), None, false),
+        );
+        let libc_v3_seen = |options: &StartOpts| {
+            let mut seen = None;
+            options
+                .with_auto_resolved(
+                    &viewed,
+                    true,
+                    CpuProfile::X86_64V2,
+                    String::new(),
+                    |needs, libc_v3| {
+                        seen = Some(libc_v3);
+                        Ok(declared(needs))
+                    },
+                )
+                .unwrap();
+            seen.unwrap()
+        };
+        assert!(!libc_v3_seen(&options));
+        let mut mounted = start_options(Vec::new());
+        mounted.mount = vec![Mount::bind(&lib, guest)];
+        assert!(libc_v3_seen(&mounted));
+    }
+
+    /// A verify match states x86-64-v3's residual for a recording where the
+    /// user asked for x86-64-v3 (named, or declared by the program), and not
+    /// where auto chose it because the host qualifies, as for its C library
+    /// (`hermit run` decides the same way), whose debug log and manifest keep
+    /// it; nor for x86-64-v2. `--verify` keeps neither, so there a match
+    /// states it for every x86-64-v3. The one place record start sets the
+    /// flag a match reads is guarded by that decision.
+    #[test]
+    fn a_recording_states_the_v3_residual_where_nothing_else_keeps_it() {
+        use detcore_model::cpu_profile::CpuProfile;
+        use hermit::cpu_profile_admission::ProfileChoice;
+        use hermit::cpu_profile_admission::ProfileReason;
+        let mut options = start_options(Vec::new());
+        options.cpu_profile = CpuProfile::X86_64V3;
+        assert_eq!(options.cpu_profile_choice().reason, ProfileReason::Explicit);
+        assert!(options.states_v3_residual(), "named");
+        options.auto_resolution = Some("--cpu-profile auto resolved to x86-64-v3".to_owned());
+        assert_eq!(options.cpu_profile_choice().reason, ProfileReason::Declared);
+        assert!(options.states_v3_residual(), "declared");
+        let admitted = ProfileChoice {
+            profile: CpuProfile::X86_64V3,
+            reason: ProfileReason::Admitted,
+            detail: Some(hermit::cpu_profile_admission::LIBC_V3_DETAIL.to_owned()),
+        };
+        options.auto_choice = Some(admitted.clone());
+        assert_eq!(options.cpu_profile_choice(), admitted);
+        assert!(!options.states_v3_residual(), "chosen for the C library");
+        options.verify = true;
+        assert!(
+            options.states_v3_residual(),
+            "chosen for the C library, under --verify"
+        );
+        options.verify = false;
+        options.cpu_profile = CpuProfile::X86_64V2;
+        options.auto_choice = Some(ProfileChoice {
+            profile: CpuProfile::X86_64V2,
+            reason: ProfileReason::Hypervisor,
+            detail: None,
+        });
+        assert!(!options.states_v3_residual(), "x86-64-v2");
+        options.verify = true;
+        assert!(!options.states_v3_residual(), "x86-64-v2, under --verify");
+        // Split, so that this test's own text does not match.
+        let source = include_str!("record_start.rs");
+        let store = ["super::verify::CPU_PROFILE_V3_RAN", ".store("].concat();
+        assert_eq!(source.matches(&store).count(), 1);
+        let before = &source[..source.find(&store).unwrap()];
+        assert!(
+            before
+                .trim_end()
+                .ends_with("if self.states_v3_residual() {"),
+            "the flag is set without asking states_v3_residual"
         );
     }
 }

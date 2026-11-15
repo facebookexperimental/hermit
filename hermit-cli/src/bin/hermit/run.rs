@@ -13613,6 +13613,15 @@ impl RunOpts {
         };
         let auto = hermit::cpu_profile_admission::choose_auto(needs, &self.cpu_profile_request())
             .map_err(Error::msg)?;
+        // An x86-64-v3 the host admitted names the C library where it declares
+        // x86-64-v3, as `hermit record start` records it. The choice is the same
+        // either way; the C library is read only for an admitted choice.
+        let auto = if auto.choice.reason == ProfileReason::Admitted {
+            let libc_v3 = hermit::cpu_profile_admission::libc_needs_v3(&program, to_host);
+            hermit::cpu_profile_admission::name_libc_need(auto, libc_v3)
+        } else {
+            auto
+        };
         let profile = auto.choice.profile;
         self.auto_resolution = Some(if needs == CpuProfile::X86_64V3 {
             format!("--cpu-profile auto resolved to {profile}: {why}")
@@ -20139,14 +20148,9 @@ impl RunOpts {
     /// auto chose by the program or the run's own options.
     fn host_drawn_inputs(&self) -> BTreeMap<String, String> {
         let mut drawn = BTreeMap::new();
-        if let Some(choice) = &self.cpu_profile_choice
-            && choice.reason.host_dependent()
-        {
-            drawn.insert(
-                crate::app::run_config::CPU_PROFILE_KEY.to_owned(),
-                choice.reason.name().to_owned(),
-            );
-        }
+        drawn.extend(crate::app::manifest::host_drawn_cpu_profile(
+            self.cpu_profile_choice.as_ref(),
+        ));
         if self.timer_downgrade.is_some() {
             drawn.insert(
                 crate::app::manifest::MAX_TIMESLICE_KEY.to_owned(),
