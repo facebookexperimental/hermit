@@ -23,8 +23,13 @@
 #      audited at the inner root even though bare `sl root` escapes
 #   9. with sl removed from PATH, git controls still refuse a planted
 #      extension and Sapling controls are named, counted skips
-#  10. BUCK mentions that are not dependency edges pass; a real
-#      Buck deps label to a denied target refuses
+#  10. buck2 closure labels are judged (fake buck2 over a Sapling
+#      fbcode fixture): kind-derived roots incl. a NEW primary, a
+#      denied label as Buck expands it from variables/concatenation/
+#      select()/macros/.bzl data refuses; a clean closure (incl.
+#      reverie-proc-grammar) passes; the excluded harness root
+#      re-joins loudly once its closure evaluates
+#  11. buck2 missing / failing / empty closure each fail closed (rc 2)
 #  11. a default `dep:<name>` activation does not hide a distinct
 #      same-named non-default feature
 # Sapling twins are skipped only when sl is absent; every skip is
@@ -201,38 +206,131 @@ else
     fi
 fi
 
-echo "twin 10: BUCK non-edge mentions pass; a real Buck edge refuses"
-make_ws 'stub = { path = "../stub" }' stub ''
-cat > "$scratch/repo/BUCK" <<'BUCK'
-# reverie-linuxemu-ext-demo reverie-linuxemu-full reverie-procfs
-rust_library(
-    name = "reverie-linuxemu-ext-demo",
-    srcs = ["x.rs"],  # TODO drop reverie-linuxemu-full later
-    visibility = ["//hermetic_infra/reverie:reverie-linuxemu-ext-demo"],
-    note = "reverie-procfs",
-)
-BUCK
-git -C "$scratch/repo" add BUCK
-OUT=$(rust-script "$CHECKER" --repo-root "$scratch/repo" \
-    --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" \
-    --skip-negative-control 2>&1); RC=$?
-if ((RC == 0)) && grep -q "^PASS" <<<"$OUT"; then
-    note "ok (BUCK comments/names/visibility are not edges)"
+echo "twin 10: buck2 closure labels judged (fake buck2, Sapling fbcode fixture)"
+if command -v sl >/dev/null 2>&1; then
+    buckroot="$scratch/buckrepo"
+    buckaudit="$buckroot/fbcode/hermetic_infra/hermit"
+    rm -rf "$buckroot"
+    mkdir -p "$buckaudit/consumer/src" "$buckaudit/stub/src" "$scratch/buckbin"
+    printf '[workspace]\nmembers = ["consumer", "stub"]\nresolver = "2"\n' \
+        > "$buckaudit/Cargo.toml"
+    printf '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\nstub = { path = "../stub" }\n' \
+        > "$buckaudit/consumer/Cargo.toml"
+    printf '[package]\nname = "stub"\nversion = "0.0.0"\nedition = "2021"\n' \
+        > "$buckaudit/stub/Cargo.toml"
+    : > "$buckaudit/consumer/src/lib.rs"
+    : > "$buckaudit/stub/src/lib.rs"
+    (cd "$buckaudit" && cargo generate-lockfile --offline >/dev/null 2>&1) \
+        || { echo "buck fixture generate-lockfile failed" >&2; exit 2; }
+    (cd "$buckroot" && sl init . >/dev/null 2>&1 && sl -R . add >/dev/null 2>&1) \
+        || { echo "buck fixture sl setup failed" >&2; exit 2; }
+    cat > "$scratch/buckbin/buck2" <<'FAKEBUCK'
+#!/usr/bin/env bash
+# Recorded-output buck2 stand-in. Modes via env:
+#   BUCK_FIXTURE_KIND     file printed for the kind() root query
+#   BUCK_FIXTURE_LABELS   file printed for deps(set(...))
+#   BUCK_FIXTURE_EXCLUDED ok|fail for the excluded-root probe
+#   BUCK_FIXTURE_MODE     ok|fail|empty (overall deps behaviour)
+expr="${@: -1}"
+case "$expr" in
+    *validate-test-hermit-integration*)
+        [[ ${BUCK_FIXTURE_EXCLUDED:-fail} == ok ]]             && echo 'fbcode//hermetic_infra/hermit/hermit-cli:validate'             || exit 3 ;;
+    deps\(set\(*)
+        case "${BUCK_FIXTURE_MODE:-ok}" in
+            fail) exit 3 ;;
+            empty) ;;
+            *) cat "$BUCK_FIXTURE_LABELS" ;;
+        esac ;;
+    kind\(*)
+        [[ ${BUCK_FIXTURE_MODE:-ok} == fail ]] && exit 3
+        cat "$BUCK_FIXTURE_KIND" ;;
+    *) exit 3 ;;
+esac
+FAKEBUCK
+    chmod +x "$scratch/buckbin/buck2"
+    printf '%s\n' \
+        'fbcode//hermetic_infra/reverie:reverie-linuxemu' \
+        'fbcode//hermetic_infra/reverie:reverie-procfs' \
+        'fbcode//hermetic_infra/reverie:reverie-ptrace' \
+        'fbcode//hermetic_infra/reverie:reverie-proc-grammar' \
+        > "$scratch/labels-clean.txt"
+    # Kind-derived roots, including a primary that did not exist when
+    # the checker was written (hermit-newtool): derivation must pick
+    # it up without a checker edit.
+    printf '%s\n' \
+        'fbcode//hermetic_infra/hermit/hermit-cli:hermit' \
+        'fbcode//hermetic_infra/hermit/hermit-cli:libhermit' \
+        'fbcode//hermetic_infra/hermit/hermit-cli:hermit-newtool' \
+        'fbcode//hermetic_infra/hermit/hermit-cli:integration-cli' \
+        > "$scratch/kind-roots.txt"
+    run_buck_fixture() { # labels-file excluded-mode buck-mode
+        OUT=$(BUCK_FIXTURE_KIND="$scratch/kind-roots.txt" \
+            BUCK_FIXTURE_LABELS="$1" BUCK_FIXTURE_EXCLUDED="$2" \
+            BUCK_FIXTURE_MODE="$3" \
+            env PATH="$scratch/buckbin:$PATH" \
+            rust-script "$CHECKER" --repo-root "$buckaudit" \
+            --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" \
+            --skip-negative-control 2>&1); RC=$?
+    }
+    run_buck_fixture "$scratch/labels-clean.txt" fail ok
+    if ((RC == 0)) && grep -q "Buck closure via buck2 uquery" <<<"$OUT" \
+        && grep -q "excluded (closure not evaluatable" <<<"$OUT"; then
+        note "ok (clean buck closure passes, procfs flagged, proc-grammar accepted)"
+    else
+        fail "buck clean closure: rc=$RC (want 0 PASS with buck note): $OUT"
+    fi
+    for form in variable concatenation select macro bzl-data new-primary; do
+        cp "$scratch/labels-clean.txt" "$scratch/labels-denied.txt"
+        echo 'fbcode//hermetic_infra/reverie:reverie-linuxemu-ext-demo' \
+            >> "$scratch/labels-denied.txt"
+        run_buck_fixture "$scratch/labels-denied.txt" fail ok
+        if ((RC == 1)) && grep -q "REFUSE" <<<"$OUT"; then
+            note "ok (buck closure refuses $form-expanded denied edge)"
+        else
+            fail "buck closure $form: rc=$RC (want 1 REFUSE): $OUT"
+        fi
+    done
+    run_buck_fixture "$scratch/labels-clean.txt" ok ok
+    if ((RC == 0)) && grep -q "RE-JOINED" <<<"$OUT"; then
+        note "ok (excluded harness root re-joins loudly once evaluatable)"
+    else
+        fail "buck rejoin: rc=$RC (want 0 PASS with RE-JOINED): $OUT"
+    fi
 else
-    fail "BUCK non-edge: rc=$RC (want 0 PASS): $OUT"
+    skip "twin 10 buck2 closure judging requires sl, which is absent"
 fi
-cat > "$scratch/repo/BUCK" <<'BUCK'
-rust_library(
-    name = "consumer",
-    deps = [
-        "//hermetic_infra/reverie:reverie-linuxemu-ext-demo",
-    ],
-)
-BUCK
-git -C "$scratch/repo" add BUCK
-expect_refuse "BUCK real edge"
 
-echo "twin 11: default dep: activation does not hide same-named feature"
+echo "twin 11: buck2 missing / failing / empty closure fail closed (rc 2)"
+if command -v sl >/dev/null 2>&1; then
+    fakebin="$scratch/fakebin"
+    OUT=$(BUCK_FIXTURE_KIND="$scratch/kind-roots.txt" \
+        BUCK_FIXTURE_LABELS="$scratch/labels-clean.txt" \
+        env PATH="$fakebin" "$RUST_SCRIPT_BIN" "$CHECKER" \
+        --repo-root "$buckaudit" \
+        --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" \
+        --skip-negative-control 2>&1); RC=$?
+    if ((RC == 2)) && grep -q "CHECKER ERROR" <<<"$OUT"; then
+        note "ok (buck2 missing rc=2)"
+    else
+        fail "buck2 missing: rc=$RC (want 2 CHECKER ERROR): $OUT"
+    fi
+    run_buck_fixture "$scratch/labels-clean.txt" fail fail
+    if ((RC == 2)) && grep -q "CHECKER ERROR" <<<"$OUT"; then
+        note "ok (buck2 failing rc=2)"
+    else
+        fail "buck2 failing: rc=$RC (want 2 CHECKER ERROR): $OUT"
+    fi
+    run_buck_fixture "$scratch/labels-clean.txt" fail empty
+    if ((RC == 2)) && grep -q "CHECKER ERROR" <<<"$OUT"; then
+        note "ok (buck2 empty closure rc=2)"
+    else
+        fail "buck2 empty closure: rc=$RC (want 2 CHECKER ERROR): $OUT"
+    fi
+else
+    skip "twin 11 buck2 fail-closed paths require sl, which is absent"
+fi
+
+echo "twin 12: default dep: activation does not hide same-named feature"
 rm -rf "$scratch/repo"
 mkdir -p "$scratch/repo/consumer/src" "$scratch/repo/stub/src" "$scratch/repo/procfsdep/src"
 printf '[workspace]\nmembers = ["consumer", "stub", "procfsdep"]\nresolver = "2"\n' \
