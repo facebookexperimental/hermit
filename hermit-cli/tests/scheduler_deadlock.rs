@@ -69,11 +69,16 @@ fn vanished(error: &io::Error) -> bool {
 }
 
 fn proc_stat_parent_and_starttime(pid: libc::pid_t) -> io::Result<(libc::pid_t, u64)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    // Field 2 (comm) is arbitrary bytes and may not be UTF-8, so read the
+    // file as bytes and parse only the ASCII fields after the last ')'.
+    let stat = fs::read(format!("/proc/{pid}/stat"))?;
     let comm_end = stat
-        .rfind(')')
+        .iter()
+        .rposition(|byte| *byte == b')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc stat comm"))?;
-    let fields: Vec<&str> = stat[comm_end + 1..].split_whitespace().collect();
+    let tail = std::str::from_utf8(&stat[comm_end + 1..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let fields: Vec<&str> = tail.split_whitespace().collect();
     let parent = fields
         .get(1)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing proc stat parent"))?

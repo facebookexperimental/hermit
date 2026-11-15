@@ -5229,15 +5229,17 @@ pub(super) fn refuses_group_kill(
 
 /// The process group of host `pid`, from `/proc/<pid>/stat`, or `None`.
 fn process_group(pid: u32) -> Option<i32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name may hold spaces and parentheses: fields resume after
-    // the last ')', as state, ppid, pgrp.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(2)?
-        .parse()
-        .ok()
+    parse_process_group(&fs::read(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Read a stat line as raw bytes (the command name may hold arbitrary,
+/// including non-UTF-8, bytes and parentheses), and parse the process
+/// group: fields resume after the last ')', as state, ppid, pgrp.
+fn parse_process_group(stat: &[u8]) -> Option<i32> {
+    let tail = &stat[stat.iter().rposition(|byte| *byte == b')')? + 1..];
+    let tail = std::str::from_utf8(tail).ok()?;
+    let pgrp = tail.split_whitespace().nth(2)?;
+    pgrp.parse().ok()
 }
 
 /// Install [`group_kill_filter`] in the forked `--namespace-only` guest and
@@ -7566,6 +7568,17 @@ mod tests {
         }
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
+    }
+
+    /// A stat line whose comm holds non-UTF-8 bytes still reveals its
+    /// process group, so the caller is not mistaken for unknown.
+    #[test]
+    fn a_nonutf8_comm_stat_line_still_yields_its_group() {
+        let stat =
+            b"6502 (\xff\xfeprobe) S 6400 4242 4242 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 5000";
+        assert_eq!(parse_process_group(stat), Some(4242));
+        assert_eq!(parse_process_group(b"1 (init) S 0 1 1 0 -1 0"), Some(1));
+        assert_eq!(parse_process_group(b"garbage"), None);
     }
 
     /// Hermit refuses a `--namespace-only` guest's `kill(0, sig)` only while
