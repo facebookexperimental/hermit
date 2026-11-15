@@ -1,0 +1,15 @@
+# Records a guest, then replays it under gdb (`--verify-with-gdbex`), and
+# checks what gdb printed: Hermit does not pass on gdb's exit status, so gdb's
+# output is the evidence that the breakpoint at main was set and hit and that
+# the guest then exited normally.
+#
+# The guest is built within x86-64-v2 and the profile is named:
+# `--gdbserver` serves only x86-64-v2, because an x86-64-v3 run refuses it
+# (https://github.com/facebookexperimental/hermit/issues/120), and a host's
+# own programs can declare x86-64-v3 (CentOS 10's do). The gdb commands are
+# one argument; the shell's quotes do not reach gdb.
+#
+# RUN: %hermit record start --cpu-profile=x86-64-v2 "--verify-with-gdbex=b main; c; c" -- %gdb_smoke_guest 2>&1 | FileCheck %s
+# CHECK: Breakpoint 1 at 0x{{[0-9a-f]+}}: file {{.*}}hello_nostdlib.c, line {{[0-9]+}}.
+# CHECK: Breakpoint 1, main () at {{.*}}hello_nostdlib.c:{{[0-9]+}}
+# CHECK: [Inferior 1 (process {{[0-9]+}}) exited normally]
