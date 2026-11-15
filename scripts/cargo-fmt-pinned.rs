@@ -36,6 +36,13 @@
 //! the pinned formatter in the image.
 //!
 //! Usage, from anywhere in the repository:
+//!   scripts/cargo-fmt-pinned.rs --workspace-members [-- --check]
+//!                                                    format exactly the root
+//!                                                    [workspace] members (the
+//!                                                    lint.rustfmt scope; plain
+//!                                                    `--all` would also descend
+//!                                                    into path-dependency crates
+//!                                                    such as the reverie submodule)
 //!   scripts/cargo-fmt-pinned.rs [CARGO-FMT-ARGS...]  e.g. `--all -- --check`;
 //!                                                    exits with cargo fmt's status
 //!   scripts/cargo-fmt-pinned.rs --self-test          the selected formatter must
@@ -334,6 +341,115 @@ fn repository_root() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("no {PIN_FILE} in {} or above it", start.display()))
 }
 
+/// The `[workspace] members` directories named by a root manifest, in
+/// declaration order. Pure text work (no Cargo run) so the scope decision
+/// is testable offline. A glob member is refused, never silently dropped:
+/// formatting fewer packages than the workspace claims is a blind gate.
+fn workspace_member_dirs(manifest: &str) -> Result<Vec<String>, String> {
+    let mut in_workspace = false;
+    let mut members: Option<Vec<String>> = None;
+    let mut collecting = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if collecting {
+                break;
+            }
+            in_workspace = trimmed == "[workspace]";
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if !collecting {
+            // Line-anchored so `default-members` is never taken for `members`.
+            let Some(rest) = trimmed.strip_prefix("members") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            members = Some(Vec::new());
+            collecting = true;
+            collect_member_strings(rest, members.as_mut().expect("just set"))?;
+            if rest.contains(']') {
+                break;
+            }
+            continue;
+        }
+        collect_member_strings(trimmed, members.as_mut().expect("collecting"))?;
+        if trimmed.contains(']') {
+            break;
+        }
+    }
+    members.ok_or_else(|| "root Cargo.toml names no [workspace] members".to_string())
+}
+
+fn collect_member_strings(text: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for quoted in text.split('"').skip(1).step_by(2) {
+        if quoted.is_empty() {
+            continue;
+        }
+        if quoted.contains('*') {
+            return Err(format!(
+                "workspace member {quoted:?} is a glob; --workspace-members refuses to \
+                 guess its expansion rather than format a narrower scope than claimed"
+            ));
+        }
+        out.push(quoted.to_string());
+    }
+    Ok(())
+}
+
+/// The `[package] name` of one member manifest.
+fn package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = trimmed.strip_prefix("name") {
+                if let Some(rest) = rest.trim_start().strip_prefix('=') {
+                    let name = rest.trim().trim_matches('"');
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Package name of every `[workspace] members` entry of the checkout at
+/// `root`. This is the `--workspace-members` formatting scope: exactly the
+/// packages this repository owns. Since the Reverie path-dependency
+/// migration, plain `cargo fmt --all` also descends into the `reverie`
+/// submodule's crates and would gate Hermit on another repository's
+/// formatting drift (its own repo formats it, with the same options).
+fn workspace_member_packages(root: &Path) -> Result<Vec<String>, String> {
+    let manifest_path = root.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+    let mut packages = Vec::new();
+    for dir in workspace_member_dirs(&text)? {
+        let member_path = root.join(&dir).join("Cargo.toml");
+        let member_text = fs::read_to_string(&member_path)
+            .map_err(|error| format!("{}: {error}", member_path.display()))?;
+        let name = package_name(&member_text).ok_or_else(|| {
+            format!("{} names no [package] name", member_path.display())
+        })?;
+        packages.push(name);
+    }
+    if packages.is_empty() {
+        return Err("root Cargo.toml [workspace] members is empty".to_string());
+    }
+    Ok(packages)
+}
+
 fn rustup_available() -> bool {
     Command::new("rustup")
         .arg("--version")
@@ -392,6 +508,16 @@ fn run() -> Result<ExitCode, String> {
                 Ok(ExitCode::from(1))
             }
         },
+        Some("--workspace-members") => {
+            let mut scoped: Vec<OsString> = Vec::new();
+            for package in workspace_member_packages(&root)? {
+                scoped.push("-p".into());
+                scoped.push(package.into());
+            }
+            scoped.extend(args.into_iter().skip(1));
+            let code = run_cargo_fmt(&resolved, &scoped, &root)?;
+            Ok(ExitCode::from(code.clamp(0, 255) as u8))
+        }
         _ => {
             let code = run_cargo_fmt(&resolved, &args, &root)?;
             Ok(ExitCode::from(code.clamp(0, 255) as u8))
@@ -446,6 +572,28 @@ mod tests {
     fn real_pin() -> Pin {
         let root = test_root();
         parse_pin(&fs::read_to_string(root.join(PIN_FILE)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn workspace_members_scope_reads_members_not_default_members() {
+        let manifest = "[workspace]\nmembers = [\n  \"alpha\",\n  \"beta/gamma\",\n]\nexclude = [\"agent-utils\"]\ndefault-members = [\n  \"alpha\",\n]\nresolver = \"2\"\n";
+        assert_eq!(
+            workspace_member_dirs(manifest).unwrap(),
+            ["alpha", "beta/gamma"]
+        );
+        // Single-line spelling, and a glob refused rather than dropped.
+        assert_eq!(
+            workspace_member_dirs("[workspace]\nmembers = [\"only\"]\n").unwrap(),
+            ["only"]
+        );
+        assert!(
+            workspace_member_dirs("[workspace]\nmembers = [\"crates/*\"]\n").is_err()
+        );
+        assert_eq!(
+            package_name("[package]\nname = \"hermit-run\"\nversion = \"0.5.7\"\n").as_deref(),
+            Some("hermit-run")
+        );
+        assert_eq!(package_name("[workspace]\nmembers = []\n"), None);
     }
 
     /// The pinned identity is a nightly rustfmt built from a commit dated the

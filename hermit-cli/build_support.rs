@@ -54,8 +54,11 @@ pub fn embedded_git_sha_in(root: &Path, stamp: Option<&str>) -> Result<Option<St
 
 /// Emit `HERMIT_BUILD_GIT_SHA` and the rerun triggers it needs.
 ///
-/// A regular build runs no Git command and registers no Git watch, so moving
-/// HEAD or the index cannot rerun the script or change the binary. A stamped
+/// A regular build runs no Git command and registers no HEAD/index watch
+/// for the revision, so moving HEAD or the index cannot rerun the script
+/// or change the binary (the Reverie pin's separate narrow watch in
+/// `reverie_pin_watch_paths` — submodule HEAD only — is the exception,
+/// and it exists because the pin has no manifest left to watch). A stamped
 /// build watches the Git metadata that can change the revision or dirty
 /// state, as before.
 pub fn emit_git_revision() {
@@ -177,6 +180,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 include!("reverie_pin.rs");
+include!("reverie_gitlink.rs");
 
 /// Package identity is independent of which backend features are declared or
 /// enabled. The source manifest and its autocargo producer say `source`; the
@@ -193,10 +197,14 @@ pub fn registry_build(identity: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// The Reverie revision this tree pins, read from the canonical manifest.
+/// The Reverie revision this tree pins: the submodule checkout's HEAD.
 ///
-/// `detcore/Cargo.toml` is the source of truth the pin checker uses; every other
-/// site restates it. Returns `unknown` rather than failing the build, because a
+/// Manifests name no revision since the path-dependency migration; the
+/// checkout is what the build actually compiles (the pin checker
+/// separately refuses a checkout sitting off its recorded gitlink; the
+/// Eden marker, recorded gitlink, and manifest reads remain as
+/// fallbacks in `reverie_pin_at`). Returns
+/// `unknown` rather than failing the build, because a
 /// missing pin must not stop a developer compiling -- the loader treats
 /// `unknown` as "cannot verify" and says so instead of asserting a match.
 ///
@@ -218,10 +226,65 @@ pub fn reverie_pin_in(crate_dir: &Path) -> String {
     let Some(root) = crate_dir.parent() else {
         return "unknown".into();
     };
-    let Ok(text) = std::fs::read_to_string(root.join("detcore/Cargo.toml")) else {
-        return "unknown".into();
-    };
-    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
+    reverie_pin_at(root).unwrap_or_else(|| "unknown".into())
+}
+
+/// Files whose change can move [`reverie_pin`]'s answer, for
+/// `cargo:rerun-if-changed`. Without these an incremental build keeps
+/// the OLD pin after a gitlink advance (the build script does not rerun:
+/// no watched file changed), so `hermit --version`, the LiteInst staging
+/// comparison and its cache key all keep judging by the previous pin.
+///
+/// The watched set is exactly what `reverie_pin_at` reads first, and
+/// deliberately narrow — not the superproject index/HEAD set
+/// `git_watch_paths_in` registers for stamped revisions (watching the
+/// index would rerun this script, and hermit-install's LiteInst
+/// staging behind it, on every `git add`): the submodule checkout's
+/// HEAD file plus its symbolic-ref target and packed-refs when HEAD
+/// is a symref (a `git -C reverie pull` moves the target, not HEAD
+/// itself), resolved through the submodule's own Git so linked
+/// worktrees and plain nested checkouts name the real files; plus,
+/// in a Sapling/Eden checkout where there is no git metadata, the
+/// `reverie.submodule.txt` marker the reader reads there. Staging a
+/// gitlink without moving the checkout changes neither the compiled
+/// sources nor the embedded pin, by design: the pin names what was
+/// compiled, and the pin checker separately refuses a checkout that
+/// sits off its recorded gitlink. Missing paths are never emitted
+/// (Cargo treats a missing watch path as perpetually dirty).
+pub fn reverie_pin_watch_paths() -> Vec<PathBuf> {
+    match std::env::var_os("CARGO_MANIFEST_DIR") {
+        Some(crate_dir) => Path::new(&crate_dir)
+            .parent()
+            .map(reverie_pin_watch_paths_in)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+pub fn reverie_pin_watch_paths_in(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let submodule = root.join("reverie");
+    if submodule.join(".git").exists() {
+        let mut names = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+        if let Some(reference) = git(&submodule, &["symbolic-ref", "-q", "HEAD"]) {
+            names.push(reference);
+        }
+        paths.extend(names.into_iter().filter_map(|name| {
+            git(
+                &submodule,
+                &["rev-parse", "--path-format=absolute", "--git-path", &name],
+            )
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+        }));
+    }
+    let marker = root.join("reverie.submodule.txt");
+    if marker.exists() {
+        paths.push(marker);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Build actual native artifacts through the existing isolated build-only root.

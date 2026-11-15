@@ -196,6 +196,7 @@ fn main() {
     let repository = manifest_dir
         .parent()
         .expect("hermit-install is not inside the Hermit repository");
+    emit_pin_watches(repository);
     build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
 
     copy_file(&repository.join("LICENSE"), &install.join("LICENSE"));
@@ -250,11 +251,66 @@ fn profile_dir_of(out_dir: &Path) -> PathBuf {
 }
 
 include!("../hermit-cli/reverie_pin.rs");
+include!("../hermit-cli/reverie_gitlink.rs");
 
-/// The Reverie revision this tree pins, read from the canonical manifest.
-fn reverie_pin(repository: &Path) -> String {
-    let Ok(text) = fs::read_to_string(repository.join("detcore/Cargo.toml")) else {
-        return "unknown".into();
+/// Watch exactly what `reverie_pin_at` reads first — the submodule
+/// checkout's HEAD (plus its symbolic-ref target and packed-refs, so
+/// a `git -C reverie pull` counts) and the Eden marker — for the same
+/// reason as THE PIN FILES above, and deliberately NOT the
+/// superproject git index/HEAD: watching those would restage the
+/// LiteInst runtime on every `git add`/checkout, while staging a
+/// gitlink without moving the checkout changes neither the compiled
+/// sources nor the pin (the pin names what was compiled; the pin
+/// checker separately refuses an off-gitlink checkout). Missing
+/// paths are never emitted (Cargo treats them as perpetually dirty).
+/// Mirrors `build_support::reverie_pin_watch_paths_in`; this crate
+/// cannot depend on hermit-cli's build support.
+fn emit_pin_watches(repository: &Path) {
+    let submodule = repository.join("reverie");
+    let mut names = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    let git_at = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&submodule)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
-    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
+    if submodule.join(".git").exists() {
+        if let Some(reference) = git_at(&["symbolic-ref", "-q", "HEAD"]) {
+            names.push(reference);
+        }
+    }
+    let mut paths: Vec<PathBuf> = if submodule.join(".git").exists() {
+        names
+            .into_iter()
+            .filter_map(|name| {
+                git_at(&["rev-parse", "--path-format=absolute", "--git-path", &name])
+                    .map(PathBuf::from)
+                    .filter(|path| path.exists())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let marker = repository.join("reverie.submodule.txt");
+    if marker.exists() {
+        paths.push(marker);
+    }
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// The Reverie revision this tree pins: the submodule checkout's HEAD,
+/// else the Eden marker, else the recorded gitlink (manifest read
+/// remains as the pre-migration fallback).
+fn reverie_pin(repository: &Path) -> String {
+    reverie_pin_at(repository).unwrap_or_else(|| "unknown".into())
 }

@@ -32,8 +32,14 @@
 //! Reverie's own Cargo.toml names it as its repository. This applies
 //! the existing rule to the now-canonical repository; it does not
 //! loosen it.
-//! All Reverie revisions across tracked Cargo dependency metadata must also be
-//! identical to each other; that is decided offline and always blocks.
+//! The pin itself is the `reverie` submodule gitlink (index entry when an
+//! advance is staged, else HEAD's tree entry): since the path-dependency
+//! migration manifests name no revision, so the gitlink is the one hash.
+//! Any Reverie revision still named in tracked Cargo dependency metadata
+//! (a pre-migration tree, or a leftover second copy) must equal it; that
+//! coherence is decided offline and always blocks. A tree with no gitlink
+//! at all falls back to the pre-migration rule — every named revision
+//! identical — so old trees and fixtures keep their verdicts.
 //!
 //! # THREE OUTCOMES, NOT TWO -- specified deliberately, not left to control flow
 //!
@@ -87,7 +93,7 @@
 //! with-proxy ./ci/run-reverie-pin-check.sh
 //! ```
 //!
-//! Repair every derived manifest and lockfile site with one command:
+//! Advance the submodule gitlink (and every derived site) with one command:
 //!
 //! ```text
 //! with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
@@ -202,7 +208,7 @@ fn usage() -> &'static str {
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
-       --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
+       --update-to-latest                  Advance the reverie gitlink (and derived sites) to the main tip\n\
        --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/<Hermit landing branch>)\n\
        --offline                           Local consistency only; no networked policy checks\n\
@@ -210,7 +216,9 @@ fn usage() -> &'static str {
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
      \n\
-     Canonical-pin scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
+     Canonical pin: the reverie submodule gitlink. Coherence scope:\n\
+     every tracked Cargo.toml and Cargo.lock from git ls-files (any revision\n\
+     named there must equal the gitlink; post-migration manifests name none).\n\
      Derived local bindings checked separately: LiteInst cache keys,\n\
      hermit-cli/BUCK, and the release values it loads from\n\
      shim/hermetic_infra/hermit/fb-only/release.bzl (whose HERMIT_VERSION must\n\
@@ -491,12 +499,10 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
             });
         }
     }
-    if pins.is_empty() {
-        return Err(
-            "no pinned GitHub Reverie dependencies found in tracked Cargo.toml/Cargo.lock files"
-                .to_string(),
-        );
-    }
+    // Zero occurrences is the post-migration steady state (path deps name
+    // no revision); whether that is an error is decided by
+    // `resolve_recorded_pin`, which knows about the gitlink. Refusing here
+    // would refuse every migrated tree.
     Ok(PinScan {
         occurrences: pins,
         tracked_files,
@@ -855,6 +861,13 @@ fn floor_read_selects(name: &str) -> bool {
 /// detached probe, an unavailable ref) -- in which case monotonicity is not
 /// asserted rather than being assumed satisfied.
 fn base_pin(root: &Path, base_ref: &str) -> Option<String> {
+    // The gitlink at the base is the floor whenever the base records one.
+    // It agrees with the manifest read below on every pre-migration base
+    // (the two were kept in sync by this same checker), and it is the only
+    // value a post-migration base records at all.
+    if let Some(pin) = gitlink_pin_at_ref(root, base_ref) {
+        return Some(pin);
+    }
     // NO `:(glob)` PATHSPEC HERE. `git ls-tree` rejects pathspec magic outright
     // -- "pathspec magic not supported by this command: 'glob'" -- so passing
     // the same spec `ls-files` accepts makes the whole call FAIL, which would
@@ -915,7 +928,7 @@ const ACK_ENV: &str = "HERMIT_PIN_BELOW_MASTER_ACK";
 /// so it stays readable instead of decaying into a reflex flag. Do not widen it.
 fn staged_pin_advisory(root: &Path, remote: &str, branch: &str) -> Result<i32, String> {
     let staged = read_pins(root)?;
-    let candidate = match unique_pin(&staged) {
+    let candidate = match recorded_pin(root, &staged) {
         Ok(pin) => pin.to_string(),
         // Inconsistent manifests are a different, always-blocking defect that
         // the normal path reports; the advisory stays quiet rather than
@@ -1654,6 +1667,120 @@ fn unique_pin(scan: &PinScan) -> Result<&str, String> {
     Ok(scan.occurrences[0].rev.as_str())
 }
 
+/// The submodule path whose gitlink IS the pin.
+const REVERIE_SUBMODULE: &str = "reverie";
+
+/// Parse one `git ls-files --stage` line (`160000 <sha> <stage>\t<path>`).
+/// Pure so the spelling is testable without a repository.
+fn parse_gitlink_stage_line(line: &str) -> Option<String> {
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("160000") {
+        return None;
+    }
+    fields.next().filter(|sha| is_full_sha(sha)).map(str::to_owned)
+}
+
+/// Parse `git ls-tree <ref> -- reverie` output (`160000 commit <sha>\t...`).
+fn parse_gitlink_tree(text: &str) -> Option<String> {
+    let mut fields = text.split_whitespace();
+    if fields.next() != Some("160000") || fields.next() != Some("commit") {
+        return None;
+    }
+    fields.next().filter(|sha| is_full_sha(sha)).map(str::to_owned)
+}
+
+/// The recorded gitlink of the working checkout: the index entry when an
+/// advance is staged, else HEAD's tree entry. `None` when the tree records
+/// no `reverie` gitlink at all (pre-migration fixtures, tarballs) — the
+/// caller then falls back to manifest coherence, never to a guess.
+fn gitlink_pin(root: &Path) -> Option<String> {
+    if let Ok(output) = git_in(root, &["ls-files", "--stage", "--", REVERIE_SUBMODULE]) {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(sha) = parse_gitlink_stage_line(line) {
+                    return Some(sha);
+                }
+            }
+        }
+    }
+    gitlink_pin_at_ref(root, "HEAD")
+}
+
+/// The gitlink recorded at `git_ref` (the monotonicity floor read).
+fn gitlink_pin_at_ref(root: &Path, git_ref: &str) -> Option<String> {
+    let output = git_in(root, &["ls-tree", git_ref, "--", REVERIE_SUBMODULE]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gitlink_tree(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The submodule checkout's own HEAD, when `reverie/` is a real submodule
+/// checkout. A symlinked `reverie/` (fbsource's ci.sh materializes one to
+/// the sibling tree) is not a checkout of this gitlink and is skipped:
+/// its HEAD names a different repository's history by construction.
+fn submodule_head(root: &Path) -> Option<String> {
+    let sub = root.join(REVERIE_SUBMODULE);
+    if fs::symlink_metadata(&sub).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    if !sub.join(".git").exists() {
+        return None;
+    }
+    let output = git_in(&sub, &["rev-parse", "HEAD"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    is_full_sha(&sha).then_some(sha)
+}
+
+/// The one recorded pin, decided purely from the gitlink (when the tree
+/// has one) and the manifest scan. The gitlink wins and every named
+/// revision must equal it — a surviving second copy at another revision
+/// is exactly the incoherence the one-hash migration exists to refuse.
+/// With no gitlink, the pre-migration rule applies unchanged.
+fn resolve_recorded_pin(gitlink: Option<&str>, scan: &PinScan) -> Result<String, String> {
+    match gitlink {
+        Some(pin) => {
+            let stray: BTreeSet<&str> = scan
+                .occurrences
+                .iter()
+                .map(|occurrence| occurrence.rev.as_str())
+                .filter(|rev| *rev != pin)
+                .collect();
+            if !stray.is_empty() {
+                return Err(format!(
+                    "reverie gitlink pins {pin} but tracked Cargo metadata still names {}: \
+                     the gitlink is the one pin, so a second copy at another revision is incoherent",
+                    stray.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Ok(pin.to_owned())
+        }
+        None => unique_pin(scan).map(str::to_owned),
+    }
+}
+
+/// [`resolve_recorded_pin`] over the checkout at `root`, plus the
+/// checkout-coherence refusal: path dependencies compile the submodule
+/// CHECKOUT, so a checkout moved off its recorded gitlink (unstaged)
+/// builds a different Reverie than the pin claims. `pre.submodules`
+/// refuses the same state in the DAG; standalone runs refuse it here.
+fn recorded_pin(root: &Path, scan: &PinScan) -> Result<String, String> {
+    let gitlink = gitlink_pin(root);
+    if let (Some(pin), Some(head)) = (gitlink.as_deref(), submodule_head(root).as_deref()) {
+        if pin != head {
+            return Err(format!(
+                "reverie submodule checkout is at {head} but the recorded gitlink pins {pin}: \
+                 stage the advance (`git add reverie`) or restore the checkout, because path \
+                 dependencies build the checkout, not the gitlink"
+            ));
+        }
+    }
+    resolve_recorded_pin(gitlink.as_deref(), scan)
+}
+
 fn run_cargo_update(root: &Path, args: &[&str]) -> Result<(), String> {
     let status = Command::new("cargo")
         .current_dir(root)
@@ -1824,20 +1951,77 @@ fn carry_derived_pin_sites(
     Ok((touched, rewritten))
 }
 
+/// Advance the `reverie` submodule checkout to `main` and stage the
+/// gitlink: the whole mechanical content of a post-migration pin bump.
+/// Fail-closed at each step — a dirty submodule, a failed fetch, or a
+/// checkout that does not land on `main` refuses with the tree as found
+/// (nothing here rewrites files, so there is no partial state to undo
+/// beyond the submodule checkout itself, which the error names).
+fn advance_gitlink(root: &Path, main: &str) -> Result<(), String> {
+    let sub = root.join(REVERIE_SUBMODULE);
+    if !sub.join(".git").exists() {
+        return Err(format!(
+            "{} is not an initialized submodule checkout; run `git submodule update --init reverie` first",
+            sub.display()
+        ));
+    }
+    let status = git_in(&sub, &["status", "--porcelain"])?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Err(format!(
+            "reverie submodule checkout at {} is dirty; refusing to advance it over local changes",
+            sub.display()
+        ));
+    }
+    let have = git_in(&sub, &["cat-file", "-e", &format!("{main}^{{commit}}")])
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !have {
+        let fetch = git_in(&sub, &["fetch", "origin", main])?;
+        if !fetch.status.success() {
+            return Err(format!(
+                "could not fetch Reverie {main} into the submodule: {}",
+                String::from_utf8_lossy(&fetch.stderr).trim()
+            ));
+        }
+    }
+    let checkout = git_in(&sub, &["checkout", "--detach", main])?;
+    if !checkout.status.success() {
+        return Err(format!(
+            "could not check out Reverie {main} in the submodule: {}",
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        ));
+    }
+    if submodule_head(root).as_deref() != Some(main) {
+        return Err(format!(
+            "reverie submodule checkout did not land on {main} after checkout"
+        ));
+    }
+    let add = git_in(root, &["add", "--", REVERIE_SUBMODULE])?;
+    if !add.status.success() {
+        return Err(format!(
+            "could not stage the advanced reverie gitlink: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn update_to_latest(
     root: &Path,
     scan: &PinScan,
     main: &str,
     verify_build: bool,
 ) -> Result<(), String> {
-    // The core carry begins at the actual uniform Cargo pin. SDK recipe
+    // The core carry begins at the actual recorded pin: the gitlink when
+    // the tree has one, else the uniform Cargo pin. SDK recipe
     // calibration belongs to the extension producer, not to this pin's ancestry.
-    let recorded = unique_pin(scan)?.to_owned();
+    let recorded = resolve_recorded_pin(gitlink_pin(root).as_deref(), scan)?;
 
-    if scan
-        .occurrences
-        .iter()
-        .all(|occurrence| occurrence.rev == main)
+    if recorded == main
+        && scan
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.rev == main)
     {
         // Cargo metadata is current, but the CI sites are a separate scope and
         // may still be mid-carry -- finish them rather than reporting success
@@ -1845,6 +2029,13 @@ fn update_to_latest(
         return finish_core_pin_update(root, &recorded, main, true, verify_build);
     }
 
+    // Post-migration the bump IS the gitlink move; manifest rewriting
+    // below then has nothing to do (zero occurrences) and remains only
+    // for pre-migration trees still naming revisions.
+    if gitlink_pin(root).is_some() && recorded != main {
+        advance_gitlink(root, main)?;
+        println!("Advanced the reverie submodule gitlink to {main} (staged).");
+    }
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
 
     println!(
@@ -1869,14 +2060,14 @@ fn update_to_latest(
     }
 
     let updated = read_pins(root)?;
-    let pin = unique_pin(&updated)?;
+    let pin = recorded_pin(root, &updated)?;
     if pin != main {
         return Err(format!(
-            "update completed but derived Cargo metadata records {pin}, expected {main}"
+            "update completed but the recorded pin is {pin}, expected {main}"
         ));
     }
     println!(
-        "Reverie pin advanced to main tip {main} across {} derived Cargo revision entries.",
+        "Reverie pin advanced to main tip {main} (gitlink; {} derived Cargo revision entries).",
         updated.occurrences.len()
     );
     finish_core_pin_update(root, &recorded, main, false, verify_build)
@@ -2633,7 +2824,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let provenance = checkout_provenance(&root, &branches.hermit);
 
     if config.print_pin {
-        println!("{}", unique_pin(&scan)?);
+        println!("{}", recorded_pin(&root, &scan)?);
         report_provenance(provenance.as_ref());
         return Ok(0);
     }
@@ -2661,14 +2852,42 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     eprintln!(
         "Canonical-pin scan exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included. Derived non-Cargo bindings are checked separately below."
     );
+    let gitlink = gitlink_pin(&root);
+    eprintln!(
+        "Canonical pin (reverie gitlink): {}.",
+        gitlink.as_deref().unwrap_or("none recorded; manifest coherence decides")
+    );
     report_provenance(provenance.as_ref());
 
     let mut by_rev: BTreeMap<&str, Vec<&PinOccurrence>> = BTreeMap::new();
     for pin in pins {
         by_rev.entry(&pin.rev).or_default().push(pin);
     }
-    if by_rev.len() != 1 && !config.update_to_latest {
+    // Incoherence, decided offline as before: named revisions disagree
+    // with each other, disagree with the gitlink, vanish entirely on a
+    // tree with no gitlink to judge by, or the submodule checkout sits
+    // off its recorded gitlink (path deps build the checkout).
+    let checkout_head = submodule_head(&root);
+    let checkout_mismatch = matches!(
+        (gitlink.as_deref(), checkout_head.as_deref()),
+        (Some(pin), Some(head)) if pin != head
+    );
+    let stray_from_gitlink = gitlink.is_some()
+        && by_rev
+            .keys()
+            .any(|rev| Some(*rev) != gitlink.as_deref());
+    let incoherent = by_rev.len() > 1
+        || stray_from_gitlink
+        || checkout_mismatch
+        || (gitlink.is_none() && by_rev.len() != 1);
+    if incoherent && !config.update_to_latest {
         loud_header("INCONSISTENT HERMIT REVERIE REVISIONS - BLOCKED");
+        if let Some(pin) = gitlink.as_deref() {
+            eprintln!("  gitlink (reverie submodule): {pin}");
+        }
+        if let Some(head) = checkout_head.as_deref() {
+            eprintln!("  submodule checkout HEAD:     {head}");
+        }
         for (rev, occurrences) in by_rev {
             eprintln!("  {rev}");
             for occurrence in occurrences {
@@ -2707,7 +2926,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
             Ok(main) => Some(main),
             Err(error) => {
                 loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
-                if let Ok(pin) = unique_pin(&scan) {
+                if let Ok(pin) = recorded_pin(&root, &scan) {
                     eprintln!("Hermit pin: {pin}");
                 }
                 eprintln!("Lookup error: {error}");
@@ -2723,19 +2942,20 @@ fn run_with_config(config: Config) -> Result<i32, String> {
             .expect("main is looked up for --update-to-latest");
         update_to_latest(&root, &scan, main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
-        let updated_pin = unique_pin(&updated)?;
-        let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
+        let updated_pin = recorded_pin(&root, &updated)?;
+        let cache_code = check_liteinst_cache_keys(&root, &updated_pin)?;
         if cache_code != 0 {
             return Ok(cache_code);
         }
-        let buck_code = check_buck_build_pin_binding(&root, updated_pin)?;
+        let buck_code = check_buck_build_pin_binding(&root, &updated_pin)?;
         if buck_code != 0 {
             return Ok(buck_code);
         }
         return Ok(0);
     }
 
-    let pin = unique_pin(&scan)?;
+    let pin_owned = recorded_pin(&root, &scan)?;
+    let pin = pin_owned.as_str();
     let cache_code = check_liteinst_cache_keys(&root, pin)?;
     if cache_code != 0 {
         return Ok(cache_code);
@@ -2935,6 +3155,8 @@ mod tests {
         ),
         // The floor read itself; its Git calls are the two above.
         ("base_pin(&root,base_ref)", None),
+        // base_pin(): the gitlink tree entry at the floor; reads no file path.
+        ("gitlink_pin_at_ref(root,base_ref)", None),
         // Binds the configured floor to `base_ref`.
         ("config.base_ref.as_str()", None),
     ];
@@ -3527,6 +3749,57 @@ mod tests {
         assert!(help.contains(BUCK_RELEASE_VALUES_SITE));
         assert!(help.contains("--no-verify-build"));
         assert!(help.contains("UNSAFE"));
+    }
+
+    #[test]
+    fn gitlink_parsers_accept_only_full_sha_gitlink_entries() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            parse_gitlink_stage_line(&format!("160000 {sha} 0\treverie")).as_deref(),
+            Some(sha)
+        );
+        assert_eq!(
+            parse_gitlink_tree(&format!("160000 commit {sha}\treverie\n")).as_deref(),
+            Some(sha)
+        );
+        // A regular file entry, a short hash, and empty output name no pin.
+        assert_eq!(
+            parse_gitlink_stage_line(&format!("100644 {sha} 0\treverie")),
+            None
+        );
+        assert_eq!(parse_gitlink_tree("160000 commit abc123\treverie"), None);
+        assert_eq!(parse_gitlink_tree(""), None);
+    }
+
+    #[test]
+    fn recorded_pin_resolution_prefers_the_gitlink_and_refuses_strays() {
+        let pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "0123456789abcdef0123456789abcdef01234567";
+        let scan = |revs: &[&str]| PinScan {
+            occurrences: revs
+                .iter()
+                .map(|rev| PinOccurrence {
+                    path: PathBuf::from("Cargo.toml"),
+                    line: 1,
+                    rev: rev.to_string(),
+                })
+                .collect(),
+            tracked_files: Vec::new(),
+        };
+        // Post-migration steady state: gitlink only, zero named revisions.
+        assert_eq!(resolve_recorded_pin(Some(pin), &scan(&[])).unwrap(), pin);
+        // A named revision agreeing with the gitlink is coherent.
+        assert_eq!(
+            resolve_recorded_pin(Some(pin), &scan(&[pin])).unwrap(),
+            pin
+        );
+        // A surviving second copy at another revision is refused by name.
+        let stray = resolve_recorded_pin(Some(pin), &scan(&[other])).unwrap_err();
+        assert!(stray.contains(other), "{stray}");
+        // No gitlink: pre-migration coherence decides, including its refusals.
+        assert_eq!(resolve_recorded_pin(None, &scan(&[pin])).unwrap(), pin);
+        assert!(resolve_recorded_pin(None, &scan(&[])).is_err());
+        assert!(resolve_recorded_pin(None, &scan(&[pin, other])).is_err());
     }
 
     #[test]

@@ -1,10 +1,13 @@
 # Updating the pinned Reverie revision
 
-Hermit depends on [Reverie](https://github.com/facebookexperimental/reverie) as
-a git dependency, pinned to a **specific commit** (`rev = "<hash>"`) rather than
-a moving `branch = "main"`. Pinning makes builds reproducible: when hermit's
-tests pass, the exact Reverie commit is recorded in the manifests (and is not
-silently changed by an upstream push).
+Hermit depends on [Reverie](https://github.com/facebookexperimental/reverie) by
+**path into the `reverie` submodule** (root `[workspace.dependencies]`, members
+inherit with `workspace = true`), pinned to a **specific commit** by the
+submodule gitlink rather than a moving `branch = "main"`. Pinning makes builds
+reproducible: when hermit's tests pass, the exact Reverie commit is the recorded
+gitlink (and is not silently changed by an upstream push). Each workspace entry
+keeps `version =` beside `path =` so publishing still resolves through the
+registry at the matching release version.
 
 The pin has two distinct purposes. For an old checkout it is an archival record:
 `cargo build` can reproduce the Reverie revision that checkout used. For current
@@ -51,11 +54,16 @@ pins, always choose the newer side.
 ## Policy gate
 
 `scripts/check-reverie-pin.rs` is the canonical verifier source. The tracked
-`ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`, derives its
-scope from `git ls-files`, and checks every tracked `Cargo.toml` and
-`Cargo.lock`. Every Reverie revision in that tracked Cargo dependency metadata
-must be identical to the others, must be an **ancestor** of
-`facebookexperimental/reverie:main`, and must not regress below the base's pin.
+`ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`. The canonical
+pin is the `reverie` submodule gitlink (index entry when an advance is staged,
+else HEAD's tree entry; the base's floor is the gitlink at the base ref). For
+coherence it also checks every tracked `Cargo.toml` and `Cargo.lock` from
+`git ls-files`: any Reverie revision still named there must equal the gitlink
+(post-migration manifests name none, and a tree with no gitlink falls back to
+the pre-migration all-identical rule). The pin must be an **ancestor** of
+`facebookexperimental/reverie:main` and must not regress below the base's pin.
+A submodule checkout sitting off its recorded gitlink is refused, because path
+dependencies build the checkout.
 The checker reports the manifest, lockfile, pinned-file, revision-entry, and
 main-history relationship on every run so a green result states its coverage.
 Tracked vendored Cargo metadata is included. Untracked/generated files and
@@ -94,14 +102,20 @@ and 1.3MB) and fails closed if the authority tip cannot be resolved at all.
 
 ## Where the pin lives
 
-The same revision appears in every tracked manifest and lockfile that resolves a
-Reverie crate. Keep them identical — mixing revisions can pull two incompatible
-`reverie` cores into one build. Do not maintain a path list in this document;
-derive the current set exactly as the checker does:
+The pin lives in exactly one place: the `reverie` submodule gitlink. Read it
+exactly as the checker does:
 
 ```bash
-git ls-files 'Cargo.toml' 'Cargo.lock' '**/Cargo.toml' '**/Cargo.lock'
+./ci/run-reverie-pin-check.sh --print-pin   # or: git ls-tree HEAD reverie
 ```
+
+Manifests name no revision, and the lockfiles record path sources without a
+hash, so they stop churning on every advance (the coherence scan still derives
+its file set as before, with `git ls-files 'Cargo.toml' 'Cargo.lock'
+'**/Cargo.toml' '**/Cargo.lock'`). Before this migration the same revision was
+copied into every manifest and lockfile that resolved a Reverie crate, and
+mixing revisions could pull two incompatible `reverie` cores into one build —
+the failure the one-hash layout removes by construction.
 
 Historical scope baseline: on 2026-08-04 at Hermit
 `e8a0d8d3be3b53985dc898bb8e5cbb696a6a719f`, the derived set was 20 manifests
@@ -135,8 +149,7 @@ a bump. Removing the old wrapper does not resolve that future design choice.
 
 ## How to advance the pin
 
-Advance every derived manifest and lockfile site to the current Reverie main tip
-in one command:
+Advance the gitlink to the current Reverie main tip in one command:
 
 ```bash
 with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
@@ -144,8 +157,15 @@ with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
 
 This is a convenient forward-update operation, not the gate's acceptance
 criterion: a pin that lags the tip but is ancestral and non-regressing already
-passes. The checker derives every manifest from `git ls-files`, replaces the old
-revision in those manifests, and asks Cargo to re-resolve both tracked lockfiles.
+passes. The updater checks the submodule out at the tip and stages the gitlink
+(the one-line change), then asks Cargo to re-resolve both tracked lockfiles —
+which change only when versions or features moved, since path sources record
+no hash. Advancing by hand is the same two steps (`git -C reverie checkout
+<tip>`, `git add reverie`) plus that re-resolve. Sequencing for a Hermit change
+that needs a new Reverie API: land the Reverie change first and let it reach
+`facebookexperimental/reverie:main`, then land the Hermit change carrying the
+one-line gitlink advance in the same diff (advance-with-consumer); until then
+the mirror pair is stale but consistent, old Hermit against old Reverie.
 LiteInst staging derives its cache suffix from that same recorded revision, so
 there is no cache-key list to update. Review the resulting diff, then run the
 test suite; a Reverie change can alter interception behavior even when it
@@ -183,11 +203,16 @@ reviewed together.
 ## Notes
 
 - `Cargo.lock` and `liteinst-runtime-build/Cargo.lock` are tracked. The runtime
-  builder is an isolated workspace, so update and commit both lockfiles with
-  every pin change.
-- When a merge or rebase conflicts in any pin-bearing manifest or lockfile,
-  resolve every site to the newer Reverie commit. The policy gate rejects the
-  older side as a regression even when that older commit is still on main.
+  builder is an isolated workspace with its own `[workspace.dependencies]`
+  path entries into the same submodule, so re-resolve and commit both lockfiles
+  with every pin change (they only move when versions or features move).
+- A Reverie *version* bump (a release) edits the `version =` fields in the two
+  `[workspace.dependencies]` tables plus that re-resolve — still one place per
+  workspace, not one file per manifest.
+- When a merge or rebase conflicts on the gitlink or a lockfile, resolve to
+  the newer Reverie commit. The policy gate rejects the older side as a
+  regression even when that older commit is still on main.
 - To point at a fork instead of upstream (e.g. for the experimental
-  `reverie-dbt` / `reverie-kvm` backends), change the `git =` URL as well as the
-  `rev`, and keep all Reverie crates on the same source.
+  `reverie-dbt` / `reverie-kvm` backends), change the submodule URL in
+  `.gitmodules` and advance the gitlink into that fork's history; keep all
+  Reverie crates on the same source (the one submodule enforces it).

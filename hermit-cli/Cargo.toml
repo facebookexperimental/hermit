@@ -76,15 +76,16 @@ pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features 
 rand = "0.10.2"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
-# Reverie is pinned to a specific commit for reproducibility. Keep this rev in
-# sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222" }
-reverie-kvm = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222" }
-reverie-ptrace = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222" }
-reverie-liteinst = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", default-features = false, optional = true }
-reverie-inguest = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", optional = true }
-safeptrace = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222" }
+# Reverie comes from the `reverie` submodule by path (root
+# [workspace.dependencies]); the gitlink is the one pin. Bump it via
+# docs/updating-reverie.md.
+reverie-core = { workspace = true }
+reverie-kvm = { workspace = true }
+reverie-ptrace = { workspace = true }
+reverie-liteinst = { workspace = true, optional = true }
+reverie-inguest = { workspace = true, optional = true }
+reverie-rpc-transport = { workspace = true, optional = true }
+safeptrace = { workspace = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"
@@ -99,7 +100,7 @@ tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
-reverie-loader = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", optional = true }
+reverie-loader = { workspace = true, optional = true }
 
 [build-dependencies]
 libc = "0.2.186"
@@ -111,11 +112,11 @@ toml = "0.8.23"
 
 [dev-dependencies]
 # Use the qualifier as a dependency without adding its unit tests to fixture binaries.
-reverie-liteinst-artifact = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", default-features = false }
-reverie-loader = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222" }
+reverie-liteinst-artifact = { workspace = true }
+reverie-loader = { workspace = true }
 # Same exact host source pin as the shared physical launcher and codec consumer.
 # Keep the shared physical-launcher regression in the ordinary unit gate.
-reverie-inguest = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", default-features = false, features = ["exec-stop"] }
+reverie-inguest = { workspace = true, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
@@ -133,7 +134,7 @@ sha1_smol = "1.0.1"
 [target.'cfg(target_arch = "x86_64")'.dev-dependencies]
 # Same exact host source pin as the shared physical launcher and codec consumer.
 # Keep the shared physical-launcher regression in the ordinary unit gate.
-reverie-inguest = { version = "0.5.7", git = "https://github.com/facebookexperimental/reverie.git", rev = "61a342fe45f9d989939e8ee22959484319f47222", default-features = false, features = ["exec-stop"] }
+reverie-inguest = { workspace = true, features = ["exec-stop"] }
 
 # Always selected with the existing backend feature; fixture exports are a
 # separate producer input, never an exemption from required execution.

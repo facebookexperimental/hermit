@@ -144,6 +144,51 @@ fn git_watch_paths_resolve_from_a_nested_crate() {
 }
 
 #[test]
+fn pin_watch_paths_cover_the_gitlink_sources_the_reader_reads() {
+    let repo = initialized_repo();
+    let git_dir = repo.path().join(".git");
+    // No submodule yet: the submodule HEAD watch is absent, not emitted
+    // missing (Cargo would treat it as perpetually dirty). The set is
+    // deliberately narrow: no index/HEAD watches (those would rerun the
+    // build scripts on every git add/checkout).
+    let before = build_support::reverie_pin_watch_paths_in(repo.path());
+    assert!(!before.contains(&git_dir.join("index")));
+    assert!(!before.contains(&git_dir.join("HEAD")));
+    assert!(!before.contains(&git_dir.join("modules/reverie/HEAD")));
+
+    // A real nested checkout: the reader resolves HEAD through the
+    // submodule's own Git, so the fixture submodule is a repository.
+    let submodule = repo.path().join("reverie");
+    fs::create_dir_all(&submodule).expect("failed to create submodule dir");
+    git(&submodule, &["init", "-q"]);
+    fs::write(submodule.join("tracked.txt"), "clean\n").unwrap();
+    git(&submodule, &["add", "tracked.txt"]);
+    git(
+        &submodule,
+        &[
+            "-c",
+            "user.name=Hermit Test",
+            "-c",
+            "user.email=hermit-test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "submodule initial",
+        ],
+    );
+    let submodule_head = submodule.join(".git/HEAD");
+    let marker = repo.path().join("reverie.submodule.txt");
+    fs::write(&marker, "Subproject commit 1111111111111111111111111111111111111111\n")
+        .expect("failed to write marker");
+
+    let paths = build_support::reverie_pin_watch_paths_in(repo.path());
+    assert!(!paths.contains(&git_dir.join("index")));
+    assert!(paths.contains(&submodule_head));
+    assert!(paths.contains(&marker));
+    assert!(paths.iter().all(|path| path.exists()));
+}
+
+#[test]
 fn untracked_generated_output_does_not_taint_version() {
     let repo = initialized_repo();
     let expected = git(repo.path(), &["rev-parse", "--short=12", "HEAD"]);
@@ -197,7 +242,7 @@ fn commit_all(repo: &Path, message: &str) {
 fn provenance_fixture(repo: &Path) -> PathBuf {
     let crate_dir = repo.join("fixture");
     fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
-    for source in ["build_support.rs", "reverie_pin.rs"] {
+    for source in ["build_support.rs", "reverie_gitlink.rs", "reverie_pin.rs"] {
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
             crate_dir.join(source),
@@ -476,7 +521,7 @@ fn a_build_script_shared_through_a_target_dir_embeds_the_building_trees_pin() {
     let crate_dir = first.join("hermit-cli");
     fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
     fs::create_dir_all(first.join("detcore")).expect("failed to create fixture detcore");
-    for source in ["build_support.rs", "reverie_pin.rs"] {
+    for source in ["build_support.rs", "reverie_gitlink.rs", "reverie_pin.rs"] {
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
             crate_dir.join(source),
@@ -543,5 +588,207 @@ fn main() {
         build_and_run(&second),
         THIRD,
         "the build read the deleted first checkout's pin manifest"
+    );
+}
+
+/// The incremental-build twin for the pin watches, in the documented
+/// manual advance sequence (seat round 4): build a fixture crate whose
+/// build script embeds `reverie_pin()` exactly as hermit-cli's does
+/// (pin watches included), read the pin its binary prints, advance the
+/// submodule CHECKOUT, rebuild incrementally against the SAME target
+/// dir and require the new pin, then stage the gitlink (`git add
+/// reverie`) and require the same pin again. Read and watch must be
+/// the same source: under V0.7 (read the index, watch the submodule
+/// HEAD) the middle build embedded the pre-advance pin while checkout,
+/// index and gitlink all said the new one after staging.
+#[test]
+fn incremental_rebuild_after_gitlink_advance_embeds_the_new_pin() {
+    without_inherited_repository_location();
+
+    let repo = initialized_repo();
+    let crate_dir = repo.path().join("hermit-cli");
+    fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
+    fs::create_dir_all(repo.path().join("detcore")).expect("failed to create fixture detcore");
+    // No rev in the fallback manifest: the pin can only come from the checkout.
+    fs::write(repo.path().join("detcore/Cargo.toml"), "[package]\n").unwrap();
+    for source in ["build_support.rs", "reverie_gitlink.rs", "reverie_pin.rs"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
+            crate_dir.join(source),
+        )
+        .expect("failed to copy build support source");
+    }
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\nname = \"reverie-pin-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    )
+    .expect("failed to write fixture manifest");
+    // The same pin lines as hermit-cli/build.rs.
+    fs::write(
+        crate_dir.join("build.rs"),
+        r#"#[allow(dead_code)]
+#[path = "build_support.rs"]
+mod build_support;
+
+fn main() {
+    let reverie_pin = build_support::reverie_pin();
+    println!("cargo:rustc-env=FIXTURE_REVERIE_PIN={reverie_pin}");
+    for path in build_support::reverie_pin_watch_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
+}
+"#,
+    )
+    .expect("failed to write fixture build script");
+    fs::write(
+        crate_dir.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"FIXTURE_REVERIE_PIN\")); }\n",
+    )
+    .expect("failed to write fixture binary");
+
+    // A real nested submodule checkout with two commits to advance between.
+    let submodule = repo.path().join("reverie");
+    fs::create_dir_all(&submodule).expect("failed to create submodule dir");
+    git(&submodule, &["init", "-q"]);
+    let submodule_commit = |message: &str| -> String {
+        git(
+            &submodule,
+            &[
+                "-c",
+                "user.name=Hermit Test",
+                "-c",
+                "user.email=hermit-test@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        git(&submodule, &["rev-parse", "HEAD"])
+    };
+    let first = submodule_commit("submodule first");
+    let second = submodule_commit("submodule second");
+    git(&submodule, &["checkout", "--quiet", &first]);
+
+    let stage = |sha: &str, message: &str| {
+        git(
+            repo.path(),
+            &["update-index", "--add", "--cacheinfo", "160000", sha, "reverie"],
+        );
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=Hermit Test",
+                "-c",
+                "user.email=hermit-test@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+    };
+    commit_all(repo.path(), "fixture");
+    stage(&first, "pin first");
+
+    let target = repo.path().join("target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let build_and_run = || {
+        checked_output(
+            Command::new(&cargo)
+                .current_dir(&crate_dir)
+                .env("CARGO_TARGET_DIR", &target)
+                .args(["build", "--quiet"]),
+        );
+        checked_output(&mut Command::new(target.join("debug/reverie-pin-fixture")))
+    };
+    assert_eq!(build_and_run(), first);
+
+    // Advance the checkout only (the manual sequence's first half): the
+    // compiled sources move, so the embedded pin must move before staging.
+    git(&submodule, &["checkout", "--quiet", &second]);
+    assert_eq!(
+        build_and_run(),
+        second,
+        "incremental build kept the pre-advance pin after checkout advance"
+    );
+
+    // Stage the gitlink: pin unchanged, and still correct.
+    stage(&second, "pin second");
+    assert_eq!(build_and_run(), second);
+}
+
+/// Eden mode: with no git anywhere, a marker-only tree embeds the
+/// marker's pin, not "unknown" (the pre-fix regression: the marker was
+/// watched but never read, so every fbsource Cargo build embedded
+/// "unknown" where it previously read the manifest rev).
+#[test]
+fn marker_only_tree_embeds_the_marker_pin() {
+    without_inherited_repository_location();
+    const MARKED: &str = "4444444444444444444444444444444444444444";
+
+    let scratch = tempfile::tempdir().expect("failed to create scratch directory");
+    let root = scratch.path();
+    let crate_dir = root.join("hermit-cli");
+    fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
+    fs::create_dir_all(root.join("detcore")).expect("failed to create fixture detcore");
+    fs::write(root.join("detcore/Cargo.toml"), "[package]\n").unwrap();
+    fs::write(
+        root.join("reverie.submodule.txt"),
+        format!("Subproject commit {MARKED}\n"),
+    )
+    .expect("failed to write marker");
+    for source in ["build_support.rs", "reverie_gitlink.rs", "reverie_pin.rs"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
+            crate_dir.join(source),
+        )
+        .expect("failed to copy build support source");
+    }
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\nname = \"reverie-pin-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[workspace]\n",
+    )
+    .expect("failed to write fixture manifest");
+    fs::write(
+        crate_dir.join("build.rs"),
+        r#"#[allow(dead_code)]
+#[path = "build_support.rs"]
+mod build_support;
+
+fn main() {
+    let reverie_pin = build_support::reverie_pin();
+    println!("cargo:rustc-env=FIXTURE_REVERIE_PIN={reverie_pin}");
+    for path in build_support::reverie_pin_watch_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
+}
+"#,
+    )
+    .expect("failed to write fixture build script");
+    fs::write(
+        crate_dir.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"FIXTURE_REVERIE_PIN\")); }\n",
+    )
+    .expect("failed to write fixture binary");
+
+    // The reader alone first, then the built binary it feeds.
+    assert_eq!(build_support::reverie_pin_in(&crate_dir), MARKED);
+    let target = root.join("target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    checked_output(
+        Command::new(&cargo)
+            .current_dir(&crate_dir)
+            .env("CARGO_TARGET_DIR", &target)
+            .args(["build", "--quiet"]),
+    );
+    assert_eq!(
+        checked_output(&mut Command::new(target.join("debug/reverie-pin-fixture"))),
+        MARKED
     );
 }

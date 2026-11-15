@@ -97,6 +97,13 @@ fn main() {
     // authority.
     let reverie_pin = build_support::reverie_pin();
     println!("cargo:rustc-env=HERMIT_REVERIE_PIN={reverie_pin}");
+    // The pin now comes from the gitlink, not a manifest: watch everything
+    // that can move it (index/HEAD/submodule HEAD, or the Eden marker), or
+    // an incremental build embeds the previous pin after an advance. The
+    // detcore manifest watch stays for the pre-migration fallback read.
+    for path in build_support::reverie_pin_watch_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NATIVE_EXEC");

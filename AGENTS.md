@@ -108,7 +108,7 @@ The checked-in rustfmt configuration needs the nightly formatter pinned in
 any other. Before finishing a Rust change, run:
 
 ```bash
-./scripts/cargo-fmt-pinned.rs --all -- --check
+./scripts/cargo-fmt-pinned.rs --workspace-members -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

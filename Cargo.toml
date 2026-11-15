@@ -23,7 +23,11 @@ members = [
   "inguest-engine",
   "tests",
 ]
-exclude = ["agent-utils"]
+# `reverie` is a path-dependency source (the submodule), never a member:
+# without this exclude Cargo adopts its crates as workspace members
+# (37 members measured, test-only deps entering Hermit's lock and gates),
+# and Hermit's clippy/test scope would silently cover Reverie.
+exclude = ["agent-utils", "reverie"]
 # Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
 # The default developer build produces the ptrace/KVM CLI. LiteInst remains
 # an explicit core feature and its in-guest runtime has a separate producer;
@@ -54,6 +58,31 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# Reverie is depended on by path into the `reverie` submodule, so the
+# submodule gitlink is the only commit hash a Reverie advance changes
+# (Reverie pin-flow design, Finding 3). Every entry keeps `version =`
+# beside `path =` so `cargo publish` drops the path and uses the
+# registry version, at the matching Hermit/Reverie release version.
+# Members inherit with `workspace = true` and add only their own
+# features/optional. `default-features = false` lives here for the four
+# crates every member already took that way, because Cargo refuses a
+# member-level default-features override on an inherited dependency.
+# In fbsource the same paths
+# resolve through the `hermit/reverie` symlink fb-only/ci.sh
+# materializes to the sibling in-tree Reverie.
+[workspace.dependencies]
+reverie-core = { path = "reverie/reverie", version = "0.5.7" }
+reverie-inguest = { path = "reverie/reverie-inguest", version = "0.5.7", default-features = false }
+reverie-kvm = { path = "reverie/reverie-kvm", version = "0.5.7" }
+reverie-liteinst = { path = "reverie/reverie-liteinst", version = "0.5.7", default-features = false }
+reverie-liteinst-artifact = { path = "reverie/reverie-liteinst-artifact", version = "0.5.7", default-features = false }
+reverie-loader = { path = "reverie/reverie-loader", version = "0.5.7" }
+reverie-procfs = { path = "reverie/reverie-procfs", version = "0.5.7" }
+reverie-ptrace = { path = "reverie/reverie-ptrace", version = "0.5.7" }
+reverie-rpc-transport = { path = "reverie/reverie-rpc-transport", version = "0.5.7" }
+reverie-syscalls = { path = "reverie/reverie-syscalls", version = "0.5.7" }
+safeptrace = { path = "reverie/safeptrace", version = "0.5.7" }
 
 # SHA-256 is the io-buffer hash, and an unoptimised build of it is the single
 # dominant cost of `--detlog-io-buffers`. Measured on a 64 MiB buffer: 1.590s

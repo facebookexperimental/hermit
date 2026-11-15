@@ -484,14 +484,14 @@ lint-script-tests: ## Run the unit tests carried by rust-script entrypoints (CI 
 
 lint-cargo: ## The two compile-heavy lint passes; CI runs these as lint.rustfmt and lint.clippy
 	./scripts/cargo-fmt-pinned.rs --self-test
-	./scripts/cargo-fmt-pinned.rs --all -- --check
+	./scripts/cargo-fmt-pinned.rs --workspace-members -- --check
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
 # The formatter is the one ci/rustfmt-toolchain.toml pins, found and checked by
 # scripts/cargo-fmt-pinned.rs exactly as lint.rustfmt finds it: never the stable
 # compiler pin's rustfmt, which ignores rustfmt.toml's nightly-only options.
 fmt: ## Format the root workspace with the pinned formatter (what lint.rustfmt checks)
-	./scripts/cargo-fmt-pinned.rs --all
+	./scripts/cargo-fmt-pinned.rs --workspace-members
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)

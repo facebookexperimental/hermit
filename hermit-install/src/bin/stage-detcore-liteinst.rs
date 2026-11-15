@@ -10,6 +10,7 @@ use reverie_liteinst_artifact as proof;
 use serde_json::json;
 
 include!("../../../hermit-cli/reverie_pin.rs");
+include!("../../../hermit-cli/reverie_gitlink.rs");
 
 /// The one named Reverie repository this staging build's
 /// compiled-source qualification expects (see the same-named
@@ -76,10 +77,8 @@ fn run() -> proof::Result<()> {
     fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
     let mut runner = proof::Runner::new(evidence.join("logs"), Duration::from_secs(900), 64 << 20)?;
     let manifest = root.join("Cargo.toml");
-    let pin = parse_reverie_pin(
-        &fs::read_to_string(root.join("detcore/Cargo.toml")).map_err(|e| e.to_string())?,
-    )
-    .ok_or("Detcore manifest must name one full Reverie pin")?;
+    let pin = reverie_pin_at(&root)
+        .ok_or("the reverie submodule gitlink must name one full Reverie pin")?;
     let expectation = proof::CompiledSourceExpectation {
         layout: proof::CompiledSourceLayout::HermitGit,
         image_kind: proof::FixedImageKind::Detcore,
