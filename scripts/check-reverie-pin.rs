@@ -4344,6 +4344,95 @@ mod tests {
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
+    /// The authority is facebookexperimental/reverie, not the drained
+    /// rrnewton fork: a pin that exists only on the export remote's main
+    /// (the 97acf74d shape) passes, and a pin that exists only on a
+    /// divergent fork remote is refused as off-history. This locks the
+    /// choice of authority in: pointing DEFAULT_REMOTE back at rrnewton
+    /// fails this test by name instead of silently re-judging pins
+    /// against a frozen fork.
+    #[test]
+    fn fbexp_only_pin_passes_and_rrnewton_only_pin_is_refused() {
+        assert_eq!(
+            DEFAULT_REMOTE, "https://github.com/facebookexperimental/reverie",
+            "the Reverie authority is the facebookexperimental export, not rrnewton"
+        );
+
+        // Two remotes diverging from one shared root commit: the export
+        // remote (the authority) and a fork remote carrying a commit the
+        // authority never merged.
+        let export = temp_path("fbexp-authority");
+        let fork = temp_path("rrnewton-fork");
+        init_fixture_repo(&export);
+        commit_file(&export, "revision", "base\n");
+        assert!(
+            git_in(&export, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let fbexp_only = commit_file(&export, "revision", "fbexp only\n");
+
+        init_fixture_repo(&fork);
+        assert!(
+            git_in(&fork, &["fetch", "--quiet", export.to_str().unwrap(), "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&fork, &["checkout", "-q", "-B", "main", "FETCH_HEAD~1"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let fork_only = commit_file(&fork, "revision", "fork only\n");
+        assert_ne!(fbexp_only, fork_only);
+
+        let judge = |label: &str, pin: &str| -> i32 {
+            let root = temp_path(label);
+            init_fixture_repo(&root);
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[dependencies]\nreverie = {{ git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"{pin}\" }}\n"
+                ),
+            )
+            .expect("write fixture manifest");
+            assert!(
+                git_in(&root, &["add", "Cargo.toml"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let code = run_with_config(Config {
+                repo: Some(root.clone()),
+                remote: Some(export.to_string_lossy().into_owned()),
+                // Isolated fixture: there is genuinely no base ref here, so the
+                // skip is DECLARED rather than stumbled into.
+                no_base: true,
+                ..Config::default()
+            })
+            .expect("pin should be classified");
+            fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+            code
+        };
+
+        assert_eq!(
+            judge("fbexp-only-pin", &fbexp_only),
+            0,
+            "a pin that exists only on facebookexperimental/reverie:main must PASS"
+        );
+        assert_eq!(
+            judge("fork-only-pin", &fork_only),
+            1,
+            "a pin that exists only on the fork remote must be REFUSED as off-history"
+        );
+
+        fs::remove_dir_all(export).expect("remove export fixture repository");
+        fs::remove_dir_all(fork).expect("remove fork fixture repository");
+    }
+
     /// A Hermit fixture whose one tracked manifest pins `pin`, plus a remote
     /// path that is never created, so any lookup of Reverie main fails.
     fn offline_fixture(label: &str, pin: &str) -> (PathBuf, PathBuf) {
