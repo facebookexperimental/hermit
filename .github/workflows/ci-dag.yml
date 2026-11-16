@@ -40,8 +40,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun
-        run: git submodule update --init agent-utils
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: actions/setup-go@v5
         with:
           go-version: stable

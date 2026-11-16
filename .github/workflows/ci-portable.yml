@@ -263,8 +263,8 @@ jobs:
       selected_cell_count: ${{ steps.coverage.outputs.selected_cell_count }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -855,8 +855,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: actions/setup-go@v5
         with:
           go-version: stable
