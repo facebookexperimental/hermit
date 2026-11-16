@@ -3,6 +3,7 @@
 
 usage: verdict.py --plan ci/expected-e2e-plan.json --import-dir IMPORT_DIR --out DIR
                   --harness TEST_HARNESS --repo-root ROOT [--source-sha SHA]
+                  [--record-host-image-interpreter-refusals BASELINE]
 
 IMPORT_DIR is what ingest.py wrote. For each (lane, category) bucket of the plan, this
 runs TEST_HARNESS in import mode (E2E_IMPORT_RESULTS=IMPORT_DIR) with the selection that
@@ -10,6 +11,7 @@ bucket's e2e node uses in the cargo flow:
 
     TEST_HARNESS run --repo-root ROOT [--source-sha SHA] --lane LANE --category CATEGORY
         --ci-only --prebuilt [--diagnostic-results]
+        [--record-host-image-interpreter-refusals BASELINE]
         --results DIR/LANE/manifest_CATEGORY/results.jsonl
         --junit DIR/LANE/manifest_CATEGORY/junit.xml
 
@@ -24,6 +26,14 @@ a cell with no result, and the diagnostic excuse. DIR receives the result files 
 would publish. The node flags that change nothing here are not passed: --allow-empty (a
 plan bucket has cells), --jobs (nothing executes) and --exclude-backend kvm (the plan
 includes KVM cells).
+A cell whose every run its host's own program interpreter refused keeps the FAIL its
+attempts measured, unless the cells ran with HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS
+(cell.sh) and recorded it HOST-INAPPLICABLE. The harness accepts such a recorded row only
+under --record-host-image-interpreter-refusals BASELINE, which this passes on to every
+bucket (give the BASELINE the cells were given); without it the row is an ERROR. Each
+recorded one is printed as HOST-INAPPLICABLE, counted in host_inapplicable and in
+host_image_interpreter_refusals, and checked against BASELINE: one that passed there, or
+that BASELINE has no row for, fails its bucket (PASS -> HOST-INAPPLICABLE).
 
 A bucket passes only when the harness exits 0 and its summary.json reports an import of
 exactly the bucket's plan cells, with no ERROR and no FAIL beyond the excused diagnostic
@@ -42,7 +52,8 @@ neither); otherwise every row is an import-stale ERROR.
 import argparse, collections, json, os, subprocess, sys
 import xml.etree.ElementTree as ET
 
-COUNTS = ("cells", "passed", "failed", "errors", "diagnostic_failures", "host_inapplicable")
+COUNTS = ("cells", "passed", "failed", "errors", "diagnostic_failures", "host_inapplicable",
+          "host_image_interpreter_refusals")
 IMPORTED = ("missing_cells", "dropped_retries")
 # DIAGNOSTIC_MANIFEST_BUCKETS in ci/manifest-plan/src/validation_dag.rs; a test pins the copy.
 DIAGNOSTIC_BUCKETS = ("compat",)
@@ -87,6 +98,8 @@ def no_verdict(rc, summary, planned):
     imported = summary["imported"] if isinstance(summary["imported"], dict) else {}
     counts = {key: summary.get(key) for key in COUNTS}
     counts["missing_cells"] = imported.get("missing_cells")
+    # Older harnesses write no host_image_interpreter_refusals; none of their cells is one.
+    counts.pop("host_image_interpreter_refusals", None)
     absent = [key for key, value in counts.items() if type(value) is not int]
     if absent:
         return (f"test-harness exited 0 but its summary.json has no integer {', '.join(absent)}; "
@@ -128,6 +141,9 @@ def main():
     ap.add_argument("--harness", required=True, help="the test-harness to judge with (ci/buck-e2e/staged/bin/test-harness)")
     ap.add_argument("--repo-root", required=True, help="the checkout whose manifests and test sources the rows must match")
     ap.add_argument("--source-sha", help="ROOT is a `git archive` of commit SHA (test-harness --source-sha)")
+    ap.add_argument("--record-host-image-interpreter-refusals", metavar="BASELINE",
+                    help="accept the cells' recorded host-image interpreter refusals, each checked against "
+                         "this PASS baseline (test-harness --record-host-image-interpreter-refusals)")
     a = ap.parse_args()
     try:
         with open(a.plan) as f:
@@ -167,6 +183,8 @@ def main():
         command += ["--source-sha", a.source_sha] if a.source_sha else []
         command += ["--lane", lane, "--category", category, "--ci-only", "--prebuilt"]
         command += ["--diagnostic-results"] if category in DIAGNOSTIC_BUCKETS else []
+        baseline = a.record_host_image_interpreter_refusals
+        command += ["--record-host-image-interpreter-refusals", os.path.abspath(baseline)] if baseline else []
         command += ["--results", os.path.join(d, "results.jsonl"), "--junit", os.path.join(d, "junit.xml")]
         try:
             with open(os.path.join(d, "harness.log"), "w") as log:
@@ -180,6 +198,11 @@ def main():
             totals[key] += counted.get(key) if type(counted.get(key)) is int else 0
         for key in IMPORTED:
             totals[key] += imported.get(key) if type(imported.get(key)) is int else 0
+        for cell in counted.get("host_image_interpreter_refusal_cells") or []:
+            if isinstance(cell, dict) and cell.get("recorded") is True:
+                print(f"verdict: HOST-INAPPLICABLE {lane}/{category} {junit_name(cell)}: recorded as a "
+                      f"host-image interpreter refusal, not a pass: {first_line(cell.get('reason'))}",
+                      file=sys.stderr)
         excused = {junit_name(cell): cell for cell in counted.get("diagnostic_failure_cells") or []}
         for name, cell in sorted(excused.items()):
             print(f"verdict: DIAGNOSTIC {lane}/{category} {name}: a diagnostic cell's product failure "

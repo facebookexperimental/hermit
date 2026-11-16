@@ -17987,6 +17987,54 @@ fn super_stress_verdict_lines(
     (lines, blocking)
 }
 
+/// The verdict line naming the cells nodes RAN and recorded
+/// HOST-INAPPLICABLE themselves
+/// ([`validate_classification::recorded_host_inapplicable_cells`]).
+fn recorded_host_inapplicable_detail(recorded: &BTreeMap<String, Vec<String>>) -> String {
+    format!(
+        "{} node(s) RAN and recorded {} manifest cell(s) HOST-INAPPLICABLE because this host's \
+         own program interpreter refused every run (test-harness {}): {}. Those cells are NOT a \
+         pass and NOT coverage, so this run is not complete.",
+        recorded.len(),
+        recorded.values().map(Vec::len).sum::<usize>(),
+        hermit_manifest_plan::runner::RECORD_INTERPRETER_REFUSALS_ARG,
+        recorded
+            .iter()
+            .map(|(node, cells)| format!("{node} ({})", cells.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+#[cfg(test)]
+mod recorded_host_inapplicable_detail_tests {
+    /// The line counts nodes and cells and names each cell under its node.
+    #[test]
+    fn the_verdict_line_names_every_recorded_cell_under_its_node() {
+        let recorded = std::collections::BTreeMap::from([
+            (
+                "e2e.manifest_a_buck".to_string(),
+                vec![
+                    "a/x [ptrace/verify]".to_string(),
+                    "a/y [kvm/verify]".to_string(),
+                ],
+            ),
+            (
+                "e2e.manifest_b".to_string(),
+                vec!["b/z [ptrace/chaos]".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            super::recorded_host_inapplicable_detail(&recorded),
+            "2 node(s) RAN and recorded 3 manifest cell(s) HOST-INAPPLICABLE because this \
+             host's own program interpreter refused every run (test-harness \
+             --record-host-image-interpreter-refusals): e2e.manifest_a_buck (a/x [ptrace/verify], \
+             a/y [kvm/verify]); e2e.manifest_b (b/z [ptrace/chaos]). Those cells are NOT a pass \
+             and NOT coverage, so this run is not complete."
+        );
+    }
+}
+
 /// The plan header's host-inapplicable clause, empty when there is none.
 fn host_inapplicable_plan_summary(nodes: &[validate_plan::HostInapplicableNode]) -> String {
     let (partly, wholly): (Vec<_>, Vec<_>) = nodes.iter().partition(|n| n.runs());
@@ -33274,6 +33322,15 @@ check_build_mode_selection(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    }
+    // Cells a node recorded HOST-INAPPLICABLE as it ran (test-harness under
+    // --record-host-image-interpreter-refusals): named here, and counted by
+    // classify_run as cells withheld, so a node that exited 0 with one cannot
+    // read as covering it.
+    let recorded_inapplicable =
+        validate_classification::recorded_host_inapplicable_cells(&outcomes);
+    if !recorded_inapplicable.is_empty() {
+        detail.push(recorded_host_inapplicable_detail(&recorded_inapplicable));
     }
     match executed_tests {
         Some(n) => detail.push(format!(

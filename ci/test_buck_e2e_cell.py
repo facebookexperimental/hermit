@@ -13,7 +13,13 @@ resolves outside the bundle, never replacing one the bundle ships, and a library
 image lacks is an ERROR. The wrapper and the harness each get a deadline that leaves
 the next one out time to stop them. A cell the harness withholds as HOST-INAPPLICABLE
 is reported skipped, with the harness's reason, on a local route only; on RE, or with any
-other run failure, it stays failed. Nothing here needs podman, /test or capabilities.
+other run failure, it stays failed. A cell whose every run this host's own program
+interpreter refused keeps its FAIL; one the harness recorded HOST-INAPPLICABLE (error_kind
+host-image-interpreter-refusal, one row) because HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS
+asked it to is reported as a withheld cell is: skipped on a local route, failed under
+HERMIT_E2E_REQUIRE_HOST_CAPS=1 and off a local route. A bundle's v2-rootfs that has
+neither an oci-layout nor NO-V2-ROOTFS fails the cell. Nothing here needs podman, /test
+or capabilities.
 
 A diverging verify cell's artifacts also go through ci/buck-e2e/ingest.py, as Tpx
 would list them, to check that both run logs come back to this host from a cell that
@@ -23,7 +29,8 @@ execution whose harness output cell.sh rejected (a pass followed by a failed exi
 malformed, contradictory or duplicated record, a skip that is not an excused FAIL, a
 withheld pair beside a row) or whose completion was never published (a normalizer or
 publication that failed at any point), and still accepts a pass, a guest failure, an
-excused diagnostic skip, a withheld cell and a cell that returned no result.
+excused diagnostic skip, a withheld cell, a recorded interpreter refusal (its one
+HOST-INAPPLICABLE row) and a cell that returned no result.
 
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
@@ -71,6 +78,14 @@ RE_EXCLUSIONS = CI / "buck-e2e" / "re_exclusions.json"
 TEST, MODE, BACKEND = "c-programs/cpuid-probe", "verify", "dbt"
 CELL = f"{TEST}/{MODE}@{BACKEND}"
 SLUG = "c-programs-cpuid-probe-verify-dbt"
+# The error kind and a reason of the row the harness records, under
+# --record-host-image-interpreter-refusals, for a cell whose every run this host's own
+# program interpreter refused (runner.rs host_image_interpreter_refusal_row).
+INTERPRETER_REFUSAL = "host-image-interpreter-refusal"
+INTERPRETER_REFUSAL_REASON = (
+    "NOT RUN, NOT a pass, no coverage: this host's own program interpreter refused the CPU Hermit "
+    "presented: \"Fatal glibc error: CPU does not support x86-64-v3\" (attempt 1); it needs "
+    "x86-64-v3, above the x86-64-v2 this cell presented (qualification-refused in its run manifests)")
 
 # test-harness, for `run ... --results F --junit F --tpx-json F`: records its argv and
 # the environment cell.sh gives it, then writes one PASS row, its test_done and the
@@ -115,9 +130,15 @@ for fd in os.listdir("/proc/self/fd"):
         fd_targets.append(os.readlink("/proc/self/fd/" + fd))
     except OSError:
         pass
+# The PASS baseline --record-host-image-interpreter-refusals names, as the harness reads it.
+baseline = None
+if "--record-host-image-interpreter-refusals" in args:
+    where = host(flag("--record-host-image-interpreter-refusals"))
+    baseline = sorted(os.listdir(where)) if os.path.isdir(where) else open(where).read()
 with open(os.environ["FAKE_CALLS"], "a") as calls:
     calls.write(json.dumps({"who": "harness", "argv": args, "env": {k: os.environ.get(k) for k in keys},
-                            "rsrcs": links, "slots": slots, "fd_targets": fd_targets}) + "\n")
+                            "rsrcs": links, "slots": slots, "fd_targets": fd_targets,
+                            "baseline": baseline}) + "\n")
 # Like hermit, which writes its private verify summary into its working directory (the
 # repository root when no enclosing checkout ignores `ignored/`), and a write through an
 # existing bundle file, which a hard-linked copy would carry back into the bundle.
@@ -158,28 +179,52 @@ if outcome == "HOST-INAPPLICABLE":
     # further run failures; FAKE_RUN_FAILURES_ONLY replaces them all. FAKE_WITHHELD_TEST,
     # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record,
     # FAKE_RUN_VERDICT_STATUS the run-verdict record's status, and FAKE_WITHHELD_ROW adds
-    # a row with that outcome, which a withheld cell never writes.
+    # FAKE_WITHHELD_ROW_COUNT (default 1) rows with that outcome, which a withheld cell
+    # never writes, of error kind FAKE_WITHHELD_ROW_KIND. FAKE_WITHHELD_ERROR_KIND gives the
+    # record an error kind and FAKE_WITHHELD_REASON replaces its reason; FAKE_EXIT replaces
+    # the exit status. With the error kind host-image-interpreter-refusal on the record and
+    # on one HOST-INAPPLICABLE row, it is the harness that recorded a cell whose every run
+    # this host's own program interpreter refused (--record-host-image-interpreter-refusals):
+    # summary.json names it, recorded, and the attempt's FAIL row is in
+    # host-image-interpreter-refusals.jsonl, not in results.jsonl.
+    error_kind = os.environ.get("FAKE_WITHHELD_ERROR_KIND")
+    reason = os.environ.get("FAKE_WITHHELD_REASON",
+                            "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter")
     with open(results, "w") as f:
-        if os.environ.get("FAKE_WITHHELD_ROW"):
-            f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
-                                "outcome": os.environ["FAKE_WITHHELD_ROW"], "attempt": 1,
-                                "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
+        for _ in range(int(os.environ.get("FAKE_WITHHELD_ROW_COUNT", "1")) if os.environ.get("FAKE_WITHHELD_ROW") else 0):
+            withheld_row = {"test": test, "mode": mode, "backend": backend,
+                            "outcome": os.environ["FAKE_WITHHELD_ROW"], "attempt": 1,
+                            "run_id": os.environ["E2E_RUN_ID"]}
+            if os.environ.get("FAKE_WITHHELD_ROW_KIND"):
+                withheld_row["error_kind"] = os.environ["FAKE_WITHHELD_ROW_KIND"]
+            f.write(json.dumps(withheld_row) + "\n")
     with open(host(flag("--junit")), "w") as f:
         f.write("<testsuite/>\n")
+    claim = {"test": test, "mode": mode, "backend": None if backend == "native" else backend}
+    if error_kind == "host-image-interpreter-refusal":
+        summary = {"schema": 1, "host_inapplicable_cells": [], "host_image_interpreter_refusals": 1,
+                   "host_image_interpreter_refusal_cells": [dict(claim, reason=reason, recorded=True,
+                                                                 evidence={"needs": 3})]}
+        with open(os.path.join(os.path.dirname(results), "host-image-interpreter-refusals.jsonl"), "w") as f:
+            f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": "FAIL",
+                                "attempt": 1, "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
+    else:
+        summary = {"schema": 1, "host_inapplicable_cells": [claim]}
     with open(os.path.join(os.path.dirname(results), "summary.json"), "w") as f:
-        f.write(json.dumps({"schema": 1, "host_inapplicable_cells": [
-            {"test": test, "mode": mode, "backend": None if backend == "native" else backend}]}) + "\n")
+        f.write(json.dumps(summary) + "\n")
     failures = ["every one of the 1 selected cell(s) was host-inapplicable; "
                 "a run that executed no cell is not a pass"]
     failures += json.loads(os.environ.get("FAKE_RUN_FAILURES") or "[]")
     if os.environ.get("FAKE_RUN_FAILURES_ONLY"):
         failures = json.loads(os.environ["FAKE_RUN_FAILURES_ONLY"])
+    details = {"outcome": os.environ.get("FAKE_WITHHELD_OUTCOME", "HOST-INAPPLICABLE"), "reason": reason}
+    if error_kind:
+        details["error_kind"] = error_kind
     with open(tpx, "w") as f:
         f.write(json.dumps({"op": "test_done",
                             "test": os.environ.get("FAKE_WITHHELD_TEST") or test + "/" + mode + "@" + backend,
                             "status": os.environ.get("FAKE_WITHHELD_STATUS", "skipped"),
-                            "details": json.dumps({"outcome": os.environ.get("FAKE_WITHHELD_OUTCOME", "HOST-INAPPLICABLE"),
-                                                   "reason": "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter"})}) + "\n")
+                            "details": json.dumps(details)}) + "\n")
         f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict",
                             "status": os.environ.get("FAKE_RUN_VERDICT_STATUS", "failed"),
                             "details": json.dumps({"run_failures": failures})}) + "\n")
@@ -187,7 +232,7 @@ if outcome == "HOST-INAPPLICABLE":
     if "FAKE_RESULTS_RAW" in os.environ:
         with open(results, "w") as f:
             f.write(os.environ["FAKE_RESULTS_RAW"])
-    sys.exit(1)
+    sys.exit(int(os.environ.get("FAKE_EXIT", "1")))
 with open(results, "w") as f:
     f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
                         "attempt": 1, "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
@@ -254,6 +299,15 @@ if os.environ.get("FAKE_SECOND_ATTEMPT"):
     for n in os.environ.get("FAKE_DETLOGS_2", "1"):
         with open(os.path.join(logs2, "run%s_log_detlog" % n), "w") as f:
             f.write("run %s detlog line 0\n" % n)
+# FAKE_REFUSAL_CLAIM=kept: the harness, without --record-host-image-interpreter-refusals,
+# for a cell whose every run this host's own program interpreter refused: the cell keeps
+# its row, and summary.json names it, not recorded.
+if os.environ.get("FAKE_REFUSAL_CLAIM") == "kept":
+    claim = {"test": test, "mode": mode, "backend": None if backend == "native" else backend}
+    with open(os.path.join(os.path.dirname(results), "summary.json"), "w") as f:
+        f.write(json.dumps({"schema": 1, "host_inapplicable_cells": [], "host_image_interpreter_refusals": 0,
+                            "host_image_interpreter_refusal_cells": [dict(claim, recorded=False, reason="refused",
+                                                                          evidence={"needs": 3})]}) + "\n")
 # FAKE_TPX_RAW replaces the payload with exactly these bytes, after the row and the
 # evidence are written, FAKE_RESULTS_RAW the rows; FAKE_EXIT replaces the exit status.
 if "FAKE_TPX_RAW" in os.environ:
@@ -405,6 +459,9 @@ class CellTest(unittest.TestCase):
         (self.bundle / "hermit" / "hermit").write_text("hermit\n")
         (self.bundle / "run-state").mkdir()
         (self.bundle / "SOURCE_SHA").write_text("a" * 40 + "\n")
+        # As ci/buck-e2e/BUCK :empty-v2-rootfs builds it for a bundle that ships no v2 rootfs.
+        (self.bundle / "v2-rootfs").mkdir()
+        (self.bundle / "v2-rootfs" / "NO-V2-ROOTFS").write_text("This bundle ships no v2 rootfs.\n")
         self.before = sorted(str(p.relative_to(self.bundle)) for p in self.bundle.rglob("*"))
         self.calls = self.tmp / "calls.jsonl"
         self.calls.touch()
@@ -758,24 +815,67 @@ class CellTest(unittest.TestCase):
     # The bundle's v2 rootfs (an oci-dir the harness retries a loader-rejected
     # verify or chaos cell under, KVM or ptrace, issue 5476) reaches the
     # harness as HERMIT_E2E_V2_OCI_DIR, from the bundle alone: a caller's
-    # value never leaks in, and a bundle without an oci-layout names none.
-    def test_a_bundle_v2_rootfs_reaches_a_host_cell(self) -> None:
-        (self.bundle / "v2-rootfs").mkdir()
+    # value never leaks in. A bundle that ships none declares it with
+    # v2-rootfs/NO-V2-ROOTFS and names none; any other v2-rootfs without an
+    # oci-layout fails the cell before the harness runs, so the retry is never
+    # lost without a word.
+    def ship_v2_rootfs(self) -> None:
+        (self.bundle / "v2-rootfs" / "NO-V2-ROOTFS").unlink()
         (self.bundle / "v2-rootfs" / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}\n')
+
+    def test_a_bundle_v2_rootfs_reaches_a_host_cell(self) -> None:
+        self.ship_v2_rootfs()
         done, _ = self.run_cell(HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_V2_OCI_DIR"], str(self.bundle / "v2-rootfs"))
 
-    def test_a_bundle_without_a_v2_rootfs_names_none(self) -> None:
+    def test_a_bundle_that_declares_no_v2_rootfs_names_none(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertIsNone(harness["env"]["HERMIT_E2E_V2_OCI_DIR"])
 
-    def test_a_pinned_root_cell_gets_the_v2_rootfs_inside_the_bundle(self) -> None:
-        (self.bundle / "v2-rootfs").mkdir()
+    def test_a_v2_rootfs_without_an_oci_layout_or_the_declaration_fails_the_cell(self) -> None:
+        # F3 (T2): the empty directory that used to disable the retry silently, a rootfs
+        # whose oci-layout was lost, and a bundle with no v2-rootfs/ at all.
+        def empty() -> None:
+            (self.bundle / "v2-rootfs" / "NO-V2-ROOTFS").unlink()
+
+        def blobs_only() -> None:
+            empty()
+            (self.bundle / "v2-rootfs" / "index.json").write_text("{}\n")
+
+        def absent() -> None:
+            shutil.rmtree(self.bundle / "v2-rootfs")
+
+        for name, change in (("an empty v2-rootfs", empty), ("a v2-rootfs without its oci-layout", blobs_only),
+                             ("no v2-rootfs", absent)):
+            with self.subTest(name):
+                self.setUp()
+                change()
+                for route in ("local", "re"):
+                    for container in ("", "pinned-root") if route == "local" else ("",):
+                        done, result = self.run_cell(HERMIT_E2E_ROUTE=route, HERMIT_E2E_CONTAINER=container)
+                        self.assertEqual(done["status"], "failed", done)
+                        self.assertEqual(json.loads(done["details"]), {
+                            "outcome": "ERROR",
+                            "reason": "the bundle's v2-rootfs/ holds no oci-layout (issue 5476's v2 rootfs) and no "
+                                      "NO-V2-ROOTFS (a bundle that ships none, ci/buck-e2e/BUCK :empty-v2-rootfs), so "
+                                      "a loader-rejected cell would lose its v2 retry without a word"})
+                        self.assertIsNone(result)
+                        self.assertEqual(self.calls_by("harness"), [])
+
+    def test_a_v2_rootfs_that_both_ships_and_declares_none_fails_the_cell(self) -> None:
         (self.bundle / "v2-rootfs" / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}\n')
+        done, result = self.run_cell()
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("holds both an oci-layout and NO-V2-ROOTFS", details_json(done)["reason"])
+        self.assertIsNone(result)
+        self.assertEqual(self.calls_by("harness"), [])
+
+    def test_a_pinned_root_cell_gets_the_v2_rootfs_inside_the_bundle(self) -> None:
+        self.ship_v2_rootfs()
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
                                 HERMIT_E2E_V2_OCI_DIR=str(self.tmp / "elsewhere"))
         self.assertEqual(done["status"], "passed", done)
@@ -1014,6 +1114,244 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("HERMIT_E2E_REQUIRE_HOST_CAPS must be 0 or 1, not 'yes'",
                       details_json(done)["reason"])
+
+    # A host-image interpreter refusal: this host's own program interpreter refused every
+    # run the harness made of the cell. Without the opt-in the harness keeps the cell's
+    # FAIL, and so does cell.sh, on every route. With
+    # HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS on a local route the harness records
+    # it HOST-INAPPLICABLE: one row of kind host-image-interpreter-refusal (the attempt's
+    # FAIL row goes to host-image-interpreter-refusals.jsonl), a skipped record of that
+    # kind, and a run that failed only for measuring no cell. cell.sh treats that as a
+    # withheld cell: a skip on a local route, a failure under
+    # HERMIT_E2E_REQUIRE_HOST_CAPS=1 (no exemption), and off a local route a failure that
+    # is never a skip, which ingest.py numbers as no attempt (F2).
+    def baseline(self) -> Path:
+        """A PASS baseline in which the cell failed: an earlier run's results.jsonl."""
+        path = self.tmp / "baseline" / "results.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"test": TEST, "mode": MODE, "backend": BACKEND, "outcome": "FAIL",
+                                    "attempt": 1}) + "\n")
+        return path
+
+    def recorded(self, **env: str) -> tuple[dict, dict | None]:
+        """run_cell with the harness's output for a cell it recorded as a host-image
+        interpreter refusal, under the opt-in, changed by ENV."""
+        base = {"FAKE_OUTCOME": "HOST-INAPPLICABLE", "FAKE_WITHHELD_ERROR_KIND": INTERPRETER_REFUSAL,
+                "FAKE_WITHHELD_ROW": "HOST-INAPPLICABLE", "FAKE_WITHHELD_ROW_KIND": INTERPRETER_REFUSAL,
+                "FAKE_WITHHELD_REASON": INTERPRETER_REFUSAL_REASON,
+                "HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS": str(self.baseline())}
+        base.update(env)
+        return self.run_cell(**base)
+
+    def test_without_the_opt_in_an_interpreter_refused_cell_keeps_its_fail(self) -> None:
+        # The default: the harness gets no --record-host-image-interpreter-refusals, and the
+        # FAIL its attempt measured is the record on every route and under every
+        # requirement; summary.json only names the refusal.
+        for route in ("local", "re"):
+            for require in ("", "0", "1"):
+                with self.subTest(route=route, require_host_caps=require):
+                    done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_REFUSAL_CLAIM="kept",
+                                                 HERMIT_E2E_ROUTE=route, HERMIT_E2E_REQUIRE_HOST_CAPS=require)
+                    self.assertEqual((done["status"], details_json(done)["outcome"]), ("failed", "FAIL"))
+                    self.assertEqual((result["outcome"], result["harness_rc"]), ("FAIL", 1))
+                    harness = self.calls_by("harness")[-1]
+                    self.assertNotIn("--record-host-image-interpreter-refusals", harness["argv"])
+
+    def test_the_opt_in_reaches_the_harness_on_a_local_route_only(self) -> None:
+        baseline = self.baseline()
+        with self.subTest("a host cell"):
+            done, _ = self.run_cell(HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(baseline))
+            self.assertEqual(done["status"], "passed", done)
+            [harness] = self.calls_by("harness")
+            flag = harness["argv"].index("--record-host-image-interpreter-refusals")
+            self.assertEqual(harness["argv"][flag + 1], str(baseline.resolve()))
+            self.assertEqual(harness["baseline"], baseline.read_text())
+        with self.subTest("a pinned-root cell gets its own copy at /src/refusal-baseline"):
+            done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                    HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(baseline))
+            self.assertEqual(done["status"], "passed", done)
+            harness = self.calls_by("harness")[-1]
+            flag = harness["argv"].index("--record-host-image-interpreter-refusals")
+            self.assertEqual(harness["argv"][flag + 1], "/src/refusal-baseline")
+            self.assertEqual(harness["baseline"], baseline.read_text())
+        with self.subTest("a directory of results is copied whole"):
+            done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                    HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(baseline.parent))
+            self.assertEqual(done["status"], "passed", done)
+            self.assertEqual(self.calls_by("harness")[-1]["baseline"], ["results.jsonl"])
+        with self.subTest("an RE cell runs without it, and its stderr says so"):
+            done, _ = self.run_cell(HERMIT_E2E_ROUTE="re",
+                                    HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(baseline))
+            self.assertEqual(done["status"], "passed", done)
+            harness = self.calls_by("harness")[-1]
+            self.assertNotIn("--record-host-image-interpreter-refusals", harness["argv"])
+            self.assertIsNone(harness["baseline"])
+            stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+            self.assertIn("cell.sh: HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS applies to local routes, "
+                          "so the harness ran without --record-host-image-interpreter-refusals on route 're': "
+                          "a refusal here stays a failure, and the cell runs again on another machine\n", stderr)
+
+    def test_an_opt_in_that_names_nothing_readable_fails_a_local_cell(self) -> None:
+        missing = self.tmp / "no-such-baseline.jsonl"
+        done, result = self.run_cell(HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(missing))
+        self.assertEqual(done["status"], "failed", done)
+        self.assertEqual(json.loads(done["details"])["reason"],
+                         f"HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS names '{missing}', which is not a "
+                         "readable results.jsonl or directory")
+        self.assertIsNone(result)
+        self.assertEqual(self.calls_by("harness"), [])
+        # Off a local route the option is not passed, so it is not read either.
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re", HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS=str(missing))
+        self.assertEqual(done["status"], "passed", done)
+
+    def assert_recorded_skip(self, done: dict, result: dict | None) -> None:
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "skipped", done)
+        details = details_json(done)
+        self.assertEqual(details["outcome"], "HOST-INAPPLICABLE")
+        self.assertEqual(details["error_kind"], INTERPRETER_REFUSAL)
+        self.assertEqual(details["reason"], "SKIP: " + INTERPRETER_REFUSAL_REASON)
+        self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+        # Its one row is the HOST-INAPPLICABLE the harness recorded, never a pass.
+        self.assertEqual((result["outcome"], result["harness_rc"]), ("HOST-INAPPLICABLE", 1))
+
+    def test_a_recorded_refusal_is_a_skip_on_a_local_route(self) -> None:
+        for require in ("", "0"):
+            with self.subTest(require_host_caps=require):
+                done, result = self.recorded(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS=require)
+                self.assert_recorded_skip(done, result)
+                artifacts = self.tmp / "tpx" / "artifacts"
+                held = [json.loads(line) for line in
+                        (artifacts / "host-image-interpreter-refusals.jsonl").read_text().splitlines()]
+                self.assertEqual([(r["test"], r["outcome"], r["attempt"]) for r in held], [(TEST, "FAIL", 1)])
+                self.assertIn("host-image-interpreter-refusals.jsonl",
+                              result["artifact_sha256"])
+                self.assertTrue((self.tmp / "tpx" / "annotations"
+                                 / "host-image-interpreter-refusals.jsonl.annotation").exists())
+
+    def test_require_host_caps_fails_a_recorded_refusal_with_no_exemption(self) -> None:
+        done, result = self.recorded(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        details = details_json(done)
+        self.assertEqual(details["outcome"], "ERROR")
+        self.assertEqual(details["reason"],
+                         "HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, which requires "
+                         "the capability here: " + INTERPRETER_REFUSAL_REASON)
+        self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+
+    def test_a_recorded_refusal_off_a_local_route_is_a_failure_never_a_skip(self) -> None:
+        # The opt-in is never passed there, but a harness given the option among the
+        # target's own flags still records; cell.sh fails it, so it runs again elsewhere.
+        for require in ("", "0", "1"):
+            with self.subTest(require_host_caps=require):
+                done, result = self.recorded(HERMIT_E2E_ROUTE="re", HERMIT_E2E_REQUIRE_HOST_CAPS=require)
+                self.assertEqual(done["status"], "failed", done)
+                details = details_json(done)
+                self.assertEqual(details["outcome"], "ERROR")
+                self.assertEqual(details["reason"],
+                                 "HOST-INAPPLICABLE (host-image-interpreter-refusal) recorded off a local route "
+                                 "(route 're'), where a refusal is a failure and never a skip; on RE the cell runs "
+                                 "again on another machine: " + INTERPRETER_REFUSAL_REASON)
+                self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+
+    def test_each_part_of_the_recorded_refusal_is_needed_for_the_skip(self) -> None:
+        # Each case changes one part of the harness's output; none is the recorded
+        # refusal, so each is a failure, with or without HERMIT_E2E_REQUIRE_HOST_CAPS=1.
+        # The FAIL row is the v2 shape (the attempt's row in results.jsonl beside a skipped
+        # record), which is no longer a skip anywhere.
+        generic = "harness rc=1 produced 2 test_done records"
+        others = ("harness rc=1 recorded this cell HOST-INAPPLICABLE (host-image-interpreter-refusal) and failed "
+                  "its run for more than measuring no cell: ")
+        baseline_refusal = ("PASS -> HOST-INAPPLICABLE against the baseline /b/results.jsonl: "
+                            f"{CELL} passed there (/b/results.jsonl)")
+        cases = [
+            ("another error kind on the record", generic, {"FAKE_WITHHELD_ERROR_KIND": "rootfs-unchecked"}),
+            ("a row of no kind", generic, {"FAKE_WITHHELD_ROW_KIND": ""}),
+            ("a row of another kind", generic, {"FAKE_WITHHELD_ROW_KIND": "rootfs-unchecked"}),
+            ("the attempt's FAIL row (the v2 shape)", generic,
+             {"FAKE_WITHHELD_ROW": "FAIL", "FAKE_WITHHELD_ROW_KIND": ""}),
+            ("a PASS row", generic, {"FAKE_WITHHELD_ROW": "PASS"}),
+            ("no row", generic, {"FAKE_WITHHELD_ROW": ""}),
+            ("two rows", generic, {"FAKE_WITHHELD_ROW_COUNT": "2"}),
+            ("a failed record", generic, {"FAKE_WITHHELD_STATUS": "failed"}),
+            ("an outcome that is not HOST-INAPPLICABLE", generic, {"FAKE_WITHHELD_OUTCOME": "FAIL"}),
+            ("a record for another cell", generic, {"FAKE_WITHHELD_TEST": "other_cell/strict@ptrace"}),
+            ("no reason", generic, {"FAKE_WITHHELD_REASON": ""}),
+            ("a run verdict that passed", generic, {"FAKE_RUN_VERDICT_STATUS": "passed"}),
+            ("a harness that exited 0", "harness rc=0 produced 2 test_done records", {"FAKE_EXIT": "0"}),
+            ("a run that did not fail for measuring no cell", generic,
+             {"FAKE_RUN_FAILURES_ONLY": json.dumps(["cannot write the test-count file"])}),
+            ("another run failure beside it", others + "cannot write the test-count file",
+             {"FAKE_RUN_FAILURES": json.dumps(["cannot write the test-count file"])}),
+            # F3: the harness's PASS baseline refused the record, which no route skips.
+            ("the PASS baseline refusing it", others + baseline_refusal,
+             {"FAKE_RUN_FAILURES": json.dumps([baseline_refusal])}),
+        ]
+        for name, needle, env in cases:
+            for require in ("", "1"):
+                with self.subTest(name, require_host_caps=require):
+                    base = {"FAKE_OUTCOME": "HOST-INAPPLICABLE", "FAKE_WITHHELD_ERROR_KIND": INTERPRETER_REFUSAL,
+                            "FAKE_WITHHELD_ROW": "HOST-INAPPLICABLE", "FAKE_WITHHELD_ROW_KIND": INTERPRETER_REFUSAL,
+                            "FAKE_WITHHELD_REASON": INTERPRETER_REFUSAL_REASON,
+                            "HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS": str(self.baseline())}
+                    self.assert_rejected_everywhere(needle, HERMIT_E2E_ROUTE="local",
+                                                    HERMIT_E2E_REQUIRE_HOST_CAPS=require, **{**base, **env})
+
+    def test_a_capability_skip_worded_as_the_refusal_still_fails_under_require_host_caps(self) -> None:
+        # The reason alone is never the refusal: a withheld cell that words its reason
+        # like one is a withheld cell, which the requirement fails.
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                HERMIT_E2E_REQUIRE_HOST_CAPS="1", FAKE_WITHHELD_REASON=INTERPRETER_REFUSAL_REASON)
+        self.assertEqual(done["status"], "failed", done)
+        self.assertEqual(details_json(done)["reason"],
+                         "HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, which requires "
+                         "the capability here: " + INTERPRETER_REFUSAL_REASON)
+
+    def test_interpreter_refusals_through_ingest(self) -> None:
+        with self.subTest("recorded on a local route: its one HOST-INAPPLICABLE row is attempt 1"):
+            self.assert_recorded_skip(*self.recorded(HERMIT_E2E_ROUTE="local"))
+            for place, summary in self.assert_ingest_accepts().items():
+                with self.subTest(ingest=place):
+                    self.assertEqual((summary["final_outcomes"], summary["attempts"]),
+                                     ({"HOST-INAPPLICABLE": 1}, {"1": 1}))
+                    self.assertEqual(summary["interpreter_refused_on_re_executions"], 0)
+                    bucket = self.tmp / "ingest" / place / "import" / "portable" / "manifest_cat"
+                    rows = [json.loads(line) for line in (bucket / "results.jsonl").read_text().splitlines()]
+                    self.assertEqual([(r["test"], r["outcome"], r["attempt"], r["error_kind"]) for r in rows],
+                                     [(TEST, "HOST-INAPPLICABLE", 1, INTERPRETER_REFUSAL)])
+                    imported = json.loads((bucket / "summary.json").read_text())
+                    self.assertEqual(imported["host_inapplicable_cells"], [])
+                    self.assertEqual(imported["host_image_interpreter_refusals"], 1)
+                    self.assertEqual([c["recorded"] for c in imported["host_image_interpreter_refusal_cells"]],
+                                     [True])
+        with self.subTest("kept as its FAIL on a local route: the attempt it was"):
+            self.run_cell(FAKE_OUTCOME="FAIL", FAKE_REFUSAL_CLAIM="kept")
+            for summary in self.assert_ingest_accepts().values():
+                self.assertEqual((summary["final_outcomes"], summary["attempts"],
+                                  summary["interpreter_refused_on_re_executions"]), ({"FAIL": 1}, {"1": 1}, 0))
+        with self.subTest("kept as its FAIL on RE, then a local pass: no attempt number"):
+            done, _ = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_REFUSAL_CLAIM="kept", HERMIT_E2E_ROUTE="re")
+            self.assertEqual(done["status"], "failed", done)
+            refused = self.snapshot("refused-on-re")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [refused, self.snapshot("passed-after-refusal")]).values():
+                self.assertEqual((summary["interpreter_refused_on_re_executions"], summary["final_outcomes"],
+                                  summary["attempts"]), (1, {"PASS": 1}, {"1": 1}))
+        with self.subTest("refused on RE only: listed for the local rerun"):
+            self.run_cell(FAKE_OUTCOME="FAIL", FAKE_REFUSAL_CLAIM="kept", HERMIT_E2E_ROUTE="re")
+            for route, proc in self.ingest("--withheld-on-re", str(self.tmp / "{route}-refused.txt")).items():
+                with self.subTest(ingest=route):
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(json.loads(proc.stdout)["withheld_on_re_every_execution"], 1)
+                    self.assertEqual((self.tmp / f"{route}-refused.txt").read_text(), SLUG + "\n")
+        with self.subTest("a refusal claim beside a passing row: ingest refuses it"):
+            done, _ = self.run_cell(FAKE_REFUSAL_CLAIM="kept")
+            self.assertEqual(done["status"], "passed", done)
+            for route, proc in self.ingest().items():
+                with self.subTest(ingest=route):
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                    self.assertIn("names it a host-image interpreter refusal, but its rows are ['PASS']", proc.stderr)
 
     # The human summary at the head of the record's details, for
     # --print-passing-details and TestX; the harness's JSON stays the last line.

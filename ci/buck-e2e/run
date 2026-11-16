@@ -37,8 +37,10 @@
 # workers differ: `hermit run --strict` on ptrace refuses where the branch counter is
 # inexact. There the harness withholds the cell (HOST-INAPPLICABLE), and its run, having
 # executed no cell, fails, so Tpx retries it on another worker. ingest.py numbers no
-# withheld execution as an attempt. A cell withheld on every RE execution is run once
-# more, locally (-c hermit_e2e.routing=local, only those targets), and the run is
+# withheld execution as an attempt, nor one whose every run the RE worker's own program
+# interpreter refused (a failure, never a skip there; "withheld" below covers both). A
+# cell withheld on every RE execution is run once more, locally
+# (-c hermit_e2e.routing=local, only those targets), and the run is
 # ingested again, so import mode never judges a claim this machine did not make. A cell
 # whose retry after a failed attempt was withheld runs once more locally too, without a
 # Tpx retry (--retry 0), so that execution is the attempt Tpx gave it and the cell keeps

@@ -35,7 +35,24 @@
 #                                  a local route FAILS instead of being skipped (for a CI
 #                                  host that must have the capability: a skip there would
 #                                  read as coverage nobody got); "0" or unset: skipped, as
-#                                  before. Any other value fails the cell.
+#                                  before. Any other value fails the cell. A cell recorded
+#                                  as a host-image interpreter refusal (next) is such a
+#                                  cell too: the flag fails it, with no exemption.
+#        HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS
+#                                  optional opt-in, local routes only: the PASS baseline,
+#                                  an earlier run's results.jsonl or a directory holding
+#                                  them. The harness then runs with
+#                                  --record-host-image-interpreter-refusals BASELINE: a
+#                                  cell whose every run this host's own program
+#                                  interpreter refused is one HOST-INAPPLICABLE row of
+#                                  kind host-image-interpreter-refusal (its attempts' rows
+#                                  are the host-image-interpreter-refusals.jsonl
+#                                  artifact), and one that passed in the baseline, or
+#                                  that the baseline has no row for, fails (PASS ->
+#                                  HOST-INAPPLICABLE). Unset or empty, the default, and
+#                                  on every other route: the option is not passed and
+#                                  such a cell keeps the FAIL its attempts measured. A
+#                                  value that names nothing readable fails the cell.
 #        HERMIT_E2E_KEEP_ARTIFACTS "1": copy this cell's artifact directory (one cell's, its
 #                                  final attempt's) to HERMIT_E2E_KEEP_DIR/<run id>/ before
 #                                  the scratch directory is removed, and name the copy in
@@ -56,6 +73,13 @@
 #         skipped, with the harness's reason (failed, naming that reason, under
 #         HERMIT_E2E_REQUIRE_HOST_CAPS=1); on RE it stays failed, so Tpx retries it on
 #         another worker (see ci/buck-e2e/run).
+#         A cell whose every run this host's own program interpreter refused is a FAIL,
+#         as its attempts measured, unless HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS
+#         had the harness record it HOST-INAPPLICABLE; a recorded one is reported as a
+#         withheld cell is on a local route: skipped with the harness's reason, failed
+#         under HERMIT_E2E_REQUIRE_HOST_CAPS=1. Off a local route it is never a skip, and
+#         on RE a refusal, recorded or a FAIL, is a failure that ingest.py numbers as no
+#         attempt, so the cell runs again on another machine, like a withheld one.
 set -u
 TEST=$1 MODE=$2 BACKEND=$3
 shift 3
@@ -130,6 +154,17 @@ case ${HERMIT_E2E_KEEP_ARTIFACTS:-} in
 "" | 0 | 1) ;;
 *) emit_fatal "HERMIT_E2E_KEEP_ARTIFACTS must be 0 or 1, not '${HERMIT_E2E_KEEP_ARTIFACTS}'" ;;
 esac
+# The opt-in that has the harness record a host-image interpreter refusal
+# HOST-INAPPLICABLE, checked against its PASS baseline: on a local route only. Off it
+# the option is not passed, so a refusal there stays a failure and the cell runs again
+# on another machine (ingest.py); the harness's stderr artifact says so.
+refusal_baseline= refusal_args=()
+if [[ -n ${HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS:-} && ${HERMIT_E2E_ROUTE:-} == local ]]; then
+    refusal_baseline=$(realpath -e -- "$HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS" 2>/dev/null) &&
+        [[ -r $refusal_baseline ]] ||
+        emit_fatal "HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS names '$HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS', which is not a readable results.jsonl or directory"
+    refusal_args=(--record-host-image-interpreter-refusals "$refusal_baseline")
+fi
 if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
     cpu_scan_env=(HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1)
 else
@@ -146,9 +181,21 @@ bundle_env=()
 # The bundle's v2 rootfs, when it carries one: an oci-dir the harness retries
 # a loader-rejected verify or chaos cell (KVM or ptrace) under (issue 5476).
 # From the bundle alone, like the record: a caller's HERMIT_E2E_V2_OCI_DIR
-# never leaks in (both harness invocations below unset it first), and a
-# bundle whose v2-rootfs has no oci-layout names none.
-[[ -f $B/v2-rootfs/oci-layout ]] && bundle_env+=(HERMIT_E2E_V2_OCI_DIR="$B/v2-rootfs")
+# never leaks in (both harness invocations below unset it first). A bundle
+# that ships none says so with v2-rootfs/NO-V2-ROOTFS (ci/buck-e2e/BUCK
+# :empty-v2-rootfs writes it), and the harness then names each retry it
+# cannot run (V2-RETRY NOT RUN). Any other bundle whose v2-rootfs has no
+# oci-layout fails the cell here, so a rootfs lost on the way never costs a
+# loader-rejected cell its retry silently.
+v2_rootfs=
+if [[ -f $B/v2-rootfs/oci-layout && -e $B/v2-rootfs/NO-V2-ROOTFS ]]; then
+    emit_fatal "the bundle's v2-rootfs/ holds both an oci-layout and NO-V2-ROOTFS, so whether it ships a v2 rootfs is ambiguous"
+elif [[ -f $B/v2-rootfs/oci-layout ]]; then
+    v2_rootfs=$B/v2-rootfs
+elif [[ ! -f $B/v2-rootfs/NO-V2-ROOTFS ]]; then
+    emit_fatal "the bundle's v2-rootfs/ holds no oci-layout (issue 5476's v2 rootfs) and no NO-V2-ROOTFS (a bundle that ships none, ci/buck-e2e/BUCK :empty-v2-rootfs), so a loader-rejected cell would lose its v2 retry without a word"
+fi
+[[ -n $v2_rootfs ]] && bundle_env+=(HERMIT_E2E_V2_OCI_DIR="$v2_rootfs")
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
@@ -251,7 +298,7 @@ case $container in
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$out/results.jsonl" --junit "$out/junit.xml" --tpx-json "$out/tpx.jsonl" \
-        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
+        "${refusal_args[@]}" "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
     ;;
 pinned-root)
@@ -411,7 +458,14 @@ exec "$@"'
     # Inside the container the record is the private copy's (paths under /src/bundle).
     inner_bundle_env=()
     [[ -f $B/BUNDLE_RECORD.json ]] && inner_bundle_env+=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
-    [[ -f $B/v2-rootfs/oci-layout ]] && inner_bundle_env+=(HERMIT_E2E_V2_OCI_DIR=/src/bundle/v2-rootfs)
+    [[ -n $v2_rootfs ]] && inner_bundle_env+=(HERMIT_E2E_V2_OCI_DIR=/src/bundle/v2-rootfs)
+    # The PASS baseline goes into the scratch tree, the container's /src.
+    inner_refusal_args=()
+    if [[ -n $refusal_baseline ]]; then
+        cp -a --reflink=auto -- "$refusal_baseline" "$R/refusal-baseline" ||
+            emit_fatal "cannot place the PASS baseline $refusal_baseline in the pinned-root scratch tree"
+        inner_refusal_args=(--record-host-image-interpreter-refusals /src/refusal-baseline)
+    fi
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
         -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
@@ -428,7 +482,7 @@ exec "$@"'
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
-        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
+        "${inner_refusal_args[@]}" "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
     fi
     ;;
@@ -438,6 +492,10 @@ t1=$(date +%s%N)
 if ((bundle_prep_ns > 0)); then
     printf 'cell.sh: CELL_BUNDLE_MODE=%s CELL_BUNDLE_PREP_NS=%s bundle_prep_start_ns=%s bundle_prep_end_ns=%s\n' \
         "$bundle_mode" "$bundle_prep_ns" "$bundle_prep_start_ns" "$bundle_prep_end_ns" >>"$W/harness.stderr"
+fi
+if [[ -n ${HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS:-} && -z $refusal_baseline ]]; then
+    printf 'cell.sh: HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS applies to local routes, so the harness ran without --record-host-image-interpreter-refusals on route %s: a refusal here stays a failure, and the cell runs again on another machine\n' \
+        "'${HERMIT_E2E_ROUTE:-}'" >>"$W/harness.stderr"
 fi
 
 copy_errors=0
@@ -450,7 +508,9 @@ put() { # put SRC NAME: logs over 256 KiB are zstd'd
     fi
 }
 for f in harness.stdout harness.stderr; do put "$W/$f" "$f"; done
-for f in results.jsonl junit.xml tpx.jsonl summary.json; do
+# host-image-interpreter-refusals.jsonl: the attempt rows of a cell the harness recorded
+# as a host-image interpreter refusal, which results.jsonl does not hold.
+for f in results.jsonl junit.xml tpx.jsonl summary.json host-image-interpreter-refusals.jsonl; do
     [[ -f $out/$f ]] && put "$out/$f" "$f"
 done
 # The harness owns retries, and each attempt gets its own artifact directory:
@@ -484,12 +544,15 @@ outcome=$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 outs=[r.get("outcome") for r in rows]
 print(next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in outs), ""))' "$out/results.jsonl" 2>/dev/null)
-# The same rows as the verdict normalizer will judge them: how many, and the last one's outcome.
+# The same rows as the verdict normalizer will judge them: how many, the outcome they
+# report (the first of PASS, FAIL, ERROR, HOST-INAPPLICABLE any has) and the last one's
+# error kind.
 rows_seen=$(python3 -c 'import json,os,sys
 p=sys.argv[1]
 rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
 assert all(isinstance(r, dict) for r in rows)
-print(json.dumps({"count": len(rows), "outcome": next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in [r.get("outcome") for r in rows]), None)}))' "$out/results.jsonl" 2>/dev/null) ||
+print(json.dumps({"count": len(rows), "outcome": next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in [r.get("outcome") for r in rows]), None),
+                  "error_kind": rows[-1].get("error_kind") if rows else None}))' "$out/results.jsonl" 2>/dev/null) ||
     rows_seen=unreadable
 n_run1=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-1__run1_log_*" | wc -l)
 n_run2=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-1__run2_log_*" | wc -l)
@@ -533,7 +596,7 @@ json.dump({
                         for n in sorted(os.listdir(art)) if n != "result.json"},
 }, open(os.path.join(art, "result.json"), "w"), indent=1, sort_keys=True)
 PY
-for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
+for f in result.json tpx.jsonl summary.json results.jsonl host-image-interpreter-refusals.jsonl harness.stderr; do
     [[ -f $A/$f ]] && printf '{"type": {"generic_text_log": {}}, "description": "%s"}\n' "$f" >"$N/$f.annotation"
 done
 # HERMIT_E2E_KEEP_ARTIFACTS=1: this one cell's artifact directory outlives the scratch
@@ -599,20 +662,23 @@ def read_records():
     return records
 
 def read_rows():
-    """(how many rows the harness wrote, the last row's outcome or None)."""
+    """(how many rows the harness wrote, the outcome they report or None, the last row's
+    error kind or None)."""
     try:
         seen = json.loads(rows_seen)
     except ValueError:
         raise Invalid(f"harness rc={rc} wrote an unreadable results.jsonl")
     # The harness owns retries: one execution writes one row per attempt.
-    return seen["count"], seen["outcome"]
+    return seen["count"], seen["outcome"], seen["error_kind"]
 
-def withheld_pair(done, rows):
-    """The cell's own record when the harness withheld this one cell as HOST-INAPPLICABLE
-    and failed the run only because it executed nothing; else None. A withheld cell runs
-    nothing, so it writes no row. This is valid output on any route; withheld_here decides
-    what the route makes of it."""
-    if rows != 0 or len(done) != 2:
+INTERPRETER_REFUSAL = "host-image-interpreter-refusal"
+
+def host_inapplicable_run(done):
+    """(the cell's own record, its details, the run's other failures) when the harness
+    reported this one cell skipped as HOST-INAPPLICABLE and failed the run because its
+    one selected cell was host-inapplicable, so it measured no cell, whatever else failed
+    it; else None."""
+    if len(done) != 2:
         return None
     own = [r for r in done if r.get("test") == cell]
     run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
@@ -625,13 +691,52 @@ def withheld_pair(done, rows):
     failures = run_details.get("run_failures")
     vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
     if (details.get("outcome") != "HOST-INAPPLICABLE" or not isinstance(failures, list)
-            or len(failures) != 1 or not isinstance(failures[0], str)
-            or not re.fullmatch(vacuous, failures[0])):
+            or not all(isinstance(f, str) for f in failures)
+            or [bool(re.fullmatch(vacuous, f)) for f in failures].count(True) != 1):
         return None
-    return own[0], details
+    return own[0], details, [f for f in failures if not re.fullmatch(vacuous, f)]
+
+def withheld_pair(done, rows):
+    """The cell's own record and details when the harness withheld this one cell as
+    HOST-INAPPLICABLE and failed the run only because it executed nothing; else None. A
+    withheld cell runs nothing, so it writes no row. This is valid output on any route;
+    withheld_here decides what the route makes of it. A recorded host-image interpreter
+    refusal is never one: it has its row (recorded_refusal_pair)."""
+    if rows != 0:
+        return None
+    found = host_inapplicable_run(done)
+    if found is None or found[2] or found[1].get("error_kind") == INTERPRETER_REFUSAL:
+        return None
+    return found[:2]
+
+def recorded_refusal_pair(done, rows, row_outcome, row_kind):
+    """The cell's own record and details when the harness, run with
+    --record-host-image-interpreter-refusals, recorded this one cell HOST-INAPPLICABLE
+    because this host's own program interpreter refused every run; else None.
+
+    results.jsonl then holds that one row, of kind host-image-interpreter-refusal (the
+    attempts' rows went to host-image-interpreter-refusals.jsonl), the cell's record is
+    a skip of that kind with a reason, and the run failed, with a nonzero exit, because
+    it measured no cell. What that becomes depends on the route, exactly as for a
+    withheld cell (withheld_here, required_here); off a local route it is a failure. A
+    run that failed for anything else besides, such as the PASS baseline refusing the
+    record (PASS -> HOST-INAPPLICABLE), is output no route skips: Invalid, naming it."""
+    if rows != 1 or row_outcome != "HOST-INAPPLICABLE" or row_kind != INTERPRETER_REFUSAL or rc == "0":
+        return None
+    found = host_inapplicable_run(done)
+    if found is None:
+        return None
+    record, details, others = found
+    reason = details.get("reason")
+    if details.get("error_kind") != INTERPRETER_REFUSAL or not isinstance(reason, str) or not reason:
+        return None
+    if others:
+        raise Invalid(f"harness rc={rc} recorded this cell HOST-INAPPLICABLE ({INTERPRETER_REFUSAL}) and "
+                      f"failed its run for more than measuring no cell: {'; '.join(others)}")
+    return record, details
 
 def withheld_here(pair):
-    """The withheld cell's record, as a skip, on a local route; else None.
+    """The withheld or recorded cell's record, as a skip, on a local route; else None.
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
@@ -645,8 +750,9 @@ def withheld_here(pair):
     return dict(record, details=json.dumps(details))
 
 def required_here(pair):
-    """A failure for the withheld cell on a local route whose host must have the
-    capability (HERMIT_E2E_REQUIRE_HOST_CAPS=1); else None."""
+    """A failure for the withheld or recorded cell on a local route whose host must have
+    the capability (HERMIT_E2E_REQUIRE_HOST_CAPS=1); else None. A recorded host-image
+    interpreter refusal has no exemption: this host cannot run the cell either."""
     if route != "local" or pair is None or require_host_caps != "1":
         return None
     reason = pair[1].get("reason")
@@ -674,15 +780,22 @@ def no_result_pair(done, rows):
 
 def verdict():
     """The one record for Tpx; raises Invalid when the harness output is invalid."""
-    rows, row_outcome = read_rows()
+    rows, row_outcome, row_kind = read_rows()
     done = [r for r in read_records() if r.get("op") == "test_done"]
-    pair = withheld_pair(done, rows)
+    refused = recorded_refusal_pair(done, rows, row_outcome, row_kind)
+    pair = refused or withheld_pair(done, rows)
     skip = withheld_here(pair)
     if skip:
         return skip
     required = required_here(pair)
     if required:
         return required
+    if refused:
+        # Off a local route a recorded refusal is a failure, never a skip; on RE, ingest.py
+        # numbers no such execution as an attempt, so the cell runs again on another machine.
+        return failed(f"HOST-INAPPLICABLE ({INTERPRETER_REFUSAL}) recorded off a local route (route {route!r}), "
+                      f"where a refusal is a failure and never a skip; on RE the cell runs again on another "
+                      f"machine: {refused[1]['reason']}")
     if pair:
         # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
         return failed(f"harness rc={rc} produced {len(done)} test_done records")
@@ -708,8 +821,8 @@ def verdict():
         raise Invalid(f"harness rc={rc} reported {status} without JSON-object details")
     outcome = details.get("outcome")
     # The harness writes `passed` exactly for a PASS outcome; for one selected cell, a
-    # lone `skipped` only for a FAIL it excuses as a diagnostic (a withheld cell is the
-    # pair above); and `failed` otherwise. A null outcome comes only with the run
+    # lone `skipped` only for a FAIL it excuses as a diagnostic (a withheld or recorded
+    # cell is a pair, above); and `failed` otherwise. A null outcome comes only with the run
     # failure no_result_pair recognizes, never alone. The row carries the record's outcome.
     if status == "passed" and outcome != "PASS":
         raise Invalid(f"harness rc={rc} reported a passing record with outcome {outcome!r}")

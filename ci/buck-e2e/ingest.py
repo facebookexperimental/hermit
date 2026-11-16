@@ -45,6 +45,15 @@ worker without an exact branch counter, which the plan cannot route around: RE w
 differ in CPU model). It is not an attempt and takes no number; the cell's next execution,
 on another worker, is attempt 1. Any other claim followed by a later execution still takes
 its number.
+An execution on an RE worker whose every run that worker's own program interpreter
+refused is the same kind of exception: its summary.json names the cell in
+host_image_interpreter_refusal_cells (recorded HOST-INAPPLICABLE under the harness's
+--record-host-image-interpreter-refusals, or kept as the FAIL its attempts measured).
+It measured that worker's CPU and image, nothing about Hermit, so it is a failure in Tpx
+but not an attempt: it takes no number, its rows are not imported, and the cell runs
+again on another machine, as a withheld one does (--withheld-on-re, --withheld-retries).
+On any route, such a claim whose rows are not all FAIL, or not the one HOST-INAPPLICABLE
+row of kind host-image-interpreter-refusal, refuses the ingest.
 --event-log FILE (repeatable) and --buck2 PATH: the invocations' Buck event logs and the
 buck2 that reads them. When an execution wrote no row, ingest reads its own record from
 them (`buck2 log show`): Tpx's status, details and duration for the target (every
@@ -54,12 +63,14 @@ such execution gets one line, {schema, test, mode, backend, attempt, cause}, in
 IMPORT_DIR/<lane>/manifest_<category>/no-row-executions.jsonl, which import mode quotes
 when it refuses the cell's history. It is diagnostics only: the refusal is the same with
 or without it, and a missing or unreadable event log only makes the cause say so.
---withheld-on-re FILE: write the Buck target name (the harness's slug) of each cell that
-has no row and was withheld on RE by every one of its executions, one per line. Import
-mode would judge such a cell's claim against the machine that imports it, which did not
-make it, so ci/buck-e2e/run runs these cells again locally and ingests once more.
---withheld-retries FILE: likewise, each cell whose last execution withheld it on RE after
-an earlier execution ran it: the retry Tpx gave a failed attempt never ran (on 2026-10-19
+--withheld-on-re FILE: write the Buck target name (the harness's slug) of each cell none
+of whose executions is an attempt (each withheld it on RE, or was refused by its RE
+worker's own program interpreter, above), one per line. Import mode would judge such a
+cell's claim against the machine that imports it, which did not make it, so
+ci/buck-e2e/run runs these cells again locally and ingests once more.
+--withheld-retries FILE: likewise, each cell whose last execution withheld it on RE, or
+was refused there, after an earlier execution ran it: the retry Tpx gave a failed attempt
+never ran (on 2026-10-19
 c-programs/sigreturn-preemption failed attempt 1 with a skid overshoot on RE and its retry
 landed on a worker without an exact branch counter). ci/buck-e2e/run runs these once more
 locally without a Tpx retry, so that execution is the cell's next attempt.
@@ -276,6 +287,13 @@ def producer_completion_problem(result):
 
 def claims_host_inapplicable(cell, summary):
     return any(cell_of(h) == cell for h in (summary or {}).get("host_inapplicable_cells", []))
+
+INTERPRETER_REFUSAL = "host-image-interpreter-refusal"  # runner.rs HOST_IMAGE_INTERPRETER_REFUSAL
+
+def claims_interpreter_refusal(cell, summary):
+    """Whether the execution's summary.json names CELL as a cell whose every run its host's
+    own program interpreter refused, recorded HOST-INAPPLICABLE or kept as its FAIL."""
+    return any(cell_of(h) == cell for h in (summary or {}).get("host_image_interpreter_refusal_cells", []))
 
 def run1_log_name(name, prefix):
     """The name hermit gave the first-run log that cell.sh stored as artifact NAME,
@@ -718,10 +736,25 @@ def main():
     def withheld_on_re(cell, rows, summary, route):
         return not rows and route == "re" and claims_host_inapplicable(cell, summary)
 
+    def refused_on_re(cell, rows, summary, route):
+        return bool(rows) and route == "re" and claims_interpreter_refusal(cell, summary)
+
+    def not_an_attempt(cell, rows, summary, route):
+        return withheld_on_re(cell, rows, summary, route) or refused_on_re(cell, rows, summary, route)
+
     def failed_attempt(cell, rows, summary, route):
         if rows:
             return rows[-1].get("outcome") != "PASS"
         return not claims_host_inapplicable(cell, summary)
+    for cell, runs in per_cell.items():
+        for (rows, summary, _), end in zip(runs, per_cell_ends[cell]):
+            outcomes = [row.get("outcome") for row in rows]
+            if claims_interpreter_refusal(cell, summary) and not (
+                    (outcomes and set(outcomes) == {"FAIL"})
+                    or (outcomes == ["HOST-INAPPLICABLE"] and rows[0].get("error_kind") == INTERPRETER_REFUSAL)):
+                sys.exit(f"ingest: the execution of {cell} that ended at {end} names it a host-image interpreter "
+                         f"refusal, but its rows are {outcomes}: neither its attempts' FAIL rows nor the one "
+                         f"HOST-INAPPLICABLE row of kind {INTERPRETER_REFUSAL}")
     missing = sorted(c for c in want if not covered(c))
     extra = sorted(set(per_cell) - set(want))
     if missing or extra:
@@ -735,13 +768,14 @@ def main():
     no_row = []  # "cell attempt N" for each execution that wrote no row and claimed no host inapplicability
     no_row_entries = collections.defaultdict(list)  # (lane, category) -> [(cell, attempt, testx end time)]
     withheld = 0  # executions that withheld their cell on an RE worker, which take no attempt number
-    rerun_locally = []  # cells withheld on RE by every execution
-    retry_locally = []  # cells whose retry after an attempt was withheld on RE
+    refused = 0  # executions an RE worker's own program interpreter refused, which take none either
+    rerun_locally = []  # cells none of whose executions is an attempt
+    retry_locally = []  # cells whose retry after an attempt was withheld or refused on RE
     for cell, runs in per_cell.items():
         lane, category = want[cell]["lane"], want[cell]["category"]
-        # A withheld execution is not an attempt, so its claim is not the cell's
-        # outcome when another execution ran the cell.
-        ran = [run for run in runs if not withheld_on_re(cell, *run)]
+        # A withheld or refused execution is not an attempt, so its claim is not the
+        # cell's outcome when another execution ran the cell.
+        ran = [run for run in runs if not not_an_attempt(cell, *run)]
         final_rows, final_summary, _ = (ran or runs)[-1]
         if final_summary:
             summaries[(lane, category)].append(final_summary)
@@ -753,7 +787,7 @@ def main():
         attempts_already = sum(len(rows) for rows, _, _ in ran)
         if not ran:
             rerun_locally.append(cell_slug(want[cell]))
-        elif withheld_on_re(cell, *runs[-1]) and attempts_already < 2:
+        elif not_an_attempt(cell, *runs[-1]) and attempts_already < 2:
             # A withheld rerun is only for an attempt the cell has not had;
             # a cell that already consumed both harness attempts is final.
             retry_locally.append(cell_slug(want[cell]))
@@ -770,6 +804,9 @@ def main():
         for (rows, summary, route), end in zip(runs, per_cell_ends[cell]):
             if withheld_on_re(cell, rows, summary, route):
                 withheld += 1
+                continue
+            if refused_on_re(cell, rows, summary, route):
+                refused += 1
                 continue
             if not rows:
                 attempt += 1
@@ -851,7 +888,8 @@ def main():
     print(json.dumps({"sources": dict(sources), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
                       "no_row_executions": len(no_row), "no_row_examples": sorted(no_row)[:20],
-                      "withheld_on_re_executions": withheld, "withheld_on_re_every_execution": len(rerun_locally),
+                      "withheld_on_re_executions": withheld, "interpreter_refused_on_re_executions": refused,
+                      "withheld_on_re_every_execution": len(rerun_locally),
                       "withheld_retries_on_re": len(retry_locally),
                       "evidence_complete_executions": sum(len(v) for v in evidence_complete.values()),
                       "verify_logs_restored": len(index) - len(unrestored), "verify_logs_unrestored": len(unrestored),

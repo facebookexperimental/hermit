@@ -9784,13 +9784,30 @@ fn is_loader_v3_on_v2_refusal(line: &str) -> bool {
 /// line without such a report earns no retry, and such a report without the
 /// line is an ordinary guest failure.
 pub fn loader_v2_rejection(attempt: &AttemptResult) -> bool {
-    let Some(report) = attempt
+    loader_rejection(attempt).is_some()
+}
+
+/// Which of the three shapes of [`loader_v2_rejection`] `attempt` shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderRejection {
+    /// A typed `first_run_rejected` at guest exit 127, the loader's line in
+    /// the attempt's stdout or stderr.
+    FirstRunRejected,
+    /// A matched comparison of two runs that both exited 127, the loader's
+    /// line in the attempt's stderr.
+    RefusedPair,
+    /// Run 1's typed `policy_refusal`, Hermit's refusal of an x86-64-v3
+    /// program interpreter on the x86-64-v2 CPU as a line of the stderr.
+    PolicyRefusal,
+}
+
+/// The shape of `attempt`'s loader rejection, or `None` when it is none
+/// ([`loader_v2_rejection`]).
+fn loader_rejection(attempt: &AttemptResult) -> Option<LoaderRejection> {
+    let report = attempt
         .verification_report
         .as_deref()
-        .and_then(|report| current_verification_report(report.as_bytes()).ok())
-    else {
-        return false;
-    };
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())?;
     let first_run_rejected = matches!(
         report.no_result_reason,
         Some(crate::canonical_verdict::NoResultReason::FirstRunRejected {
@@ -9810,11 +9827,18 @@ pub fn loader_v2_rejection(attempt: &AttemptResult) -> bool {
             ..
         })
     );
-    (first_run_rejected
+    if first_run_rejected
         && (attempt.stdout.contains(LOADER_V2_SIGNATURE)
-            || attempt.stderr.contains(LOADER_V2_SIGNATURE)))
-        || (both_runs_refused && attempt.stderr.contains(LOADER_V2_SIGNATURE))
-        || (run1_policy_refused && attempt.stderr.lines().any(is_loader_v3_on_v2_refusal))
+            || attempt.stderr.contains(LOADER_V2_SIGNATURE))
+    {
+        Some(LoaderRejection::FirstRunRejected)
+    } else if both_runs_refused && attempt.stderr.contains(LOADER_V2_SIGNATURE) {
+        Some(LoaderRejection::RefusedPair)
+    } else if run1_policy_refused && attempt.stderr.lines().any(is_loader_v3_on_v2_refusal) {
+        Some(LoaderRejection::PolicyRefusal)
+    } else {
+        None
+    }
 }
 
 /// Whether any inner attempt of `result` is a loader rejection
@@ -9928,6 +9952,547 @@ pub fn is_v2_retry_refusal(result: &CellResult) -> bool {
         result.error_kind.as_deref(),
         Some(ROOTFS_MISSING_SYMBOL | ROOTFS_UNCHECKED)
     )
+}
+
+/// The error kind of the one HOST-INAPPLICABLE row a run records, under
+/// [`RECORD_INTERPRETER_REFUSALS_ARG`] only, in place of a cell's whole
+/// history when this host's own program interpreter refused the CPU Hermit
+/// presented in every run of every attempt
+/// ([`interpreter_refusal_evidence`]). A cell withheld before dispatch
+/// ([`host_inapplicable_result`] alone) carries no error kind.
+pub const HOST_IMAGE_INTERPRETER_REFUSAL: &str = "host-image-interpreter-refusal";
+
+/// The `test-harness run` option that records a host-image interpreter
+/// refusal as one HOST-INAPPLICABLE row. Its value is the PASS baseline every
+/// recorded cell is checked against ([`PassBaseline`]). Without it a refused
+/// cell keeps the FAIL its attempts measured.
+pub const RECORD_INTERPRETER_REFUSALS_ARG: &str = "--record-host-image-interpreter-refusals";
+
+/// The start of the schema-5 `skip` reason the harness writes, in the dagrun
+/// test counts, for a cell it recorded as a host-image interpreter refusal.
+/// Validate counts a node with such a row as one that ran with manifest cells
+/// withheld ([`is_recorded_host_inapplicable_skip`]).
+pub const RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX: &str = "HOST-INAPPLICABLE (host-image-interpreter-refusal, recorded under --record-host-image-interpreter-refusals): ";
+
+/// Whether a schema-5 skip reason is the harness's record of a host-image
+/// interpreter refusal ([`RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX`]).
+pub fn is_recorded_host_inapplicable_skip(reason: &str) -> bool {
+    reason.starts_with(RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX)
+}
+
+/// The file beside `results.jsonl` that holds, under
+/// [`RECORD_INTERPRETER_REFUSALS_ARG`], each attempt row the harness held
+/// back from `results.jsonl` because every run of it was an interpreter
+/// refusal. A cell recorded HOST-INAPPLICABLE has its attempts' rows here
+/// only; a row a later attempt disqualified is in `results.jsonl` too.
+pub const INTERPRETER_REFUSAL_ROWS_FILE: &str = "host-image-interpreter-refusals.jsonl";
+
+/// Whether `result` is the row [`host_image_interpreter_refusal_row`] builds.
+pub fn is_host_image_interpreter_refusal(result: &CellResult) -> bool {
+    result.outcome == "HOST-INAPPLICABLE"
+        && result.error_kind.as_deref() == Some(HOST_IMAGE_INTERPRETER_REFUSAL)
+}
+
+/// The x86-64 level a recorded CPU profile fixes. Only x86-64-v2 and
+/// x86-64-v3 fix one: `host-no-rdrand` presents the host's own CPUID, and
+/// `auto` is resolved to a named profile before a run records it.
+fn profile_level(profile: &str) -> Option<u8> {
+    match profile {
+        "x86-64-v2" => Some(2),
+        "x86-64-v3" => Some(3),
+        _ => None,
+    }
+}
+
+/// The highest x86-64 level Hermit's automatic profile presents: x86-64-v3,
+/// on a host that qualifies for it. An interpreter built for more than this
+/// is refused on every host, so no other host could run the cell.
+const HIGHEST_AUTO_PROFILE_LEVEL: u8 = 3;
+
+/// The reasons a run manifest gives for a CPU profile the host chose
+/// (hermit-cli/src/cpu_profile_admission.rs, `ProfileReason::host_dependent`:
+/// `admitted`, `hypervisor`, `qualification-refused`). Under any other reason
+/// (`explicit`, `declared`, `request-not-admissible`) the same command
+/// presents the same CPU on every host, so its refusal is the cell's own.
+const HOST_DEPENDENT_PROFILE_REASONS: [&str; 3] =
+    ["admitted", "hypervisor", "qualification-refused"];
+
+/// The x86-64 level glibc's fatal ISA line in `line` names: the decimal
+/// digits right after [`LOADER_V2_SIGNATURE`], one or two without a leading
+/// zero, as the loader prints them (detcore/src/loader_cpu_abort.rs,
+/// `parse_message`). `None` where `line` names no level.
+fn loader_line_level(line: &str) -> Option<u8> {
+    let (_, rest) = line.split_once(LOADER_V2_SIGNATURE)?;
+    let digits = &rest[..rest.bytes().take_while(u8::is_ascii_digit).count()];
+    if digits.is_empty() || digits.len() > 2 || digits.starts_with('0') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The CPU profile a run presented and why, as its run manifest records them
+/// (`cpu_profile.profile` and `cpu_profile.reason`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PresentedCpuProfile {
+    pub profile: String,
+    pub reason: String,
+}
+
+/// One run of an attempt in which this host's program interpreter refused
+/// the CPU Hermit presented ([`attempt_interpreter_refusal`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InterpreterRefusal {
+    /// The refusal as the attempt captured it: Hermit's typed refusal where
+    /// Hermit watched the interpreter, else the loader's own line.
+    line: String,
+    /// The x86-64 level the interpreter was built for.
+    needs: u8,
+    /// The CPU profile Hermit presented and why, as the run manifests name it.
+    presented: PresentedCpuProfile,
+    /// Whether the run's evidence shows that the program never started:
+    /// Hermit's own refusal says so (a policy refusal), the loader's line
+    /// alone does not.
+    program_never_started: bool,
+}
+
+/// The CPU profile `attempt`'s own evidence says Hermit presented, and why,
+/// or `None` where that evidence does not determine both. The source is the
+/// `cpu_profile` each manifest its runs wrote records (every `hermit run` of
+/// a verify or chaos attempt writes one before its guest starts, and the
+/// runner keeps them in the attempt's data directory;
+/// [`crate::cpu_profile_record`]): at least one must record a profile and a
+/// reason, and every one that records a choice must record the same pair.
+/// Hermit's typed refusal of the interpreter (`refusal`) names a profile too,
+/// which must be that one. A run with `--no-virtualize-cpuid` presents the
+/// host's own CPUID whatever its manifest says, so it names none here.
+fn attempt_presented_profile(
+    attempt: &AttemptResult,
+    refusal: Option<&str>,
+) -> Option<PresentedCpuProfile> {
+    if attempt
+        .argv
+        .iter()
+        .any(|arg| arg == NO_VIRTUALIZE_CPUID_ARG)
+    {
+        return None;
+    }
+    let (_, retained) = crate::cpu_profile_record::attempt_dirs(&attempt.env, &attempt.index)?;
+    let record = crate::cpu_profile_record::read_record(&retained);
+    let mut named = Vec::new();
+    for choice in record.manifests.values().filter(|choice| !choice.is_null()) {
+        let field = |key: &str| {
+            choice
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        };
+        named.push(PresentedCpuProfile {
+            profile: field("profile")?,
+            reason: field("reason")?,
+        });
+    }
+    let first = named.first()?.clone();
+    if named.iter().any(|presented| *presented != first) {
+        return None;
+    }
+    if let Some(line) = refusal {
+        let (profile, _) = line
+            .strip_prefix("--cpu-profile ")?
+            .split_once(" refused: ")?;
+        if profile != first.profile {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// What `attempt`, one run of a cell attempt, shows of this host's program
+/// interpreter refusing the CPU Hermit presented, or `None` where it shows
+/// anything else. It must be a loader rejection ([`loader_v2_rejection`]),
+/// every line of its output that quotes glibc's fatal ISA line must name the
+/// same level, and its own evidence must name the profile Hermit presented
+/// and why ([`attempt_presented_profile`]). The line quoted is Hermit's typed
+/// refusal for a policy refusal, else the loader's line, from stderr where it
+/// is.
+fn attempt_interpreter_refusal(attempt: &AttemptResult) -> Option<InterpreterRefusal> {
+    let shape = loader_rejection(attempt)?;
+    let quoting = |text: &'_ str| {
+        text.lines()
+            .filter(|line| line.contains(LOADER_V2_SIGNATURE))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let (stderr, stdout) = (quoting(&attempt.stderr), quoting(&attempt.stdout));
+    let needs = loader_line_level(stderr.first().or(stdout.first())?)?;
+    if stderr
+        .iter()
+        .chain(&stdout)
+        .any(|line| loader_line_level(line) != Some(needs))
+    {
+        return None;
+    }
+    let hermit_refusal = attempt
+        .stderr
+        .lines()
+        .find(|line| is_loader_v3_on_v2_refusal(line));
+    let line = match shape {
+        LoaderRejection::PolicyRefusal => hermit_refusal?.to_owned(),
+        LoaderRejection::FirstRunRejected | LoaderRejection::RefusedPair => {
+            stderr.first().or(stdout.first())?.clone()
+        }
+    };
+    Some(InterpreterRefusal {
+        line: line.trim().to_owned(),
+        needs,
+        presented: attempt_presented_profile(attempt, hermit_refusal)?,
+        program_never_started: shape == LoaderRejection::PolicyRefusal,
+    })
+}
+
+/// Whether `argv` runs its guest inside an image (`--image`), as a v2 retry
+/// attempt does ([`RunContext::with_v2_retry`]). Any `--image` word counts,
+/// in either spelling, so a guest argument spelled that way can only keep a
+/// cell's result.
+fn runs_inside_an_image(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|arg| arg == "--image" || arg.starts_with("--image="))
+}
+
+/// Why `evidence`'s refusal is not one another host could avoid, if it is
+/// not: the interpreter must need a level above the one the presented profile
+/// fixes and no higher than Hermit's automatic profile presents anywhere
+/// ([`HIGHEST_AUTO_PROFILE_LEVEL`]), and the manifests must say the host
+/// chose that profile ([`HOST_DEPENDENT_PROFILE_REASONS`]).
+fn host_dependent_refusal_error(needs: u8, presented: &PresentedCpuProfile) -> Option<String> {
+    let Some(level) = profile_level(&presented.profile) else {
+        return Some(format!(
+            "the presented profile {} fixes no x86-64 level",
+            presented.profile
+        ));
+    };
+    if needs <= level {
+        return Some(format!(
+            "the interpreter needs x86-64-v{needs}, which the presented {} is not below",
+            presented.profile
+        ));
+    }
+    if needs > HIGHEST_AUTO_PROFILE_LEVEL {
+        return Some(format!(
+            "the interpreter needs x86-64-v{needs}, above the x86-64-v{HIGHEST_AUTO_PROFILE_LEVEL} Hermit presents on any host"
+        ));
+    }
+    if !HOST_DEPENDENT_PROFILE_REASONS.contains(&presented.reason.as_str()) {
+        return Some(format!(
+            "the run manifests give {} for {}, which the host did not choose",
+            presented.reason, presented.profile
+        ));
+    }
+    None
+}
+
+/// What a cell's finished attempts show of a host-image interpreter refusal,
+/// as typed fields: what the harness decides a recorded refusal from, and
+/// what its `summary.json` carries so an import can check the decision
+/// without the run manifests ([`check_interpreter_refusal_claim`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InterpreterRefusalEvidence {
+    /// The x86-64 level the refusing interpreter was built for.
+    pub needs: u8,
+    /// The CPU profile every run presented, and why, from its run manifests.
+    pub presented: PresentedCpuProfile,
+    /// The first attempt's first refusal, as it captured it.
+    pub quoted: String,
+    /// The attempt number of the row whose run is quoted.
+    pub quoted_attempt: u64,
+    /// The attempts (result rows) and the runs in them.
+    pub attempts: usize,
+    pub runs: usize,
+    /// Whether every run shows that the program never started (Hermit's own
+    /// refusal of the interpreter says so; the loader's line alone does not).
+    pub program_never_started: bool,
+    /// The attempts' artifact directories, which keep their logs.
+    pub artifact_dirs: Vec<String>,
+}
+
+/// The evidence that `history`, the finished attempts of `cell` after its
+/// retries, measured nothing about Hermit: this host's own program
+/// interpreter refused the CPU Hermit presented, in every run of every
+/// attempt, and another host could have run it. `None` keeps the cell's
+/// result. All of these must hold:
+///
+/// - `cell` declares no image, so the interpreter is this host's;
+/// - every attempt is a FAIL with runs, and no run ran inside an image
+///   ([`runs_inside_an_image`]): no v2 retry ran, because the cell was not
+///   eligible for it or the run had no rootfs. A v2 retry refused before
+///   launch ([`is_v2_retry_refusal`]) is an ERROR row with no runs, so it
+///   keeps the cell's result too;
+/// - every run of every attempt is a loader rejection whose evidence names
+///   the level its interpreter needs and the CPU profile Hermit presented
+///   and why ([`attempt_interpreter_refusal`]), and every run names the same
+///   level, profile and reason;
+/// - that refusal is one another host could avoid
+///   ([`host_dependent_refusal_error`]): the level is above the presented
+///   profile's and no higher than x86-64-v3, and the host chose the profile.
+///
+/// A level that is not above the presented one (glibc naming x86-64-v2 under
+/// x86-64-v2: Hermit presented a CPU short of its own profile), a profile the
+/// evidence does not name, a profile chosen for another reason than the host
+/// (an `explicit` x86-64-v2, say), any run whose guest started, or a v2 retry
+/// keeps the FAIL. Requiring this of every attempt, not only the last, keeps
+/// a failure an earlier attempt measured.
+pub fn interpreter_refusal_evidence(
+    cell: &SelectedCell,
+    history: &[CellResult],
+) -> Option<InterpreterRefusalEvidence> {
+    if cell.image.is_some() {
+        return None;
+    }
+    let mut evidence: Option<InterpreterRefusalEvidence> = None;
+    for row in history {
+        if row.outcome != "FAIL" || row.attempts.is_empty() {
+            return None;
+        }
+        for attempt in &row.attempts {
+            if runs_inside_an_image(&attempt.argv) {
+                return None;
+            }
+            let refusal = attempt_interpreter_refusal(attempt)?;
+            match &mut evidence {
+                None => {
+                    evidence = Some(InterpreterRefusalEvidence {
+                        needs: refusal.needs,
+                        presented: refusal.presented,
+                        quoted: refusal.line,
+                        quoted_attempt: row.attempt,
+                        attempts: 0,
+                        runs: 0,
+                        program_never_started: refusal.program_never_started,
+                        artifact_dirs: Vec::new(),
+                    })
+                }
+                Some(evidence) => {
+                    if evidence.needs != refusal.needs || evidence.presented != refusal.presented {
+                        return None;
+                    }
+                    evidence.program_never_started &= refusal.program_never_started;
+                }
+            }
+            evidence.as_mut().expect("set above").runs += 1;
+        }
+        let evidence = evidence.as_mut().expect("a FAIL with runs sets it");
+        evidence.attempts += 1;
+        evidence.artifact_dirs.push(row.artifact_dir.clone());
+    }
+    let evidence = evidence?;
+    if host_dependent_refusal_error(evidence.needs, &evidence.presented).is_some() {
+        return None;
+    }
+    Some(evidence)
+}
+
+/// Why an imported claim of a host-image interpreter refusal for `cell` is
+/// not one this run would record, if it is not: its typed evidence must name
+/// at least one attempt and run, and a refusal another host could avoid
+/// ([`host_dependent_refusal_error`]), and `cell`, as this checkout declares
+/// it, must have no image. The runs' own evidence stays with the producer;
+/// this re-checks every typed field it decided from.
+pub fn check_interpreter_refusal_claim(
+    cell: &SelectedCell,
+    claim: &InterpreterRefusalEvidence,
+) -> Result<(), String> {
+    if cell.image.is_some() {
+        return Err(
+            "this checkout's cell declares an image, so its interpreter is the image's".into(),
+        );
+    }
+    if claim.attempts == 0
+        || claim.runs < claim.attempts
+        || claim.artifact_dirs.len() != claim.attempts
+    {
+        return Err(format!(
+            "the claim's evidence is not one history: {} attempt(s), {} run(s), {} artifact directory(ies)",
+            claim.attempts,
+            claim.runs,
+            claim.artifact_dirs.len()
+        ));
+    }
+    if loader_line_level(&claim.quoted) != Some(claim.needs) {
+        return Err(format!(
+            "the quoted refusal {:?} does not name x86-64-v{}",
+            claim.quoted, claim.needs
+        ));
+    }
+    match host_dependent_refusal_error(claim.needs, &claim.presented) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The reason of the row that records `evidence`: it says the cell was not a
+/// pass and measured nothing, quotes the first refusal, names the level the
+/// interpreter needs and the profile presented with the manifests' reason,
+/// counts the attempts and names their artifact directories. It says the
+/// guest never started only where every run shows it ([`InterpreterRefusalEvidence::program_never_started`]).
+pub fn interpreter_refusal_reason(evidence: &InterpreterRefusalEvidence) -> String {
+    format!(
+        "NOT RUN, NOT a pass, no coverage: {}this host's own program interpreter refused the CPU \
+         Hermit presented: \"{}\" (attempt {}); it needs x86-64-v{}, above the {} this cell \
+         presented ({} in its run manifests); {} attempt(s) ran Hermit and every run was refused \
+         this way, so nothing about Hermit was measured, and no v2 retry ran; the attempts' logs \
+         are in {}",
+        if evidence.program_never_started {
+            "the guest never started because "
+        } else {
+            ""
+        },
+        evidence.quoted,
+        evidence.quoted_attempt,
+        evidence.needs,
+        evidence.presented.profile,
+        evidence.presented.reason,
+        evidence.attempts,
+        evidence.artifact_dirs.join(", ")
+    )
+}
+
+/// The one HOST-INAPPLICABLE row that records `evidence` for `cell`:
+/// [`host_inapplicable_result`] with error kind
+/// [`HOST_IMAGE_INTERPRETER_REFUSAL`] and [`interpreter_refusal_reason`]: no
+/// observed result, an understood prerequisite failure, and no attempts, as
+/// every HOST-INAPPLICABLE row, so no reader of the row counts a comparison
+/// it did not make. The attempts' rows are in [`INTERPRETER_REFUSAL_ROWS_FILE`].
+pub fn host_image_interpreter_refusal_row(
+    context: &RunContext,
+    cell: &SelectedCell,
+    evidence: &InterpreterRefusalEvidence,
+) -> CellResult {
+    let mut row = host_inapplicable_result(context, cell, interpreter_refusal_reason(evidence));
+    row.error_kind = Some(HOST_IMAGE_INTERPRETER_REFUSAL.into());
+    row
+}
+
+/// [`host_image_interpreter_refusal_row`] for `history`'s evidence
+/// ([`interpreter_refusal_evidence`]), or `None` where it keeps its result.
+pub fn host_image_interpreter_refusal(
+    context: &RunContext,
+    cell: &SelectedCell,
+    history: &[CellResult],
+) -> Option<CellResult> {
+    interpreter_refusal_evidence(cell, history)
+        .map(|evidence| host_image_interpreter_refusal_row(context, cell, &evidence))
+}
+
+/// The final outcome of each cell in an earlier run's rows: the PASS
+/// baseline a recorded host-image interpreter refusal is checked against
+/// ([`RECORD_INTERPRETER_REFUSALS_ARG`]). It is read from a `results.jsonl`
+/// file or from every `results.jsonl` below a directory (an E2E result root,
+/// an import root, a Buck verdict directory); a cell's final outcome is its
+/// last row's, and a cell with rows in two files is refused as ambiguous.
+#[derive(Debug, Default)]
+pub struct PassBaseline {
+    pub path: PathBuf,
+    finals: BTreeMap<(String, String, Option<String>), (String, PathBuf)>,
+}
+
+impl PassBaseline {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let mut files = Vec::new();
+        if path.is_dir() {
+            let mut pending = vec![path.to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                let entries = fs::read_dir(&dir)
+                    .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+                    let kind = entry.file_type().map_err(|error| {
+                        format!("cannot stat {}: {error}", entry.path().display())
+                    })?;
+                    if kind.is_dir() {
+                        pending.push(entry.path());
+                    } else if kind.is_file() && entry.file_name() == "results.jsonl" {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+        } else {
+            files.push(path.to_path_buf());
+        }
+        let mut finals: BTreeMap<(String, String, Option<String>), (String, PathBuf)> =
+            BTreeMap::new();
+        for file in &files {
+            let text = fs::read_to_string(file)
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+            let mut seen = BTreeMap::new();
+            for (number, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let row: JsonValue = serde_json::from_str(line)
+                    .map_err(|error| format!("{}:{}: {error}", file.display(), number + 1))?;
+                let text = |key: &str| row.get(key).and_then(JsonValue::as_str).map(str::to_owned);
+                let (Some(test), Some(mode), Some(outcome)) =
+                    (text("test"), text("mode"), text("outcome"))
+                else {
+                    return Err(format!(
+                        "{}:{}: a row without test, mode and outcome",
+                        file.display(),
+                        number + 1
+                    ));
+                };
+                seen.insert((test, mode, text("backend")), outcome);
+            }
+            for (cell, outcome) in seen {
+                if let Some((_, other)) = finals.get(&cell) {
+                    return Err(format!(
+                        "{} and {} both hold rows of {}/{}@{}, so its final outcome is ambiguous",
+                        other.display(),
+                        file.display(),
+                        cell.0,
+                        cell.1,
+                        cell.2.as_deref().unwrap_or("native")
+                    ));
+                }
+                finals.insert(cell, (outcome, file.clone()));
+            }
+        }
+        if finals.is_empty() {
+            return Err(format!(
+                "{} holds no result row, so it cannot rule out PASS -> HOST-INAPPLICABLE",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            finals,
+        })
+    }
+
+    /// Why recording `cell` HOST-INAPPLICABLE fails against this baseline, if
+    /// it does: its final row there was a PASS, or the baseline has no row
+    /// for it, which cannot rule a PASS out.
+    pub fn refuses(&self, cell: &CellId) -> Option<String> {
+        let key = (cell.test.clone(), cell.mode.clone(), cell.backend.clone());
+        match self.finals.get(&key) {
+            Some((outcome, file)) if outcome == "PASS" => Some(format!(
+                "PASS -> HOST-INAPPLICABLE against the baseline {}: {}/{}@{} passed there ({})",
+                self.path.display(),
+                cell.test,
+                cell.mode,
+                cell.backend.as_deref().unwrap_or("native"),
+                file.display()
+            )),
+            Some(_) => None,
+            None => Some(format!(
+                "the baseline {} has no row for {}/{}@{}, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
+                self.path.display(),
+                cell.test,
+                cell.mode,
+                cell.backend.as_deref().unwrap_or("native")
+            )),
+        }
+    }
 }
 
 /// Whether `attempt` retains a current verification report in which Hermit
@@ -10956,7 +11521,13 @@ pub fn infrastructure_error_result(
 /// No argv, environment, binary identity, or attempt is invented: the cell did
 /// not run. Its normal identity and source digest remain present so the row
 /// stays in the selected denominator and downstream completeness checks can
-/// distinguish explicit inapplicability from missing output.
+/// distinguish explicit inapplicability from missing output. A cell withheld
+/// before dispatch keeps no error kind; the row a run records, under
+/// [`RECORD_INTERPRETER_REFUSALS_ARG`], in place of the history of a cell
+/// whose every run this host's own program interpreter refused carries
+/// [`HOST_IMAGE_INTERPRETER_REFUSAL`] ([`host_image_interpreter_refusal_row`]),
+/// with the same empty attempts: its attempts' rows are in
+/// [`INTERPRETER_REFUSAL_ROWS_FILE`].
 pub fn host_inapplicable_result(
     context: &RunContext,
     cell: &SelectedCell,
@@ -11337,8 +11908,12 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
-    // record names the withheld node and prerequisite separately.
-    if result.outcome == "HOST-INAPPLICABLE" {
+    // record names the withheld node and prerequisite separately. A
+    // host-image interpreter refusal, which a run records only under
+    // RECORD_INTERPRETER_REFUSALS_ARG, is published: that row is the record,
+    // and like every HOST-INAPPLICABLE row it carries no attempts, so nothing
+    // counts it as an observation.
+    if result.outcome == "HOST-INAPPLICABLE" && !is_host_image_interpreter_refusal(result) {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -26023,6 +26598,942 @@ backends_disabled:
             Some(dir.clone())
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// glibc's fatal ISA line for an x86-64-v3 loader, as CentOS Stream 10's
+    /// prints it.
+    const LOADER_V3_LINE: &str = "Fatal glibc error: CPU does not support x86-64-v3";
+
+    /// An empty temporary directory of its own for the interpreter-refusal
+    /// test `name`.
+    fn refusal_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-interpreter-refusal-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `attempt` as a run that presented `profile` leaves it: its environment
+    /// names the Hermit data stage of the cell directory `cell_dir`, and the
+    /// attempt's own data directory holds the manifest the run wrote before its
+    /// guest started (`cpu_profile_record`). A second call adds a second run's
+    /// manifest.
+    fn presenting(attempt: AttemptResult, cell_dir: &Path, profile: &str) -> AttemptResult {
+        presenting_for(attempt, cell_dir, profile, Some("qualification-refused"))
+    }
+
+    /// [`presenting`] with the manifest's `cpu_profile.reason` given, or
+    /// absent for `None`.
+    fn presenting_for(
+        mut attempt: AttemptResult,
+        cell_dir: &Path,
+        profile: &str,
+        reason: Option<&str>,
+    ) -> AttemptResult {
+        use crate::cpu_profile_record::DATA_DIR_ENV;
+        use crate::cpu_profile_record::data_dir;
+        use crate::cpu_profile_record::stage_dir;
+        attempt.env.insert(
+            DATA_DIR_ENV.into(),
+            stage_dir(cell_dir).display().to_string(),
+        );
+        let run = data_dir(cell_dir, &attempt.index)
+            .join(format!("run-{profile}-{}", reason.unwrap_or("none")));
+        fs::create_dir_all(&run).unwrap();
+        let mut choice = serde_json::json!({"profile": profile});
+        if let Some(reason) = reason {
+            choice["reason"] = reason.into();
+        }
+        fs::write(
+            run.join("manifest.json"),
+            serde_json::json!({"cpu_profile": choice}).to_string(),
+        )
+        .unwrap();
+        attempt
+    }
+
+    /// The FAIL row of attempt `number` of the fixture cell whose runs are
+    /// `attempts`, as the runner leaves a loader-rejected attempt: a crash-error
+    /// product failure in the attempt's own artifact directory.
+    fn refused_row(number: u64, attempts: Vec<AttemptResult>) -> CellResult {
+        let mut row = cell_result_that_located_nothing();
+        row.attempt = number;
+        row.outcome = "FAIL".into();
+        row.result = Some(ObservedResult::CrashError);
+        row.failure_class = Some(FailureClass::ProductFailure);
+        row.reason =
+            Some("verify exited with status 125 before producing a terminal comparison".into());
+        row.artifact_dir = match number {
+            1 => "/results/runs/fixture/fixture-test-verify-ptrace".into(),
+            _ => format!("/results/runs/fixture/fixture-test-verify-ptrace-attempt-{number}"),
+        };
+        row.attempts = attempts;
+        row
+    }
+
+    /// Hermit's typed refusal of an x86-64-v3 program interpreter on the
+    /// x86-64-v2 CPU, as the ptrace backend prints it.
+    fn v3_on_v2_refusal() -> String {
+        interpreter_refusal(
+            "x86-64-v2",
+            "x86-64-v3",
+            "the x86-64-v2 CPU this profile presents is below the x86-64-v3 it was built for; \
+             rerun with --cpu-profile x86-64-v3, on a host that qualifies for it",
+        )
+    }
+
+    /// `row` is the one HOST-INAPPLICABLE row of a host-image interpreter
+    /// refusal of `attempts` attempts, with every invariant a HOST-INAPPLICABLE
+    /// row keeps, and its reason quotes `line`. It says the guest never
+    /// started exactly when `never_started`.
+    fn assert_interpreter_refusal_row(
+        row: &CellResult,
+        line: &str,
+        attempts: usize,
+        never_started: bool,
+    ) {
+        assert_eq!(row.outcome, "HOST-INAPPLICABLE");
+        assert_eq!(
+            row.error_kind.as_deref(),
+            Some(HOST_IMAGE_INTERPRETER_REFUSAL)
+        );
+        assert!(is_host_image_interpreter_refusal(row));
+        assert_eq!(row.result, None);
+        assert_eq!(
+            row.failure_class,
+            Some(FailureClass::UnderstoodPrerequisiteFailure)
+        );
+        assert_eq!(
+            failure_class(&row.outcome, row.result, row.error_kind.as_deref()),
+            row.failure_class,
+            "the class the row carries is the one its error kind derives"
+        );
+        assert!(row.attempts.is_empty() && row.argv.is_empty(), "{row:#?}");
+        row.require_current_classification().unwrap();
+        // It is the cell's whole history: a history of that one row selects it.
+        assert_eq!(
+            cell_result_after_retries(std::slice::from_ref(row))
+                .unwrap()
+                .outcome,
+            "HOST-INAPPLICABLE"
+        );
+        let reason = row.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with("NOT RUN, NOT a pass, no coverage: "),
+            "{reason}"
+        );
+        assert!(reason.contains(&format!("\"{line}\"")), "{reason}");
+        assert!(
+            reason.contains(
+                "it needs x86-64-v3, above the x86-64-v2 this cell presented \
+                 (qualification-refused in its run manifests)"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!("{attempts} attempt(s) ran Hermit")),
+            "{reason}"
+        );
+        assert_eq!(
+            reason.contains("the guest never started"),
+            never_started,
+            "{reason}"
+        );
+        assert!(
+            reason.contains("logs are in /results/runs/fixture/fixture-test-verify-ptrace"),
+            "{reason}"
+        );
+    }
+
+    /// Shape a of a loader rejection (`first_run_rejected` at exit 127 beside
+    /// glibc's line), under the x86-64-v2 profile the run's manifest records
+    /// the host chose (`qualification-refused`), of a cell with no image whose
+    /// history ran no v2 retry, is one HOST-INAPPLICABLE row of kind
+    /// host-image-interpreter-refusal quoting the line. Two such attempts, as
+    /// the universal retry gives a cell the v2 retry is not for, become the
+    /// same one row, which names both attempts' directories. The loader's line
+    /// alone does not show that the guest never started, so the row does not
+    /// say it. `append_result` publishes the row, which has no attempts.
+    #[test]
+    fn an_interpreter_refused_first_run_becomes_one_host_inapplicable_row() {
+        let root = refusal_dir("shape-a");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let attempt = |number: u64| {
+            refused_row(
+                number,
+                vec![presenting(
+                    loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                    &root.join(format!("cell-{number}")),
+                    "x86-64-v2",
+                )],
+            )
+        };
+        let one = host_image_interpreter_refusal(&context, &cell, &[attempt(1)]).unwrap();
+        assert_interpreter_refusal_row(&one, LOADER_V3_LINE, 1, false);
+        let two =
+            host_image_interpreter_refusal(&context, &cell, &[attempt(1), attempt(2)]).unwrap();
+        assert_interpreter_refusal_row(&two, LOADER_V3_LINE, 2, false);
+        assert!(
+            two.reason.as_deref().unwrap().contains(
+                "/results/runs/fixture/fixture-test-verify-ptrace, \
+                 /results/runs/fixture/fixture-test-verify-ptrace-attempt-2"
+            ),
+            "{two:#?}"
+        );
+        // The recorded row is published, as the record of the cell; a cell
+        // withheld before dispatch still is not.
+        let results = root.join("results.jsonl");
+        append_result(
+            &results,
+            &host_inapplicable_result(&context, &cell, "withheld".into()),
+        )
+        .unwrap();
+        assert!(!results.exists(), "a withheld cell's row is not published");
+        append_result(&results, &one).unwrap();
+        let published: CellResult =
+            serde_json::from_str(fs::read_to_string(&results).unwrap().trim()).unwrap();
+        assert!(is_host_image_interpreter_refusal(&published));
+        assert!(published.attempts.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Shape b (a matched comparison of two runs at exit 127, glibc's line in
+    /// stderr) is the same one row, for a verify cell and for a chaos cell
+    /// whose every seed was refused alike.
+    #[test]
+    fn an_interpreter_refused_matched_pair_becomes_one_host_inapplicable_row() {
+        let root = refusal_dir("shape-b");
+        let context = run_context(&root);
+        let pair = |index: &str| {
+            let mut attempt = compared_runs_attempt(
+                Verdict::Matched,
+                127,
+                127,
+                &format!(":: Comparing captured verification logs...\n{LOADER_V3_LINE}\n"),
+            );
+            attempt.index = index.into();
+            presenting(attempt, &root.join("cell"), "x86-64-v2")
+        };
+        let verify = host_image_interpreter_refusal(
+            &context,
+            &ptrace_cell("verify"),
+            &[refused_row(1, vec![pair("1")])],
+        )
+        .unwrap();
+        assert_interpreter_refusal_row(&verify, LOADER_V3_LINE, 1, false);
+        let seeds = (0..3).map(|seed| pair(&format!("seed-{seed}"))).collect();
+        let mut chaos = refused_row(1, seeds);
+        chaos.mode = "chaos".into();
+        let chaos =
+            host_image_interpreter_refusal(&context, &ptrace_cell("chaos"), &[chaos]).unwrap();
+        assert_interpreter_refusal_row(&chaos, LOADER_V3_LINE, 1, false);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Shape c (run 1's typed `policy_refusal` beside Hermit's refusal of an
+    /// x86-64-v3 interpreter on the x86-64-v2 CPU) is the same one row, and
+    /// Hermit's refusal shows the program never started, so the row says the
+    /// guest never started. Hermit's refusal names the profile but not why
+    /// the host presented it, so the run's manifest must say that: without
+    /// one, or with one naming another profile, the FAIL stands.
+    #[test]
+    fn hermits_interpreter_refusal_becomes_one_host_inapplicable_row() {
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        let root = refusal_dir("shape-c");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let refused = || {
+            run_failed_attempt(
+                VerificationRun::Run1,
+                RunFailure::PolicyRefusal,
+                &refused_run_stderr(&v3_on_v2_refusal()),
+            )
+        };
+        let decide = |attempt: AttemptResult| {
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, vec![attempt])])
+        };
+        let row = decide(presenting(refused(), &root.join("cell"), "x86-64-v2")).unwrap();
+        assert_interpreter_refusal_row(&row, &v3_on_v2_refusal(), 1, true);
+        assert!(decide(refused()).is_none(), "no manifest says why");
+        assert!(
+            decide(presenting(refused(), &root.join("other"), "x86-64-v3")).is_none(),
+            "a manifest naming another profile than Hermit's refusal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: exit 127 without glibc's line is no loader rejection, under
+    /// any profile, so the cell's FAIL stands.
+    #[test]
+    fn exit_127_without_the_loader_line_stays_a_fail() {
+        let root = refusal_dir("no-line");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let dir = root.join("cell");
+        for attempt in [
+            loader_rejected_attempt(127, "guest: command not found\n"),
+            compared_runs_attempt(Verdict::Matched, 127, 127, "guest: command not found\n"),
+        ] {
+            let history = [refused_row(1, vec![presenting(attempt, &dir, "x86-64-v2")])];
+            assert!(host_image_interpreter_refusal(&context, &cell, &history).is_none());
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: glibc naming x86-64-v2 under the x86-64-v2 profile says
+    /// Hermit presented a CPU short of its own profile, a defect, not this
+    /// host's interpreter, so the FAIL stands.
+    #[test]
+    fn a_loader_line_naming_v2_under_the_v2_profile_stays_a_fail() {
+        let root = refusal_dir("v2-under-v2");
+        let history = [refused_row(
+            1,
+            vec![presenting(
+                loader_rejected_attempt(127, "Fatal glibc error: CPU does not support x86-64-v2\n"),
+                &root.join("cell"),
+                "x86-64-v2",
+            )],
+        )];
+        assert!(
+            host_image_interpreter_refusal(&run_context(&root), &ptrace_cell("verify"), &history)
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: an x86-64-v3 interpreter refusing under the x86-64-v3
+    /// profile needs no level above the one presented, so the FAIL stands.
+    #[test]
+    fn a_level_not_above_the_presented_profile_stays_a_fail() {
+        let root = refusal_dir("v3-under-v3");
+        let history = [refused_row(
+            1,
+            vec![presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join("cell"),
+                "x86-64-v3",
+            )],
+        )];
+        assert!(
+            host_image_interpreter_refusal(&run_context(&root), &ptrace_cell("verify"), &history)
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: where the attempt's evidence does not determine the profile
+    /// Hermit presented the FAIL stands: no manifest, a data directory whose
+    /// runs recorded no profile, manifests that disagree, a profile that fixes
+    /// no level (host-no-rdrand presents the host's CPUID), or
+    /// `--no-virtualize-cpuid`, under which the guest saw the host's CPUID
+    /// whatever the manifest says. The same attempt with one x86-64-v2
+    /// manifest is a refusal, so each twin differs in the profile alone.
+    #[test]
+    fn an_unknown_presented_profile_stays_a_fail() {
+        use crate::cpu_profile_record::DATA_DIR_ENV;
+        use crate::cpu_profile_record::data_dir;
+        use crate::cpu_profile_record::stage_dir;
+        let root = refusal_dir("unknown-profile");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let refused = || loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n"));
+        let decide = |attempt: AttemptResult| {
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, vec![attempt])])
+        };
+        assert!(decide(presenting(refused(), &root.join("known"), "x86-64-v2")).is_some());
+        assert!(decide(refused()).is_none(), "no manifest");
+        // The attempt's data directory is there, but one run in it wrote no
+        // manifest and the other a manifest without a CPU profile.
+        let unrecorded_dir = root.join("unrecorded");
+        let mut unrecorded = refused();
+        unrecorded.env.insert(
+            DATA_DIR_ENV.into(),
+            stage_dir(&unrecorded_dir).display().to_string(),
+        );
+        let runs = data_dir(&unrecorded_dir, &unrecorded.index);
+        fs::create_dir_all(runs.join("run-without-a-manifest")).unwrap();
+        fs::create_dir_all(runs.join("run-without-a-profile")).unwrap();
+        fs::write(runs.join("run-without-a-profile/manifest.json"), "{}").unwrap();
+        assert!(
+            decide(unrecorded.clone()).is_none(),
+            "runs that recorded no profile"
+        );
+        assert!(
+            decide(presenting(unrecorded, &unrecorded_dir, "x86-64-v2")).is_some(),
+            "the same runs beside one that recorded x86-64-v2"
+        );
+        let split = presenting(
+            presenting(refused(), &root.join("split"), "x86-64-v2"),
+            &root.join("split"),
+            "x86-64-v3",
+        );
+        assert!(decide(split).is_none(), "manifests that disagree");
+        assert!(
+            decide(presenting(refused(), &root.join("host"), "host-no-rdrand")).is_none(),
+            "a profile that fixes no level"
+        );
+        let mut unvirtualized = presenting(refused(), &root.join("unvirtualized"), "x86-64-v2");
+        unvirtualized.argv.push(NO_VIRTUALIZE_CPUID_ARG.into());
+        assert!(decide(unvirtualized).is_none(), "--no-virtualize-cpuid");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: a cell with an image runs the image's interpreter, not this
+    /// host's, so the FAIL stands; the same history without the image is a
+    /// refusal.
+    #[test]
+    fn a_cell_with_an_image_stays_a_fail() {
+        let root = refusal_dir("image");
+        let context = run_context(&root);
+        let history = [refused_row(
+            1,
+            vec![presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join("cell"),
+                "x86-64-v2",
+            )],
+        )];
+        let mut cell = ptrace_cell("verify");
+        assert!(host_image_interpreter_refusal(&context, &cell, &history).is_some());
+        cell.image = Some("oci-dir:/images/bucket".into());
+        assert!(host_image_interpreter_refusal(&context, &cell, &history).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: a history in which a v2 retry ran keeps the cell's own result,
+    /// whether the retry ran inside the v2 rootfs (`--image PATH` or
+    /// `--image=PATH`, here refused again) or was refused before launch.
+    #[test]
+    fn a_history_in_which_a_v2_retry_ran_stays_a_fail() {
+        let root = refusal_dir("v2-retry");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let refused = |number: u64| {
+            refused_row(
+                number,
+                vec![presenting(
+                    loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                    &root.join(format!("cell-{number}")),
+                    "x86-64-v2",
+                )],
+            )
+        };
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused(1), refused(2)]).is_some()
+        );
+        let mut in_rootfs = refused(2);
+        in_rootfs.attempts[0]
+            .argv
+            .extend(["--image".into(), "oci-dir:/bundle/v2-rootfs".into()]);
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused(1), in_rootfs]).is_none()
+        );
+        let mut in_rootfs_one_word = refused(2);
+        in_rootfs_one_word.attempts[0]
+            .argv
+            .push("--image=oci-dir:/bundle/v2-rootfs".into());
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused(1), in_rootfs_one_word])
+                .is_none(),
+            "the --image=PATH spelling"
+        );
+        let mut refused_before_launch =
+            infrastructure_error_result(&context, &cell, "v2 retry refused before launch".into());
+        refused_before_launch.attempt = 2;
+        refused_before_launch.failure_class = Some(FailureClass::UnderstoodPrerequisiteFailure);
+        refused_before_launch.error_kind = Some(ROOTFS_UNCHECKED.into());
+        assert!(is_v2_retry_refusal(&refused_before_launch));
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused(1), refused_before_launch])
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: on the same host, an attempt whose guest ran and failed, or
+    /// whose comparison diverged, after a refused first attempt measured
+    /// Hermit, so the FAIL stands; so does a chaos row in which one seed's
+    /// comparison diverged beside refused seeds.
+    #[test]
+    fn a_genuine_guest_failure_after_a_refused_attempt_stays_a_fail() {
+        let root = refusal_dir("genuine");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let refused = || {
+            presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join("cell-1"),
+                "x86-64-v2",
+            )
+        };
+        let measured = |attempt: AttemptResult| {
+            refused_row(
+                2,
+                vec![presenting(attempt, &root.join("cell-2"), "x86-64-v2")],
+            )
+        };
+        for (label, second) in [
+            (
+                "guest exited 1",
+                measured(loader_rejected_attempt(1, "guest: assertion failed\n")),
+            ),
+            (
+                "comparison diverged",
+                measured(compared_runs_attempt(Verdict::Diverged, 0, 0, "")),
+            ),
+        ] {
+            assert!(
+                host_image_interpreter_refusal(
+                    &context,
+                    &cell,
+                    &[refused_row(1, vec![refused()]), second]
+                )
+                .is_none(),
+                "{label}"
+            );
+        }
+        let mut diverged_seed = compared_runs_attempt(Verdict::Diverged, 0, 0, "");
+        diverged_seed.index = "seed-1".into();
+        let mut chaos = refused_row(
+            1,
+            vec![
+                refused(),
+                presenting(diverged_seed, &root.join("cell-1"), "x86-64-v2"),
+            ],
+        );
+        chaos.mode = "chaos".into();
+        assert!(
+            host_image_interpreter_refusal(&context, &ptrace_cell("chaos"), &[chaos]).is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every attempt must be refused, not only the last: a failure an
+    /// earlier attempt measured keeps the FAIL under a refused last attempt.
+    #[test]
+    fn an_earlier_measured_failure_keeps_the_fail_under_a_refused_last_attempt() {
+        let root = refusal_dir("earlier");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let first = refused_row(
+            1,
+            vec![presenting(
+                compared_runs_attempt(Verdict::Diverged, 0, 0, ""),
+                &root.join("cell-1"),
+                "x86-64-v2",
+            )],
+        );
+        let last = refused_row(
+            2,
+            vec![presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join("cell-2"),
+                "x86-64-v2",
+            )],
+        );
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, std::slice::from_ref(&last)).is_some()
+        );
+        assert!(host_image_interpreter_refusal(&context, &cell, &[first, last]).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: glibc's line in an attempt that is none of the three shapes
+    /// of a loader rejection keeps the FAIL: a first run rejected at another
+    /// exit status, two refused runs whose comparison diverged, and Hermit's
+    /// refusal of run 2 rather than run 1. The same line at exit 127 under the
+    /// same manifest is a refusal.
+    #[test]
+    fn a_loader_line_without_a_loader_rejection_stays_a_fail() {
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        let root = refusal_dir("not-a-rejection");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let line = format!("{LOADER_V3_LINE}\n");
+        let decide = |attempt: AttemptResult| {
+            let attempt = presenting(attempt, &root.join("cell"), "x86-64-v2");
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, vec![attempt])])
+        };
+        assert!(decide(loader_rejected_attempt(127, &line)).is_some());
+        for (label, attempt) in [
+            (
+                "first run rejected at exit 1",
+                loader_rejected_attempt(1, &line),
+            ),
+            (
+                "two refused runs that diverged",
+                compared_runs_attempt(Verdict::Diverged, 127, 127, &line),
+            ),
+            (
+                "Hermit's refusal of run 2",
+                run_failed_attempt(
+                    VerificationRun::Run2,
+                    RunFailure::PolicyRefusal,
+                    &refused_run_stderr(&v3_on_v2_refusal()),
+                ),
+            ),
+        ] {
+            assert!(decide(attempt).is_none(), "{label}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Red twin: only a FAIL row with runs is evidence. An ERROR row keeps its
+    /// result although its run shows the refusal, and so does a FAIL row that
+    /// retains no run, alone or after a refused attempt. The same row as a
+    /// FAIL with its run is a refusal.
+    #[test]
+    fn a_row_that_is_not_a_fail_with_runs_keeps_its_result() {
+        let root = refusal_dir("not-a-fail");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let refused = refused_row(
+            1,
+            vec![presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join("cell"),
+                "x86-64-v2",
+            )],
+        );
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, std::slice::from_ref(&refused))
+                .is_some()
+        );
+        let mut error = refused.clone();
+        error.outcome = "ERROR".into();
+        error.result = None;
+        error.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[error]).is_none(),
+            "an ERROR"
+        );
+        let mut without_runs = refused.clone();
+        without_runs.attempt = 2;
+        without_runs.attempts.clear();
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, std::slice::from_ref(&without_runs))
+                .is_none(),
+            "a FAIL that retains no run"
+        );
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused, without_runs]).is_none(),
+            "a FAIL that retains no run, after a refused attempt"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// F3: the profile check reads the run manifest's reason. A refusal under
+    /// an x86-64-v2 the host chose (`qualification-refused`, `hypervisor`) is
+    /// one another host could avoid; under a profile chosen for any other
+    /// reason (`explicit`, `declared`, `request-not-admissible`), or a
+    /// manifest that records no reason, the same command presents the same CPU
+    /// everywhere, so the FAIL stands.
+    #[test]
+    fn a_refusal_under_a_profile_the_host_did_not_choose_stays_a_fail() {
+        let root = refusal_dir("reason");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let decide = |reason: Option<&str>| {
+            let attempt = presenting_for(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join(format!("cell-{}", reason.unwrap_or("none"))),
+                "x86-64-v2",
+                reason,
+            );
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, vec![attempt])])
+        };
+        for reason in ["qualification-refused", "hypervisor"] {
+            let row = decide(Some(reason)).unwrap_or_else(|| panic!("{reason}"));
+            assert!(
+                row.reason.as_deref().unwrap().contains(&format!(
+                    "x86-64-v2 this cell presented ({reason} in its run manifests)"
+                )),
+                "{row:#?}"
+            );
+        }
+        for reason in [
+            Some("explicit"),
+            Some("declared"),
+            Some("request-not-admissible"),
+            None,
+        ] {
+            assert!(decide(reason).is_none(), "{reason:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An interpreter built for more than x86-64-v3 is refused under every
+    /// profile Hermit presents automatically, on every host, so its FAIL
+    /// stands; the same attempt naming x86-64-v3 is a refusal.
+    #[test]
+    fn an_interpreter_needing_more_than_x86_64_v3_stays_a_fail() {
+        let root = refusal_dir("v4");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let decide = |level: &str| {
+            let attempt = presenting(
+                loader_rejected_attempt(
+                    127,
+                    &format!("Fatal glibc error: CPU does not support x86-64-v{level}\n"),
+                ),
+                &root.join(format!("cell-{level}")),
+                "x86-64-v2",
+            );
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, vec![attempt])])
+        };
+        assert!(decide("3").is_some());
+        assert!(decide("4").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Conflicting glibc levels keep the FAIL: one run whose stdout names
+    /// another level than its stderr, and two runs that agree on the level
+    /// but whose manifests give the presented profile different reasons, so
+    /// no one profile and reason describes the cell.
+    #[test]
+    fn conflicting_glibc_levels_or_profiles_stay_a_fail() {
+        let root = refusal_dir("conflicting");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let decide = |attempts: Vec<AttemptResult>| {
+            host_image_interpreter_refusal(&context, &cell, &[refused_row(1, attempts)])
+        };
+        let mut agreeing = loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n"));
+        agreeing.stdout = format!("{LOADER_V3_LINE}\n");
+        assert!(decide(vec![presenting(agreeing, &root.join("agree"), "x86-64-v2")]).is_some());
+        let mut split = loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n"));
+        split.stdout = "Fatal glibc error: CPU does not support x86-64-v4\n".into();
+        assert!(
+            decide(vec![presenting(split, &root.join("split"), "x86-64-v2")]).is_none(),
+            "stdout names x86-64-v4 beside stderr's x86-64-v3"
+        );
+        let seed = |index: &str, reason: &str| {
+            let mut attempt = loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n"));
+            attempt.index = index.into();
+            presenting_for(attempt, &root.join("seeds"), "x86-64-v2", Some(reason))
+        };
+        assert!(
+            decide(vec![
+                seed("seed-0", "qualification-refused"),
+                seed("seed-1", "qualification-refused")
+            ])
+            .is_some()
+        );
+        assert!(
+            decide(vec![
+                seed("seed-2", "qualification-refused"),
+                seed("seed-3", "hypervisor")
+            ])
+            .is_none(),
+            "two runs whose manifests give different reasons"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The level glibc's line names is one or two decimal digits right after
+    /// the signature, without a leading zero; anything else names none.
+    #[test]
+    fn the_loader_line_names_one_or_two_digits_without_a_leading_zero() {
+        let line = |rest: &str| format!("ld.so: {LOADER_V2_SIGNATURE}{rest}");
+        for (rest, level) in [
+            ("3", Some(3)),
+            ("3.", Some(3)),
+            ("3 (from /lib64/ld-linux-x86-64.so.2)", Some(3)),
+            ("12", Some(12)),
+            ("", None),
+            ("0", None),
+            ("03", None),
+            ("123", None),
+            ("x", None),
+            (" 3", None),
+        ] {
+            assert_eq!(loader_line_level(&line(rest)), level, "{rest:?}");
+        }
+        assert_eq!(loader_line_level("CPU does not support x86-64-v3"), None);
+    }
+
+    /// The row says the guest never started only where every run shows it:
+    /// Hermit's own refusal of the interpreter does (shape c), the loader's
+    /// line alone does not (shapes a and b), and a history that mixes them
+    /// does not either.
+    #[test]
+    fn the_reason_says_the_guest_never_started_only_where_every_run_shows_it() {
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        let root = refusal_dir("wording");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let policy = |cell_dir: &str| {
+            presenting(
+                run_failed_attempt(
+                    VerificationRun::Run1,
+                    RunFailure::PolicyRefusal,
+                    &refused_run_stderr(&v3_on_v2_refusal()),
+                ),
+                &root.join(cell_dir),
+                "x86-64-v2",
+            )
+        };
+        let loader = |cell_dir: &str| {
+            presenting(
+                loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                &root.join(cell_dir),
+                "x86-64-v2",
+            )
+        };
+        let never_started = |history: &[CellResult]| {
+            interpreter_refusal_evidence(&cell, history)
+                .unwrap()
+                .program_never_started
+        };
+        assert!(never_started(&[refused_row(1, vec![policy("c")])]));
+        assert!(!never_started(&[refused_row(1, vec![loader("a")])]));
+        assert!(!never_started(&[
+            refused_row(1, vec![policy("mixed-1")]),
+            refused_row(2, vec![loader("mixed-2")])
+        ]));
+        let row = host_image_interpreter_refusal(
+            &context,
+            &cell,
+            &[
+                refused_row(1, vec![policy("mixed-3")]),
+                refused_row(2, vec![loader("mixed-4")]),
+            ],
+        )
+        .unwrap();
+        assert!(
+            !row.reason.as_deref().unwrap().contains("never started"),
+            "{row:#?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An imported claim is checked field by field: the evidence the harness
+    /// decided from passes, and each field changed to one this run would not
+    /// record fails, as does a cell this checkout gives an image.
+    #[test]
+    fn an_imported_refusal_claim_is_checked_field_by_field() {
+        let root = refusal_dir("claim");
+        let cell = ptrace_cell("verify");
+        let claim = interpreter_refusal_evidence(
+            &cell,
+            &[refused_row(
+                1,
+                vec![presenting(
+                    loader_rejected_attempt(127, &format!("{LOADER_V3_LINE}\n")),
+                    &root.join("cell"),
+                    "x86-64-v2",
+                )],
+            )],
+        )
+        .unwrap();
+        check_interpreter_refusal_claim(&cell, &claim).unwrap();
+        let round_trip: InterpreterRefusalEvidence =
+            serde_json::from_value(serde_json::to_value(&claim).unwrap()).unwrap();
+        assert_eq!(round_trip, claim);
+        let mut changes: Vec<(&str, InterpreterRefusalEvidence)> = Vec::new();
+        let mut changed = claim.clone();
+        changed.needs = 2;
+        changes.push(("needs no level above the profile", changed));
+        let mut changed = claim.clone();
+        changed.needs = 4;
+        changed.quoted = "Fatal glibc error: CPU does not support x86-64-v4".into();
+        changes.push(("needs x86-64-v4", changed));
+        let mut changed = claim.clone();
+        changed.presented.reason = "explicit".into();
+        changes.push(("a profile the host did not choose", changed));
+        let mut changed = claim.clone();
+        changed.presented.profile = "host-no-rdrand".into();
+        changes.push(("a profile that fixes no level", changed));
+        let mut changed = claim.clone();
+        changed.quoted = "Fatal glibc error: CPU does not support x86-64-v2".into();
+        changes.push(("a quoted line naming another level", changed));
+        let mut changed = claim.clone();
+        changed.attempts = 0;
+        changes.push(("no attempt", changed));
+        let mut changed = claim.clone();
+        changed.runs = 0;
+        changes.push(("fewer runs than attempts", changed));
+        let mut changed = claim.clone();
+        changed.artifact_dirs.push("/elsewhere".into());
+        changes.push(("an artifact directory per attempt", changed));
+        for (label, changed) in changes {
+            assert!(
+                check_interpreter_refusal_claim(&cell, &changed).is_err(),
+                "{label}"
+            );
+        }
+        let mut imaged = cell.clone();
+        imaged.image = Some("oci-dir:/images/bucket".into());
+        assert!(check_interpreter_refusal_claim(&imaged, &claim).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The PASS baseline: a cell whose final row in the earlier run was a PASS
+    /// is refused, and so is a cell the baseline has no row for; a cell that
+    /// ended in anything else there is not. A directory is read through every
+    /// results.jsonl below it, a cell's final row is its last, and a cell in
+    /// two files, or a baseline with no row, is refused.
+    #[test]
+    fn a_pass_baseline_refuses_a_cell_that_passed_there_or_that_it_lacks() {
+        let root = refusal_dir("baseline");
+        let id = |test: &str| CellId {
+            test: test.into(),
+            mode: "verify".into(),
+            backend: Some("ptrace".into()),
+        };
+        let row = |test: &str, outcome: &str| {
+            serde_json::json!({"test": test, "mode": "verify", "backend": "ptrace", "outcome": outcome})
+                .to_string()
+        };
+        let bucket = root.join("portable/manifest_a");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(
+            bucket.join("results.jsonl"),
+            [
+                row("passed", "FAIL"),
+                row("passed", "PASS"),
+                row("failed", "FAIL"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let baseline = PassBaseline::load(&root).unwrap();
+        let passed = baseline.refuses(&id("passed")).unwrap();
+        assert!(
+            passed.starts_with("PASS -> HOST-INAPPLICABLE against the baseline"),
+            "{passed}"
+        );
+        assert_eq!(baseline.refuses(&id("failed")), None);
+        let absent = baseline.refuses(&id("absent")).unwrap();
+        assert!(
+            absent.contains("has no row for absent/verify@ptrace"),
+            "{absent}"
+        );
+        let file = PassBaseline::load(&bucket.join("results.jsonl")).unwrap();
+        assert!(file.refuses(&id("passed")).is_some());
+        let other = root.join("portable/manifest_b");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("results.jsonl"), row("failed", "PASS")).unwrap();
+        assert!(
+            PassBaseline::load(&root).unwrap_err().contains("ambiguous"),
+            "a cell in two files"
+        );
+        let empty = root.join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        assert!(
+            PassBaseline::load(&empty)
+                .unwrap_err()
+                .contains("holds no result row")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

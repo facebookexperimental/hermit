@@ -333,6 +333,36 @@ class VerdictTest(unittest.TestCase):
         process, _ = self.verdict({"portable/compat": report})
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
 
+    def test_the_refusal_opt_in_reaches_every_bucket_and_each_recorded_refusal_is_printed(self):
+        """Without --record-host-image-interpreter-refusals no bucket's harness gets it, so a
+        recorded row is an ERROR there; with it, every bucket's harness gets the baseline as
+        an absolute path, and each recorded refusal is printed and counted, never dropped."""
+        process, calls = self.verdict({})
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertTrue(all("--record-host-image-interpreter-refusals" not in c["argv"] for c in calls), calls)
+        refusal = {"test": "t/r", "mode": "verify", "backend": "ptrace", "recorded": True,
+                   "reason": "NOT RUN, NOT a pass, no coverage: this host's own program interpreter refused it\nmore"}
+        kept = dict(refusal, test="t/k", recorded=False, reason="kept as its FAIL")
+        report = {"rc": 0, "junit": [], "summary": summary(
+            2, passed=1, host_inapplicable=1, host_image_interpreter_refusals=1,
+            host_image_interpreter_refusal_cells=[refusal, kept])}
+        relative = os.path.relpath(self.root / "baseline", Path.cwd())
+        shutil.rmtree(self.out, ignore_errors=True)
+        self.calls.unlink(missing_ok=True)
+        process, calls = self.verdict({"portable/compat": report},
+                                      "--record-host-image-interpreter-refusals", relative)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            flag = call["argv"].index("--record-host-image-interpreter-refusals")
+            self.assertEqual(call["argv"][flag + 1], str(self.root / "baseline"))
+        self.assertIn("verdict: HOST-INAPPLICABLE portable/compat t/r/verify/ptrace: recorded as a host-image "
+                      "interpreter refusal, not a pass: NOT RUN, NOT a pass, no coverage: this host's own program "
+                      "interpreter refused it\n", process.stderr)
+        self.assertNotIn("t/k/verify/ptrace", process.stderr)
+        printed = json.loads(process.stdout)
+        self.assertEqual((printed["host_inapplicable"], printed["host_image_interpreter_refusals"]), (1, 1))
+
     def test_an_error_on_an_excused_diagnostic_cell_is_still_listed(self):
         erroring = {"rc": 1, "summary": summary(2, errors=1, failed=1, passed=0, diagnostic=[(E, "exit status 3")]),
                     "junit": [[D, "error", "import-stale: the row's test digest differs"],

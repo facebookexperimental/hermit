@@ -271,6 +271,35 @@ impl RunClassification {
     }
 }
 
+/// The manifest cells each node RAN and recorded HOST-INAPPLICABLE itself,
+/// by node tag: the schema-5 `skip` rows of its typed test results whose
+/// reason is test-harness's record of a host-image interpreter refusal it
+/// made under `--record-host-image-interpreter-refusals`
+/// (`hermit_manifest_plan::runner::is_recorded_host_inapplicable_skip`). A
+/// node that exits 0 with one did not cover that cell, exactly as a node run
+/// with cells withheld before dispatch did not, so [`classify_run`] counts it
+/// the same way. Any other runtime skip is not one.
+pub(super) fn recorded_host_inapplicable_cells(
+    outcomes: &[StepOutcome],
+) -> BTreeMap<String, Vec<String>> {
+    let mut cells = BTreeMap::<String, Vec<String>>::new();
+    for outcome in outcomes {
+        for result in outcome.test_results.iter().flatten() {
+            if result
+                .skip_reason
+                .as_deref()
+                .is_some_and(hermit_manifest_plan::runner::is_recorded_host_inapplicable_skip)
+            {
+                cells
+                    .entry(outcome.tag.clone())
+                    .or_default()
+                    .push(result.id.clone());
+            }
+        }
+    }
+    cells
+}
+
 pub(super) fn classify_run(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
@@ -312,6 +341,12 @@ pub(super) fn classify_run(
     classified
         .understood_prerequisite_failure_nodes
         .extend(host_inapplicable.iter().map(|node| node.tag.clone()));
+    // A node that recorded cells HOST-INAPPLICABLE as it ran is counted as one
+    // the plan ran with cells withheld: it keeps its own verdict, and the run
+    // is not complete.
+    classified
+        .understood_prerequisite_failure_nodes
+        .extend(recorded_host_inapplicable_cells(outcomes).into_keys());
     classified.no_result_nodes.extend(skipped.iter().cloned());
     let accounted: BTreeSet<_> = outcomes
         .iter()
@@ -1092,6 +1127,77 @@ fn populations_bracket() -> Result<(), String> {
         return Err(format!(
             "classification: a node run with host-inapplicable cells withheld was promoted to \
              completion: {withheld:?}"
+        ));
+    }
+    // A bucket node that RAN and passed while test-harness recorded one of its
+    // cells HOST-INAPPLICABLE (a host-image interpreter refusal, a schema-5
+    // skip with the harness's reason) is counted the same way as one whose
+    // cells were withheld before dispatch: product result kept, run
+    // incomplete. An ordinary runtime skip, with any other reason, is not.
+    let skip_row = |id: &str, reason: String| {
+        dagrun::TestResult::skipped(
+            id.into(),
+            vec![
+                dagrun::TestAttemptResult::new(
+                    1,
+                    dagrun::TestAttemptOutcome::Skipped,
+                    Some(reason.clone()),
+                )
+                .map_err(|error| format!("classification fixture: {error}"))?,
+            ],
+            reason,
+        )
+        .map_err(|error| format!("classification fixture: {error}"))
+    };
+    let mut recording = fixture_outcome("e2e.recording", 0);
+    recording.test_results = Some(vec![skip_row(
+        "loader/refused [ptrace/verify]",
+        format!(
+            "{}NOT RUN, NOT a pass, no coverage: fixture",
+            hermit_manifest_plan::runner::RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX
+        ),
+    )?]);
+    let recording_attempts = [reported_attempt(&recording, 1)];
+    let recording_plan = BTreeSet::from([recording.tag.clone()]);
+    let recorded = classify_run(
+        std::slice::from_ref(&recording),
+        &recording_attempts,
+        &[],
+        &recording_plan,
+        &[],
+    );
+    if recorded.product_result_nodes != recording_plan
+        || recorded.understood_prerequisite_failure_nodes != recording_plan
+        || recorded.no_results() != 1
+        || validation_is_complete(true, &recorded, &recording_plan)
+        || recorded_host_inapplicable_cells(std::slice::from_ref(&recording))
+            != BTreeMap::from([(
+                recording.tag.clone(),
+                vec!["loader/refused [ptrace/verify]".to_string()],
+            )])
+    {
+        return Err(format!(
+            "classification: a node that recorded a cell HOST-INAPPLICABLE was promoted to \
+             completion: {recorded:?}"
+        ));
+    }
+    let mut skipping = fixture_outcome("test.skipping", 0);
+    skipping.test_results = Some(vec![skip_row(
+        "fixture::needs_kvm",
+        "no /dev/kvm on this host".into(),
+    )?]);
+    let skipping_attempts = [reported_attempt(&skipping, 1)];
+    let skipping_plan = BTreeSet::from([skipping.tag.clone()]);
+    let ordinary = classify_run(
+        std::slice::from_ref(&skipping),
+        &skipping_attempts,
+        &[],
+        &skipping_plan,
+        &[],
+    );
+    if ordinary.no_results() != 0 || !validation_is_complete(true, &ordinary, &skipping_plan) {
+        return Err(format!(
+            "classification: an ordinary runtime skip changed completeness: {ordinary:?}"
         ));
     }
     // Missing super repetitions keep the committed denominator and never become

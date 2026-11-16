@@ -171,6 +171,20 @@ def withheld_on(route, cell, end, run_id):
     return execution(cell, end, None, run_id, summary=summary, result=result)
 
 
+def refused_on(route, cell, end, run_id, recorded=False):
+    """An execution of CELL whose every run its host's own program interpreter refused,
+    on ROUTE: the harness names the cell in host_image_interpreter_refusal_cells, and
+    either keeps the attempt's FAIL row or, RECORDED (--record-host-image-interpreter-
+    refusals), writes the one HOST-INAPPLICABLE row of kind host-image-interpreter-refusal."""
+    refused_row = dict(row(cell, "HOST-INAPPLICABLE", run_id), error_kind="host-image-interpreter-refusal") \
+        if recorded else row(cell, "FAIL", run_id)
+    summary = {"schema": 1, "host_inapplicable_cells": [], "host_image_interpreter_refusals": int(recorded),
+               "host_image_interpreter_refusal_cells": [dict(claim(cell), recorded=recorded, reason="refused",
+                                                             evidence={"needs": 3})]}
+    result = {"cell": cell, "run_id": run_id, "evidence_complete": True, "producer_completion": VALID, "route": route}
+    return execution(cell, end, None, run_id, rows=[refused_row], summary=summary, result=result)
+
+
 Y_PASSES = execution(Y, 150, "PASS", "ry1")
 HOST_INAPPLICABLE_X = {"schema": 1, "host_inapplicable_cells": [claim(X)]}
 X_SLUG = "t-x-custom-ptrace"
@@ -524,6 +538,63 @@ class IngestTest(unittest.TestCase):
             {"RUN": [withheld_on("re", X, 100, "rx1"), withheld_on("local", X, 200, "rx2"), Y_PASSES]}
         )
         self.assertEqual(printed["withheld_on_re_every_execution"], 0)
+
+    def test_an_execution_its_re_workers_interpreter_refused_takes_no_attempt_number(self):
+        """F2: that worker's CPU and image refused the cell, which measured nothing about
+        Hermit, so it is a failure but not an attempt, whether the harness recorded it or
+        kept its FAIL: its row is not imported, and the cell runs again elsewhere."""
+        for recorded in (False, True):
+            with self.subTest(recorded=recorded):
+                refused = refused_on("re", X, 100, "rx1", recorded)
+                printed, rows, summary = self.accepted({"RUN": [refused, execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+                self.assertEqual(rows, [(X, 1, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+                self.assertEqual(summary.get("host_image_interpreter_refusal_cells"), None)
+                self.assertEqual((printed["interpreter_refused_on_re_executions"], printed["withheld_on_re_executions"],
+                                  printed["final_outcomes"]), (1, 0, {"PASS": 2}))
+                # Refused on every RE execution: listed for the local rerun, as a withheld cell is.
+                printed, rows, _ = self.accepted({"RUN": [refused, Y_PASSES]}, withheld_on_re=[X_SLUG])
+                self.assertEqual(rows, [(Y, 1, "PASS", "ry1")])
+                self.assertEqual((printed["interpreter_refused_on_re_executions"],
+                                  printed["withheld_on_re_every_execution"]), (1, 1))
+                # Refused on the retry of a failed attempt: that retry runs locally.
+                printed, rows, _ = self.accepted(
+                    {"RUN": [execution(X, 50, "FAIL", "rx0"), refused, Y_PASSES]}, withheld_retries=[X_SLUG])
+                self.assertEqual(rows, [(X, 1, "FAIL", "rx0"), (Y, 1, "PASS", "ry1")])
+                self.assertEqual(printed["withheld_retries_on_re"], 1)
+
+    def test_an_interpreter_refusal_on_a_local_route_is_the_attempt_it_was(self):
+        """Without the opt-in the cell keeps its FAIL; recorded, its one row is the cell's."""
+        printed, rows, _ = self.accepted(
+            {"RUN": [refused_on("local", X, 100, "rx1"), execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["interpreter_refused_on_re_executions"], 0)
+        printed, rows, summary = self.accepted({"RUN": [refused_on("local", X, 100, "rx1", True), Y_PASSES]})
+        self.assertEqual(rows, [(X, 1, "HOST-INAPPLICABLE", "rx1"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["final_outcomes"], {"HOST-INAPPLICABLE": 1, "PASS": 1})
+        self.assertEqual([c["recorded"] for c in summary["host_image_interpreter_refusal_cells"]], [True])
+        self.assertEqual(summary["host_image_interpreter_refusals"], 1)
+
+    def test_an_interpreter_refusal_claim_must_match_its_rows(self):
+        """The claim is made only from FAIL attempts, or as the one recorded row; on any
+        route, rows that say otherwise refuse the ingest rather than drop or keep them."""
+        def contradicted(route, rows):
+            refused = refused_on(route, X, 100, "rx1")
+            refused["rows"] = rows
+            return refused
+        cases = [
+            ("a PASS row", [row(X, "PASS", "rx1")], "['PASS']"),
+            ("a FAIL row and a PASS row", [row(X, "FAIL", "rx1"), dict(row(X, "PASS", "rx1"), attempt=2)],
+             "['FAIL', 'PASS']"),
+            ("no row", None, "[]"),
+            ("a HOST-INAPPLICABLE row of no kind", [row(X, "HOST-INAPPLICABLE", "rx1")], "['HOST-INAPPLICABLE']"),
+            ("an ERROR row", [row(X, "ERROR", "rx1")], "['ERROR']"),
+        ]
+        for route in ("re", "local"):
+            for name, rows, outcomes in cases:
+                with self.subTest(name, route=route):
+                    self.refused({"RUN": [contradicted(route, rows), Y_PASSES]},
+                                 f"ingest: the execution of {X} that ended at 100 names it a host-image interpreter "
+                                 f"refusal, but its rows are {outcomes}")
 
     def test_every_plan_cell_and_no_other_cell(self):
         self.refused(

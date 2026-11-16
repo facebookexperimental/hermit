@@ -45,6 +45,16 @@
 //!   same cell does not count.
 //! - A producer's host-inapplicable claim counts only if this machine lacks a
 //!   capability the cell requires, and the row carries this machine's reason.
+//! - The one HOST-INAPPLICABLE row a producer writes is a host-image
+//!   interpreter refusal it recorded under
+//!   `--record-host-image-interpreter-refusals`, as a cell's only row. It
+//!   counts only if this run was given that option too, and only with the
+//!   producer's `summary.json` claim for the cell, whose typed evidence must
+//!   be a refusal this run would record (`check_interpreter_refusal_claim`);
+//!   the cell is then this run's own such row, rebuilt from that evidence.
+//!   Without the option it is one `import-host-image-interpreter-refusal`
+//!   ERROR, never a HOST-INAPPLICABLE and never a pass. This run's own PASS
+//!   baseline check applies to it as to a refusal it recorded itself.
 //!
 //! An imported row is rebound to this run before publication: its `run_id`
 //! (and the run id its CPU observations are bound to) becomes this run's, and
@@ -63,11 +73,15 @@ use serde::Deserialize;
 
 use crate::runner::CELL_RESULT_SCHEMA;
 use crate::runner::CellResult;
+use crate::runner::InterpreterRefusalEvidence;
 use crate::runner::RunContext;
 use crate::runner::SelectedCell;
 use crate::runner::cell_timeouts;
+use crate::runner::check_interpreter_refusal_claim;
+use crate::runner::host_image_interpreter_refusal_row;
 use crate::runner::host_inapplicable_result;
 use crate::runner::infrastructure_error_result;
+use crate::runner::is_host_image_interpreter_refusal;
 use crate::runner::outcome_after_retries;
 use crate::runner::proc_level_mismatch;
 use crate::runner::test_digest;
@@ -93,6 +107,10 @@ pub struct ImportPolicy<'a> {
     pub earns_retry: &'a dyn Fn(&SelectedCell, &[CellResult]) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
+    /// Whether this run records a host-image interpreter refusal
+    /// (`--record-host-image-interpreter-refusals`), and so may accept one a
+    /// producer recorded.
+    pub record_refusals: bool,
 }
 
 /// What the import root says about one selected cell, already turned into the
@@ -100,6 +118,9 @@ pub struct ImportPolicy<'a> {
 #[derive(Clone, Debug)]
 pub struct ImportedCell {
     pub rows: Vec<CellResult>,
+    /// The checked evidence of a host-image interpreter refusal the producer
+    /// recorded and this run accepted; `rows` is then that one row.
+    pub refusal: Option<InterpreterRefusalEvidence>,
 }
 
 /// The import of one `run`: one entry per selected cell, in selection order.
@@ -120,6 +141,21 @@ struct Summary {
     host_inapplicable_cells: Vec<SummaryCell>,
     #[serde(default)]
     evidence_complete_executions: Vec<SummaryExecution>,
+    #[serde(default)]
+    host_image_interpreter_refusal_cells: Vec<RefusalClaim>,
+}
+
+/// One entry of a producer's `host_image_interpreter_refusal_cells`: a cell
+/// whose every run its host's program interpreter refused, `recorded` when the
+/// producer recorded it HOST-INAPPLICABLE, with the typed evidence it decided
+/// from.
+#[derive(Deserialize)]
+struct RefusalClaim {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    recorded: bool,
+    evidence: InterpreterRefusalEvidence,
 }
 
 #[derive(Deserialize)]
@@ -267,7 +303,9 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
 
 /// Why `rows`, in file order, are not a history a producer writes, if they
 /// are not. The executed path's own rule decides (`outcome_after_retries`),
-/// and a producer never writes a HOST-INAPPLICABLE row. `no_rows` names, by
+/// and a producer writes no HOST-INAPPLICABLE row except a recorded
+/// host-image interpreter refusal as a cell's only row, which `load` takes
+/// before this, so here any is refused. `no_rows` names, by
 /// attempt, the cause the producer recorded for each execution that wrote no
 /// row; it only words the refusal and never decides it.
 fn history_error(rows: &[CellResult], no_rows: Option<&BTreeMap<u64, String>>) -> Option<String> {
@@ -314,6 +352,7 @@ pub fn load(
     let mut rows = BTreeMap::<Key, Vec<CellResult>>::new();
     let mut inapplicable = BTreeMap::<Key, String>::new();
     let mut evidence_complete = BTreeSet::<(Key, String)>::new();
+    let mut refusal_claims = BTreeMap::<Key, Vec<InterpreterRefusalEvidence>>::new();
     let mut no_rows = BTreeMap::<Key, BTreeMap<u64, String>>::new();
     for (lane, category) in &buckets {
         let dir = bucket_dir(root, lane, category);
@@ -394,6 +433,21 @@ pub fn load(
                         inapplicable.insert(id, cell.reason.unwrap_or_default());
                     }
                 }
+                for claim in summary.host_image_interpreter_refusal_cells {
+                    if !claim.recorded {
+                        continue;
+                    }
+                    let id = key(
+                        lane,
+                        category,
+                        &claim.test,
+                        &claim.mode,
+                        claim.backend.as_deref(),
+                    );
+                    if wanted.contains(&id) {
+                        refusal_claims.entry(id).or_default().push(claim.evidence);
+                    }
+                }
                 evidence_complete.extend(summary.evidence_complete_executions.into_iter().map(
                     |execution| {
                         let id = key(
@@ -421,6 +475,8 @@ pub fn load(
             let id = cell_key(cell);
             let found = rows.remove(&id);
             let claimed = inapplicable.remove(&id);
+            let claims = refusal_claims.remove(&id).unwrap_or_default();
+            let mut refusal = None;
             let rows = match (found, claimed) {
                 (Some(_), Some(_)) => vec![error_row(
                     context,
@@ -452,6 +508,53 @@ pub fn load(
                             root.display()
                         ),
                     )]
+                }
+                (Some(found), None)
+                    if found.len() == 1 && is_host_image_interpreter_refusal(&found[0]) =>
+                {
+                    // A producer's recorded host-image interpreter refusal.
+                    let row = &found[0];
+                    if let Some(reason) = stale_reason(context, cell, row) {
+                        vec![error_row(context, cell, "import-stale", reason)]
+                    } else if !policy.record_refusals {
+                        vec![error_row(
+                            context,
+                            cell,
+                            "import-host-image-interpreter-refusal",
+                            format!(
+                                "{IMPORT_RESULTS_ENV}'s producer recorded this cell as a host-image interpreter refusal, which this run records only under {}: {}",
+                                crate::runner::RECORD_INTERPRETER_REFUSALS_ARG,
+                                row.reason.as_deref().unwrap_or("no reason")
+                            ),
+                        )]
+                    } else {
+                        let checked = match claims.as_slice() {
+                            [claim] => check_interpreter_refusal_claim(cell, claim)
+                                .map(|()| claim.clone()),
+                            [] => Err("its summary.json has no recorded claim for it".into()),
+                            _ => Err(format!(
+                                "its summary.json has {} recorded claims for it",
+                                claims.len()
+                            )),
+                        };
+                        match checked {
+                            Ok(evidence) => {
+                                source_run_ids.insert(row.run_id.clone());
+                                let rebuilt =
+                                    host_image_interpreter_refusal_row(context, cell, &evidence);
+                                refusal = Some(evidence);
+                                vec![rebuilt]
+                            }
+                            Err(error) => vec![error_row(
+                                context,
+                                cell,
+                                "import-history",
+                                format!(
+                                    "{IMPORT_RESULTS_ENV}'s producer recorded this cell as a host-image interpreter refusal this run does not accept: {error}"
+                                ),
+                            )],
+                        }
+                    }
                 }
                 (Some(mut found), None) => {
                     if let Some(reason) = found.iter().find_map(|row| stale_reason(context, cell, row)) {
@@ -510,7 +613,7 @@ pub fn load(
                     }
                 }
             };
-            ImportedCell { rows }
+            ImportedCell { rows, refusal }
         })
         .collect();
     Ok(ImportedRun {

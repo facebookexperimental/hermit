@@ -27,10 +27,15 @@ use hermit_manifest_plan::parity::ParityCellId;
 use hermit_manifest_plan::runner::CellId;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::INTERPRETER_REFUSAL_ROWS_FILE;
+use hermit_manifest_plan::runner::InterpreterRefusalEvidence;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::MAX_SKID_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::PassBaseline;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::RECORD_INTERPRETER_REFUSALS_ARG;
+use hermit_manifest_plan::runner::RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX;
 use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
 use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::SKID_INFRA_VERDICT;
@@ -47,10 +52,13 @@ use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::diagnostic_failure_reason;
+use hermit_manifest_plan::runner::host_image_interpreter_refusal_row;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::host_input_change_only;
 use hermit_manifest_plan::runner::host_strictness;
+use hermit_manifest_plan::runner::interpreter_refusal_evidence;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
+use hermit_manifest_plan::runner::is_host_image_interpreter_refusal;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::ptrace_cell_capability;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
@@ -132,6 +140,23 @@ Execution and output options:
   --diagnostic-results             Write dagrun structured-result schema 4, which
                                    reports a diagnostic cell's failure without
                                    failing the node (run only)
+  --record-host-image-interpreter-refusals <BASELINE>
+                                   Record a cell whose every run this host's own
+                                   program interpreter refused (the CPU profile the
+                                   host chose is below the level the interpreter
+                                   needs; no image, no v2 retry) as one
+                                   HOST-INAPPLICABLE row of kind
+                                   host-image-interpreter-refusal, in results.jsonl
+                                   and as a schema-5 skip in the dagrun test counts
+                                   (a node that passes it declares schema 5; validate
+                                   counts the node incomplete). Without it the cell
+                                   keeps its FAIL. BASELINE is an earlier run's rows
+                                   (a results.jsonl, or a directory searched for
+                                   them): a recorded cell whose final row there is a
+                                   PASS, or that it has no row for, fails the run
+                                   (PASS -> HOST-INAPPLICABLE). The attempts' rows go
+                                   to host-image-interpreter-refusals.jsonl beside
+                                   results.jsonl (run only)
   --allow-empty                    Permit an empty explicit CI selection
   --no-retry                       Run each selected cell exactly once: a product
                                    failure is final instead of earning the one
@@ -490,6 +515,8 @@ struct Args {
     execution_owner: Option<String>,
     prebuilt: bool,
     diagnostic_results: bool,
+    /// `--record-host-image-interpreter-refusals`: the PASS baseline.
+    record_refusals: Option<PathBuf>,
     allow_empty: bool,
     retries: Retries,
     ci_only: bool,
@@ -594,6 +621,14 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
+            RECORD_INTERPRETER_REFUSALS_ARG => {
+                let value = required_value(&mut values, RECORD_INTERPRETER_REFUSALS_ARG);
+                if args.record_refusals.replace(PathBuf::from(value)).is_some() {
+                    fail(format!(
+                        "{RECORD_INTERPRETER_REFUSALS_ARG} may be specified only once"
+                    ));
+                }
+            }
             "--allow-empty" => args.allow_empty = true,
             "--no-retry" => args.retries = Retries::Off,
             "--results" => {
@@ -720,6 +755,73 @@ fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults,
         });
     }
     TestResults::diagnostic(
+        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
+        0,
+        rows,
+    )
+}
+
+/// The schema-5 structured report dagrun reads for a run under
+/// `--record-host-image-interpreter-refusals`: every row
+/// [`structured_test_results`] writes (a diagnostic failure as one only when
+/// the run declared `--diagnostic-results`), plus one `skip` row per cell the
+/// run recorded as a host-image interpreter refusal, so the cell is counted in
+/// `executed_tests` as neither a pass nor a failure and never vanishes from
+/// the counts. Its reason starts with [`RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX`],
+/// by which validate tells it from any other skip; every attempt it ran
+/// (`refused`, by cell index; an imported record has none here) is a skipped
+/// attempt. A cell withheld before dispatch, or cancelled, has no row, as in
+/// [`terminal_test_results`].
+fn skipped_test_results(
+    histories: &[Vec<CellResult>],
+    refused: &BTreeMap<usize, Vec<CellResult>>,
+    diagnostic_results: bool,
+) -> Result<TestResults, String> {
+    let mut rows = Vec::new();
+    for (index, history) in histories.iter().enumerate() {
+        if history.is_empty() {
+            continue;
+        }
+        let (result, _) = cell_result_and_attempts_after_retries(history)?;
+        let id = format!(
+            "{} [{}/{}]",
+            result.test,
+            result.backend.as_deref().unwrap_or("native"),
+            result.mode
+        );
+        if is_host_image_interpreter_refusal(result) {
+            let reason = format!(
+                "{RECORDED_HOST_INAPPLICABLE_SKIP_PREFIX}{}",
+                result.reason_for_display().trim()
+            );
+            let ran = refused.get(&index).map_or(1, Vec::len).max(1);
+            let attempts = (1..=ran)
+                .map(|attempt| {
+                    TestAttemptResult::new(
+                        u64::try_from(attempt).map_err(|_| "attempt number does not fit u64")?,
+                        TestAttemptOutcome::Skipped,
+                        Some(reason.clone()),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.push(TestResult::skipped(id, attempts, reason)?);
+            continue;
+        }
+        if result.outcome == "HOST-INAPPLICABLE" {
+            continue;
+        }
+        let attempts = history
+            .iter()
+            .map(structured_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.push(
+            match diagnostic_failure_reason(history).filter(|_| diagnostic_results) {
+                Some(reason) => TestResult::diagnostic_failure(id, attempts, reason.to_string())?,
+                None => TestResult::with_attempt_results(id, result.outcome == "PASS", attempts)?,
+            },
+        );
+    }
+    TestResults::skipped(
         u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
         0,
         rows,
@@ -980,6 +1082,11 @@ fn validate_args(command: &str, args: &Args) {
     }
     if command != "run" && args.diagnostic_results {
         fail("--diagnostic-results is accepted by run only");
+    }
+    if command != "run" && args.record_refusals.is_some() {
+        fail(format!(
+            "{RECORD_INTERPRETER_REFUSALS_ARG} is accepted by run only"
+        ));
     }
     if command != "run" && args.retries == Retries::Off {
         fail("--no-retry is accepted by run only");
@@ -3501,6 +3608,19 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             dir.display()
         );
     }
+    // A host-image interpreter refusal is recorded only on request, and every
+    // recorded cell is checked against the PASS baseline the request names,
+    // so the baseline is read before any cell runs.
+    let refusal_baseline = args.record_refusals.as_deref().map(|path| {
+        PassBaseline::load(path)
+            .unwrap_or_else(|error| fail(format!("{RECORD_INTERPRETER_REFUSALS_ARG}: {error}")))
+    });
+    if let Some(baseline) = &refusal_baseline {
+        eprintln!(
+            "test-harness: recording host-image interpreter refusals; each is checked against the PASS baseline {}",
+            baseline.path.display()
+        );
+    }
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -3569,6 +3689,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            record_refusals: refusal_baseline.is_some(),
         };
         let imported =
             imported_results::load(import_root, &cells, &context, &results_path, &policy)
@@ -3585,6 +3706,33 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     });
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
+    // The histories a recorded host-image interpreter refusal replaced in
+    // `attempt_results`, by cell index: their rows are what ran (they are in
+    // INTERPRETER_REFUSAL_ROWS_FILE), so the post-passes below read them.
+    let mut interpreter_refused_histories = BTreeMap::new();
+    // Under --record-host-image-interpreter-refusals, the attempt rows held
+    // back from results.jsonl, by cell index, while every attempt of the cell
+    // so far is an interpreter refusal.
+    let mut held_refusals: BTreeMap<usize, Vec<CellResult>> = BTreeMap::new();
+    let refusal_rows_path = results_path
+        .parent()
+        .map(|dir| dir.join(INTERPRETER_REFUSAL_ROWS_FILE))
+        .unwrap_or_else(|| PathBuf::from(INTERPRETER_REFUSAL_ROWS_FILE));
+    // Every cell whose finished history is an interpreter refusal, recorded
+    // (true) or kept as its FAIL, with its evidence, by cell index.
+    let mut refusal_cells: BTreeMap<usize, (bool, InterpreterRefusalEvidence)> = BTreeMap::new();
+    // An import's recorded refusals, with the evidence it checked.
+    let imported_refusals = imported
+        .as_ref()
+        .map(|imported| {
+            imported
+                .cells
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| Some((index, cell.refusal.clone()?)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut failed = false;
     // Sum the producer-owned CPU measurement from EVERY executed observation,
     // including a failed row that is retried. This is specifically cell CPU;
@@ -3695,7 +3843,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             // the complete typed row is already present even if the containing
             // bucket is killed before its JUnit/summary epilogue. The worker
             // waits for this acknowledgement before starting a retry.
-            let published = if let Err(error) = append_result(&results_path, &result) {
+            //
+            // Under --record-host-image-interpreter-refusals, an attempt whose
+            // every run, like every earlier attempt's, is an interpreter
+            // refusal goes to INTERPRETER_REFUSAL_ROWS_FILE instead: if the
+            // cell ends that way, results.jsonl gets its one HOST-INAPPLICABLE
+            // row and no attempt row a reader could count as a measurement. An
+            // attempt that ends that streak publishes the held rows first, in
+            // order. A run that dies holding one leaves the cell without a row
+            // in results.jsonl, which fails the run, and the row in that file.
+            let refused_so_far = refusal_baseline.is_some() && imported.is_none() && {
+                let mut so_far = attempt_results[index].clone();
+                so_far.push(result.clone());
+                interpreter_refusal_evidence(&cells[index], &so_far).is_some()
+            };
+            let publication = if refused_so_far {
+                append_result(&refusal_rows_path, &result)
+            } else {
+                held_refusals
+                    .remove(&index)
+                    .unwrap_or_default()
+                    .iter()
+                    .try_for_each(|held| append_result(&results_path, held))
+                    .and_then(|()| append_result(&results_path, &result))
+            };
+            if refused_so_far && publication.is_ok() {
+                held_refusals.entry(index).or_default().push(result.clone());
+            }
+            let published = if let Err(error) = publication {
                 eprintln!(
                     "ERROR {} ({}/{}): completed cell result could not be published: {error}",
                     result.test,
@@ -3767,6 +3942,16 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     " [attempt {} of at most {}; retrying this cell only]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
                 ),
+                // No rootfs, so no retry: say so, rather than end the cell as
+                // if the retry did not exist.
+                (false, Some(RetryCause::LoaderV2))
+                    if v2_oci_dir.is_none() && imported.is_none() =>
+                {
+                    format!(
+                        " [V2-RETRY NOT RUN: attempt {} was refused by the guest loader on the x86-64-v2 CPU, but this run was given no v2 rootfs ({V2_OCI_DIR_ENV}), so it gets no retry inside one]",
+                        result.attempt
+                    )
+                }
                 (false, _) => String::new(),
             };
             println!(
@@ -3807,6 +3992,46 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 );
             }
             if !effective_will_retry {
+                // A cell whose every run this host's own program interpreter
+                // refused measured nothing about Hermit
+                // (`interpreter_refusal_evidence`). Without
+                // --record-host-image-interpreter-refusals it keeps its FAIL
+                // and is only named; with it, its history becomes one
+                // HOST-INAPPLICABLE row, published in results.jsonl, which the
+                // rest of this branch then accounts like any final row. An
+                // import's recorded refusal arrives as that row already.
+                if let Some(evidence) =
+                    interpreter_refusal_evidence(&cells[index], &attempt_results[index])
+                {
+                    let recorded = refusal_baseline.is_some() && imported.is_none();
+                    if recorded {
+                        let mut row =
+                            host_image_interpreter_refusal_row(&context, &cells[index], &evidence);
+                        if let Err(error) = append_result(&results_path, &row) {
+                            row.outcome = "ERROR".into();
+                            row.result = None;
+                            row.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+                            row.error_kind = Some("result-publication".into());
+                            row.reason = Some(format!(
+                                "completed cell result could not be published: {error}"
+                            ));
+                        }
+                        println!(
+                            "{} {} ({}/{}) {}",
+                            row.outcome,
+                            row.test,
+                            row.mode,
+                            row.backend.as_deref().unwrap_or("native"),
+                            row.reason_for_display()
+                        );
+                        held_refusals.remove(&index);
+                        let ran = std::mem::replace(&mut attempt_results[index], vec![row]);
+                        interpreter_refused_histories.insert(index, ran);
+                    }
+                    refusal_cells.insert(index, (recorded, evidence));
+                } else if let Some(evidence) = imported_refusals.get(&index) {
+                    refusal_cells.insert(index, (true, evidence.clone()));
+                }
                 let result = match cell_result_after_retries(&attempt_results[index]) {
                     Ok(result) => result.clone(),
                     Err(error) => {
@@ -3852,6 +4077,43 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     // Why the run fails beyond its failed cells. Each reason fails the exit
     // status AND is reported to Tpx, so the two cannot disagree.
     let mut run_failures = Vec::new();
+    // A cell whose history did not end in the loop above (its retry never
+    // ran) publishes the attempts it held back as the rows they are.
+    for (_, rows) in std::mem::take(&mut held_refusals) {
+        for row in rows {
+            if let Err(error) = append_result(&results_path, &row) {
+                run_failures.push(format!(
+                    "{} ({}/{}) attempt {}: a held attempt row could not be published: {error}",
+                    row.test,
+                    row.mode,
+                    row.backend.as_deref().unwrap_or("native"),
+                    row.attempt
+                ));
+            }
+        }
+    }
+    // Every recorded refusal is checked against the PASS baseline the run
+    // was given: one whose cell passed there, or that it has no row for,
+    // fails the run (PASS -> HOST-INAPPLICABLE), though the row stays the
+    // cell's record.
+    let mut baseline_refusals = Vec::new();
+    if let Some(baseline) = &refusal_baseline {
+        for (index, (recorded, _)) in &refusal_cells {
+            if !*recorded {
+                continue;
+            }
+            if let Some(reason) = baseline.refuses(&cells[*index].id) {
+                eprintln!("test-harness: {reason}");
+                baseline_refusals.push(serde_json::json!({
+                    "test": cells[*index].id.test,
+                    "mode": cells[*index].id.mode,
+                    "backend": cells[*index].id.backend,
+                    "reason": reason,
+                }));
+                run_failures.push(reason);
+            }
+        }
+    }
     let returned = indexed_results
         .iter()
         .map(|(index, _)| *index)
@@ -4052,12 +4314,58 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .iter()
         .filter(|result| result.outcome == "HOST-INAPPLICABLE")
         .count();
+    // The cells whose every run this host's own program interpreter refused:
+    // recorded HOST-INAPPLICABLE under --record-host-image-interpreter-refusals
+    // (counted in `host_inapplicable`, as nothing about Hermit was measured),
+    // or kept as their FAIL without it; each is named on its own.
+    let recorded_refusals = refusal_cells
+        .values()
+        .filter(|(recorded, _)| *recorded)
+        .count();
+    if expected > 0 {
+        println!(
+            "test-harness: HOST-INAPPLICABLE count {host_inapplicable}; HOST-IMAGE-INTERPRETER-REFUSAL count {} ({recorded_refusals} recorded HOST-INAPPLICABLE under {RECORD_INTERPRETER_REFUSALS_ARG}: not run, not a pass, no coverage; {} kept as FAIL{})",
+            refusal_cells.len(),
+            refusal_cells.len() - recorded_refusals,
+            if refusal_baseline.is_some() {
+                ""
+            } else {
+                ", as this run was not given that option"
+            }
+        );
+    }
+    for (index, (recorded, evidence)) in &refusal_cells {
+        if !*recorded {
+            let cell = &cells[*index];
+            println!(
+                "test-harness: HOST-IMAGE-INTERPRETER-REFUSAL kept FAIL {} ({}/{}): every run of its {} attempt(s) was refused by this host's own program interpreter, which needs x86-64-v{} above the {} the host chose ({}); {RECORD_INTERPRETER_REFUSALS_ARG} BASELINE would record it HOST-INAPPLICABLE",
+                cell.id.test,
+                cell.id.mode,
+                cell.id.backend.as_deref().unwrap_or("native"),
+                evidence.attempts,
+                evidence.needs,
+                evidence.presented.profile,
+                evidence.presented.reason
+            );
+        }
+    }
     let cell_cpu_usage_usec = (cpu_measurements > 0)
         .then_some(cell_cpu_usage_usec)
         .flatten();
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
-        let written = if args.diagnostic_results {
+        let written = if refusal_baseline.is_some() {
+            skipped_test_results(
+                &attempt_results,
+                &interpreter_refused_histories,
+                args.diagnostic_results,
+            )
+            .and_then(|report| {
+                report
+                    .write_skipped_typed(&path)
+                    .map_err(|error| error.to_string())
+            })
+        } else if args.diagnostic_results {
             structured_test_results(&attempt_results).and_then(|report| {
                 report
                     .write_diagnostic_typed(&path)
@@ -4136,9 +4444,15 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         "cancelled": cancelled_cells.len(),
         "cancelled_cells": cancelled_cells,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
+        // The cells withheld before dispatch, which wrote no row. Import mode
+        // reads this list as the producer's claim for a cell without rows
+        // (`imported_results`), so a recorded host-image interpreter
+        // refusal, which has its row in results.jsonl, is listed only below.
         "host_inapplicable_cells": results
             .iter()
-            .filter(|result| result.outcome == "HOST-INAPPLICABLE")
+            .filter(|result| {
+                result.outcome == "HOST-INAPPLICABLE" && !is_host_image_interpreter_refusal(result)
+            })
             .map(|result| serde_json::json!({
                 "test": result.test,
                 "mode": result.mode,
@@ -4146,6 +4460,30 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 "reason": result.reason,
             }))
             .collect::<Vec<_>>(),
+        // Cells whose every run this host's own program interpreter refused
+        // before anything about Hermit was measured: the ones recorded
+        // HOST-INAPPLICABLE (each also counted in `host_inapplicable`; an
+        // import checks a recorded one against `evidence`), and with
+        // `recorded: false` the ones kept as their FAIL, which ingest.py
+        // reads to give such a cell on RE its run on another machine.
+        "host_image_interpreter_refusals": recorded_refusals,
+        "host_image_interpreter_refusal_cells": refusal_cells
+            .iter()
+            .map(|(index, (recorded, evidence))| serde_json::json!({
+                "test": cells[*index].id.test,
+                "mode": cells[*index].id.mode,
+                "backend": cells[*index].id.backend,
+                "recorded": recorded,
+                "reason": hermit_manifest_plan::runner::interpreter_refusal_reason(evidence),
+                "evidence": evidence,
+            }))
+            .collect::<Vec<_>>(),
+        // The PASS baseline the recorded refusals were checked against, and
+        // each one it refused (PASS -> HOST-INAPPLICABLE), which failed the run.
+        "host_image_interpreter_refusal_baseline": refusal_baseline
+            .as_ref()
+            .map(|baseline| baseline.path.display().to_string()),
+        "host_image_interpreter_refusal_baseline_refusals": baseline_refusals,
     });
     if let (Some(import_root), Some(imported)) = (&import_root, &imported) {
         summary["imported"] = serde_json::json!({
@@ -4174,7 +4512,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         ExitCode::SUCCESS
     };
     // Every determinism output above is final. The parity post-pass only
-    // reads it, and nothing it does reaches `exit`.
+    // reads it, and nothing it does reaches `exit`. The post-passes read what
+    // ran: a history a recorded host-image interpreter refusal replaced goes
+    // back to its attempts' rows, the ones INTERPRETER_REFUSAL_ROWS_FILE holds.
+    for (index, ran) in interpreter_refused_histories {
+        attempt_results[index] = ran;
+    }
     report_parity(
         &parity_scope,
         &context,
@@ -7421,6 +7764,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            record_refusals: false,
         };
         let imported = imported_results::load(
             &import,
@@ -7537,6 +7881,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            record_refusals: false,
         };
         let imported = imported_results::load(
             &import,
@@ -7638,6 +7983,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            record_refusals: false,
         };
         for dirty in [false, true] {
             let mut context = clean.clone();
@@ -12358,6 +12704,915 @@ sys.exit(1 if failed else 0)
                 "{label}"
             );
         }
+    }
+
+    /// The commit the interpreter-refusal fixtures name: each child runs its
+    /// fixture as a Git-less source snapshot, as the skid test does.
+    const REFUSAL_FIXTURE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The variable naming the fixture an interpreter-refusal child harness
+    /// runs ([`interpreter_refusal_run`]).
+    const REFUSAL_FIXTURE_CHILD: &str = "HERMIT_INTERPRETER_REFUSAL_FIXTURE";
+
+    /// The fake Hermit of an interpreter-refusal fixture. Each run of a verify
+    /// pair writes its `--verify-run` record and the manifest Hermit writes
+    /// before the guest starts, recording the x86-64-v2 profile. In a cell
+    /// whose name starts with `refused` the run then fails as an x86-64-v3
+    /// loader refusing that CPU does: glibc's line on stderr, exit 127; and
+    /// `log-diff` reports `first_run_rejected` (refused.json) and exits 1.
+    /// Every other cell's runs match (matched.json).
+    const REFUSAL_FAKE_HERMIT: &str = r#"#!/usr/bin/python3
+import json,os,pathlib,sys
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+# `hermit verify-inputs --OPTION VALUE... PAIR`: the holder seals, then execs the pair.
+if a and a[0]=='verify-inputs':
+ i=1
+ while a[i].startswith('--'):i+=2
+ os.execvp(a[i],a[i:])
+if '--help' in a:
+ print('--verify-strict');sys.exit(0)
+stage=os.environ.get('HERMIT_DATA_DIR','')
+if 'run' in a and '--verify-run' in a:
+ d=pathlib.Path(a[a.index('--verify-run')+1]);d.mkdir();(d/'verify-run.json').write_text('{}\n')
+ m=pathlib.Path(stage)/str(os.getpid());m.mkdir(parents=True)
+ (m/'manifest.json').write_text(json.dumps({'cpu_profile':{'profile':'x86-64-v2','reason':'qualification-refused'}}))
+ if '/loader-refused' in stage:
+  sys.stderr.write('Fatal glibc error: CPU does not support x86-64-v3\n');sys.exit(127)
+ sys.exit(0)
+if 'log-diff' not in a:sys.exit(0)
+a=a[a.index('log-diff'):]
+if '--verify-log-dir' in a:
+ logdir=pathlib.Path(a[a.index('--verify-log-dir')+1]);logdir.mkdir(parents=True,exist_ok=True)
+ (logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
+report=pathlib.Path(a[a.index('--verify-json')+1])
+refused='/loader-refused' in str(report)
+report.write_bytes((root/('refused.json' if refused else 'matched.json')).read_bytes())
+sys.exit(1 if refused else 0)
+"#;
+
+    /// The variable naming the PASS baseline an interpreter-refusal child
+    /// passes as `--record-host-image-interpreter-refusals`; unset, it passes
+    /// none.
+    const REFUSAL_BASELINE_CHILD: &str = "HERMIT_INTERPRETER_REFUSAL_BASELINE";
+
+    /// In the child [`interpreter_refusal_run`] starts: run the harness over
+    /// the fixture's `loader` cells as an e2e node does, with a Tpx payload,
+    /// and exit with its status. In the parent it returns.
+    fn interpreter_refusal_child() {
+        use std::process::ExitCode;
+
+        let Some(fixture) = std::env::var_os(REFUSAL_FIXTURE_CHILD) else {
+            return;
+        };
+        let fixture = std::path::PathBuf::from(fixture);
+        let path = |name: &str| fixture.join(name).display().to_string();
+        let mut values = vec![
+            "--category".to_string(),
+            "loader".into(),
+            "--ci-only".into(),
+            "--prebuilt".into(),
+            "--repo-root".into(),
+            fixture.display().to_string(),
+            "--source-sha".into(),
+            REFUSAL_FIXTURE_SHA.into(),
+            "--jobs".into(),
+            "1".into(),
+            "--results".into(),
+            path("results.jsonl"),
+            "--junit".into(),
+            path("junit.xml"),
+            "--tpx-json".into(),
+            path("tpx.jsonl"),
+        ];
+        if let Some(baseline) = std::env::var_os(REFUSAL_BASELINE_CHILD) {
+            values.push(super::RECORD_INTERPRETER_REFUSALS_ARG.into());
+            values.push(baseline.to_string_lossy().into_owned());
+        }
+        let args = parse(values.into_iter());
+        validate_args("run", &args);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let code = super::run(&fixture, &manifests, &args);
+        std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+    }
+
+    /// What one [`interpreter_refusal_run`] left: the child's exit status and
+    /// output, and the fixture directory with the run's result files.
+    struct RefusalRun {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl RefusalRun {
+        /// The run's JSON file `name`.
+        fn json(&self, name: &str) -> serde_json::Value {
+            serde_json::from_slice(&fs::read(self.dir.join(name)).unwrap()).unwrap()
+        }
+
+        /// Every row of the run's results.jsonl.
+        fn rows(&self) -> Vec<CellResult> {
+            fs::read_to_string(self.dir.join("results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    impl Drop for RefusalRun {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run the real harness, in a child that runs test `test` again, over a
+    /// fixture of one verify@ptrace cell `loader/<name>` per name in `cells`,
+    /// whose fake Hermit ([`REFUSAL_FAKE_HERMIT`]) presents x86-64-v2 because
+    /// the host failed the x86-64-v3 qualification, and has this host's loader
+    /// refuse it in every cell whose name starts with `refused`. No v2 rootfs
+    /// is given, so a refused cell gets no retry. Without `baseline` the run
+    /// is not given `--record-host-image-interpreter-refusals`; with it, it is,
+    /// naming a baseline results.jsonl of one row per `(cell name, outcome)`.
+    fn interpreter_refusal_run(
+        test: &str,
+        cells: &[&str],
+        baseline: Option<&[(&str, &str)]>,
+    ) -> RefusalRun {
+        let dir = refusal_fixture(test, cells);
+        let mut env = Vec::new();
+        if let Some(rows) = baseline {
+            let file = dir.join("baseline/results.jsonl");
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(
+                &file,
+                rows.iter()
+                    .map(|(name, outcome)| {
+                        serde_json::json!({"test": format!("loader/{name}"), "mode": "verify",
+                            "backend": "ptrace", "outcome": outcome})
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            env.push((REFUSAL_BASELINE_CHILD, file.into_os_string()));
+        }
+        refusal_child_run(test, dir, &env)
+    }
+
+    /// Run test `test`'s child harness over the fixture `dir` with `env`.
+    fn refusal_child_run(
+        test: &str,
+        dir: std::path::PathBuf,
+        env: &[(&str, std::ffi::OsString)],
+    ) -> RefusalRun {
+        use std::process::Command;
+
+        let hermit = dir.join("fake-hermit");
+        let result = Command::new("timeout")
+            .args(["--kill-after=2s", "60s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(REFUSAL_FIXTURE_CHILD, &dir)
+            .env("HERMIT_BIN", &hermit)
+            .env("E2E_RESULT_ROOT", dir.join("artifacts"))
+            .env("E2E_BUILD_ROOT", dir.join("build"))
+            .env("E2E_RUN_ID", "interpreter-refusal-control")
+            .env("E2E_MACHINE_SHORTNAME", "interpreter-refusal-control")
+            .env("E2E_KERNEL_VERSION", "interpreter-refusal-control")
+            .env("E2E_KEEP_VERIFY_LOGS", "1")
+            .env("DAGRUN_TEST_COUNTS_PATH", dir.join("counts.json"))
+            // The strict level on any host: a verify cell at the relaxed
+            // level runs with --no-virtualize-cpuid, which presents no
+            // profile, so no refusal could be classified there.
+            .env(
+                hermit_manifest_plan::host_capability::ASSUME_PRESENT_ENV,
+                "cpuid-faulting",
+            )
+            .envs(env.iter().map(|(key, value)| (*key, value)))
+            .output()
+            .unwrap();
+        RefusalRun {
+            code: result.status.code(),
+            stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+            dir,
+        }
+    }
+
+    /// The fixture directory of [`interpreter_refusal_run`] for test `test`.
+    fn refusal_fixture(test: &str, cells: &[&str]) -> std::path::PathBuf {
+        use hermit_manifest_plan::canonical_verdict::NoResultReason;
+        use hermit_manifest_plan::canonical_verdict::VerificationReport;
+        use serde_json::json;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-harness-interpreter-refusal-{}-{}",
+            std::process::id(),
+            test.rsplit("::").next().unwrap()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let manifests_dir = dir.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests_dir).unwrap();
+        fs::write(
+            manifests_dir.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+        )
+        .unwrap();
+        let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+            "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+            "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+            "liteinst": "Not selected by this control",
+            "in-guest-trap": "Not selected by this control"
+        }});
+        let tests = cells
+            .iter()
+            .map(|name| {
+                json!({
+                    "id": format!("loader/{name}"),
+                    "description": format!("Host-image interpreter refusal control {name}"),
+                    "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                    "observation": {"status": true, "stdout": true, "stderr": true},
+                    "modes": {
+                        "verify": {"ci": true, "backends_enabled": ["ptrace"],
+                            "backends_disabled": {"kvm": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}},
+                        "naked": {"ci": false, "backends_enabled": [],
+                            "backends_disabled": {"native": "Not selected by this CI control"}},
+                        "chaos": disabled, "replay": disabled, "custom": disabled
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            manifests_dir.join("loader.yaml"),
+            serde_json::to_vec(&json!({"schema": 3, "bucket": "loader", "test": tests})).unwrap(),
+        )
+        .unwrap();
+        let mut refused = VerificationReport::no_result();
+        refused.no_result_reason = Some(NoResultReason::FirstRunRejected {
+            exit_code: Some(127),
+            signal: None,
+            stdout_bytes: 0,
+            stderr_bytes: "Fatal glibc error: CPU does not support x86-64-v3\n".len() as u64,
+        });
+        refused.guest_exit_code = Some(127);
+        let output = json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let matched = json!({
+            "verified": true, "bitwise_parity": true, "verdict": "matched",
+            "no_result_reason": null, "infrastructure_error": null,
+            "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+            "compared_log_messages": {"left": 2, "right": 2},
+            "compared_outputs": {"left": output, "right": output},
+            "guest_exit_code": 0, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        for (name, report) in [
+            ("refused.json", serde_json::to_vec(&refused).unwrap()),
+            ("matched.json", serde_json::to_vec(&matched).unwrap()),
+        ] {
+            VerificationReport::from_current_json_slice(&report).unwrap();
+            fs::write(dir.join(name), report).unwrap();
+        }
+        let hermit = dir.join("fake-hermit");
+        hermit_manifest_plan::exec_safe_fs::write_executable(&hermit, REFUSAL_FAKE_HERMIT, 0o755)
+            .unwrap();
+        dir
+    }
+
+    /// The rows of the run's results.jsonl as (test, attempt, outcome).
+    fn row_outcomes(run: &RefusalRun) -> BTreeSet<(String, u64, String)> {
+        run.rows()
+            .into_iter()
+            .map(|row| (row.test, row.attempt, row.outcome))
+            .collect()
+    }
+
+    /// F1: without `--record-host-image-interpreter-refusals` a cell whose
+    /// every run this host's own program interpreter refused keeps the FAIL
+    /// its attempt measured. The run fails, the cell is a failed Tpx record and
+    /// a `fail` row of the dagrun counts beside the passing cell (two executed
+    /// tests), results.jsonl holds its FAIL row and no HOST-INAPPLICABLE row,
+    /// and nothing is held back. summary.json and stdout still name it, as
+    /// kept FAIL, and its FAIL line says the v2 retry did not run for want of
+    /// a rootfs.
+    #[test]
+    fn an_interpreter_refused_cell_stays_a_fail_without_the_opt_in() {
+        use serde_json::json;
+
+        const TEST: &str = "tests::an_interpreter_refused_cell_stays_a_fail_without_the_opt_in";
+        interpreter_refusal_child();
+        let run = interpreter_refusal_run(TEST, &["refused", "passing"], None);
+        assert_eq!(run.code, Some(1), "{}\n{}", run.stdout, run.stderr);
+        let records = read_tpx(&run.dir.join("tpx.jsonl"))
+            .into_iter()
+            .map(|(test, status, details)| (test, (status, details)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(records["loader/passing/verify@ptrace"].0, "passed");
+        let (status, details) = &records["loader/refused/verify@ptrace"];
+        assert_eq!(status, "failed");
+        assert_eq!(details["outcome"], "FAIL");
+        let counts = run.json("counts.json");
+        assert_eq!(counts["schema"], json!(2), "{counts:#}");
+        assert_eq!(counts["executed_tests"], json!(2), "{counts:#}");
+        let mut results = counts["results"].as_array().unwrap().clone();
+        results.sort_by_key(|row| row["id"].as_str().unwrap().to_owned());
+        assert_eq!(
+            results,
+            [
+                json!({"id": "loader/passing [ptrace/verify]", "result": "pass", "attempts": 1}),
+                json!({"id": "loader/refused [ptrace/verify]", "result": "fail", "attempts": 1}),
+            ],
+            "{counts:#}"
+        );
+        assert_eq!(
+            row_outcomes(&run),
+            BTreeSet::from([
+                ("loader/passing".to_string(), 1, "PASS".to_string()),
+                ("loader/refused".to_string(), 1, "FAIL".to_string()),
+            ])
+        );
+        assert!(
+            !run.dir
+                .join(hermit_manifest_plan::runner::INTERPRETER_REFUSAL_ROWS_FILE)
+                .exists()
+        );
+        let summary = run.json("summary.json");
+        for (key, want) in [
+            ("passed", 1),
+            ("failed", 1),
+            ("host_inapplicable", 0),
+            ("host_image_interpreter_refusals", 0),
+        ] {
+            assert_eq!(summary[key], json!(want), "{key}: {summary:#}");
+        }
+        let cells = summary["host_image_interpreter_refusal_cells"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cells.len(), 1, "{summary:#}");
+        assert_eq!(
+            (&cells[0]["test"], &cells[0]["recorded"]),
+            (&json!("loader/refused"), &json!(false))
+        );
+        assert_eq!(
+            cells[0]["evidence"]["presented"],
+            json!({"profile": "x86-64-v2", "reason": "qualification-refused"})
+        );
+        assert!(
+            run.stdout.contains(
+                "test-harness: HOST-INAPPLICABLE count 0; HOST-IMAGE-INTERPRETER-REFUSAL count 1 \
+                 (0 recorded HOST-INAPPLICABLE under --record-host-image-interpreter-refusals: \
+                 not run, not a pass, no coverage; 1 kept as FAIL, as this run was not given \
+                 that option)\n"
+            ),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .contains("test-harness: HOST-IMAGE-INTERPRETER-REFUSAL kept FAIL loader/refused (verify/ptrace): "),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains(&format!(
+                "FAIL loader/refused (verify/ptrace) [V2-RETRY NOT RUN: attempt 1 was refused by \
+                 the guest loader on the x86-64-v2 CPU, but this run was given no v2 rootfs ({})",
+                super::V2_OCI_DIR_ENV
+            )),
+            "{}",
+            run.stdout
+        );
+    }
+
+    /// Under `--record-host-image-interpreter-refusals` the refused cell is a
+    /// skipped Tpx record: its details carry the error kind
+    /// host-image-interpreter-refusal and the reason, which quotes the
+    /// loader's line and does not claim the guest never started (the loader's
+    /// line does not show it). Beside a passing cell, with a baseline in which
+    /// the cell failed, the run passes, and JUnit skips the cell with the same
+    /// reason.
+    #[test]
+    fn an_interpreter_refused_cell_is_a_skipped_tpx_record_with_its_kind_and_reason() {
+        const TEST: &str =
+            "tests::an_interpreter_refused_cell_is_a_skipped_tpx_record_with_its_kind_and_reason";
+        interpreter_refusal_child();
+        let run = interpreter_refusal_run(
+            TEST,
+            &["refused", "passing"],
+            Some(&[("refused", "FAIL"), ("passing", "PASS")]),
+        );
+        assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+        let records = read_tpx(&run.dir.join("tpx.jsonl"))
+            .into_iter()
+            .map(|(test, status, details)| (test, (status, details)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            records.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "loader/passing/verify@ptrace",
+                "loader/refused/verify@ptrace"
+            ],
+            "no run-verdict record: the run passed"
+        );
+        assert_eq!(records["loader/passing/verify@ptrace"].0, "passed");
+        let (status, details) = &records["loader/refused/verify@ptrace"];
+        assert_eq!(status, "skipped");
+        assert_eq!(details["outcome"], "HOST-INAPPLICABLE");
+        assert_eq!(
+            details["error_kind"],
+            hermit_manifest_plan::runner::HOST_IMAGE_INTERPRETER_REFUSAL
+        );
+        assert_eq!(details["failure_class"], "understood_prerequisite_failure");
+        let reason = details["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(
+                "NOT RUN, NOT a pass, no coverage: this host's own program interpreter"
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("never started"), "{reason}");
+        assert!(
+            reason.contains("\"Fatal glibc error: CPU does not support x86-64-v3\""),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "it needs x86-64-v3, above the x86-64-v2 this cell presented \
+                 (qualification-refused in its run manifests)"
+            ),
+            "{reason}"
+        );
+        let junit = fs::read_to_string(run.dir.join("junit.xml")).unwrap();
+        assert!(junit.contains("skipped=\"1\""), "{junit}");
+        assert!(
+            junit.contains("<skipped message=\"NOT RUN, NOT a pass, no coverage: "),
+            "{junit}"
+        );
+    }
+
+    /// F1: under the opt-in the refused cell is recorded, never dropped. The
+    /// dagrun counts are schema 5 and count both cells as executed tests: the
+    /// pass, and the refused cell as a `skip` whose reason starts with the
+    /// recorded-HOST-INAPPLICABLE prefix validate counts. results.jsonl holds
+    /// the refused cell's one HOST-INAPPLICABLE row and no FAIL row; its
+    /// attempt's FAIL row is in host-image-interpreter-refusals.jsonl and in
+    /// its CPU-profile record. summary.json counts it among the
+    /// HOST-INAPPLICABLE (PASS + FAIL + ERROR + HOST-INAPPLICABLE is every
+    /// cell), names it with its evidence and the baseline, and keeps it out of
+    /// `host_inapplicable_cells`, which import mode reads as the claim for a
+    /// cell with no row. stdout counts it and prints its line.
+    #[test]
+    fn counts_results_and_summary_record_the_interpreter_refused_cell_under_the_opt_in() {
+        use serde_json::json;
+
+        const TEST: &str = "tests::counts_results_and_summary_record_the_interpreter_refused_cell_under_the_opt_in";
+        interpreter_refusal_child();
+        let run = interpreter_refusal_run(
+            TEST,
+            &["refused", "passing"],
+            Some(&[("refused", "FAIL"), ("passing", "PASS")]),
+        );
+        let counts = run.json("counts.json");
+        assert_eq!(counts["schema"], json!(5), "{counts:#}");
+        assert_eq!(counts["executed_tests"], json!(2), "{counts:#}");
+        let mut results = counts["results"].as_array().unwrap().clone();
+        results.sort_by_key(|row| row["id"].as_str().unwrap().to_owned());
+        assert_eq!(results.len(), 2, "{counts:#}");
+        assert_eq!(results[0]["id"], "loader/passing [ptrace/verify]");
+        assert_eq!(results[0]["result"], "pass");
+        let skip = &results[1];
+        assert_eq!(skip["id"], "loader/refused [ptrace/verify]", "{counts:#}");
+        assert_eq!(skip["result"], "skip", "{counts:#}");
+        let skip_reason = skip["skip_reason"].as_str().unwrap();
+        assert!(
+            hermit_manifest_plan::runner::is_recorded_host_inapplicable_skip(skip_reason),
+            "{skip_reason}"
+        );
+        assert_eq!(
+            skip["attempt_results"][0]["outcome"], "skipped",
+            "{counts:#}"
+        );
+        // The node itself exits 0; validate counts the skip as a cell withheld
+        // and refuses the run as incomplete (validate_classification).
+        assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+        assert_eq!(
+            row_outcomes(&run),
+            BTreeSet::from([
+                ("loader/passing".to_string(), 1, "PASS".to_string()),
+                (
+                    "loader/refused".to_string(),
+                    1,
+                    "HOST-INAPPLICABLE".to_string()
+                ),
+            ])
+        );
+        let recorded = run
+            .rows()
+            .into_iter()
+            .find(|row| row.test == "loader/refused")
+            .unwrap();
+        assert!(super::is_host_image_interpreter_refusal(&recorded));
+        assert!(recorded.attempts.is_empty(), "{recorded:#?}");
+        let held = fs::read_to_string(
+            run.dir
+                .join(hermit_manifest_plan::runner::INTERPRETER_REFUSAL_ROWS_FILE),
+        )
+        .unwrap();
+        let held = held
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            held.iter()
+                .map(|row| (row.test.as_str(), row.attempt, row.outcome.as_str()))
+                .collect::<Vec<_>>(),
+            [("loader/refused", 1, "FAIL")]
+        );
+        let summary = run.json("summary.json");
+        for (key, want) in [
+            ("cells", 2),
+            ("passed", 1),
+            ("failed", 0),
+            ("errors", 0),
+            ("host_inapplicable", 1),
+            ("host_image_interpreter_refusals", 1),
+        ] {
+            assert_eq!(summary[key], json!(want), "{key}: {summary:#}");
+        }
+        assert_eq!(summary["host_inapplicable_cells"], json!([]), "{summary:#}");
+        let cells = summary["host_image_interpreter_refusal_cells"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cells.len(), 1, "{summary:#}");
+        assert_eq!(
+            (
+                &cells[0]["test"],
+                &cells[0]["mode"],
+                &cells[0]["backend"],
+                &cells[0]["recorded"]
+            ),
+            (
+                &json!("loader/refused"),
+                &json!("verify"),
+                &json!("ptrace"),
+                &json!(true)
+            )
+        );
+        assert_eq!(cells[0]["evidence"]["needs"], json!(3), "{summary:#}");
+        assert_eq!(cells[0]["reason"], json!(recorded.reason), "{summary:#}");
+        assert!(
+            summary["host_image_interpreter_refusal_baseline"]
+                .as_str()
+                .unwrap()
+                .ends_with("baseline/results.jsonl"),
+            "{summary:#}"
+        );
+        assert_eq!(
+            summary["host_image_interpreter_refusal_baseline_refusals"],
+            json!([])
+        );
+        assert!(
+            run.stdout.contains(
+                "test-harness: HOST-INAPPLICABLE count 1; HOST-IMAGE-INTERPRETER-REFUSAL count 1 \
+                 (1 recorded HOST-INAPPLICABLE under --record-host-image-interpreter-refusals: \
+                 not run, not a pass, no coverage; 0 kept as FAIL)\n"
+            ),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains(
+                "HOST-INAPPLICABLE loader/refused (verify/ptrace) NOT RUN, NOT a pass, no coverage: "
+            ),
+            "{}",
+            run.stdout
+        );
+        let profiles = fs::read_to_string(run.dir.join("cpu-profiles.jsonl")).unwrap();
+        let refused = profiles
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["test"] == "loader/refused")
+            .unwrap();
+        assert_eq!(
+            (&refused["outcome"], &refused["cpu_profile"]["profile"]),
+            (&json!("FAIL"), &json!("x86-64-v2")),
+            "{profiles}"
+        );
+    }
+
+    /// F3: a recorded refusal of a cell that passed in the PASS baseline, or
+    /// that the baseline has no row for, fails the run: a failed run-verdict
+    /// record naming PASS -> HOST-INAPPLICABLE, exit 1. The cell is still its
+    /// one HOST-INAPPLICABLE row, and summary.json names the refusal.
+    #[test]
+    fn a_recorded_refusal_against_a_baseline_pass_fails_the_run() {
+        use serde_json::json;
+
+        const TEST: &str = "tests::a_recorded_refusal_against_a_baseline_pass_fails_the_run";
+        interpreter_refusal_child();
+        for (label, baseline, wanted) in [
+            (
+                "passed in the baseline",
+                &[("refused", "PASS"), ("passing", "PASS")][..],
+                "PASS -> HOST-INAPPLICABLE against the baseline ",
+            ),
+            (
+                "absent from the baseline",
+                &[("passing", "PASS")][..],
+                "has no row for loader/refused/verify@ptrace, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
+            ),
+        ] {
+            let run = interpreter_refusal_run(TEST, &["refused", "passing"], Some(baseline));
+            assert_eq!(run.code, Some(1), "{label}\n{}\n{}", run.stdout, run.stderr);
+            let records = read_tpx(&run.dir.join("tpx.jsonl"));
+            let verdict = records
+                .iter()
+                .find(|(test, _, _)| test == super::TPX_RUN_VERDICT_TEST)
+                .unwrap_or_else(|| panic!("{label}: no run verdict"));
+            assert_eq!(verdict.1, "failed");
+            let failures = verdict.2["run_failures"].as_array().unwrap();
+            assert_eq!(failures.len(), 1, "{label}: {failures:?}");
+            assert!(
+                failures[0].as_str().unwrap().contains(wanted),
+                "{label}: {failures:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|(test, status, _)| test == "loader/refused/verify@ptrace"
+                        && status == "skipped"),
+                "{label}"
+            );
+            let summary = run.json("summary.json");
+            assert_eq!(summary["host_image_interpreter_refusals"], json!(1));
+            let refusals = summary["host_image_interpreter_refusal_baseline_refusals"]
+                .as_array()
+                .unwrap();
+            assert_eq!(refusals.len(), 1, "{label}: {summary:#}");
+            assert_eq!(refusals[0]["test"], json!("loader/refused"));
+            drop(run);
+        }
+    }
+
+    /// A run whose every selected cell this host's own program interpreter
+    /// refused executed no measurement of Hermit, and under the opt-in still
+    /// fails with the vacuity refusal: exit 1 and a failed run-verdict record,
+    /// beside each cell's skipped record; the dagrun counts count both cells,
+    /// as skips.
+    #[test]
+    fn a_run_whose_every_cell_is_interpreter_refused_still_fails_the_vacuity_refusal() {
+        use serde_json::json;
+
+        const TEST: &str =
+            "tests::a_run_whose_every_cell_is_interpreter_refused_still_fails_the_vacuity_refusal";
+        interpreter_refusal_child();
+        let run = interpreter_refusal_run(
+            TEST,
+            &["refused-a", "refused-b"],
+            Some(&[("refused-a", "FAIL"), ("refused-b", "FAIL")]),
+        );
+        assert_eq!(run.code, Some(1), "{}\n{}", run.stdout, run.stderr);
+        let refusal = super::vacuity_refusal(2, 2).unwrap();
+        assert!(
+            run.stderr.contains(&format!("test-harness: {refusal}\n")),
+            "{}",
+            run.stderr
+        );
+        let records = read_tpx(&run.dir.join("tpx.jsonl"));
+        let statuses = records
+            .iter()
+            .map(|(test, status, _)| (test.as_str(), status.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            statuses,
+            BTreeSet::from([
+                ("loader/refused-a/verify@ptrace", "skipped"),
+                ("loader/refused-b/verify@ptrace", "skipped"),
+                (super::TPX_RUN_VERDICT_TEST, "failed"),
+            ])
+        );
+        let verdict = records
+            .iter()
+            .find(|(test, _, _)| test == super::TPX_RUN_VERDICT_TEST)
+            .unwrap();
+        assert_eq!(verdict.2["run_failures"], json!([refusal]));
+        let summary = run.json("summary.json");
+        assert_eq!(
+            (
+                &summary["cells"],
+                &summary["host_inapplicable"],
+                &summary["host_image_interpreter_refusals"]
+            ),
+            (&json!(2), &json!(2), &json!(2))
+        );
+        let counts = run.json("counts.json");
+        assert_eq!(counts["executed_tests"], json!(2), "{counts:#}");
+        assert!(
+            counts["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["result"] == "skip"),
+            "{counts:#}"
+        );
+    }
+
+    /// Import mode accepts a producer's recorded refusal only under the
+    /// opt-in, with its summary claim: then the cell is this run's own
+    /// HOST-INAPPLICABLE row and the run passes, as the producer's Tpx did;
+    /// without the opt-in it is an ERROR, never a HOST-INAPPLICABLE, and the
+    /// run fails; and with the opt-in but without the claim, or with a claim
+    /// this run would not record, it is an ERROR too. This run's own PASS
+    /// baseline applies to an accepted one: a cell that passed there fails
+    /// the run (PASS -> HOST-INAPPLICABLE).
+    #[test]
+    fn an_imported_recorded_refusal_needs_the_opt_in_and_its_claim() {
+        use serde_json::json;
+
+        const TEST: &str = "tests::an_imported_recorded_refusal_needs_the_opt_in_and_its_claim";
+        interpreter_refusal_child();
+        let producer = interpreter_refusal_run(
+            TEST,
+            &["refused", "passing"],
+            Some(&[("refused", "FAIL"), ("passing", "PASS")]),
+        );
+        assert_eq!(
+            producer.code,
+            Some(0),
+            "{}\n{}",
+            producer.stdout,
+            producer.stderr
+        );
+        let mut summary = producer.json("summary.json");
+        let passing = producer
+            .rows()
+            .into_iter()
+            .find(|row| row.test == "loader/passing")
+            .unwrap();
+        summary["evidence_complete_executions"] = json!([{"test": "loader/passing",
+            "mode": "verify", "backend": "ptrace", "run_id": passing.run_id}]);
+        let rows = fs::read(producer.dir.join("results.jsonl")).unwrap();
+        // An import under the opt-in when `baseline` names the refused cell's
+        // outcome there, with `claims` as the producer's summary claims.
+        let import = |label: &str, baseline: Option<&str>, claims: &serde_json::Value| {
+            let dir = refusal_fixture(&format!("{TEST}-{label}"), &["refused", "passing"]);
+            let bucket = hermit_manifest_plan::imported_results::bucket_dir(
+                &dir.join("import"),
+                "portable",
+                "loader",
+            );
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(bucket.join("results.jsonl"), &rows).unwrap();
+            let mut summary = summary.clone();
+            summary["host_image_interpreter_refusal_cells"] = claims.clone();
+            fs::write(bucket.join("summary.json"), summary.to_string()).unwrap();
+            let mut env = vec![(
+                hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV,
+                dir.join("import").into_os_string(),
+            )];
+            if let Some(outcome) = baseline {
+                let file = dir.join("baseline.jsonl");
+                fs::write(
+                    &file,
+                    json!({"test": "loader/refused", "mode": "verify", "backend": "ptrace",
+                        "outcome": outcome})
+                    .to_string(),
+                )
+                .unwrap();
+                env.push((REFUSAL_BASELINE_CHILD, file.into_os_string()));
+            }
+            refusal_child_run(TEST, dir, &env)
+        };
+        let claims = summary["host_image_interpreter_refusal_cells"].clone();
+        assert_eq!(claims.as_array().map(Vec::len), Some(1), "{summary:#}");
+        let accepted = import("accepted", Some("FAIL"), &claims);
+        assert_eq!(
+            accepted.code,
+            Some(0),
+            "{}\n{}",
+            accepted.stdout,
+            accepted.stderr
+        );
+        assert_eq!(
+            row_outcomes(&accepted),
+            BTreeSet::from([
+                ("loader/passing".to_string(), 1, "PASS".to_string()),
+                (
+                    "loader/refused".to_string(),
+                    1,
+                    "HOST-INAPPLICABLE".to_string()
+                ),
+            ])
+        );
+        let summary = accepted.json("summary.json");
+        assert_eq!(
+            summary["host_image_interpreter_refusals"],
+            json!(1),
+            "{summary:#}"
+        );
+        assert_eq!(summary["host_inapplicable"], json!(1), "{summary:#}");
+        let mut explicit = claims.clone();
+        explicit[0]["evidence"]["presented"]["reason"] = json!("explicit");
+        for (label, baseline, claims, wanted) in [
+            (
+                "without-opt-in",
+                None,
+                &claims,
+                "import-host-image-interpreter-refusal",
+            ),
+            ("without-claim", Some("FAIL"), &json!([]), "import-history"),
+            (
+                "unrecordable-claim",
+                Some("FAIL"),
+                &explicit,
+                "import-history",
+            ),
+        ] {
+            let run = import(label, baseline, claims);
+            assert_eq!(run.code, Some(1), "{label}\n{}\n{}", run.stdout, run.stderr);
+            let refused = run
+                .rows()
+                .into_iter()
+                .find(|row| row.test == "loader/refused")
+                .unwrap();
+            assert_eq!(refused.outcome, "ERROR", "{label}");
+            assert_eq!(refused.error_kind.as_deref(), Some(wanted), "{label}");
+        }
+        let flipped = import("baseline-pass", Some("PASS"), &claims);
+        assert_eq!(
+            flipped.code,
+            Some(1),
+            "{}\n{}",
+            flipped.stdout,
+            flipped.stderr
+        );
+        assert!(
+            row_outcomes(&flipped).contains(&(
+                "loader/refused".to_string(),
+                1,
+                "HOST-INAPPLICABLE".to_string()
+            )),
+            "{}",
+            flipped.stdout
+        );
+        let verdict = read_tpx(&flipped.dir.join("tpx.jsonl"))
+            .into_iter()
+            .find(|(test, _, _)| test == super::TPX_RUN_VERDICT_TEST)
+            .unwrap();
+        assert!(
+            verdict.2["run_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure
+                    .as_str()
+                    .unwrap()
+                    .contains("PASS -> HOST-INAPPLICABLE against the baseline ")),
+            "{verdict:?}"
+        );
+    }
+
+    /// The option is `run`'s only, takes one PASS baseline, and a baseline
+    /// that holds no row refuses the run before any cell runs.
+    #[test]
+    fn the_refusal_option_names_one_readable_baseline() {
+        let args = super::parse(
+            [super::RECORD_INTERPRETER_REFUSALS_ARG, "/baseline"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(
+            args.record_refusals.as_deref(),
+            Some(std::path::Path::new("/baseline"))
+        );
+        assert_eq!(super::parse(std::iter::empty()).record_refusals, None);
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-harness-refusal-baseline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            hermit_manifest_plan::runner::PassBaseline::load(&dir)
+                .unwrap_err()
+                .contains("holds no result row")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The production retry decision for a replay cell: its product FAIL (a
