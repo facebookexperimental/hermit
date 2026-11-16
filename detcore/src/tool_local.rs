@@ -56,6 +56,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::InstructionOffset;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::resources::ResourceMap;
 use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::stat::*;
@@ -8668,7 +8669,7 @@ impl<T> ThreadState<T> {
 
     /// Build a singleton resource request from the current thread.
     pub fn mk_request(&self, rid: ResourceID, perm: Permission) -> Resources {
-        let mut resources = HashMap::new();
+        let mut resources = ResourceMap::default();
         resources.insert(rid, perm);
         Resources {
             tid: self.dettid,

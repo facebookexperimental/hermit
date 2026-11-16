@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
+use std::hash::BuildHasherDefault;
+use std::hash::DefaultHasher;
 use std::path::PathBuf;
 
 use reverie::Errno;
@@ -566,6 +568,24 @@ pub enum Device {
 // address spaces.
 //
 
+/// The map type of [`Resources::resources`]: a `HashMap` whose hasher has
+/// fixed keys.
+///
+/// A `RandomState` map draws its keys from the host's random source the first
+/// time a thread builds one. Where `getrandom` is unavailable, std falls back
+/// to a `/dev/urandom` descriptor that it opens and keeps open for the life of
+/// the process. Detcore builds these requests on the guest's syscall paths, so
+/// in-guest that descriptor would land in the guest's descriptor table, and
+/// only on some hosts. `DefaultHasher::new` has fixed zero keys, so building
+/// this map draws no randomness and opens nothing. Detcore's other
+/// `RandomState` maps are unchanged and can still open that descriptor.
+///
+/// The hash seed is always the same, so the iteration order depends only on
+/// the binary, the map's contents (the `ResourceID` values, including any
+/// host-derived value one carries) and its insertion and removal history. That
+/// order is not sorted or canonical, and it is not promised across toolchains.
+pub type ResourceMap = HashMap<ResourceID, Permission, BuildHasherDefault<DefaultHasher>>;
+
 /// `Resources` is a request to lock zero or more resources so that the thread can perform an action.
 ///
 /// There can only be one outstanding request at a time for a given TID.
@@ -574,7 +594,7 @@ pub struct Resources {
     /// The thread ID requesting the resources.
     pub tid: DetTid,
     /// The set of resources requested.
-    pub resources: HashMap<ResourceID, Permission>,
+    pub resources: ResourceMap,
     /// If the guest thread is polling the resource, retrying until success, it should
     /// increment this field after each attempt, as a hint to the scheduler to deprioritize it.
     /// That is, requests with a nonzero value will be deprioritized. Zero values will be treated
@@ -963,7 +983,7 @@ impl Resources {
     pub fn new(tid: DetTid) -> Resources {
         Resources {
             tid,
-            resources: HashMap::new(),
+            resources: ResourceMap::default(),
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
@@ -1254,6 +1274,15 @@ pub(crate) fn one_resource_of_each_variant(op: ExternalOpId) -> Vec<ResourceID> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the exact type of the request map: a return to `RandomState`
+    /// (`HashMap::new`) does not compile here.
+    #[test]
+    fn request_map_hasher_has_fixed_keys() {
+        fn fixed_keys(_: &HashMap<ResourceID, Permission, BuildHasherDefault<DefaultHasher>>) {}
+        let request = Resources::new(DetTid::from_raw(1));
+        fixed_keys(&request.resources);
+    }
 
     /// The classification the published list of kernel-run blocking calls
     /// (A5 design 16.11, `ResourceID::is_kernel_run_blocking`) is pinned to,

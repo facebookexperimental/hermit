@@ -100,6 +100,7 @@ use crate::resources::ChaosEpochTransition;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::resources::ResourceMap;
 use crate::resources::Resources;
 use crate::scheduler::AdmitIntent;
 use crate::scheduler::AdmitSide;
@@ -7386,7 +7387,7 @@ impl GlobalState {
             }
             // The resources that must be held for the fresh thread to run:
             let rsrcs = {
-                let mut s = HashMap::new();
+                let mut s = ResourceMap::default();
                 s.insert(ResourceID::MemAddrSpace(detpid), Permission::RW); // TODO(T78055411): track mem aliasing.
                 Resources {
                     tid: dettid,
@@ -8635,8 +8636,12 @@ pub enum SignalScope {
 /// signal to another process where the backend keeps the guest's signal
 /// queues (stage X1 slice C of the KVM cross-process signal design,
 /// https://github.com/rrnewton/hermit/issues/4485; 58 on its own base, 59 at
-/// its rebase onto main's 58); it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 59;
+/// its rebase onto main's 58).
+/// 60 retypes `Resources::resources` to `ResourceMap`, a map whose hasher has
+/// fixed keys: the map still crosses the RPC as the same entries, but the
+/// `Resources` definition, which the digest reads as text, changed; it is
+/// current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 60;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -22331,13 +22336,12 @@ mod tests {
             .await
             .expect("the parent continuation must commit");
             assert_eq!(committed.tid, parent);
-            assert_eq!(
-                committed.resources,
-                std::collections::HashMap::from([(
-                    crate::resources::ResourceID::ParentContinue { parent, child },
-                    crate::resources::Permission::W,
-                )]),
+            let mut expected = crate::resources::ResourceMap::default();
+            expected.insert(
+                crate::resources::ResourceID::ParentContinue { parent, child },
+                crate::resources::Permission::W,
             );
+            assert_eq!(committed.resources, expected);
             registration.await;
         })
         .await

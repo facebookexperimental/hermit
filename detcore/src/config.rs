@@ -433,6 +433,13 @@ mod tests {
         // base, renumbered to 59 at its rebase onto main's 58. Digest
         // measured at this head.
         (59, "fb8c186c3fd4a2d2", "f8b1309588141fd0"),
+        // Retypes `Resources::resources` to `ResourceMap`, a map whose hasher
+        // has fixed keys, so building a request draws no random keys. The map
+        // still crosses the RPC as the same entries; the `Resources`
+        // definition, which this digest reads as text, changed. The enums'
+        // digest is unchanged. 58 on main's 57, renumbered to 60 over the
+        // import base's 59; digests measured at this head.
+        (60, "fb8c186c3fd4a2d2", "73abee5d6e81af44"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
