@@ -7311,6 +7311,7 @@ fn run_manifest_plan_for_budgets(root: &Path) -> Result<Budgets, String> {
         .args([
             "run",
             "--quiet",
+            "--locked",
             "-p",
             "hermit-manifest-plan",
             "--",
@@ -22694,7 +22695,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         || runtime_build_steps[0].cmd.contains("--release")
         || !manifest_plan_steps[0]
             .cmd
-            .contains("cargo build -p hermit-manifest-plan --bins")
+            .contains("cargo build --locked -p hermit-manifest-plan --bins")
         || manifest_plan_steps[0]
             .cmd
             .contains("cargo build --locked --profile validate -p hermit-run --bin hermit")

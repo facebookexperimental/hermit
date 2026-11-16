@@ -1019,7 +1019,9 @@ fn rust_script(root: &Path, script: &str) -> Command {
 }
 
 /// Nextest's JSON list of the suite: the prepared runner's when the node requires prepared
-/// executables, `cargo nextest`'s otherwise.
+/// executables, `cargo nextest`'s otherwise. That one builds the suite, so it passes
+/// `--locked`: a stale committed Cargo.lock stops it instead of being rewritten
+/// (ci/manifest-plan/src/locked_cargo.rs).
 fn nextest_list(root: &Path, nextest_args: &[String]) -> Result<serde_json::Value, String> {
     let mut command = if env::var("HERMIT_PREPARED_NEXTEST_REQUIRED").as_deref() == Ok("1") {
         let mut command = rust_script(root, "ci/nextest-binaries.rs");
@@ -1027,7 +1029,7 @@ fn nextest_list(root: &Path, nextest_args: &[String]) -> Result<serde_json::Valu
         command
     } else {
         let mut command = Command::new("cargo");
-        command.args(["nextest", "list"]);
+        command.args(["nextest", "list", "--locked"]);
         command
     };
     let output = command

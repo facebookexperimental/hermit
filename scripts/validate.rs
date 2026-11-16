@@ -5986,7 +5986,9 @@ cleared-caps refusal names {} starved step(s)",
             &pinned_manifest_producer.cmd,
         )?;
         if pinned_manifest_command
-            != format!("{RUST_SCRIPT_COMMAND_PREFIX}cargo build -p hermit-manifest-plan --bins")
+            != format!(
+                "{RUST_SCRIPT_COMMAND_PREFIX}cargo build --locked -p hermit-manifest-plan --bins"
+            )
         {
             return Err(format!(
                 "full-plan bracket: pinned-root manifest producer can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
@@ -14460,6 +14462,64 @@ fn finish_committed_selection(mut plan: Plan, source_path: PathBuf, source_bytes
 }
 
 #[cfg(test)]
+mod locked_cargo_tests {
+    use hermit_manifest_plan::locked_cargo;
+
+    use super::*;
+
+    /// A stale committed Cargo.lock fails the first Cargo call of every
+    /// focused plan: `--only LANE NODE` for each node that makes a
+    /// lock-resolving Cargo call, in each lane that carries the node, on and
+    /// off the record. Off the record the plan's only preflight is
+    /// pre.submodules, the pin and pre.cargo_lock, so the node's own call runs
+    /// beside the lock gate. Each first call, run as written against a stale
+    /// lock file in a fixture, must refuse it and leave it byte-identical, and
+    /// its mutant without --locked must rewrite it.
+    #[test]
+    fn a_stale_lock_fails_the_first_cargo_call_of_every_focused_plan() {
+        let root = test_source_root();
+        let (committed, _, _) = load_committed_validation_dag(&root).unwrap();
+        let mut first: BTreeMap<Vec<String>, BTreeSet<String>> = BTreeMap::new();
+        for step in &committed.steps {
+            if !locked_cargo::cargo_calls(&step.cmd)
+                .iter()
+                .any(locked_cargo::CargoCall::resolves_lock)
+            {
+                continue;
+            }
+            for lane in &step.labels {
+                for off_record in [false, true] {
+                    let mut argv = Vec::new();
+                    if off_record {
+                        argv.push("--allow-local-off-the-record-run".to_string());
+                    }
+                    argv.extend(["--only".to_string(), lane.clone(), step.tag()]);
+                    let args = parse_argv(&argv).unwrap();
+                    let plan = build_plan(&root, &args, &std::env::temp_dir())
+                        .unwrap_or_else(|error| panic!("{}: {error}", argv.join(" ")));
+                    for (node, calls) in locked_cargo::first_lock_resolving_steps(&plan.cfg.steps) {
+                        for call in calls {
+                            first
+                                .entry(call.argv)
+                                .or_default()
+                                .insert(format!("{}: {node}", argv.join(" ")));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            first.values().flatten().any(|plan| {
+                plan == "--allow-local-off-the-record-run --only full lint.clippy: lint.clippy"
+            }),
+            "off the record, lint.clippy's own Cargo call no longer runs first: {first:?}"
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        locked_cargo::check_stale_lock_twins(&first, scratch.path()).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod case_selection_tests {
     use super::*;
 
@@ -16144,7 +16204,7 @@ fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
 fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
-        "cargo build --release -p hermit-run --features liteinst".to_string()
+        "cargo build --locked --release -p hermit-run --features liteinst".to_string()
     } else {
         // A caller-supplied binary is reused rather than rebuilt, but it must
         // exist: silently proceeding with a missing binary would fail every row

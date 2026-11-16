@@ -70,7 +70,21 @@ function invoke_nextest {
         fi
         run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" "${context_args[@]}" --config-file "$nextest_config" "$@"
     else
-        cargo nextest --config-file "$nextest_config" "$operation" "$@"
+        # Nextest builds with `cargo test --no-run` here, so a stale committed
+        # Cargo.lock must stop the build, never be rewritten
+        # (ci/manifest-plan/src/locked_cargo.rs). Nextest refuses a repeated
+        # --locked, so a caller's own before any `--` is dropped.
+        local -a forwarded=()
+        local arg separated=0
+        for arg in "$@"; do
+            if [[ $arg == -- ]]; then
+                separated=1
+            fi
+            if ((separated)) || [[ $arg != --locked ]]; then
+                forwarded+=("$arg")
+            fi
+        done
+        cargo nextest --config-file "$nextest_config" "$operation" --locked "${forwarded[@]}"
     fi
 }
 
@@ -814,7 +828,7 @@ PYEOF
     cp -- "$inventory" "$ordinary_inventory" || return 1
     [[ $got == *$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
-    printf '%s\n' --color never --message-format json --profile ci -p suite \
+    printf '%s\n' --locked --color never --message-format json --profile ci -p suite \
         -- --skip skipme >"$scratch/expected-list-arguments"
     cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
     [[ $(<"$scratch/wrapper-counts.json") == \
@@ -936,6 +950,7 @@ PYEOF
 
     # Preserve the original zero-terminal launch failure separately from the
     # executed exit23 control above. Stderr's twelve failures are not test rows.
+    # This caller passes its own --locked, which the list below must not repeat.
     launch_failure=1
     ordinary_attempts=$attempts
     attempts="$scratch/launch-attempts"
@@ -944,7 +959,7 @@ PYEOF
     got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
         run_nextest "$scratch/launch-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/launch-cpu.json" \
-        --profile ci -p suite -j 1 --retries 2 -- --skip skipme) || status=$?
+        --profile ci --locked -p suite -j 1 --retries 2 -- --skip skipme) || status=$?
     [[ $status == 100 ]] || return 1
     [[ $got == *$'running 0 tests\ntest result: FAILED. 0 passed; 0 failed; 0 ignored; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1

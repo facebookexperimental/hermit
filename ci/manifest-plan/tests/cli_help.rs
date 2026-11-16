@@ -610,7 +610,7 @@ fn test_harness_selftest_refuses_anything_but_one_known_name() {
 fn test_harness_selftest_scorecard_refuses_a_missing_helper() {
     const REFUSAL: &str = "test-harness: self-test scorecard needs the hermit-manifest-plan \
          binary built beside test-harness; build both with \
-         `cargo build -p hermit-manifest-plan --bins`\n";
+         `cargo build --locked -p hermit-manifest-plan --bins`\n";
     let directory = non_repository_dir("selftest-missing-helper");
     // A copy, not a symlink: the helper is looked up beside the resolved
     // executable, and a symlink resolves to the build directory. Not a hard

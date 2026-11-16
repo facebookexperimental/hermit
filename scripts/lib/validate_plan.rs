@@ -65,7 +65,7 @@ pub mod canonical_test_epoch;
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
-pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
+pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build --locked -p hermit-manifest-plan --bins";
 pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 
 /// CPU fallback for synthetic configs used by generator and self-test fixtures.

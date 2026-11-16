@@ -69,7 +69,14 @@ fn guest_path() -> PathBuf {
     let guest = binary_directory.join(GUEST);
     if !guest.is_file() {
         let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "hermetic_infra_hermit_tests", "--bin", GUEST])
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "hermetic_infra_hermit_tests",
+                "--bin",
+                GUEST,
+            ])
             .status()
             .expect("failed to invoke cargo to build the guest");
         assert!(status.success(), "building {GUEST} failed");

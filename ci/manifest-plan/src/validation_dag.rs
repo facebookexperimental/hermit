@@ -1264,8 +1264,8 @@ pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/rel
 const PORTABLE_FOCUSED_COMPAT_TAG: &str = "portablecompat.manifest_compat";
 
 /// Backends whose cells the `PORTABLE_FOCUSED_COMPAT_TAG` step omits with
-/// `--exclude-backend`. Its release build, `cargo build --release -p hermit-run
-/// --features liteinst`, does not build the in-guest Detcore
+/// `--exclude-backend`. Its release build, `cargo build --locked --release -p
+/// hermit-run --features liteinst`, does not build the in-guest Detcore
 /// runtime (libdetcore_liteinst.so, the separate detcore-liteinst package)
 /// that the `liteinst` and `in-guest-trap` backends load, so each of their
 /// cells would end backend-unavailable. The run type stays what it was, the
@@ -5225,7 +5225,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         "compatprep.hermit_release_in_pinned_root",
     )?;
     if crate::nextest_build_selections::execution_command(focused_image)?
-        != "cargo build --release -p hermit-run --features liteinst"
+        != "cargo build --locked --release -p hermit-run --features liteinst"
         || focused_image.labels != ["portable-strict-compat-only"]
         || focused_image.deps
             != [
@@ -5244,7 +5244,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     let pinned_manifest_command =
         crate::nextest_build_selections::execution_command(pinned_manifest_setup)?;
     if pinned_manifest_command
-        != "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins"
+        != "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --locked -p hermit-manifest-plan --bins"
     {
         return Err(format!(
             "pinned-root manifest setup can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
@@ -5922,6 +5922,63 @@ mod tests {
         87 + PINNED_NATIVE_EXEC_TAGS.len()
     }
 
+    /// The `pre` nodes that no manifest gate waits for, directly or through
+    /// another node: the preflight checks [`materialize_focused_preflight`]
+    /// leaves off the gate.
+    fn gate_exempt_preflight(cfg: &DagConfig) -> BTreeSet<String> {
+        let ahead_of_a_gate = [
+            "gate.manifest",
+            "gate.manifest_on_host",
+            "quick-super-gate.manifest",
+        ]
+        .into_iter()
+        .flat_map(|gate| {
+            dagrun::select_steps_by_tags(cfg, &[gate.to_string()], false)
+                .unwrap_or_else(|error| panic!("{gate}: {error}"))
+                .steps
+        })
+        .map(|step| step.tag())
+        .collect::<BTreeSet<_>>();
+        cfg.steps
+            .iter()
+            .filter(|step| step.group == "pre" && !ahead_of_a_gate.contains(&step.tag()))
+            .map(Step::tag)
+            .collect()
+    }
+
+    /// The generator gives a `pre` node no manifest gate, and nothing then
+    /// orders it after one. Today that is only the Cargo.lock freshness gate,
+    /// which waits for the submodules and the Reverie pin alone. A new `pre`
+    /// node that no gate waits for is reviewed here rather than exempted
+    /// silently.
+    #[test]
+    fn the_cargo_lock_gate_is_the_only_preflight_check_ahead_of_no_manifest_gate() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_eq!(
+            gate_exempt_preflight(&committed),
+            BTreeSet::from(["pre.cargo_lock".to_string()])
+        );
+        let lock_gate = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "pre.cargo_lock")
+            .unwrap();
+        assert_eq!(lock_gate.deps, ["pre.reverie_pin", "pre.submodules"]);
+
+        // A planted `pre` node that no gate waits for changes the set.
+        let mut planted = committed.clone();
+        let mut probe = lock_gate.clone();
+        probe.job = "planted_probe".into();
+        planted.steps.push(probe);
+        assert_eq!(
+            gate_exempt_preflight(&planted),
+            BTreeSet::from([
+                "pre.cargo_lock".to_string(),
+                "pre.planted_probe".to_string()
+            ])
+        );
+    }
+
     #[test]
     fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
         let scratch = Scratch::create().unwrap();
@@ -6097,7 +6154,7 @@ mod tests {
                         // alone to carry the width; the hosted-privileged copy
                         // keeps dagrun's default `-j` as well.
                         format!(
-                            "cargo:{width}\n<build>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n{}",
+                            "cargo:{width}\n<build>\n<--locked>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n{}",
                             if tag.ends_with("_on_host") {
                                 format!("<-j>\n<{width}>\n")
                             } else {

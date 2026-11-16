@@ -27734,24 +27734,27 @@ backends_disabled:
 
     /// HOST_DEPENDENT_PROFILE_REASONS is a copy of hermit-cli's
     /// `ProfileReason::host_dependent` (hermit-cli/src/cpu_profile_admission.rs),
-    /// which this crate does not depend on. Every reason the copy admits must
-    /// be one hermit-cli still calls host-dependent: were hermit-cli to drop
-    /// one, the copy would record a refusal under a profile the host did not
-    /// choose. A reason hermit-cli adds and the copy lacks only keeps such a
-    /// refusal a FAIL, so it is allowed. The source is read when the test is
+    /// which this crate does not depend on, so it must name exactly the
+    /// reasons hermit-cli does. Were hermit-cli to drop a reason the copy
+    /// admits, the copy would record a refusal under a profile the host did
+    /// not choose; were hermit-cli to add one the copy lacks, a refusal under
+    /// a profile the host did choose would stay the cell's own FAIL. Either is
+    /// a stale copy, so either fails here. The source is read when the test is
     /// compiled, and a parse that cannot read it fails rather than passing.
     #[test]
-    fn host_dependent_profile_reasons_are_reasons_hermit_cli_calls_host_dependent() {
+    fn host_dependent_profile_reasons_are_the_reasons_hermit_cli_calls_host_dependent() {
         let source = include_str!("../../../hermit-cli/src/cpu_profile_admission.rs");
         let hermit_cli = hermit_cli_host_dependent_reasons(source)
             .unwrap_or_else(|error| panic!("hermit-cli/src/cpu_profile_admission.rs: {error}"));
-        for reason in HOST_DEPENDENT_PROFILE_REASONS {
-            assert!(
-                hermit_cli.contains(reason),
-                "HOST_DEPENDENT_PROFILE_REASONS admits {reason:?}, which hermit-cli's \
-                 ProfileReason::host_dependent does not name: {hermit_cli:?}"
-            );
-        }
+        let copy = HOST_DEPENDENT_PROFILE_REASONS
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            copy, hermit_cli,
+            "HOST_DEPENDENT_PROFILE_REASONS (left) must name exactly the reasons \
+             hermit-cli's ProfileReason::host_dependent names (right)"
+        );
         // The parse refuses what it cannot read instead of answering.
         assert!(hermit_cli_host_dependent_reasons("").is_err());
         let unnamed = source.replace(

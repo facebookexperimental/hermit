@@ -1425,7 +1425,7 @@ fn run_tool_self_test(values: &[String]) -> ExitCode {
             .unwrap_or_else(|| {
                 fail(format!(
                     "self-test {} needs the hermit-manifest-plan binary built beside \
-                     test-harness; build both with `cargo build -p hermit-manifest-plan --bins`",
+                     test-harness; build both with `cargo build --locked -p hermit-manifest-plan --bins`",
                     tool.name
                 ))
             });

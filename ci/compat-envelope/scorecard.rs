@@ -4309,7 +4309,13 @@ fn manifest_plan_cargo(subcommand: &str) -> Result<Command, String> {
     let tool = manifest_tool_root()?;
     let mut command = Command::new("cargo");
     command
-        .args([subcommand, "--quiet", "-p", "hermit-manifest-plan"])
+        .args([
+            subcommand,
+            "--quiet",
+            "--locked",
+            "-p",
+            "hermit-manifest-plan",
+        ])
         .args(["--bin", "hermit-manifest-plan"])
         .arg("--manifest-path")
         .arg(tool.join("Cargo.toml"))

@@ -40,5 +40,5 @@ fi
 # hygiene on the host target remains denied by the workspace build and
 # clippy. With no ambient RUSTFLAGS this changes nothing locally.
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-A deprecated" \
-    cargo check -p hermit-detcore --target "$target"
+    cargo check --locked -p hermit-detcore --target "$target"
 echo "check-musl-detcore: OK -- hermit-detcore compiles for $target"
