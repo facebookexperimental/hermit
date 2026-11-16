@@ -44,12 +44,6 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/bin/preempt_spin_flag.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/bin/preempt_spin_flag.c is owned by target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false): Pure-userspace spin guest for issue 119; only backends delivering preemption timer events (ptrace, KVM) can pass it, the rest are named gaps"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/bin/robust_futex_test.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/bin/robust_futex_test.c is owned by target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1985,6 +1979,12 @@
       "path": "tests/c/preadv2_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/preadv2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/preempt_spin_flag.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/preempt_spin_flag.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Pure-userspace spin guest for issue 119; only backends delivering preemption timer events (ptrace, KVM) can pass it, the rest are named gaps"
     },
     {
       "disposition": "cargo-integration-test-fixture",

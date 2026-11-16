@@ -46098,7 +46098,7 @@
     },
     {
       "backend": "ptrace",
-      "category": "bin-c",
+      "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
       "lane": "portable",
@@ -46113,12 +46113,12 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "bin-c/preempt-spin-flag",
+      "test": "c-programs/preempt-spin-flag",
       "timeout_seconds": 180
     },
     {
       "backend": "kvm",
-      "category": "bin-c",
+      "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
       "lane": "portable",
@@ -46133,12 +46133,12 @@
       "requires_host_capabilities": [
         "kvm"
       ],
-      "test": "bin-c/preempt-spin-flag",
+      "test": "c-programs/preempt-spin-flag",
       "timeout_seconds": 180
     },
     {
       "backend": "ptrace",
-      "category": "bin-c",
+      "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
       "lane": "portable",
@@ -46150,7 +46150,7 @@
         "ptrace",
         "cc"
       ],
-      "test": "bin-c/preempt-spin-flag",
+      "test": "c-programs/preempt-spin-flag",
       "timeout_seconds": 180
     }
   ],

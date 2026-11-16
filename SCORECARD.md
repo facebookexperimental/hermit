@@ -49,8 +49,8 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 7 / 7 | 7 / 7 | 0 / 7 | 14 | 21 |
-| `bin-c` | 3 / 3 | 2 / 3 | 0 / 3 | 5 | 9 |
-| `c-programs` | 303 / 305 | 265 / 305 | 3 / 305 | 571 | 915 |
+| `bin-c` | 2 / 2 | 1 / 2 | 0 / 2 | 3 | 6 |
+| `c-programs` | 304 / 306 | 266 / 306 | 3 / 306 | 573 | 918 |
 | `chaos-c` | 1 / 1 | 1 / 1 | 1 / 1 | 3 | 3 |
 | `compat` | 212 / 221 | 215 / 221 | 0 / 221 | 427 | 663 |
 | `data-handling` | 6 / 6 | 6 / 6 | 0 / 6 | 12 | 18 |

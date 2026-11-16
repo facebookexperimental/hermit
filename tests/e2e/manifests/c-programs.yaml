@@ -22439,3 +22439,74 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/preempt-spin-flag
+    description: A pure-userspace spin with no syscalls must be preempted so its peer thread can set the flag; it keeps its own --max-timeslice at the default level, so the harness withholds it on a host whose hermit reports no exact branch counter (refused_on_an_inexact_branch_counter), and a runner without the PMU timer does not run it
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/preempt_spin_flag.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        no_retry_reason: 'A skid or preemption flake is the signal this cell exists to measure; retrying it into green would erase exactly that evidence.'
+        hermit_args:
+          ptrace:
+          - --max-timeslice=200000000
+        hermit_args_reason: 'An explicit default-level 200 ms maximum timeslice keeps the preemption timer armed (and both timer stages reachable) on hosts where the harness would otherwise add --max-timeslice=disabled, which is exactly this cell failing twin; with its own timeslice named, the cell is withheld on such hosts instead of failing. The value is the hermit default, not a calibration: any finite slice lets the setter finish long before the spinner cap.'
+        backends_disabled:
+          dbt: Reverie BackendCapabilities::DBT delivers_preemption_timer_events=false and its Guest refuses set_timer, so a pure-userspace spin is never preempted and this guest can only reach its starvation cap (https://github.com/facebookexperimental/hermit/issues/119)
+          sabre: Reverie BackendCapabilities::SABRE delivers_preemption_timer_events=false, so a pure-userspace spin is never preempted and this guest can only reach its starvation cap (https://github.com/facebookexperimental/hermit/issues/119)
+          liteinst: Reverie BackendCapabilities::LITEINST_IN_GUEST delivers_preemption_timer_events=false and the in-guest host refuses set_timer with ENOSYS, so a pure-userspace spin runs unpreempted to its next syscall (https://github.com/facebookexperimental/hermit/issues/119)
+          in-guest-trap: The in-guest trap host shares LiteInst's set_timer ENOSYS refusal (delivers_preemption_timer_events=false), so a pure-userspace spin is never preempted (https://github.com/facebookexperimental/hermit/issues/119)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this cell asserts strict verification under Hermit preemption; native scheduling also preempts and would pass without testing the gap, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-outcome guest (pass only under preemption); chaos seed diversity adds no oracle beyond the verify pass.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

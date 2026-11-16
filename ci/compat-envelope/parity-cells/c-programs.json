@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 1525,
-      "applicable": 1256,
-      "selectable": 1016,
-      "population": 1515,
-      "population_candidate_selected": 1016,
+      "cells": 1530,
+      "applicable": 1257,
+      "selectable": 1017,
+      "population": 1520,
+      "population_candidate_selected": 1017,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 259
+      "population_candidate_disabled": 263
     },
     "by_backend": {
       "dbt": {
-        "cells": 305,
+        "cells": 306,
         "applicable": 267,
         "selectable": 266,
-        "population": 303,
+        "population": 304,
         "population_candidate_selected": 266,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 36
+        "population_candidate_disabled": 37
       },
       "in-guest-trap": {
-        "cells": 305,
+        "cells": 306,
         "applicable": 227,
         "selectable": 227,
-        "population": 303,
+        "population": 304,
         "population_candidate_selected": 227,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 76
+        "population_candidate_disabled": 77
       },
       "kvm": {
-        "cells": 305,
-        "applicable": 297,
-        "selectable": 297,
-        "population": 303,
-        "population_candidate_selected": 297,
+        "cells": 306,
+        "applicable": 298,
+        "selectable": 298,
+        "population": 304,
+        "population_candidate_selected": 298,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 6
       },
       "liteinst": {
-        "cells": 305,
+        "cells": 306,
         "applicable": 226,
         "selectable": 226,
-        "population": 303,
+        "population": 304,
         "population_candidate_selected": 226,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 77
+        "population_candidate_disabled": 78
       },
       "sabre": {
-        "cells": 305,
+        "cells": 306,
         "applicable": 239,
         "selectable": 0,
-        "population": 303,
+        "population": 304,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 239,
-        "population_candidate_disabled": 64
+        "population_candidate_disabled": 65
       }
     }
   },
@@ -895,6 +895,11 @@
     {"test_id":"c-programs/preadv2-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/preadv2-flags","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/preadv2-flags","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/preempt-spin-flag","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Reverie BackendCapabilities::DBT delivers_preemption_timer_events=false and its Guest refuses set_timer, so a pure-userspace spin is never preempted and this guest can only reach its starvation cap (https://github.com/facebookexperimental/hermit/issues/119)"},
+    {"test_id":"c-programs/preempt-spin-flag","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest trap host shares LiteInst's set_timer ENOSYS refusal (delivers_preemption_timer_events=false), so a pure-userspace spin is never preempted (https://github.com/facebookexperimental/hermit/issues/119)"},
+    {"test_id":"c-programs/preempt-spin-flag","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/preempt-spin-flag","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Reverie BackendCapabilities::LITEINST_IN_GUEST delivers_preemption_timer_events=false and the in-guest host refuses set_timer with ENOSYS, so a pure-userspace spin runs unpreempted to its next syscall (https://github.com/facebookexperimental/hermit/issues/119)"},
+    {"test_id":"c-programs/preempt-spin-flag","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Reverie BackendCapabilities::SABRE delivers_preemption_timer_events=false, so a pure-userspace spin is never preempted and this guest can only reach its starvation cap (https://github.com/facebookexperimental/hermit/issues/119)"},
     {"test_id":"c-programs/print-memaddrs","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/print-memaddrs","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/print-memaddrs","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

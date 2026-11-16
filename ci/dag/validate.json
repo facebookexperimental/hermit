@@ -1250,27 +1250,6 @@
         {
           "lane": "portable",
           "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
           "test": "bin-c/robust-futex-test",
           "mode": "replay",
           "backend": "ptrace"
@@ -6562,6 +6541,27 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -28423,13 +28423,6 @@
         {
           "lane": "portable",
           "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
           "test": "bin-c/robust-futex-test",
           "mode": "verify",
           "backend": "ptrace"
@@ -29572,6 +29565,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -33661,20 +33661,6 @@
         {
           "lane": "portable",
           "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
           "test": "bin-c/robust-futex-test",
           "mode": "replay",
           "backend": "ptrace"
@@ -35993,6 +35979,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -45104,27 +45104,6 @@
         {
           "lane": "portable",
           "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
-          "test": "bin-c/preempt-spin-flag",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "bin-c",
           "test": "bin-c/robust-futex-test",
           "mode": "replay",
           "backend": "ptrace"
@@ -50400,6 +50379,27 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/preempt-spin-flag",
           "mode": "verify",
           "backend": "ptrace"
         },
