@@ -1,11 +1,13 @@
 name: CI (GitHub-managed portable)
 
-# Diagnostic fan-out of the constructed portable plan. It runs automatically
-# after a commit reaches the integration branch and for pull requests opened by
-# anyone other than the project bot (owner decision, 2026-10-27: "invoke CI
-# automatically only for external PRs not by our hermit-bot account"), and may
-# also be dispatched manually. Follow AGENTS.md for landing: local or GitHub
-# evidence is acceptable, and reported failures require investigation.
+# Diagnostic fan-out of the constructed portable plan. Since 2026-11-16 it runs
+# on manual dispatch and after a commit reaches the integration branch (see the
+# `on:` block below); the automatic check for pull requests and for main is
+# ci.yml. Before that it also ran for pull requests opened by anyone other than
+# the project bot (owner decision, 2026-10-27: "invoke CI automatically only
+# for external PRs not by our hermit-bot account") and for pushes to main.
+# Follow AGENTS.md for landing: local or GitHub evidence is acceptable, and
+# reported failures require investigation.
 #
 # EXTERNAL PULL REQUESTS. A pull_request run whose author is hermit-bot3, or
 # whose pull request is a draft, skips every job: the gate sits on the jobs
@@ -69,13 +71,18 @@ name: CI (GitHub-managed portable)
 # case also skips without a JDK, is scheduled by no DAG step or manifest. A job
 # that starts running Java must add the package to its own list.
 
-# Pushes to main, the exported tip, also run it (owner, 2026-11-12).
+# MANUAL SINCE 2026-11-16 (owner: "I'd rather it check LESS but be reliable").
+# Pull requests and pushes to main no longer start this DAG; ci.yml, a small
+# build-and-unit-test workflow, took over that automatic role, and its header
+# lists what runs where. A push to `integration` still starts this workflow,
+# and any branch can run it with `gh workflow run ci-portable.yml --ref <ref>`.
+# The jobs below keep their pull_request gates. Restoring the old triggers
+# would also need scripts/check-github-actions-triggers.rs, which now allows
+# pull_request and main-push triggers only on ci.yml, to allow them here.
 on:
   workflow_dispatch:
   push:
-    branches: [integration, main]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [integration]
 
 concurrency:
   # Runs for one ref share a group. cancel-in-progress:false lets the running

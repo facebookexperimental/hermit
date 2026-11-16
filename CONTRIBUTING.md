@@ -20,14 +20,16 @@ We actively welcome your pull requests.
 5. Make sure your code lints.
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
-GitHub-hosted portable CI (`.github/workflows/ci-portable.yml`) runs
-automatically on pull requests opened by anyone other than the project bot,
-from a branch or a fork, once the pull request is out of draft. A run for a
-fork pull request waits for a maintainer to approve it in the Actions tab; the
-maintainer first reads the pull request's `.github/` changes, because GitHub
-runs the workflow files from the pull request itself. The privileged
-(self-hosted, PMU/KVM) workflows are not triggered by pull requests: a
-maintainer dispatches them after reviewing the change. CI results are
+GitHub-hosted CI (`.github/workflows/ci.yml`: build every target, then the
+unit tests that need nothing from the host) runs automatically on pull
+requests opened by anyone other than the project bot, from a branch or a
+fork, once the pull request is out of draft. A run for a fork pull request
+waits for a maintainer to approve it in the Actions tab; the maintainer first
+reads the pull request's `.github/` changes, because GitHub runs the workflow
+files from the pull request itself. The larger GitHub-hosted portable workflow
+(`.github/workflows/ci-portable.yml`) and the privileged (self-hosted,
+PMU/KVM) workflows are not triggered by pull requests: a maintainer
+dispatches them after reviewing the change. CI results are
 supplemental evidence; local validation (below) is what a reviewer looks for.
 
 ## Local Validation Protocol
@@ -48,7 +50,7 @@ exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
 future work, not v1 routes. Run `./scripts/validate.rs --all` for the
 complete suite.
 
-`scripts/validate.rs portable-only` is the local mirror of the required
+`scripts/validate.rs portable-only` is the local mirror of the manual
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
 format, documentation, and test matrix. The focused privileged capability
 contract is reproduced with `ci/run-dag.sh privileged -j 2`.
