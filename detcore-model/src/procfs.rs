@@ -12,15 +12,56 @@ use std::collections::BTreeSet;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
-pub use reverie_procfs::mountinfo::MOUNT_PEER_PREFIXES;
-/// The mountinfo and fdinfo parsers live in `reverie-procfs` (single
-/// grammar owner, PR-3a/PR-3b of the virtual-/proc factoring);
-/// re-exported here so producers and consumers keep one path. The
-/// seed-mount exclusion and mount-identity provenance rules below are
-/// Detcore policy and stay.
-pub use reverie_procfs::mountinfo::MountInfoRow;
-pub use reverie_procfs::mountinfo::parse_fdinfo_mount_id;
-pub use reverie_procfs::mountinfo::parse_mountinfo;
+pub use reverie_proc_grammar::mountinfo::MOUNT_PEER_PREFIXES;
+/// The mountinfo grammar lives in `reverie-proc-grammar` (single
+/// grammar owner since Slice 2 S2-R1; this S2-D1 switch ends
+/// detcore-model's last `reverie-procfs` edge). The legacy
+/// identity-bearing row shape is kept here so producers and
+/// consumers keep one path and change nothing: `raw_device` is
+/// computed with `libc::makedev` at this conversion exactly as the
+/// former procfs shim did, and grammar refusals map to `None`.
+/// The seed-mount exclusion and mount-identity provenance rules
+/// below are Detcore policy and stay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountInfoRow {
+    pub raw_mount_id: u64,
+    pub raw_parent_id: u64,
+    pub raw_device: u64,
+    pub root: Vec<u8>,
+    pub raw_peer_groups: Vec<u64>,
+    /// The superblock options verbatim (the comma-separated field after
+    /// the source, e.g. `ro,relatime`). Callers split on `,`; flags such
+    /// as `ro` versus `rw` come from here when `statmount(2)` is
+    /// unavailable.
+    pub super_options: Vec<u8>,
+}
+
+fn from_grammar(row: reverie_proc_grammar::MountInfoRow) -> MountInfoRow {
+    let raw_peer_groups = row.peer_groups();
+    MountInfoRow {
+        raw_mount_id: row.mount_id,
+        raw_parent_id: row.parent_id,
+        raw_device: libc::makedev(row.device_major, row.device_minor),
+        root: row.root,
+        raw_peer_groups,
+        super_options: row.super_options,
+    }
+}
+
+/// Strictly parse a Linux `/proc/*/mountinfo` snapshot into the
+/// legacy identity-bearing rows. Empty files are valid empty
+/// snapshots; malformed rows and duplicate mount IDs refuse.
+pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
+    reverie_proc_grammar::parse_mountinfo(contents)
+        .ok()
+        .map(|rows| rows.into_iter().map(from_grammar).collect())
+}
+
+/// The one `mnt_id` value an `fdinfo` file carries (the grammar
+/// crate's documented field extractor, not its fdinfo grammar).
+pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
+    reverie_proc_grammar::parse_fdinfo_mount_id(contents)
+}
 
 /// Whether captured mount-identity provenance is well formed: the
 /// namespace order names each raw mount ID once, and the assignment order
@@ -158,6 +199,8 @@ mod tests {
     use super::exclude_ephemeral_host_seed_mounts;
     use super::is_ephemeral_host_seed_mount;
     use super::mount_ids_are_ordered_subset;
+    use super::parse_fdinfo_mount_id;
+    use super::parse_mountinfo;
 
     #[test]
     fn mount_id_subset_requires_unique_members_in_captured_order() {
@@ -239,5 +282,29 @@ mod tests {
             exclude_ephemeral_host_seed_mounts(&contents),
             b"18 1 0:21 / /proc rw - proc proc rw\n100 1 0:70 / /test rw - tmpfs none rw\n77 1 0:51 / /mnt/xarfuse/stable-release rw - fuse.squashfuse_ll squashfuse_ll rw"
         );
+    }
+
+    #[test]
+    fn mountinfo_wrapper_keeps_legacy_shape_and_canonical_refusals() {
+        let rows = parse_mountinfo(b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n")
+            .expect("valid mountinfo row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].raw_mount_id, 37);
+        assert_eq!(rows[0].raw_parent_id, 1);
+        assert_eq!(rows[0].raw_device, libc::makedev(8, 1));
+        assert_eq!(rows[0].root, b"/");
+        assert_eq!(rows[0].raw_peer_groups, [9]);
+        assert_eq!(rows[0].super_options, b"rw");
+        assert_eq!(parse_mountinfo(b""), Some(Vec::new()));
+        // The grammar's canonical rules, as refusals here: no final
+        // newline on a nonempty snapshot, leading-zero decimals, and
+        // unknown numeric optional fields fail closed.
+        assert!(parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_none());
+        assert!(parse_mountinfo(b"037 1 8:1 / / rw - ext4 /dev/root rw\n").is_none());
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw future_peer:19 - ext4 /dev/root rw\n").is_none()
+        );
+        assert_eq!(parse_fdinfo_mount_id(b"pos:\t0\nmnt_id:\t37\n"), Some(37));
+        assert_eq!(parse_fdinfo_mount_id(b"mnt_id:\t37\nmnt_id:\t38\n"), None);
     }
 }

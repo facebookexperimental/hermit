@@ -78,7 +78,7 @@ reverie-kvm = { path = "reverie/reverie-kvm", version = "0.5.7" }
 reverie-liteinst = { path = "reverie/reverie-liteinst", version = "0.5.7", default-features = false }
 reverie-liteinst-artifact = { path = "reverie/reverie-liteinst-artifact", version = "0.5.7", default-features = false }
 reverie-loader = { path = "reverie/reverie-loader", version = "0.5.7" }
-reverie-procfs = { path = "reverie/reverie-procfs", version = "0.5.7" }
+reverie-proc-grammar = { path = "reverie/reverie-proc-grammar", version = "0.5.7" }
 reverie-ptrace = { path = "reverie/reverie-ptrace", version = "0.5.7" }
 reverie-rpc-transport = { path = "reverie/reverie-rpc-transport", version = "0.5.7" }
 reverie-syscalls = { path = "reverie/reverie-syscalls", version = "0.5.7" }

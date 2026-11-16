@@ -367,7 +367,7 @@ dependencies = [
  "libc",
  "nix 0.30.1",
  "reverie-core",
- "reverie-procfs",
+ "reverie-proc-grammar",
  "reverie-syscalls",
  "serde",
  "serde_json",
@@ -1099,6 +1099,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-proc-grammar"
+version = "0.5.7"
+
+[[package]]
 name = "reverie-process"
 version = "0.5.7"
 dependencies = [
@@ -1112,14 +1116,6 @@ dependencies = [
  "syscalls",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "reverie-procfs"
-version = "0.5.7"
-dependencies = [
- "libc",
- "serde",
 ]
 
 [[package]]
