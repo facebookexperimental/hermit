@@ -1581,7 +1581,7 @@ tmpfs), with the capability, or with the overlay.
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. Refused with `--strict`, because host time would reach the guest unbound. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
-| `--cpu-profile PROFILE` | `auto` (the default) gives the guest x86-64-v3 where the run and host qualify and x86-64-v2 elsewhere; `x86-64-v2` and `x86-64-v3` name one profile on every host; see below. |
+| `--cpu-profile PROFILE` | `auto` (the default) gives the guest x86-64-v3 where the run and host qualify and x86-64-v2 elsewhere; `x86-64-v2`, `x86-64-v2-legacy` (the pre-psABI table a pre-split document reruns on; cannot be recorded) and `x86-64-v3` name one profile on every host; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
 | `--virtual-cpus=N` | Tells the guest it has N CPUs (1 to 128) instead of one, so thread pools start N workers; see below. |
 
@@ -1652,8 +1652,28 @@ records the profile and why, as `cpu_profile` with the reason `admitted`
 `qualification-refused`, `request-not-admissible`, `declared` (the program
 declares x86-64-v3, or a recording chose by the declarations) or `explicit`;
 its rerun (`hermit run --from`)
-presents the same profile. A manifest or recording that names no profile
-presents x86-64-v2, the profile every older run presented.
+presents the same profile. x86-64-v2 is exactly the psABI level.
+What an older document means by it is told by its version: a
+recording from before the split (recording version 0x1a0, naming
+x86-64-v2 or no profile) replays on the legacy table it recorded
+with, which also advertised AVX, BMI1, HLE, AVX2, BMI2, RTM and
+ADX; a pre-split manifest (schema v1/v2) or saved run config
+(hermit-run-config/v1) likewise reruns on that table, with the
+migration recorded in the run's manifest as
+`cpu_profile_migration` and a line in the log saying so. That
+table's public name is `x86-64-v2-legacy`: a manifest or saved
+run config such a run writes names it explicitly, so a rerun of
+a rerun presents the same CPU, and it may be named directly to
+rerun what a pre-split document ran. An explicit
+`--cpu-profile` on the command line always wins over a
+document's era; the era maps only a profile the document named
+or left absent. `HERMIT_CPU_PROFILE` does not lift the
+migration either: with a document loaded, the document's
+era-mapped profile wins over the environment variable, which
+supplies a value only where neither the document nor the flag
+names one, so overriding a document's era takes the flag. New recordings record the psABI table's digest
+as well as its name, and replay refuses a digest that is not
+this replayer's. The legacy table cannot be recorded onto.
 
 So software built for x86-64-v3 (CentOS Stream 10's glibc, for example)
 starts wherever v3 can be offered. Where it cannot, its loader prints

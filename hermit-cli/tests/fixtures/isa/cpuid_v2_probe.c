@@ -17,24 +17,13 @@
  * built on any host.
  *
  * It prints only host-independent lines: "v2", then one verdict per
- * check, and exits 0 only if every ordinary check passed and every
- * known CPUID leak is still present exactly as named.
- *
- * The ordinary checks assert the x86-64-v2 features are present and
- * every x86-64-v3 feature (plus RDSEED, AVX-512F, and masked RDRAND)
- * is absent. Hermit's current v2 table
- * (detcore/src/cpuid.rs, CPUIDS) nevertheless advertises AVX,
- * BMI1, HLE, AVX2, BMI2, RTM, and ADX. That is
- * https://github.com/facebookexperimental/hermit/issues/124, not the
- * designed v2 contract. Those seven are therefore strict
- * expected-failure ("known leak") checks: the probe requires each
- * bit to still be set and reports it as LEAK. If one is fixed, the
- * probe reports FIXED and fails the whole run on purpose, so the
- * expected-failure cannot silently linger after the table is fixed;
- * removing it is part of the issue-124 change. glibc still computes
- * level v2 today because OSXSAVE/XSAVE are withheld, which the
- * loader oracle in cpu_profile_v2_rootfs.rs asserts separately; a
- * guest that trusts leaf 7 alone would still see the leaked bits.
+ * check, and exits 0 only if every check passed: the x86-64-v2
+ * features present, and every above-v2 feature absent — AVX, BMI1,
+ * HLE, AVX2, BMI2, RTM and ADX included. Those seven were
+ * advertised by the pre-psABI table until
+ * https://github.com/facebookexperimental/hermit/issues/124 was
+ * fixed; they are ordinary assertions now, so any of them
+ * reappearing turns this probe red.
  */
 
 static void write_all(const char* s, unsigned long len) {
@@ -60,20 +49,6 @@ static void check(const char* what, int ok) {
   write_all(what, str_len(what));
   write_all(ok ? ": ok\n" : ": FAIL\n", ok ? 5 : 7);
   if (!ok) {
-    failures++;
-  }
-}
-
-/* A feature that must be absent under x86-64-v2 but is currently
- * advertised (facebookexperimental/hermit#124). Still advertised is
- * the expected state until that issue is fixed; absent flips this
- * run to FAIL on purpose so the expectation is removed with the fix. */
-static void check_known_leak(const char* what, int advertised) {
-  const char* suffix = advertised ? ": LEAK (facebookexperimental/hermit#124)\n"
-                                  : ": FIXED (facebookexperimental/hermit#124)\n";
-  write_all(what, str_len(what));
-  write_all(suffix, str_len(suffix));
-  if (!advertised) {
     failures++;
   }
 }
@@ -108,16 +83,16 @@ void _start(void) {
           !bit(ecx1, 27) && !bit(ecx1, 29));
   check("rdrand masked", !bit(ecx1, 30));
 
-  check_known_leak("known leak avx hidden", bit(ecx1, 28));
+  check("avx hidden", !bit(ecx1, 28));
 
   leaf(7, 0, r);
   unsigned ebx7 = r[1];
-  check_known_leak("known leak bmi1 hidden", bit(ebx7, 3));
-  check_known_leak("known leak hle hidden", bit(ebx7, 4));
-  check_known_leak("known leak avx2 hidden", bit(ebx7, 5));
-  check_known_leak("known leak bmi2 hidden", bit(ebx7, 8));
-  check_known_leak("known leak rtm hidden", bit(ebx7, 11));
-  check_known_leak("known leak adx hidden", bit(ebx7, 19));
+  check("bmi1 hidden", !bit(ebx7, 3));
+  check("hle hidden", !bit(ebx7, 4));
+  check("avx2 hidden", !bit(ebx7, 5));
+  check("bmi2 hidden", !bit(ebx7, 8));
+  check("rtm hidden", !bit(ebx7, 11));
+  check("adx hidden", !bit(ebx7, 19));
   check("avx512f and rdseed hidden", !bit(ebx7, 16) && !bit(ebx7, 18));
 
   leaf(0x80000001, 0, r);

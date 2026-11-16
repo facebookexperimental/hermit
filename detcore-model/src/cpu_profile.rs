@@ -25,12 +25,32 @@ use serde::Serialize;
     clap::ValueEnum
 )]
 pub enum CpuProfile {
-    /// x86-64-v2: the table every earlier Hermit has served, needing no
-    /// qualification. An absent field means this profile.
+    /// x86-64-v2: exactly the psABI x86-64-v2 level (the
+    /// "Micro-Architecture Levels" table), needing no qualification.
+    /// Fresh runs and new recordings get this table; it is the
+    /// enum's default, so a serialized launch configuration without
+    /// the field means it too.
     #[default]
     #[value(name = "x86-64-v2")]
     #[serde(rename = "x86-64-v2")]
     X86_64V2,
+    /// The pre-psABI x86-64-v2 table (a Broadwell-era capture that
+    /// also advertises AVX, BMI1, HLE, AVX2, BMI2, RTM and ADX;
+    /// facebookexperimental/hermit#124), kept bit-for-bit so stored
+    /// recordings replay against the CPU they recorded with. No
+    /// serialized form written before the split names it: recording
+    /// metadata of that era says `x86-64-v2` (or nothing) and is
+    /// migrated here by recording version at load. Its public name,
+    /// `x86-64-v2-legacy`, is what documents a migrated run writes
+    /// carry, so a rerun presents this table by name; it may also
+    /// be named explicitly to rerun what a pre-split document ran.
+    /// Never recorded (recording refuses it) and never chosen by
+    /// auto: resolution chooses it only for a pre-split document,
+    /// and replay only for a pre-split recording, because that
+    /// document's `x86-64-v2` named this table.
+    #[value(name = "x86-64-v2-legacy")]
+    #[serde(rename = "x86-64-v2-legacy", alias = "x86-64-v2-legacy-broadwell")]
+    X86_64V2LegacyBroadwell,
     /// x86-64-v3: v2 plus AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE and XSAVE.
     /// Offered only on the ptrace backend, on hosts that pass its startup
     /// qualification.
@@ -60,16 +80,27 @@ pub enum CpuProfile {
 }
 
 impl CpuProfile {
-    /// Whether this is the default profile, which needs no qualification and
-    /// binds no host facts.
+    /// Whether this profile needs no qualification and binds no host
+    /// facts: both x86-64-v2 tables. (Not "the default" for launch:
+    /// resolution chooses [`CpuProfile::X86_64V2`]; the legacy
+    /// variant comes only from a pre-split recording or document.)
     pub fn is_default(&self) -> bool {
-        *self == CpuProfile::X86_64V2
+        matches!(
+            self,
+            CpuProfile::X86_64V2 | CpuProfile::X86_64V2LegacyBroadwell
+        )
     }
 
-    /// The name used on the command line.
+    /// The name used on the command line, which is also the serde
+    /// name: one public name per profile everywhere. The two v2
+    /// tables have different names now; recordings written before
+    /// the split say `x86-64-v2` (or nothing) for the legacy table
+    /// and are told apart by recording version at load, not by
+    /// this name.
     pub fn name(&self) -> &'static str {
         match self {
             CpuProfile::X86_64V2 => "x86-64-v2",
+            CpuProfile::X86_64V2LegacyBroadwell => "x86-64-v2-legacy",
             CpuProfile::X86_64V3 => "x86-64-v3",
             CpuProfile::HostNoRdrand => "host-no-rdrand",
             CpuProfile::Auto => "auto",
@@ -94,7 +125,7 @@ impl CpuProfile {
     /// until the CLI resolves it.
     pub fn x86_64_level(&self) -> Option<u8> {
         match self {
-            CpuProfile::X86_64V2 => Some(2),
+            CpuProfile::X86_64V2 | CpuProfile::X86_64V2LegacyBroadwell => Some(2),
             CpuProfile::X86_64V3 => Some(3),
             CpuProfile::HostNoRdrand | CpuProfile::Auto => None,
         }
@@ -242,7 +273,7 @@ pub const HOST_NO_RDRAND_RESIDUAL: &str = host_no_rdrand_residual!();
 
 /// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
 pub const CPU_PROFILE_LONG_HELP: &str = concat!(
-    "The CPU the guest sees: auto (the default), x86-64-v2, x86-64-v3, or host-no-rdrand. \
+    "The CPU the guest sees: auto (the default), x86-64-v2, x86-64-v2-legacy, x86-64-v3, or host-no-rdrand. \
      auto presents x86-64-v3 where the run and host qualify for it and x86-64-v2 everywhere \
      else; name x86-64-v2 for a run whose CPU must not depend on the host. A run qualifies \
      on the ptrace backend, with CPUID virtualized and no --gdbserver, on a host that passes \
@@ -262,7 +293,12 @@ pub const CPU_PROFILE_LONG_HELP: &str = concat!(
      x86-64-v2 elsewhere, where glibc refuses it. Hermit's library launch reads the \
      declarations alone. The chosen profile and why are logged at debug level and written to \
      the run's manifest, and a recording holds the profile; replays and reruns use it and \
-     never choose again. A later exec of an image needing more is refused where each exec is checked \
+     never choose again. x86-64-v2 is exactly the psABI level; recordings made before it \
+     meant that replay on the legacy table they recorded with, under their stored name. \
+     x86-64-v2-legacy is that legacy table's public name: a pre-split manifest or run \
+     config reruns on it, documents such a run writes name it explicitly so a rerun of a \
+     rerun presents the same CPU, and an explicit --cpu-profile on the command line always \
+     wins over a document's era. It cannot be recorded. A later exec of an image needing more is refused where each exec is checked \
      (the ptrace backend), never upgraded; KVM checks only the first image, so a later KVM \
      exec gets no such refusal. Apart from that C library, auto reads no shared library: where \
      only another library declares its need, name the profile. \
@@ -327,14 +363,42 @@ mod tests {
 
     #[test]
     fn names_round_trip_on_the_command_line_and_in_serde() {
+        // Every profile has one public name, on the command line
+        // and in serde alike, the legacy table included: documents
+        // a migrated run writes name it, so a rerun parses it back.
+        let listed: Vec<&str> = CpuProfile::value_variants()
+            .iter()
+            .map(|profile| profile.name())
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "x86-64-v2",
+                "x86-64-v2-legacy",
+                "x86-64-v3",
+                "host-no-rdrand",
+                "auto"
+            ]
+        );
         for profile in CpuProfile::value_variants() {
             assert_eq!(CpuProfile::from_str(profile.name(), false), Ok(*profile));
             let json = serde_json::to_string(profile).unwrap();
             assert_eq!(json, format!("\"{}\"", profile.name()));
             assert_eq!(serde_json::from_str::<CpuProfile>(&json).unwrap(), *profile);
         }
-        assert_eq!(CpuProfile::default(), CpuProfile::X86_64V2);
+        // The interim internal spelling still deserializes, for
+        // documents written while the split was in flight.
+        assert_eq!(
+            serde_json::from_str::<CpuProfile>("\"x86-64-v2-legacy-broadwell\"").unwrap(),
+            CpuProfile::X86_64V2LegacyBroadwell
+        );
+        assert_eq!(
+            CpuProfile::default(),
+            CpuProfile::X86_64V2,
+            "a fresh configuration's absent field means the psABI table"
+        );
         assert!(CpuProfile::X86_64V2.is_default());
+        assert!(CpuProfile::X86_64V2LegacyBroadwell.is_default());
         assert!(!CpuProfile::X86_64V3.is_default());
         assert!(!CpuProfile::HostNoRdrand.is_default());
     }

@@ -398,6 +398,23 @@ fn admit_host_no_rdrand_with(
     Ok(cpu)
 }
 
+/// Recording (not replay) refuses the legacy v2 table: it exists
+/// so recordings and documents from before the psABI split keep
+/// the CPU they saved, and a new recording on it would silently
+/// extend the leaky table's life
+/// (facebookexperimental/hermit#124). Everything
+/// [`check_record_or_replay`] refuses is refused here too.
+pub fn check_record(profile: CpuProfile) -> Result<(), CpuProfileRefusal> {
+    if profile == CpuProfile::X86_64V2LegacyBroadwell {
+        return Err(CpuProfileRefusal::new(
+            profile,
+            "the legacy x86-64-v2 table cannot be recorded; record with \
+             --cpu-profile=x86-64-v2 (the psABI table) or x86-64-v3",
+        ));
+    }
+    check_record_or_replay(profile)
+}
+
 /// A recording currently binds only the v3 host facts, not a complete native
 /// CPUID snapshot. Refuse host mode before writing metadata or launching a
 /// guest rather than accidentally treating it as v3.
@@ -1343,6 +1360,34 @@ fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, A
         probe_cases,
         probe_forced_exit,
     })
+}
+
+/// A recording on the psABI x86-64-v2 table binds that table's digest;
+/// replay refuses a recording whose digest is absent or not the one
+/// this replayer computes, so a future table change cannot silently
+/// replay it against a different CPU (the hole the legacy split
+/// closes going forward). Legacy-table recordings carry no digest
+/// and are not checked here.
+pub fn check_recorded_table_digest(
+    profile: CpuProfile,
+    recorded_digest: Option<&str>,
+) -> Result<(), CpuProfileRefusal> {
+    let refuse = |why: String| CpuProfileRefusal::new(profile, why);
+    let recorded_digest = recorded_digest.ok_or_else(|| {
+        refuse("the recording names x86-64-v2 (psABI) but carries no CPUID table digest".into())
+    })?;
+    let config = detcore::Config {
+        cpu_profile: profile,
+        ..Default::default()
+    };
+    let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&config));
+    if recorded_digest != digest.as_str() {
+        return Err(refuse(format!(
+            "the recording's CPUID table digest {recorded_digest:?} is not this replayer's \
+             {digest}"
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses a v3 replay before the qualification probe runs when the recording
@@ -2296,6 +2341,11 @@ pub(crate) mod tests {
             detail: Some("AMX".into()),
         };
         let written = serde_json::to_value(&choice).unwrap();
+        // One name everywhere a manifest speaks: the fresh psABI
+        // choice and a pre-split manifest both say "x86-64-v2" here;
+        // the era that tells the tables apart is the manifest
+        // schema (and, for recordings, the recording version), not
+        // a second spelling.
         assert_eq!(
             written,
             serde_json::json!({
@@ -2490,6 +2540,43 @@ pub(crate) mod tests {
         assert_eq!(
             CpuProfileRefusal::new(CpuProfile::HostNoRdrand, "no faulting").to_string(),
             "--cpu-profile host-no-rdrand refused: no faulting"
+        );
+    }
+
+    /// Recording on the legacy table is refused by name: it exists
+    /// for pre-split recordings and documents, and a fresh default
+    /// is the psABI table.
+    #[test]
+    fn recording_the_legacy_table_is_refused() {
+        let refused = check_record(CpuProfile::X86_64V2LegacyBroadwell).unwrap_err();
+        assert!(refused.reason.contains("cannot be recorded"), "{refused}");
+        assert_eq!(check_record(CpuProfile::X86_64V2), Ok(()));
+    }
+
+    /// A psABI-v2 recording binds its table digest: the right one
+    /// passes, a wrong or absent one is refused by name, so a future
+    /// table change cannot silently replay it elsewhere.
+    #[test]
+    fn psabi_v2_replay_requires_the_recorded_table_digest() {
+        let profile = CpuProfile::X86_64V2;
+        let config = detcore::Config {
+            cpu_profile: profile,
+            ..Default::default()
+        };
+        let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&config));
+        assert_eq!(
+            check_recorded_table_digest(profile, Some(&digest)),
+            Ok(())
+        );
+        let wrong = check_recorded_table_digest(profile, Some("00")).unwrap_err();
+        assert!(
+            wrong.reason.contains("CPUID table digest"),
+            "{wrong}"
+        );
+        let absent = check_recorded_table_digest(profile, None).unwrap_err();
+        assert!(
+            absent.reason.contains("carries no CPUID table digest"),
+            "{absent}"
         );
     }
 

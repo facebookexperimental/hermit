@@ -1,0 +1,15 @@
+v2
+sse2 advertised: ok
+v2 features advertised: ok
+v3 leaf1 features hidden: ok
+rdrand masked: ok
+known leak avx hidden: LEAK (facebookexperimental/hermit#124)
+known leak bmi1 hidden: LEAK (facebookexperimental/hermit#124)
+known leak hle hidden: LEAK (facebookexperimental/hermit#124)
+known leak avx2 hidden: LEAK (facebookexperimental/hermit#124)
+known leak bmi2 hidden: LEAK (facebookexperimental/hermit#124)
+known leak rtm hidden: LEAK (facebookexperimental/hermit#124)
+known leak adx hidden: LEAK (facebookexperimental/hermit#124)
+avx512f and rdseed hidden: ok
+lahf advertised: ok
+lzcnt hidden: ok

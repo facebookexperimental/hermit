@@ -2797,6 +2797,20 @@ pub struct RunOpts {
     #[clap(skip)]
     cpu_profile_choice: Option<hermit::cpu_profile_admission::ProfileChoice>,
 
+    /// Runtime-only: the document expansion loaded (--config schema
+    /// v1 or manifest schema v1/v2) predates x86-64-v2 meaning the
+    /// psABI table, so a v2 it resolves to is mapped back to the
+    /// legacy table it saved. Set once by `main` from expansion.
+    #[clap(skip)]
+    pre_psabi_v2: bool,
+
+    /// Runtime-only: resolution mapped this run's x86-64-v2 back to
+    /// the legacy table under [`Self::pre_psabi_v2`]. The run's
+    /// manifest records it (`cpu_profile_migration`), durably,
+    /// where the debug log line alone would not survive.
+    #[clap(skip)]
+    cpu_profile_migrated: bool,
+
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
     /// replace it to reach both on a host whose counters pass.
@@ -13596,6 +13610,16 @@ impl RunOpts {
         use hermit::cpu_profile_admission::ProfileReason;
         let profile = self.det_opts.det_config.cpu_profile;
         if profile != CpuProfile::Auto {
+            let era_profile = self.era_profile(profile);
+            if era_profile != profile {
+                self.cpu_profile_migrated = true;
+                self.auto_log.push(
+                    "pre-psABI document: x86-64-v2 reruns on the legacy table it saved"
+                        .to_owned(),
+                );
+            }
+            let profile = era_profile;
+            self.det_opts.det_config.cpu_profile = profile;
             self.cpu_profile_choice = Some(ProfileChoice {
                 profile,
                 reason: ProfileReason::Explicit,
@@ -13628,6 +13652,16 @@ impl RunOpts {
         };
         let auto = hermit::cpu_profile_admission::choose_auto(needs, &self.cpu_profile_request())
             .map_err(Error::msg)?;
+        // A v2 an old document's auto resolves to is the legacy
+        // table it saved, resolved the pre-split way.
+        let mut auto = auto;
+        let migrated = self.era_profile(auto.choice.profile) != auto.choice.profile;
+        if migrated {
+            auto.choice.profile = CpuProfile::X86_64V2LegacyBroadwell;
+            auto.log.push(
+                "pre-psABI document: x86-64-v2 reruns on the legacy table it saved".to_owned(),
+            );
+        }
         // An x86-64-v3 the host admitted names the C library where it declares
         // x86-64-v3, as `hermit record start` records it. The choice is the same
         // either way; the C library is read only for an admitted choice.
@@ -13655,6 +13689,7 @@ impl RunOpts {
                 .push(detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
         }
         self.cpu_profile_choice = Some(auto.choice);
+        self.cpu_profile_migrated = migrated;
         self.det_opts.det_config.cpu_profile = profile;
         Ok(())
     }
@@ -19820,6 +19855,26 @@ impl RunOpts {
         self.det_opts.det_config.cpu_profile = profile;
     }
 
+    /// Note that expansion loaded a pre-psABI document, so an
+    /// x86-64-v2 this run resolves to presents the legacy table.
+    pub(crate) fn note_pre_psabi_document(&mut self) {
+        self.pre_psabi_v2 = true;
+    }
+
+    /// The profile a resolved x86-64-v2 means for this run: the
+    /// legacy table when the loaded document predates the split.
+    fn era_profile(
+        &self,
+        profile: detcore_model::cpu_profile::CpuProfile,
+    ) -> detcore_model::cpu_profile::CpuProfile {
+        use detcore_model::cpu_profile::CpuProfile;
+        if self.pre_psabi_v2 && profile == CpuProfile::X86_64V2 {
+            CpuProfile::X86_64V2LegacyBroadwell
+        } else {
+            profile
+        }
+    }
+
     /// Retain source identity independently of YAML capture, which may fail
     /// for a non-UTF-8 argument and does not run for embedded OCI commands.
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
@@ -20136,8 +20191,14 @@ impl RunOpts {
         }
         // The profile auto resolved to, given or not: loading the config
         // (`--config`, or `--from` a manifest) runs that profile and never
-        // derives one again.
-        if self.auto_resolution.is_some() {
+        // derives one again. The legacy table likewise: a document this
+        // run writes names x86-64-v2-legacy explicitly, never the
+        // x86-64-v2 token a pre-split document carried, so a rerun of
+        // the rerun presents the same CPU instead of switching tables.
+        if self.auto_resolution.is_some()
+            || self.det_opts.det_config.cpu_profile
+                == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
+        {
             config.run.insert(
                 CPU_PROFILE_KEY.to_owned(),
                 self.det_opts.det_config.cpu_profile.name().into(),
@@ -20440,6 +20501,14 @@ impl RunOpts {
             document = document.with_image(image);
         }
         document.cpu_profile = self.cpu_profile_choice.clone();
+        if self.cpu_profile_migrated {
+            document.cpu_profile_migration = Some(
+                "pre-psabi-document: the loaded document predates the x86-64-v2 psABI \
+                 split, so its x86-64-v2 presented the legacy table \
+                 (x86-64-v2-legacy) it saved"
+                    .to_owned(),
+            );
+        }
         document.cpu_profile_residual =
             crate::app::manifest::residual_of(self.cpu_profile_choice.as_ref());
         let path = match &network_trace {

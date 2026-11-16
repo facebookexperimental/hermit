@@ -36,7 +36,7 @@
 //!
 //! ```json
 //! {
-//!   "schema": "hermit-recording-manifest/v1",
+//!   "schema": "hermit-recording-manifest/v3",
 //!   "hermit": {"version": "0.4.1 (...)"},
 //!   "id": "3f2a91...",
 //!   "kind": "inputs-only",
@@ -91,6 +91,15 @@ pub(crate) const SCHEMA: &str = "hermit-recording-manifest/v1";
 /// The reader accepts both revisions; the writer uses this one only when an
 /// image identity is present, so existing v1 recordings stay readable.
 pub(crate) const SCHEMA_V2: &str = "hermit-recording-manifest/v2";
+
+/// The schema revision from the x86-64-v2 psABI split: a manifest at
+/// this revision that names x86-64-v2 means the psABI table, while
+/// v1/v2 documents were written when the name meant the legacy
+/// Broadwell table, so rerunning one migrates its v2 to that table
+/// (named `x86-64-v2-legacy` in what the rerun writes) instead of
+/// silently presenting another CPU. The writer always uses this
+/// revision now.
+pub(crate) const SCHEMA_V3: &str = "hermit-recording-manifest/v3";
 
 /// The manifest file's name inside its recording directory.
 pub(crate) const MANIFEST_NAME: &str = hermit::MANIFEST_NAME;
@@ -528,7 +537,8 @@ impl Image {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
-    /// Always [`SCHEMA`].
+    /// The format revision that wrote it; new documents write
+    /// [`SCHEMA_V3`].
     pub(crate) schema: String,
     pub(crate) hermit: Writer,
     pub(crate) id: String,
@@ -554,6 +564,12 @@ pub(crate) struct Manifest {
     /// x86-64-v2, and for a run auto could not resolve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cpu_profile: Option<hermit::cpu_profile_admission::ProfileChoice>,
+    /// Why this run presented the legacy table, when a pre-split
+    /// document's x86-64-v2 migrated to it: the durable record of
+    /// the migration, beside the debug log line. Absent when no
+    /// migration applied (including an explicit x86-64-v2-legacy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_profile_migration: Option<String>,
     /// For an x86-64-v3 run, what its qualification leaves uncovered
     /// (`detcore_model::cpu_profile::V3_RESIDUAL`), as a recording's metadata
     /// states it. A `--verify` match prints it on stderr only where the user
@@ -570,7 +586,7 @@ impl Manifest {
     /// A manifest of `kind` for a run of `command` with `inputs`.
     pub(crate) fn new(id: Id, kind: Kind, command: Command, inputs: Inputs) -> Self {
         Manifest {
-            schema: SCHEMA.to_owned(),
+            schema: SCHEMA_V3.to_owned(),
             hermit: Writer {
                 version: crate::app::version::Version::get().to_owned(),
             },
@@ -582,16 +598,20 @@ impl Manifest {
             image: None,
             preemption: None,
             cpu_profile: None,
+            cpu_profile_migration: None,
             cpu_profile_residual: None,
             exit: None,
             artifacts: None,
         }
     }
 
-    /// Attach a resolved input-image identity, promoting the document to
-    /// the schema revision that defines the field.
+    /// Attach a resolved input-image identity. New documents are
+    /// already at the current schema revision, which defines the
+    /// field; a document read at an older revision keeps its own.
     pub(crate) fn with_image(mut self, image: Image) -> Self {
-        self.schema = SCHEMA_V2.to_owned();
+        if self.schema == SCHEMA {
+            self.schema = SCHEMA_V2.to_owned();
+        }
         self.image = Some(image);
         self
     }
@@ -768,12 +788,12 @@ pub(crate) fn parse(text: &str) -> Result<Manifest, Error> {
     let manifest: Manifest =
         serde_json::from_str(text).context("the file is not a hermit manifest")?;
     anyhow::ensure!(
-        manifest.schema == SCHEMA || manifest.schema == SCHEMA_V2,
-        "the manifest's schema is {:?}; this hermit reads {SCHEMA:?} and {SCHEMA_V2:?}",
+        manifest.schema == SCHEMA || manifest.schema == SCHEMA_V2 || manifest.schema == SCHEMA_V3,
+        "the manifest's schema is {:?}; this hermit reads {SCHEMA:?}, {SCHEMA_V2:?} and {SCHEMA_V3:?}",
         manifest.schema
     );
     anyhow::ensure!(
-        manifest.schema == SCHEMA_V2 || manifest.image.is_none(),
+        manifest.schema != SCHEMA || manifest.image.is_none(),
         "a {SCHEMA} manifest cannot carry an image identity"
     );
     anyhow::ensure!(
@@ -1265,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn an_image_manifest_uses_schema_v2_and_survives_write_and_read() {
+    fn an_image_manifest_uses_the_current_schema_and_survives_write_and_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("id").join(MANIFEST_NAME);
         let manifest = sample().with_image(Image {
@@ -1275,20 +1295,20 @@ mod tests {
             manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
             image_id: Some("a".repeat(64)),
         });
-        assert_eq!(manifest.schema, SCHEMA_V2);
+        assert_eq!(manifest.schema, SCHEMA_V3);
         write(&path, &manifest).unwrap();
         assert_eq!(read(&path).unwrap(), manifest);
     }
 
     #[test]
-    fn a_no_image_manifest_serializes_exactly_as_v1() {
+    fn a_no_image_manifest_serializes_exactly_as_v3() {
         let mut manifest = sample();
         manifest.hermit.version = "test".to_owned();
         manifest.id = "abc".to_owned();
         manifest.created = "2026-10-13T23:55:00.000000Z".to_owned();
         let text = serde_json::to_string_pretty(&manifest).unwrap();
         let expected = r#"{
-  "schema": "hermit-recording-manifest/v1",
+  "schema": "hermit-recording-manifest/v3",
   "hermit": {
     "version": "test"
   },
@@ -1329,8 +1349,11 @@ mod tests {
             manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
             image_id: Some("a".repeat(64)),
         });
-        let valid_v2: serde_json::Value =
+        // The writer is at v3 now; shape this document as the v2
+        // revision whose invariants are under test here.
+        let mut valid_v2: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&image_manifest).unwrap()).unwrap();
+        valid_v2["schema"] = SCHEMA_V2.into();
         assert!(parse(&valid_v2.to_string()).is_ok());
 
         let mut v1_with_image = valid_v2.clone();
@@ -1384,7 +1407,7 @@ mod tests {
     #[test]
     fn another_schema_and_unknown_keys_are_refused() {
         let text = serde_json::to_string(&sample()).unwrap();
-        let other = text.replace(SCHEMA, "hermit-recording-manifest/v0");
+        let other = text.replace(SCHEMA_V3, "hermit-recording-manifest/v0");
         assert!(parse(&other).is_err());
         let unknown = text.replacen('{', "{\"surprise\":1,", 1);
         assert!(parse(&unknown).is_err());

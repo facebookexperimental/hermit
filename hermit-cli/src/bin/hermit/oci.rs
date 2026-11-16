@@ -131,6 +131,13 @@ impl OciOpts {
         Ok(())
     }
 
+    /// Forward the pre-psABI document note to the embedded run.
+    pub(crate) fn note_pre_psabi_document(&mut self) {
+        if let OciSubcommand::Run(opts) = &mut self.command {
+            opts.run.note_pre_psabi_document();
+        }
+    }
+
     /// Preserve the embedded run's explicit maximum separately from its default.
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         if let OciSubcommand::Run(opts) = &mut self.command {

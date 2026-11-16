@@ -63546,12 +63546,21 @@ impl UnpinnedRun {
 /// The profile Detcore's debug configuration line shows in `log`, which a
 /// v3 run binds host facts for and a v2 run does not.
 fn logged_profile(log: &str) -> Option<&'static str> {
-    if log.contains("cpu_profile: X86_64V3") && log.contains("cpu_profile_host: Some(") {
-        Some("x86-64-v3")
-    } else if log.contains("cpu_profile: X86_64V2") && log.contains("cpu_profile_host: None") {
-        Some("x86-64-v2")
-    } else {
-        None
+    // The whole Debug token, so the legacy variant can never be
+    // read as its psABI prefix: `X86_64V2LegacyBroadwell` is a
+    // different answered than `X86_64V2`.
+    let token = log.split("cpu_profile: ").nth(1).map(|rest| {
+        rest.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+    })?;
+    match token.as_str() {
+        "X86_64V3" if log.contains("cpu_profile_host: Some(") => Some("x86-64-v3"),
+        "X86_64V2" if log.contains("cpu_profile_host: None") => Some("x86-64-v2"),
+        "X86_64V2LegacyBroadwell" if log.contains("cpu_profile_host: None") => {
+            Some("x86-64-v2-legacy")
+        }
+        _ => None,
     }
 }
 
@@ -64663,14 +64672,16 @@ fn record_start_keeps_or_states_what_auto_chose_by_the_host() {
 }
 
 /// On a host where auto presents x86-64-v3, a manifest written before the
-/// profile was saved (no `cpu-profile` key) reruns as x86-64-v2, by `hermit
-/// run --from` and by `hermit replay`, and so does a recording whose metadata
-/// names no profile: both ran x86-64-v2, the only default an older Hermit
-/// had. Elsewhere the contrast cannot be shown, so the test records a named
+/// profile was saved (no `cpu-profile` key) reruns on the legacy x86-64-v2
+/// table, by `hermit run --from` and by `hermit replay`: it ran the table
+/// an older Hermit's x86-64-v2 named, which the pre-split schema it
+/// carries migrates to. (A pre-split recording's migration is covered by
+/// the genuine-fixture test below, not by relabelling a new recording.)
+/// Elsewhere the contrast cannot be shown, so the test records a named
 /// skip, or fails under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
 #[test]
-fn a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2() {
-    let test = "a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2";
+fn a_manifest_without_a_profile_reruns_on_the_legacy_table() {
+    let test = "a_manifest_without_a_profile_reruns_on_the_legacy_table";
     let unmarked = isa_fixture("old-inputs-unmarked", None, 0, IsaLink::Static);
     let unmarked = unmarked.to_str().unwrap();
     let attempt = || {
@@ -64716,6 +64727,12 @@ fn a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2() {
         .unwrap()
         .remove("cpu-profile");
     manifest.as_object_mut().unwrap().remove("cpu_profile");
+    // An old manifest is not just a new one with keys removed: it
+    // carries the pre-split schema, under which x86-64-v2 named the
+    // legacy table. It migrates to that table at resolution, so it
+    // reruns on the CPU it recorded, exact-token distinguishable
+    // from the psABI table in the log.
+    manifest["schema"] = "hermit-recording-manifest/v1".into();
     fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     let directory = path.parent().unwrap();
     let id = directory.file_name().unwrap().to_str().unwrap();
@@ -64731,7 +64748,7 @@ fn a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2() {
         );
         assert_eq!(
             logged_profile(&stderr),
-            Some("x86-64-v2"),
+            Some("x86-64-v2-legacy"),
             "{args:?}:\n{stderr}"
         );
         assert!(
@@ -64739,40 +64756,477 @@ fn a_manifest_without_a_profile_and_an_old_recording_rerun_as_v2() {
             "{args:?}:\n{stderr}"
         );
     }
-    // An older Hermit's recording: its metadata names no profile.
-    let image = isa_fixture("old-recording-unmarked", None, 0, IsaLink::Static);
-    let image = image.to_str().unwrap();
-    let recorded = UnpinnedRun::new();
-    let (status, stdout, stderr) = recorded.run(
-        &["record", "start", "--cpu-profile", "x86-64-v2", "--", image],
+}
+
+/// Writes a pre-split (hermit-run-config/v1) run config naming
+/// x86-64-v2 for `program`, in a scratch directory the caller keeps.
+fn v1_run_config(program: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = directory.path().join("old.yaml");
+    fs::write(
+        &path,
+        format!(
+            "schema: hermit-run-config/v1\nrun: {{cpu-profile: x86-64-v2}}\nprogram: {program}\n"
+        ),
+    )
+    .unwrap();
+    (directory, path)
+}
+
+/// A saved run config from before the split (schema
+/// hermit-run-config/v1) naming x86-64-v2 reruns on the legacy
+/// table on any host — no x86-64-v3 contrast needed — the
+/// manifest it writes names x86-64-v2-legacy explicitly, and the
+/// migration is recorded in the manifest durably.
+#[test]
+fn a_v1_run_config_reruns_on_the_legacy_table_and_records_the_migration() {
+    let unmarked = isa_fixture("v1-config-unmarked", None, 0, IsaLink::Static);
+    let (_scratch, config) = v1_run_config(unmarked.to_str().unwrap());
+    let config = config.to_str().unwrap();
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "--log=debug",
+            "run",
+            "--config",
+            config,
+            "--manifest=always",
+        ],
         &[],
     );
     assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
-    let metadata_path = fs::read_dir(recorded.data())
-        .unwrap()
-        .map(|entry| entry.unwrap().path().join("metadata.json"))
-        .find(|path| path.is_file())
-        .expect("no recording metadata.json");
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (_, manifest) = &manifests[0];
+    assert_eq!(
+        manifest["inputs"]["run"]["cpu-profile"], "x86-64-v2-legacy",
+        "{manifest:#}"
+    );
+    assert_eq!(
+        manifest["cpu_profile"]["profile"], "x86-64-v2-legacy",
+        "{manifest:#}"
+    );
+    let migration = manifest["cpu_profile_migration"].as_str().unwrap_or("");
+    assert!(
+        migration.contains("x86-64-v2-legacy"),
+        "the manifest records the migration and its reason: {manifest:#}"
+    );
+}
+
+/// An explicit `--cpu-profile` on the command line wins over a
+/// pre-split document: its x86-64-v2 is the psABI table the name
+/// means today, and no migration is recorded.
+#[test]
+fn an_explicit_cpu_profile_wins_over_a_pre_psabi_document() {
+    let unmarked = isa_fixture("v1-config-override-unmarked", None, 0, IsaLink::Static);
+    let (_scratch, config) = v1_run_config(unmarked.to_str().unwrap());
+    let config = config.to_str().unwrap();
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "--log=debug",
+            "run",
+            "--config",
+            config,
+            "--cpu-profile=x86-64-v2",
+            "--manifest=always",
+        ],
+        &[],
+    );
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{stderr}");
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (_, manifest) = &manifests[0];
+    assert_eq!(manifest["cpu_profile"]["profile"], "x86-64-v2", "{manifest:#}");
+    assert!(
+        manifest.get("cpu_profile_migration").is_none(),
+        "no migration applied, so none is recorded: {manifest:#}"
+    );
+}
+
+/// A rerun of an era-migrated manifest stays on the legacy
+/// table: the migrated run writes x86-64-v2-legacy explicitly
+/// into its own manifest, so the second rerun presents the same
+/// CPU by name, with no era left to migrate.
+#[test]
+fn a_rerun_of_an_era_migrated_manifest_stays_on_the_legacy_table() {
+    let unmarked = isa_fixture("era-rerun-unmarked", None, 0, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "--log=debug",
+            "run",
+            "--cpu-profile=x86-64-v2",
+            "--manifest=always",
+            "--",
+            unmarked,
+        ],
+        &[],
+    );
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{stderr}");
+
+    // The old document: the same manifest at the pre-split
+    // schema, with no recorded choice. Its inputs still name
+    // x86-64-v2, which meant the legacy table then.
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (old_path, mut old) = manifests.into_iter().next().unwrap();
+    assert_eq!(old["inputs"]["run"]["cpu-profile"], "x86-64-v2", "{old:#}");
+    old.as_object_mut().unwrap().remove("cpu_profile");
+    old["schema"] = "hermit-recording-manifest/v1".into();
+    fs::write(&old_path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+    // Each rerun writes one new manifest; name the new one.
+    let rerun = |from: &Path| {
+        let before: Vec<PathBuf> = run.manifests().into_iter().map(|(path, _)| path).collect();
+        let from = from.to_str().unwrap();
+        let (status, stdout, stderr) = run.run(
+            &["--log=debug", "run", "--from", from, "--manifest=always"],
+            &[],
+        );
+        assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+        assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+        let mut written: Vec<(PathBuf, serde_json::Value)> = run
+            .manifests()
+            .into_iter()
+            .filter(|(path, _)| !before.contains(path))
+            .collect();
+        assert_eq!(written.len(), 1, "{stderr}");
+        written.pop().unwrap()
+    };
+
+    let old_dir = old_path.parent().unwrap().to_path_buf();
+    let (second_path, second) = rerun(&old_dir);
+    assert_eq!(
+        second["inputs"]["run"]["cpu-profile"], "x86-64-v2-legacy",
+        "the migrated run writes its profile by its public name: {second:#}"
+    );
+    assert_eq!(
+        second["cpu_profile"]["profile"], "x86-64-v2-legacy",
+        "{second:#}"
+    );
+    assert!(
+        second["cpu_profile_migration"]
+            .as_str()
+            .is_some_and(|text| text.contains("x86-64-v2-legacy")),
+        "the migrated run records its migration: {second:#}"
+    );
+
+    let second_dir = second_path.parent().unwrap().to_path_buf();
+    let (_, third) = rerun(&second_dir);
+    assert_eq!(
+        third["inputs"]["run"]["cpu-profile"], "x86-64-v2-legacy",
+        "{third:#}"
+    );
+    assert_eq!(
+        third["cpu_profile"]["profile"], "x86-64-v2-legacy",
+        "{third:#}"
+    );
+    assert!(
+        third.get("cpu_profile_migration").is_none(),
+        "the second rerun names the table directly; nothing migrated: {third:#}"
+    );
+}
+
+/// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest
+/// replays bit for bit on the legacy table its era migrates to.
+/// The fixture under tests/fixtures/recordings was recorded by a
+/// pre-fix binary (see its README); its guest prints a LEAK line
+/// per leaked bit, so replaying it on the psABI table instead —
+/// which is what removing the load-time migration would do —
+/// changes its output and its exit status, and this test goes red.
+/// The copy whose version is edited to the psABI era must instead
+/// be refused: no digest was ever recorded for it to bind.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
+    const ID: &str = "7a1b8833fde348c785270b61161d3a17";
+    fn copy_recording(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_recording(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/recordings")
+        .join(ID);
+    let expected = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/recordings")
+            .join(format!("{ID}-expected-stdout.txt")),
+    )
+    .unwrap();
+    let run = UnpinnedRun::new();
+    copy_recording(&fixture, &run.data().join(ID));
+    let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    assert_eq!(
+        (status, stdout.as_str()),
+        (Some(0), expected.as_str()),
+        "{stderr}"
+    );
+    assert_eq!(
+        logged_profile(&stderr),
+        Some("x86-64-v2-legacy"),
+        "{stderr}"
+    );
+
+    // The same recording claiming the psABI era carries no table
+    // digest for replay to bind, so it is refused by name.
+    let edited = UnpinnedRun::new();
+    copy_recording(&fixture, &edited.data().join(ID));
+    let metadata_path = edited.data().join(ID).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["cpu_profile"], "x86-64-v2", "{metadata:#}");
-    for key in [
-        "cpu_profile",
-        "cpu_profile_host",
-        "cpu_table_digest",
-        "cpu_profile_residual",
-    ] {
-        metadata.as_object_mut().unwrap().remove(key);
-    }
+    metadata["version"] = 0x1a1.into();
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let id = metadata_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap();
-    let (status, _, stderr) = recorded.run(&["--log=debug", "replay", "--autopilot", id], &[]);
-    assert_eq!(status, Some(0), "{stderr}");
-    assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{stderr}");
+    let (status, stdout, stderr) =
+        edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    assert_ne!(status, Some(0), "{stderr}");
+    assert_ne!(stdout, expected, "{stderr}");
+    assert!(
+        stderr.contains("carries no CPUID table digest"),
+        "{stderr}"
+    );
+
+    // The output-discriminating control: the same recording claiming
+    // the psABI era WITH that table's digest passes the digest gate
+    // and replays on the psABI table, where the guest's branches on
+    // the seven bits go the other way and the replay departs from
+    // the recorded output instead of reproducing it. This is what
+    // removing the load-time migration would do to the genuine
+    // replay above, so the migration is pinned by output, not only
+    // by the refusal.
+    let forced = UnpinnedRun::new();
+    copy_recording(&fixture, &forced.data().join(ID));
+    let metadata_path = forced.data().join(ID).join("metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    metadata["version"] = 0x1a1.into();
+    let digest = detcore::virtual_cpuid_digest(&detcore::Config {
+        cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
+        ..Default::default()
+    });
+    metadata["cpu_table_digest"] = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .into();
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    let (status, stdout, stderr) =
+        forced.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    assert!(
+        !stderr.contains("CPUID table digest"),
+        "the forced copy must pass the digest gate:\n{stderr}"
+    );
+    assert_eq!(
+        logged_profile(&stderr),
+        Some("x86-64-v2"),
+        "the forced copy must present the psABI table:\n{stderr}"
+    );
+    assert_ne!(status, Some(0), "{stderr}");
+    // The departure is exactly at the first discriminating line:
+    // every line the two tables answer alike is reproduced, and
+    // the replay stops on the write whose verdict the psABI
+    // table flips, so stdout ends mid-line there.
+    assert_eq!(
+        stdout,
+        "v2\n\
+         sse2 advertised: ok\n\
+         v2 features advertised: ok\n\
+         v3 leaf1 features hidden: ok\n\
+         rdrand masked: ok\n\
+         known leak avx hidden",
+        "the forced replay must depart at the first leak line:\n{stderr}"
+    );
+}
+
+/// `record start` refuses the legacy table by name before any
+/// guest runs: it exists for pre-split recordings and documents,
+/// and a new recording on it would extend the leaky table's life.
+#[test]
+fn record_start_refuses_the_legacy_table_by_name() {
+    let unmarked = isa_fixture("record-legacy-unmarked", None, 0, IsaLink::Static);
+    let unmarked = unmarked.to_str().unwrap();
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "record",
+            "start",
+            "--cpu-profile=x86-64-v2-legacy",
+            "--",
+            unmarked,
+        ],
+        &[],
+    );
+    assert_eq!(stdout, "", "{stderr}");
+    assert_eq!(
+        status,
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v2-legacy refused")
+            && stderr.contains("cannot be recorded"),
+        "{stderr}"
+    );
+}
+
+/// With a pre-split document loaded, HERMIT_CPU_PROFILE does not
+/// displace the document's own profile — the environment
+/// supplies a value only where neither the document nor the
+/// flag names one — so the document's era-mapped legacy table
+/// wins over the environment, and the migration is recorded.
+/// Only an explicit --cpu-profile flag overrides the era (the
+/// companion test above).
+#[test]
+fn hermit_cpu_profile_in_the_environment_does_not_lift_a_documents_migration() {
+    let unmarked = isa_fixture("v1-config-env-unmarked", None, 0, IsaLink::Static);
+    let (_scratch, config) = v1_run_config(unmarked.to_str().unwrap());
+    let config = config.to_str().unwrap();
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "--log=debug",
+            "run",
+            "--config",
+            config,
+            "--manifest=always",
+        ],
+        &[("HERMIT_CPU_PROFILE", "x86-64-v2")],
+    );
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let (_, manifest) = &manifests[0];
+    assert!(
+        manifest["cpu_profile_migration"]
+            .as_str()
+            .is_some_and(|text| text.contains("x86-64-v2-legacy")),
+        "the migration is recorded even with the env var set: {manifest:#}"
+    );
+}
+
+/// The checked-in pre-split recording is exported publicly, so no file
+/// of it may carry the recording host's environment: no
+/// home-directory paths, host names, or internal tree or domain
+/// names. The fixture was recorded with `--base-env=minimal` from a
+/// neutral scratch directory for exactly this property (see its
+/// README); this scan keeps a future re-record honest.
+#[test]
+fn the_checked_in_pre_psabi_recording_carries_no_host_environment() {
+    const FORBIDDEN: &[&[u8]] = &[
+        b"/home/",
+        b"devbig",
+        b"internalfb",
+        b"facebook.com",
+        b"fbcode",
+        b"dev-hermit",
+    ];
+    fn hits_in(path: &Path, bytes: &[u8], hits: &mut Vec<String>) {
+        for needle in FORBIDDEN {
+            if bytes.windows(needle.len()).any(|w| w == *needle) {
+                hits.push(format!(
+                    "{} contains {}",
+                    path.display(),
+                    String::from_utf8_lossy(needle)
+                ));
+            }
+        }
+    }
+    // Paths a recording stores as byte arrays (mount-table roots
+    // and the like) are invisible to a raw scan of the JSON text:
+    // decode every all-byte array in the parsed documents, and
+    // scan their strings too.
+    fn scan_json(path: &Path, value: &serde_json::Value, hits: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => hits_in(path, text.as_bytes(), hits),
+            serde_json::Value::Array(items) => {
+                let bytes: Option<Vec<u8>> = items
+                    .iter()
+                    .map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+                    .collect();
+                if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
+                    hits_in(path, &bytes, hits);
+                }
+                for item in items {
+                    scan_json(path, item, hits);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for value in map.values() {
+                    scan_json(path, value, hits);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn scan(dir: &Path, hits: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                scan(&path, hits);
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                hits_in(&path, &bytes, hits);
+                if path.extension().is_some_and(|ext| ext == "json")
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                {
+                    scan_json(&path, &value, hits);
+                }
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recordings");
+    let mut hits = Vec::new();
+    scan(&root, &mut hits);
+    assert!(
+        hits.is_empty(),
+        "host environment leaked into the checked-in recording:\n{}",
+        hits.join("\n")
+    );
+
+    // The recorded guest environment is exactly the synthetic
+    // minimal set `--base-env=minimal` presents, key for key:
+    // anything else in `envs` came from a recording host.
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            root.join("7a1b8833fde348c785270b61161d3a17")
+                .join("metadata.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let env_keys: BTreeSet<&str> = metadata["envs"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        env_keys,
+        BTreeSet::from([
+            "ASAN_OPTIONS",
+            "HOME",
+            "HOSTNAME",
+            "LOGNAME",
+            "LSAN_OPTIONS",
+            "PATH",
+            "USER"
+        ]),
+        "the checked-in recording's guest environment is not the minimal set"
+    );
 }
 
 /// Runs `image` with `--cpu-profile auto`, which `what` makes resolve to

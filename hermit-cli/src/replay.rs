@@ -63,6 +63,27 @@ fn qualified_host_facts(
     metadata: &Metadata,
     gdbserver: bool,
 ) -> Result<Option<detcore_model::cpu_profile::HostXstate>, Error> {
+    if metadata.cpu_profile
+        == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
+        && metadata.version >= crate::metadata::RECORD_VERSION
+    {
+        // Renaming a psABI-era recording to the legacy profile must
+        // not skip its table digest: legacy is only ever migrated
+        // to from pre-split versions at load.
+        return Err(crate::cpu_profile_admission::CpuProfileRefusal::new(
+            metadata.cpu_profile,
+            "the recording names the legacy x86-64-v2 table at a psABI-era \
+             recording version; only a pre-split recording replays on it",
+        )
+        .into());
+    }
+    if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V2 {
+        crate::cpu_profile_admission::check_recorded_table_digest(
+            metadata.cpu_profile,
+            metadata.cpu_table_digest.as_deref(),
+        )?;
+        return Ok(None);
+    }
     if metadata.cpu_profile != detcore_model::cpu_profile::CpuProfile::X86_64V3 {
         return Ok(None);
     }
@@ -638,6 +659,31 @@ fn stage_recorded_exec_image(
 mod tests {
     use super::*;
 
+    /// A psABI-era recording renamed to the legacy profile is
+    /// refused by name: legacy is only ever migrated to from
+    /// pre-split versions at load, never named by a new recording.
+    #[test]
+    fn replay_refuses_a_renamed_psabi_era_legacy_recording() {
+        let metadata: crate::metadata::Metadata = serde_json::from_value(serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": crate::metadata::RECORD_VERSION,
+            "cpu_profile": "x86-64-v2-legacy",
+        }))
+        .unwrap();
+        let refused = qualified_host_facts(&metadata, false).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("only a pre-split recording replays on it"),
+            "{refused:#}"
+        );
+    }
+
     /// Replay refuses a recording from before the inode numbering change
     /// (RECORD_VERSION 0x123) as soon as it reads the metadata, before it
     /// starts the guest, whose procfs reads would otherwise be re-rendered
@@ -718,6 +764,17 @@ mod tests {
     /// refusal before the guest starts, not an internal failure.
     #[tokio::test]
     async fn replay_refuses_a_recording_without_this_runs_rcb_identity() {
+        // The fixture binds the psABI v2 table digest a
+        // current-version recording carries, so spawn reaches the
+        // RCB-identity refusal this test asserts instead of the
+        // table-digest one.
+        let profile = detcore_model::cpu_profile::CpuProfile::X86_64V2;
+        let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(
+            &detcore::Config {
+                cpu_profile: profile,
+                ..Default::default()
+            },
+        ));
         for (identity, cause) in [
             (None, "states no RCB coordinate identity"),
             (
@@ -739,6 +796,8 @@ mod tests {
                 "hostname": null,
                 "domainname": null,
                 "envs": {},
+                "cpu_profile": serde_json::to_value(profile).unwrap(),
+                "cpu_table_digest": digest.clone(),
                 "version": serde_json::to_value(RECORD_VERSION).unwrap(),
             });
             if let Some(identity) = identity {

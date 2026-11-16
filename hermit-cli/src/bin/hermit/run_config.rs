@@ -78,8 +78,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_yaml::Value;
 
-/// The `schema` value of the format this hermit reads and writes.
+/// The `schema` values of the format this hermit reads; it writes
+/// [`SCHEMA_V2`]. v2 is the x86-64-v2 psABI split: in a v1 document
+/// `cpu-profile: x86-64-v2` named the legacy Broadwell table, so
+/// [`parse`] notes the pre-split era for one and it reruns on the
+/// legacy table its name meant then, not the psABI table the name
+/// means now.
 pub(crate) const SCHEMA: &str = "hermit-run-config/v1";
+pub(crate) const SCHEMA_V2: &str = "hermit-run-config/v2";
 
 const RUN: &str = "run";
 const CONFIG_ID: &str = "config";
@@ -132,7 +138,7 @@ pub(crate) struct RunConfig {
 impl RunConfig {
     fn new() -> Self {
         RunConfig {
-            schema: SCHEMA.to_owned(),
+            schema: SCHEMA_V2.to_owned(),
             hermit_version: Some(crate::app::version::Version::get().to_owned()),
             global: BTreeMap::new(),
             run: BTreeMap::new(),
@@ -170,17 +176,18 @@ pub(crate) fn parse(text: &str) -> Result<RunConfig, Error> {
         serde_yaml::from_str(text).context("the file is not a YAML (or JSON) document")?;
     let Value::Mapping(map) = &document else {
         anyhow::bail!(
-            "a run config is a mapping that starts with `schema: {SCHEMA}`; this document is a \
-             {}",
+            "a run config is a mapping that starts with `schema: {SCHEMA_V2}`; this document \
+             is a {}",
             kind(&document)
         );
     };
-    match map.get("schema") {
+    let pre_psabi = match map.get("schema") {
         None => anyhow::bail!(
-            "the document has no `schema` key; a run config starts with `schema: {SCHEMA}`. \
+            "the document has no `schema` key; a run config starts with `schema: {SCHEMA_V2}`. \
              Write one with `hermit run --save-config FILE`."
         ),
-        Some(Value::String(schema)) if schema == SCHEMA => {}
+        Some(Value::String(schema)) if schema == SCHEMA_V2 => false,
+        Some(Value::String(schema)) if schema == SCHEMA => true,
         Some(other) => {
             let written_by = map
                 .get("hermit-version")
@@ -188,12 +195,19 @@ pub(crate) fn parse(text: &str) -> Result<RunConfig, Error> {
                 .map(|version| format!(" (it was written by hermit {version})"))
                 .unwrap_or_default();
             anyhow::bail!(
-                "the document has schema {}{written_by}, but this hermit reads only `{SCHEMA}`. \
-                 Load it with the hermit that wrote it, or write it again with this hermit's \
-                 `hermit run --save-config FILE`.",
+                "the document has schema {}{written_by}, but this hermit reads only \
+                 `{SCHEMA}` and `{SCHEMA_V2}`. Load it with the hermit that wrote it, or \
+                 write it again with this hermit's `hermit run --save-config FILE`.",
                 display_value(other)
             );
         }
+    };
+    // In a v1 document `cpu-profile: x86-64-v2` named the legacy
+    // Broadwell table, and an absent profile resolves auto as it
+    // did then. Note the era: resolution maps a v2 result back to
+    // the legacy table, so the config reruns on the CPU it saved.
+    if pre_psabi {
+        note_pre_psabi_era();
     }
     const KEYS: &str = "`schema`, `hermit-version`, `global`, `run`, `program` and `args`";
     for key in map.keys() {
@@ -274,11 +288,15 @@ pub(crate) fn from_manifest_at(
 /// The run config a manifest's `inputs` and `command` stand for, which
 /// `hermit run --from` loads as `--config` loads a file.
 ///
-/// A manifest without a `cpu-profile` reruns x86-64-v2: Hermit has saved the
-/// profile whenever auto resolved it, so a manifest without one is from a run
-/// that presented x86-64-v2 (the default before auto chose by the host) or
-/// launched nothing. Only a manifest is read this way; a run config file
-/// without the key keeps auto.
+/// A manifest without a `cpu-profile` reruns the x86-64-v2 its era
+/// meant: Hermit has saved the profile whenever auto resolved it,
+/// so a manifest without one is from a run that presented
+/// x86-64-v2 (the default before auto chose by the host) or
+/// launched nothing — the psABI table at the current schema, the
+/// legacy table at a pre-split schema (noted here for resolution
+/// to map). Only a manifest is read this way; a run config file
+/// without the key keeps auto, whose v2 result an old document
+/// likewise maps back to the legacy table.
 pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result<RunConfig, Error> {
     let section = |entries: &BTreeMap<String, serde_json::Value>| {
         entries
@@ -296,7 +314,7 @@ pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result
     config.hermit_version = Some(manifest.hermit.version.clone());
     config.global = section(&manifest.inputs.global)?;
     config.run = section(&manifest.inputs.run)?;
-    config
+    let _cpu_profile = config
         .run
         .entry(CPU_PROFILE_KEY.to_owned())
         .or_insert_with(|| {
@@ -304,6 +322,25 @@ pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result
                 .name()
                 .into()
         });
+    // A pre-split manifest (schema v1/v2) naming x86-64-v2 meant the
+    // legacy Broadwell table, and so does a manifest of any schema
+    // whose recorded choice is that table (one an era-migrated run
+    // wrote before its inputs named the choice). Note the era:
+    // resolution maps a v2 result back to that table, so the
+    // manifest reruns on the CPU it recorded, exactly as a
+    // recording of its era replays. A manifest whose inputs name
+    // x86-64-v2-legacy directly needs no mapping, and noting the
+    // era is then a no-op.
+    if manifest.schema != crate::app::manifest::SCHEMA_V3
+        || manifest
+            .cpu_profile
+            .as_ref()
+            .is_some_and(|choice| {
+                choice.profile == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
+            })
+    {
+        note_pre_psabi_era();
+    }
     config.program = manifest.command.program.clone();
     config.args = manifest.command.args.clone();
     Ok(config)
@@ -512,6 +549,44 @@ fn scalar(text: &str) -> Value {
     }
 }
 
+// The document the last expansion loaded predates the x86-64-v2
+// psABI split, so an `x86-64-v2` it expands to named the legacy
+// Broadwell table. Expansion is single-threaded CLI startup;
+// `main` takes this once after parsing and hands it to the run
+// options, whose resolution maps a psABI result back to the
+// legacy table the document saved. The document's own token
+// parses as the psABI profile, so argv alone cannot carry this.
+// The era maps only a profile the document named or left
+// absent: where the command line itself names `--cpu-profile`,
+// that explicit choice wins and the era is not taken.
+std::thread_local! {
+    static PRE_PSABI_ERA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLI_CPU_PROFILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Note that the document being expanded was written before the
+/// psABI split. Called by [`parse`] (schema v1) and
+/// [`from_manifest`] (manifest schema v1/v2, or a manifest whose
+/// recorded choice is the legacy table).
+fn note_pre_psabi_era() {
+    PRE_PSABI_ERA.with(|era| era.set(true));
+}
+
+/// Note that the invocation being expanded names `--cpu-profile`
+/// itself, so no document era may reinterpret it.
+fn note_cli_cpu_profile() {
+    CLI_CPU_PROFILE.with(|given| given.set(true));
+}
+
+/// Take the era noted by the last expansion, if any: a
+/// pre-psABI document whose profile the command line did not
+/// itself name.
+pub(crate) fn take_pre_psabi_era() -> bool {
+    let era = PRE_PSABI_ERA.with(|era| era.take());
+    let cli = CLI_CPU_PROFILE.with(|given| given.take());
+    era && !cli
+}
+
 /// Rewrites a `hermit [GLOBAL] run --config FILE [OPTIONS] [-- PROGRAM ARGS]`
 /// invocation into the command line it means: the file's options and guest,
 /// less every option the command line gives itself, followed by the
@@ -539,6 +614,9 @@ pub(super) fn expand_argv_for_application(
     argv: &[OsString],
     application_backend: Option<&str>,
 ) -> Result<Option<Vec<OsString>>, Error> {
+    // Each expansion notes its own document's era from a clean slate.
+    PRE_PSABI_ERA.with(|era| era.set(false));
+    CLI_CPU_PROFILE.with(|given| given.set(false));
     expand_argv_with_selection(command, argv, application_backend)
 }
 
@@ -599,6 +677,9 @@ fn expand_argv_with_selection(
     let Some(run_matches) = matches.subcommand_matches(RUN) else {
         return Ok(None);
     };
+    if run_matches.value_source("cpu_profile") == Some(ValueSource::CommandLine) {
+        note_cli_cpu_profile();
+    }
     let Some((path, mut config)) = input_config(run_matches, true)? else {
         return Ok(None);
     };
@@ -2020,6 +2101,74 @@ mod tests {
         assert!(format!("{error:#}").contains("hermit replay"), "{error:#}");
     }
 
+    /// A pre-psABI manifest (schema v1/v2) that would rerun
+    /// x86-64-v2 meant the legacy table then; it migrates to that
+    /// table at resolution (the era is noted for it), exactly as
+    /// a recording of its era replays. The same document at the
+    /// current schema notes no era and reruns as written.
+    #[test]
+    fn a_pre_psabi_manifest_notes_the_legacy_era() {
+        use crate::app::manifest;
+        let mut document = manifest::Manifest::new(
+            hermit::Id::unique(),
+            manifest::Kind::InputsOnly,
+            manifest::Command {
+                program: Some("/bin/date".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            manifest::Inputs {
+                global: BTreeMap::new(),
+                run: BTreeMap::new(),
+                host_drawn: BTreeMap::new(),
+            },
+        );
+        assert!(from_manifest(&document).is_ok());
+        assert!(!take_pre_psabi_era());
+        document.schema = manifest::SCHEMA.to_owned();
+        assert!(from_manifest(&document).is_ok());
+        assert!(take_pre_psabi_era());
+        // A current-schema manifest whose recorded choice is the
+        // legacy table (written by an era-migrated run before its
+        // inputs named the choice) notes the era too, so its
+        // x86-64-v2 input still reruns on the table it presented.
+        document.schema = manifest::SCHEMA_V3.to_owned();
+        document.cpu_profile = Some(hermit::cpu_profile_admission::ProfileChoice {
+            profile: detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell,
+            reason: hermit::cpu_profile_admission::ProfileReason::Explicit,
+            detail: None,
+        });
+        assert!(from_manifest(&document).is_ok());
+        assert!(take_pre_psabi_era());
+    }
+
+    /// The era maps only a profile the document named or left
+    /// absent: an explicit `--cpu-profile` on the command line
+    /// being expanded wins over a pre-psABI document, so its
+    /// x86-64-v2 (or auto) means what it means today.
+    #[test]
+    fn an_explicit_cpu_profile_takes_no_pre_psabi_era() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old.yaml");
+        std::fs::write(
+            &path,
+            format!("schema: {SCHEMA}\nrun: {{cpu-profile: x86-64-v2}}\nprogram: /bin/true\n"),
+        )
+        .unwrap();
+        load(&path, &[]);
+        assert!(take_pre_psabi_era(), "the document's own v2 migrates");
+        load(&path, &["--cpu-profile=x86-64-v2"]);
+        assert!(
+            !take_pre_psabi_era(),
+            "an explicit x86-64-v2 is the psABI table, era or not"
+        );
+        load(&path, &["--cpu-profile=auto"]);
+        assert!(
+            !take_pre_psabi_era(),
+            "the command line's own auto resolves the current way"
+        );
+    }
+
     /// `--from` and `--config` together are refused, as two sources for one
     /// run's options.
     #[test]
@@ -2197,7 +2346,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = config_file(
             &directory,
-            "schema: hermit-run-config/v1\n\
+            "schema: hermit-run-config/v2\n\
              global: {log: info, log-file: /from/file.log}\n\
              run: {seed: 1, env: [A=1, B=2], verify: true, summary: true}\n\
              program: /bin/from-file\n\
@@ -2351,14 +2500,14 @@ mod tests {
     fn a_missing_or_different_schema_is_refused() {
         for (text, expected) in [
             (
-                "schema: hermit-run-config/v2\nhermit-version: '9.9'\nrun: {new-option: 1}\n",
-                "the document has schema `hermit-run-config/v2` (it was written by hermit 9.9), \
-                 but this hermit reads only `hermit-run-config/v1`",
+                "schema: hermit-run-config/v3\nhermit-version: '9.9'\nrun: {new-option: 1}\n",
+                "the document has schema `hermit-run-config/v3` (it was written by hermit 9.9), \
+                 but this hermit reads only `hermit-run-config/v1` and `hermit-run-config/v2`",
             ),
             (
                 "run: {seed: 1}\n",
                 "the document has no `schema` key; a run config starts with `schema: \
-                 hermit-run-config/v1`",
+                 hermit-run-config/v2`",
             ),
             ("schema: 1\n", "the document has schema `1`"),
             ("- schema\n", "this document is a list"),

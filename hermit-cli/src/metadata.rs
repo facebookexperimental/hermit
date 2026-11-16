@@ -41,7 +41,21 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
+        // The window is tied to the literal first psABI version, so
+        // it closes itself when RECORD_VERSION next moves: accepting
+        // 0x1a0 then would admit a stream whose format may have
+        // changed since, which is what the exact gate exists for.
+        const _: () = assert!(
+            RECORD_VERSION.0 == 0x1a1,
+            "the 0x1a0 compatibility window must be re-decided when RECORD_VERSION moves"
+        );
+        // Exact, with one deliberate window: the 0x1a1 replayer
+        // accepts the last pre-psABI version so its recordings
+        // replay on the legacy CPUID table (migrated at load). An
+        // older replayer still refuses this version by the same
+        // equality, by name.
         self == other
+            || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
     }
 }
 
@@ -1017,7 +1031,20 @@ impl RecordVersion {
 // took such a signal, would replay with different output. It is refused
 // here.
 // https://github.com/rrnewton/hermit/pull/5259
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
+// 0x1a0 -> 0x1a1: `x86-64-v2` changed meaning to the psABI table
+// (facebookexperimental/hermit#124). The event stream is unchanged;
+// the bump is the era marker metadata load migrates on: a recording
+// at 0x1a0 naming (or omitting) x86-64-v2 replayed on the legacy
+// Broadwell table it recorded with, and recordings at 0x1a1 bind
+// their CPUID table digest. It is also why an older replayer
+// refuses a new recording by name instead of replaying it against
+// the wrong CPU. This is the one deliberate exception to exact
+// version equality: RECORD_VERSION accepts 0x1a0 beside itself.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a1);
+
+/// The last recording version whose `x86-64-v2` (named or absent)
+/// means the pre-psABI legacy table.
+pub(crate) const LAST_PRE_PSABI_RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1042,7 +1069,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a0;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a1;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1170,15 +1197,20 @@ pub struct Metadata {
     #[serde(default)]
     pub proc_level: Option<detcore_model::config::ProcLevel>,
     /// The CPU the guest saw (<https://github.com/rrnewton/hermit/issues/4243>).
-    /// Absent means x86-64-v2.
+    /// What `x86-64-v2` (named or absent) means depends on
+    /// `version`: at or before [`LAST_PRE_PSABI_RECORD_VERSION`] it
+    /// is the legacy Broadwell table, migrated at load; from
+    /// [`RECORD_VERSION`] it is the psABI table.
     #[serde(default)]
     pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
     /// Under x86-64-v3, the host facts the guest's leaf 0xD and XCOMP answers
     /// came from. Replay refuses a host where any of them differs.
     #[serde(default)]
     pub cpu_profile_host: Option<detcore_model::cpu_profile::HostXstate>,
-    /// Under x86-64-v3, the hex SHA-256 of the full CPUID table and the bound
-    /// host facts (`detcore::virtual_cpuid_digest`). Replay recomputes it.
+    /// The hex SHA-256 of the full CPUID table (and, under x86-64-v3,
+    /// the bound host facts; `detcore::virtual_cpuid_digest`). Replay
+    /// recomputes it where present. Absent on recordings of the
+    /// legacy v2 table, which predate the binding.
     #[serde(default)]
     pub cpu_table_digest: Option<String>,
     /// Under x86-64-v3, what the host qualification leaves uncovered
@@ -1262,11 +1294,35 @@ impl Metadata {
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let metadata_path = dir.join(METADATA_NAME);
         // Buffered: serde_json reads an unbuffered file one byte per read(2).
-        serde_json::from_reader(std::io::BufReader::new(
+        let mut metadata: Self = serde_json::from_reader(std::io::BufReader::new(
             fs::File::open(&metadata_path)
                 .with_context(|| format!("Failed to open {:?}", metadata_path))?,
         ))
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))
+        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
+        // Era migration for the psABI split: a recording at or
+        // before the last pre-psABI version that says (or omits)
+        // x86-64-v2 saw the legacy table, whatever serde made of
+        // the name today. No recorder of that era wrote a table
+        // digest for v2, so one present here means the metadata was
+        // edited down from a psABI-era recording to skip its
+        // digest check: refuse it rather than migrating it.
+        if metadata.version <= LAST_PRE_PSABI_RECORD_VERSION
+            && metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V2
+            && metadata.cpu_table_digest.is_some()
+        {
+            anyhow::bail!(
+                "this recording names x86-64-v2 at a pre-psABI recording version but \
+                 carries a CPUID table digest no recorder of that era wrote; refusing \
+                 it rather than replaying it on the legacy table"
+            );
+        }
+        if metadata.version <= LAST_PRE_PSABI_RECORD_VERSION
+            && metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V2
+        {
+            metadata.cpu_profile =
+                detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell;
+        }
+        Ok(metadata)
     }
 
     /// Constructs a command from the metadata.
@@ -1768,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn record_version_requires_an_exact_match() {
+    fn record_version_requires_an_exact_match_apart_from_the_pre_psabi_window() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
 
         // DERIVED FROM THE COMPATIBILITY RULE, NOT ENUMERATED.
@@ -1780,13 +1836,23 @@ mod tests {
         // fail for the reason its name gives once the value has moved past the
         // range someone happened to write down.
         //
-        // `compatible_with` is exact equality, so the property to assert is
+        // `compatible_with` is exact equality apart from the one
+        // pre-psABI window below, so the property to assert is
         // "every OTHER version is refused". Re-deriving the cases from
         // RECORD_VERSION itself means the window travels with the constant and
         // cannot go stale.
         let current = RECORD_VERSION.0;
         for delta in 1..=16u32 {
             let older = RecordVersion(current - delta);
+            // The one deliberate window, open only at 0x1a1: the
+            // last pre-psABI version stays readable so its
+            // recordings replay on the legacy CPUID table (migrated
+            // at load). A future replayer does not inherit it.
+            if older == LAST_PRE_PSABI_RECORD_VERSION {
+                assert!(RECORD_VERSION.compatible_with(&older));
+                assert!(!RecordVersion(0x1a2).compatible_with(&older));
+                continue;
+            }
             assert!(
                 !RECORD_VERSION.compatible_with(&older),
                 "recorder at {current:#x} must refuse a recording made at {:#x}",
@@ -2701,6 +2767,69 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.local_networking, None);
         assert_eq!(metadata.schedule, RecordedSchedule::Default);
+    }
+
+    /// The psABI split is version-keyed at load: named and absent
+    /// x86-64-v2 at the pre-split version become the legacy table,
+    /// at the current version they stay psABI, a pre-split v3 names
+    /// itself, and a pre-split document carrying a table digest no
+    /// recorder of its era wrote is refused.
+    #[test]
+    fn metadata_load_migrates_pre_psabi_v2_to_the_legacy_table() {
+        use detcore_model::cpu_profile::CpuProfile;
+        let load_with = |version: u32, profile: Option<&str>, digest: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut document = serde_json::json!({
+                "exe": "/bin/true",
+                "program": "true",
+                "arg0": "true",
+                "args": [],
+                "current_dir": "/",
+                "hostname": null,
+                "domainname": null,
+                "envs": {},
+                "version": version,
+            });
+            if let Some(profile) = profile {
+                document["cpu_profile"] = profile.into();
+            }
+            if let Some(digest) = digest {
+                document["cpu_table_digest"] = digest.into();
+            }
+            std::fs::write(
+                dir.path().join(METADATA_NAME),
+                serde_json::to_string(&document).unwrap(),
+            )
+            .unwrap();
+            Metadata::load(dir.path())
+        };
+        let old = LAST_PRE_PSABI_RECORD_VERSION.0;
+        let new = RECORD_VERSION.0;
+        assert_eq!(
+            load_with(old, Some("x86-64-v2"), None).unwrap().cpu_profile,
+            CpuProfile::X86_64V2LegacyBroadwell
+        );
+        assert_eq!(
+            load_with(old, None, None).unwrap().cpu_profile,
+            CpuProfile::X86_64V2LegacyBroadwell
+        );
+        assert_eq!(
+            load_with(new, Some("x86-64-v2"), None).unwrap().cpu_profile,
+            CpuProfile::X86_64V2
+        );
+        assert_eq!(
+            load_with(new, None, None).unwrap().cpu_profile,
+            CpuProfile::X86_64V2
+        );
+        assert_eq!(
+            load_with(old, Some("x86-64-v3"), None).unwrap().cpu_profile,
+            CpuProfile::X86_64V3
+        );
+        let renamed = load_with(old, Some("x86-64-v2"), Some("00")).unwrap_err();
+        assert!(
+            format!("{renamed:#}").contains("no recorder of that era wrote"),
+            "{renamed:#}"
+        );
     }
 
     /// A chaos schedule sets chaos mode and seeds only the scheduler: the

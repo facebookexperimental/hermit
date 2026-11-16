@@ -51,7 +51,7 @@ impl Record {
         options: Option<RecordOptions>,
     ) -> Result<Self, Error> {
         let cpu_profile = options.unwrap_or_default().cpu_profile;
-        crate::cpu_profile_admission::check_record_or_replay(cpu_profile)?;
+        crate::cpu_profile_admission::check_record(cpu_profile)?;
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = options.map(|options| options.local_networking);
         // A recording always names its level, so its replay does not depend
@@ -91,7 +91,11 @@ impl Record {
         let mut config = record_or_replay_config(dir);
         config.cpu_profile = cpu_profile;
         config.cpu_profile_host = cpu_profile_host;
-        if !cpu_profile.is_default() {
+        // Every profile whose table a future replayer must be able to
+        // tell from another binds its digest. The legacy v2 table is
+        // the exception: recordings of its era carry no digest, and
+        // it is never chosen for a new recording.
+        if cpu_profile != detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell {
             metadata.cpu_table_digest = Some(hex_digest(&detcore::virtual_cpuid_digest(&config)));
         }
 

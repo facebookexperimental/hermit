@@ -336,6 +336,17 @@ fn args_from_matches_with_schema(
             _ => unreachable!("only run subcommands carry a maximum timeslice"),
         }
     }
+    // Expansion noted when the document it loaded predates the
+    // x86-64-v2 psABI split; resolution maps its v2 back to the
+    // legacy table. Taken here, once, whether or not this command
+    // is a run, so no later expansion in this process inherits it.
+    if run_config::take_pre_psabi_era() {
+        match &mut args.command {
+            Subcommand::Run(run) => run.note_pre_psabi_document(),
+            Subcommand::Oci(oci) => oci.note_pre_psabi_document(),
+            _ => {}
+        }
+    }
     // `--namespace-only` bypasses instrumentation, so an explicit backend would
     // be silently ignored. The backend is a global option, which clap's
     // per-subcommand `conflicts_with` cannot see, so refuse the pair here as the

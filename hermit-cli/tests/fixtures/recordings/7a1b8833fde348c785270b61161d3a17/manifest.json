@@ -1,0 +1,32 @@
+{
+  "schema": "hermit-recording-manifest/v1",
+  "hermit": {
+    "version": "0.5.7 (fbsource: unknown, fbpkg: hermit:unknown)"
+  },
+  "id": "7a1b8833fde348c785270b61161d3a17",
+  "kind": "full-syscall",
+  "created": "2026-11-16T00:32:11.156035Z",
+  "command": {
+    "program": "/tmp/v2record/work/cpuid-v2-probe",
+    "args": [],
+    "cwd": "/tmp/v2record/work"
+  },
+  "inputs": {
+    "global": {},
+    "run": {},
+    "host_drawn": {}
+  },
+  "cpu_profile": {
+    "profile": "x86-64-v2",
+    "reason": "explicit"
+  },
+  "exit": {
+    "code": 0
+  },
+  "artifacts": {
+    "syscall_recording": {
+      "record_version": 416,
+      "metadata": "metadata.json"
+    }
+  }
+}

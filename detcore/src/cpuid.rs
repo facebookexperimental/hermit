@@ -33,6 +33,12 @@ const XSAVE_SUBLEAVES: usize = 10;
 
 /// Leaf 1 ECX bits v3 adds to v2: FMA (12), MOVBE (22), XSAVE (26), OSXSAVE
 /// (27) and F16C (29). AVX (28), SSE4.2, POPCNT and the rest are already there.
+/// Leaf 1 ECX bit the psABI x86-64-v2 table clears from the base
+/// table: AVX (bit 28), which the Broadwell-era capture advertises
+/// (facebookexperimental/hermit#124). The v3 table sets it back as
+/// part of its own derivation from the same base.
+pub const V2_LEAF1_ECX_CLEARED: u32 = 1 << 28;
+
 pub const V3_LEAF1_ECX_ADDED: u32 = (1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 29);
 /// Leaf 1 ECX bit 31, "running under a hypervisor": a platform declaration,
 /// not an instruction the guest needs, which v3 clears so that the host check
@@ -76,10 +82,19 @@ pub(crate) fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
 }
 
 impl InterceptedCpuid {
-    /// The x86-64-v2 table.
+    /// The x86-64-v2 table: exactly the psABI level.
     pub fn new() -> Self {
         InterceptedCpuid {
             profile: CpuProfile::X86_64V2,
+            xsave: [[0; 4]; XSAVE_SUBLEAVES],
+        }
+    }
+
+    /// The pre-psABI x86-64-v2 table, bit-for-bit as served before
+    /// the split, for replaying recordings made against it.
+    pub fn legacy_v2() -> Self {
+        InterceptedCpuid {
+            profile: CpuProfile::X86_64V2LegacyBroadwell,
             xsave: [[0; 4]; XSAVE_SUBLEAVES],
         }
     }
@@ -112,6 +127,7 @@ impl InterceptedCpuid {
     pub fn for_config(cfg: &crate::Config) -> Self {
         match cfg.cpu_profile {
             CpuProfile::X86_64V2 => Self::new(),
+            CpuProfile::X86_64V2LegacyBroadwell => Self::legacy_v2(),
             CpuProfile::X86_64V3 => Self::v3(cfg.cpu_profile_host.as_ref().expect(
                 "--cpu-profile x86-64-v3 reached Detcore without the qualified host's xstate facts",
             )),
@@ -164,6 +180,19 @@ impl InterceptedCpuid {
         } else {
             return None;
         };
+        if self.profile == CpuProfile::X86_64V2 {
+            // Exactly the psABI x86-64-v2 level: no AVX in leaf 1, and
+            // no leaf 7 subleaf 0 EBX feature at all (none is in the
+            // v2 set; the base word is a Broadwell capture carrying
+            // FSGSBASE, BMI1, HLE, AVX2, BMI2, ERMS, RTM, ADX and
+            // supervisor bits). The legacy profile serves the base
+            // word unchanged.
+            match leaf {
+                0x1 => result.ecx &= !V2_LEAF1_ECX_CLEARED,
+                0x7 => result.ebx = 0,
+                _ => {}
+            }
+        }
         if self.profile == CpuProfile::X86_64V3 {
             match leaf {
                 0x1 => result.ecx = (result.ecx | V3_LEAF1_ECX_ADDED) & !LEAF1_ECX_HYPERVISOR,
@@ -289,7 +318,8 @@ impl InterceptedCpuid {
     /// are not shown.
     pub fn cpuinfo(&self, cpus: u32) -> Vec<u8> {
         let bugs = match self.profile {
-            CpuProfile::X86_64V2 => CPUINFO_BUGS,
+            CpuProfile::X86_64V2 => CPUINFO_BUGS_V2_PSABI,
+            CpuProfile::X86_64V2LegacyBroadwell => CPUINFO_BUGS,
             CpuProfile::X86_64V3 => CPUINFO_BUGS_V3,
             // The virtual profiles' fixed vulnerability lists describe their
             // invented CPUs, not this host. Do not invent a host bug list.
@@ -644,6 +674,14 @@ const LEAF2_CACHES: &str = "06:i:8 08:i:16 09:i:32 0a:d:8 0c:d:16 0d:d:16 0e:d:2
 /// table change, must recompute it from Linux's `cpu_set_bug_bits` for the new
 /// vendor, family, model and features.
 const CPUINFO_BUGS: &str = "cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
+    itlb_multihit bhi spectre_v2_user its";
+
+/// The `bugs` set for the psABI v2 table: the legacy set without
+/// `taa`, which Linux derives only where RTM is advertised and the
+/// psABI table clears every leaf 7 EBX bit including RTM. `bhi` and
+/// `its` stay: the hypervisor bit they key on (per the v3 note
+/// below) is kept.
+const CPUINFO_BUGS_V2_PSABI: &str = "cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs \
     itlb_multihit bhi spectre_v2_user its";
 
 /// The `bugs` set Linux 7.1.3's `cpu_set_bug_bits` derives for the v3 table:
@@ -1013,11 +1051,14 @@ mod tests {
 
     #[test]
     fn cpuinfo_describes_the_virtual_cpu() {
-        // Each line is derived from the table above as Linux derives it; see
-        // `InterceptedCpuid::cpuinfo`. The flags include `avx` without
-        // `xsave` and `hle`/`rtm` because the table advertises them
-        // (https://github.com/rrnewton/hermit/issues/4251,
-        // https://github.com/rrnewton/hermit/issues/4252); Linux shows them too.
+        // The golden block below is the psABI (default) table's:
+        // each line is derived from it as Linux derives it; see
+        // `InterceptedCpuid::cpuinfo`. The legacy table's block
+        // differs exactly in the flags its capture advertises
+        // (`avx` without `xsave`, `hle`/`rtm`, leaf 7 names;
+        // https://github.com/rrnewton/hermit/issues/4251,
+        // https://github.com/rrnewton/hermit/issues/4252) and the
+        // `taa` bug, asserted after.
         let expected = "processor\t: 0\n\
             vendor_id\t: GenuineIntel\n\
             cpu family\t: 6\n\
@@ -1038,8 +1079,8 @@ mod tests {
             wp\t\t: yes\n\
             flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pse36 \
             clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt \
-            avx hypervisor lahf_lm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
-            bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
+            hypervisor lahf_lm\n\
+            bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs \
             itlb_multihit bhi spectre_v2_user its\n\
             bogomips\t: 2000.00\n\
             clflush size\t: 64\n\
@@ -1050,6 +1091,18 @@ mod tests {
             String::from_utf8(InterceptedCpuid::new().cpuinfo(1)).unwrap(),
             expected
         );
+        let legacy = String::from_utf8(InterceptedCpuid::legacy_v2().cpuinfo(1)).unwrap();
+        let flags = legacy
+            .lines()
+            .find(|line| line.starts_with("flags"))
+            .unwrap_or("");
+        assert!(
+            flags.ends_with(
+                "avx hypervisor lahf_lm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap"
+            ),
+            "legacy flags lost the capture's names: {flags}"
+        );
+        assert!(legacy.contains(&format!("bugs\t\t: {CPUINFO_BUGS}")));
     }
 
     /// `render_cpuinfo` for a CPU whose CPUID answers with `entries`
@@ -1234,6 +1287,10 @@ mod tests {
         let cpuid = InterceptedCpuid::new();
 
         assert_eq!(registers(cpuid.cpuid(0x07, 1).unwrap()), [0; 4]);
+        assert_eq!(
+            registers(InterceptedCpuid::legacy_v2().cpuid(0x07, 1).unwrap()),
+            [0; 4]
+        );
         for leaf in [0x04, 0x0b, 0x0d, 0x0f, 0x10, 0x12, 0x14] {
             assert_eq!(
                 registers(cpuid.cpuid(leaf, 1).unwrap()),
@@ -1241,8 +1298,11 @@ mod tests {
                 "leaf {leaf:#x}"
             );
         }
+        // The psABI v2 table masks leaf 7 EBX to zero; the legacy
+        // table keeps the Broadwell capture's word.
+        assert_eq!(registers(cpuid.cpuid(0x07, 0).unwrap()), [0; 4]);
         assert_eq!(
-            registers(cpuid.cpuid(0x07, 0).unwrap()),
+            registers(InterceptedCpuid::legacy_v2().cpuid(0x07, 0).unwrap()),
             [0, 0x0018_0fb9, 0, 0]
         );
         assert_eq!(registers(cpuid.cpuid(0x0b, 0).unwrap()), [0, 1, 0x100, 1]);
@@ -1320,8 +1380,39 @@ mod tests {
     }
 
     #[test]
-    fn the_v3_table_is_v2_with_the_v3_bits_and_the_hosts_leaf_0xd() {
+    fn the_v2_table_is_the_psabi_level_and_legacy_keeps_the_capture() {
         let v2 = InterceptedCpuid::new();
+        let legacy = InterceptedCpuid::legacy_v2();
+        let regs = |t: &InterceptedCpuid, leaf, sub| registers(t.cpuid(leaf, sub).unwrap());
+        let [_, _, ecx, _] = regs(&v2, 1, 0);
+        // The v2-required bits stay, with the hypervisor bit.
+        for bit in [0, 9, 13, 19, 20, 23, 31] {
+            assert_ne!(ecx & (1 << bit), 0, "leaf 1 ECX bit {bit}");
+        }
+        assert_eq!(
+            ecx & V2_LEAF1_ECX_CLEARED,
+            0,
+            "AVX is x86-64-v3, not v2 (facebookexperimental/hermit#124)"
+        );
+        assert_eq!(
+            regs(&v2, 7, 0)[1],
+            0,
+            "no leaf 7 EBX feature is in the psABI v2 set"
+        );
+        // The legacy table is today's capture, bit for bit.
+        assert_eq!(regs(&legacy, 7, 0)[1], 0x0018_0fb9);
+        assert_ne!(regs(&legacy, 1, 0)[2] & V2_LEAF1_ECX_CLEARED, 0);
+        // Everything the mask does not name is shared.
+        for leaf in [0, 2, 4, 0xb, 0x8000_0000, 0x8000_0001, 0x8000_0008] {
+            assert_eq!(regs(&v2, leaf, 0), regs(&legacy, leaf, 0), "leaf {leaf:#x}");
+        }
+    }
+
+    #[test]
+    fn the_v3_table_is_v2_with_the_v3_bits_and_the_hosts_leaf_0xd() {
+        // v3 derives from the same Broadwell base as the legacy v2
+        // table, not from the masked psABI v2 table.
+        let v2 = InterceptedCpuid::legacy_v2();
         let v3 = InterceptedCpuid::v3(&epyc_9d85());
         let regs = |t: &InterceptedCpuid, leaf, sub| registers(t.cpuid(leaf, sub).unwrap());
         let [_, _, ecx2, _] = regs(&v2, 1, 0);
@@ -1404,6 +1495,11 @@ mod tests {
         let v3 = InterceptedCpuid::v3(&host);
         let digest = v3.digest(Some(&host));
         assert_ne!(digest, InterceptedCpuid::new().digest(None));
+        assert_ne!(
+            InterceptedCpuid::new().digest(None),
+            InterceptedCpuid::legacy_v2().digest(None),
+            "the psABI and legacy v2 tables digest differently"
+        );
         assert_eq!(
             digest,
             InterceptedCpuid::v3(&host.clone()).digest(Some(&host))

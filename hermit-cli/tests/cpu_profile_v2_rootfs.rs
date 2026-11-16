@@ -28,17 +28,13 @@
 //!   (`isa_1=0x3`, v2 "supported, searched", v3/v4 unsupported) — the
 //!   dynamic-loader ISA enforcement a static guest cannot exercise;
 //! - a CPUID probe guest (`fixtures/isa/cpuid_v2_probe.c`, dynamically
-//!   linked against the fixture libc) asserts every v2 feature and
-//!   every above-v2 feature's place, and runs at bitwise parity under
-//!   `--strict --verify --verify-strict` on the ptrace backend (L2).
-//!   Seven of those assertions are strict expected failures today:
-//!   the v2 table advertises AVX, BMI1, HLE, AVX2, BMI2, RTM and ADX
-//!   (https://github.com/facebookexperimental/hermit/issues/124).
-//!   The probe requires each leak by name, so fixing the table flips
-//!   this test red until the expected failures are removed with the
-//!   fix — the bug stays visible without hiding it behind a skip.
-//!   glibc still computes level v2 (OSXSAVE/XSAVE are withheld),
-//!   which the loader oracle above asserts separately;
+//!   linked against the fixture libc) asserts every v2 feature
+//!   present and every above-v2 feature absent — AVX, BMI1, HLE,
+//!   AVX2, BMI2, RTM and ADX included, the seven the pre-psABI
+//!   table advertised until
+//!   https://github.com/facebookexperimental/hermit/issues/124
+//!   was fixed — and runs at bitwise parity under
+//!   `--strict --verify --verify-strict` on the ptrace backend (L2);
 //! - a library declaring x86-64-v3 is refused by the *guest's ld.so*
 //!   ("CPU ISA level is lower than required", no Hermit policy
 //!   refusal), and a v3-declaring executable gets Hermit's named
@@ -452,23 +448,22 @@ fn run_guest(
 }
 
 /// The probe's exact verdict lines after its `v2` header, in order.
-/// The seven `LEAK` lines are the strict expected failures for
-/// facebookexperimental/hermit#124: the test goes red the moment
-/// any of them flips to `FIXED` (the probe itself also exits
-/// nonzero then), so removing them belongs to the table fix, not
-/// to a later tidy-up that could forget.
+/// The seven `* hidden: ok` lines for AVX, BMI1, HLE, AVX2, BMI2,
+/// RTM and ADX are what facebookexperimental/hermit#124 fixed;
+/// they were strict expected failures until that change, and are
+/// ordinary assertions now.
 const PROBE_EXPECTED: [&str; 14] = [
     "sse2 advertised: ok",
     "v2 features advertised: ok",
     "v3 leaf1 features hidden: ok",
     "rdrand masked: ok",
-    "known leak avx hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak bmi1 hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak hle hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak avx2 hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak bmi2 hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak rtm hidden: LEAK (facebookexperimental/hermit#124)",
-    "known leak adx hidden: LEAK (facebookexperimental/hermit#124)",
+    "avx hidden: ok",
+    "bmi1 hidden: ok",
+    "hle hidden: ok",
+    "avx2 hidden: ok",
+    "bmi2 hidden: ok",
+    "rtm hidden: ok",
+    "adx hidden: ok",
     "avx512f and rdseed hidden: ok",
     "lahf advertised: ok",
     "lzcnt hidden: ok",
@@ -479,9 +474,7 @@ fn assert_probe_output(output: &Output) {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "probe run failed (a FIXED known-leak line means \
-         facebookexperimental/hermit#124 was fixed: remove the \
-         expected failures)\nstdout:\n{stdout}\nstderr:\n{}",
+        "probe run failed\nstdout:\n{stdout}\nstderr:\n{}",
         stderr_of(output)
     );
     let mut lines = stdout.lines();
@@ -535,7 +528,7 @@ fn v2_rootfs_loader_sees_exactly_x86_64_v2() {
 }
 
 /// A dynamic guest linked against the fixture libc sees the v2 CPU
-/// (with the seven named table leaks above) and runs
+/// (with the seven formerly leaked features now hidden) and runs
 /// deterministically: `--strict --verify --verify-strict`
 /// on the ptrace backend with `bitwise_parity: true` (L2), the v2
 /// counterpart of `cli.rs`'s v3 parity run but with its userland

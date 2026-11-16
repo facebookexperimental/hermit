@@ -846,7 +846,11 @@ impl StartOpts {
                 .main_with_preparation(global, preparation);
         }
         if !replay_only {
-            hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
+            // The recording check, not only the replay one: the
+            // legacy table is refused here, before any host
+            // qualification or container work, not only once the
+            // recorder is reached.
+            hermit::cpu_profile_admission::check_record(self.cpu_profile).map_err(
                 |refusal| {
                     Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string())
                 },
