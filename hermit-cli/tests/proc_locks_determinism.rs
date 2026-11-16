@@ -2292,9 +2292,20 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x1a0,
+        metadata["version"], 0x1a1,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
+    // Drop the current recorder's CPU profile fields, so the era check does not fire first.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     // 0x180, 0x17f, 0x17e, 0x17d and 0x17c keep, or drop by length alone, the
     // rows a closing read repeats; 0x177 (dbt's) and 0x176 do not recheck the
     // entry as procfs; 0x173 and 0x172 read the fdinfo by path, without the

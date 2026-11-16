@@ -1209,10 +1209,21 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .as_u64()
         .expect("recording metadata has no numeric version");
     assert_eq!(
-        current, 0x1a0,
+        current, 0x1a1,
         "RECORD_VERSION moved; point this test at the current and pre-flock epochs"
     );
     metadata["version"] = serde_json::json!(0x10b);
+    // Drop the current recorder's CPU profile fields, so the era check does not fire first.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     fs::write(
         &metadata_path,
         serde_json::to_string(&metadata).expect("failed to serialize the rewritten metadata"),

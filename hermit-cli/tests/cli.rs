@@ -5982,7 +5982,7 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     )
     .unwrap();
     assert_eq!(
-        manifest["schema"], "hermit-recording-manifest/v1",
+        manifest["schema"], "hermit-recording-manifest/v3",
         "{manifest}"
     );
     assert_eq!(manifest["kind"], "full-syscall", "{manifest}");
@@ -13345,10 +13345,21 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x1a0,
+        metadata["version"], 0x1a1,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
+    // Drop the current recorder's CPU profile fields, so the era check does not fire first.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let refused = hermit(&replay_args);
     assert!(
@@ -23827,7 +23838,7 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     assert_eq!(written.len(), 1, "{}", stderr(&original));
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&written[0]).unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "hermit-recording-manifest/v1");
+    assert_eq!(manifest["schema"], "hermit-recording-manifest/v3");
     assert_eq!(manifest["kind"], "inputs-only");
     assert_eq!(manifest["inputs"]["host_drawn"]["epoch"], "host-now");
     assert_eq!(manifest["inputs"]["host_drawn"]["seed"], "SystemRandom");
@@ -38944,7 +38955,7 @@ fn run_config_saved_by_one_run_reproduces_it() {
 
     let saved: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-    assert_eq!(saved["schema"], "hermit-run-config/v1", "{saved:?}");
+    assert_eq!(saved["schema"], "hermit-run-config/v2", "{saved:?}");
     assert_eq!(saved["global"]["log-file"], first_log.as_str(), "{saved:?}");
     assert!(saved["run"]["epoch"].is_string(), "{saved:?}");
     assert!(saved["run"]["seed"].is_u64(), "{saved:?}");
@@ -53676,8 +53687,19 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x1a0, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a1, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
+    // Drop the current recorder's CPU profile fields, so the era check does not fire first.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
     let replay = hermit(&replay_args);

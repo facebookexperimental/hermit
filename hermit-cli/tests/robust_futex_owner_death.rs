@@ -1132,10 +1132,21 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x1a0,
+        metadata["version"], 0x1a1,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);
+    // Drop the current recorder's CPU profile fields, so the era check does not fire first.
+    if let Some(document) = metadata.as_object_mut() {
+        for field in [
+            "cpu_profile",
+            "cpu_table_digest",
+            "cpu_profile_host",
+            "cpu_profile_residual",
+        ] {
+            document.remove(field);
+        }
+    }
     fs::write(
         &metadata_path,
         serde_json::to_vec(&metadata).expect("failed to serialize the metadata"),
