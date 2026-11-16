@@ -598,6 +598,7 @@ fn child_exit_event(
             user_ticks: 13,
             system_ticks: 17,
         },
+        forced: false,
     }
 }
 
