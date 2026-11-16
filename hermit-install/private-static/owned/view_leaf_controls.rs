@@ -179,7 +179,7 @@ pub fn foreign_owner_controls(source:&VerifiedStaticSource,archive:&StaticArchiv
     elf:&FileIdentity,map:&FileIdentity,lld:&Path,runner:&mut Runner,
     report:&mut Value,files:&[FileIdentity])->Result<(),String> {
     let expected_error="static archive belongs to another source transaction";
-    let start=runner.commands.len();
+    let start=runner.commands().len();
     let mut rows=Vec::new();
     let nested=VerifiedStaticSource::with_resolved(expected,runner,|foreign,runner| {
         need(source.metadata_sha256()==archive.metadata_sha256() &&
@@ -201,7 +201,7 @@ pub fn foreign_owner_controls(source:&VerifiedStaticSource,archive:&StaticArchiv
         Ok(()) // with_resolved must still close this real nested source.
     });
     let closed=close(selected,archive,files);
-    let no_link=runner.commands[start..].iter().all(|c|c.program.as_str()!=lld.to_string_lossy().as_ref());
+    let no_link=runner.commands()[start..].iter().all(|c|c.program()!=lld.to_string_lossy().as_ref());
     let roles=report["roles"].as_array_mut().ok_or("View foreign control has no actual role report")?;
     for kind in [Leaf::Site,Leaf::Table] {
         let name=kind.name();

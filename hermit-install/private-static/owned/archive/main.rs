@@ -25,7 +25,7 @@ fn run() -> Result<(), String> {
     });
     // Record commands on resolver/build/close failure as well. No reconstructed
     // metadata or old Cargo stream is supplied to the factory.
-    let commands = write_new(&logs.join("commands.debug"), format!("{:#?}\n", runner.commands).as_bytes());
+    let commands = write_new(&logs.join("commands.debug"), format!("{:#?}\n", runner.commands()).as_bytes());
     let archive = match (body, commands) {
         (Ok(value), Ok(())) => value,
         (Err(error), Ok(())) => return Err(error),

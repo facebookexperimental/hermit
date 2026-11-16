@@ -158,46 +158,50 @@ fn record_compiler_crash_retry(record: &mut Option<PathBuf>, leaf: &str, line: &
 /// normal non-zero exit whose output carries a compiler-crash text is rerun; a
 /// spawn failure, a byte-limit or deadline kill, a plain build error and a
 /// second crash all fail as before. The crashed attempt's logs stay in the log
-/// directory, and its evidence leaves `runner.commands` because the receipt
-/// admits only successful commands and exactly one Cargo build.
+/// directory and the Runner retains its record (its records are read-only
+/// through `commands()`), so this returns the crashed record's index beside
+/// the rerun output and the receipt construction excludes that one index,
+/// because the receipt admits only successful commands and exactly one Cargo
+/// build.
 fn run_cargo_build(
     runner: &mut Runner,
     leaf: &str,
     arguments: &[String],
     root: &Path,
-) -> Result<Vec<u8>> {
-    let commands_before = runner.commands.len();
+) -> Result<(Vec<u8>, Option<usize>)> {
+    let commands_before = runner.commands().len();
     let error = match runner.run("cargo", arguments, root) {
-        Ok(output) => return Ok(output),
+        Ok(output) => return Ok((output, None)),
         Err(error) => error,
     };
-    let Some(failed) = runner.commands.get(commands_before) else {
+    let Some(failed) = runner.commands().get(commands_before) else {
         return Err(error);
     };
-    if runner.commands.len() != commands_before + 1 || failed.status <= 0 {
+    if runner.commands().len() != commands_before + 1 || failed.status() <= 0 {
         return Err(error);
     }
-    let stdout = fs::read(&failed.stdout.path).map_err(|e| e.to_string())?;
-    let stderr = fs::read(&failed.stderr.path).map_err(|e| e.to_string())?;
+    let stdout = fs::read(&failed.stdout().path).map_err(|e| e.to_string())?;
+    let stderr = fs::read(&failed.stderr().path).map_err(|e| e.to_string())?;
     let Some(crash) = compiler_crash_line(&stdout, &stderr) else {
         return Err(error);
     };
     let failed = runner
-        .commands
-        .pop()
-        .expect("the failed build's evidence is present");
+        .commands()
+        .get(commands_before)
+        .expect("the failed build's evidence is present")
+        .clone();
     let mut record = None;
     let command = format!("cargo {}", arguments.join(" "));
     for line in [
         format!(
             "retry-on-compiler-crash: INFRA RETRY 1 of 1: the compiler crashed (exit {}) in: {command}",
-            failed.status
+            failed.status()
         ),
         "retry-on-compiler-crash: first run's crash lines:".to_owned(),
         crash.clone(),
         format!(
             "retry-on-compiler-crash: first run's logs: {}",
-            failed.stderr.path.display()
+            failed.stderr().path.display()
         ),
         "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node"
             .to_owned(),
@@ -217,7 +221,7 @@ fn run_cargo_build(
             ),
         },
     );
-    rerun
+    rerun.map(|output| (output, Some(commands_before)))
 }
 
 fn cargo_profile(validate: bool) -> Value {
@@ -364,7 +368,7 @@ fn build_leaf(
     } else {
         build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
     }
-    let output = run_cargo_build(&mut runner, name, &build_arguments, root)?;
+    let (output, crashed_build) = run_cargo_build(&mut runner, name, &build_arguments, root)?;
     compiled_sources.verify_unchanged(&mut runner)?;
     let features = leaf_features(standalone);
     let cargo_artifact = m1_artifact::select_artifact(
@@ -398,6 +402,17 @@ fn build_leaf(
     require(before == after, "source changed during leaf production")?;
     current.verify()?;
     artifact.verify()?;
+    // The one crashed-and-rerun Cargo build (if any) stays in the Runner's
+    // retained records; the receipt admits only successful commands and
+    // exactly one Cargo build, so that one index is excluded here (and in
+    // the readback below, whose list is taken after the final verify).
+    let receipt_commands: Vec<_> = runner
+        .commands()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != crashed_build)
+        .map(|(_, command)| command.clone())
+        .collect();
     let receipt = RuntimeReceipt {
         schema_version: m1_artifact::SCHEMA,
         source_before: before.clone(),
@@ -430,7 +445,7 @@ fn build_leaf(
         .map(|name| (name.to_owned(), std::env::var(name).ok()))
         .collect(),
         target_directory: target,
-        commands: runner.commands.clone(),
+        commands: receipt_commands,
         executed_tests: 0,
         full_m1_pass_claimed: false,
     };
@@ -467,7 +482,13 @@ fn build_leaf(
         &own.join("compiled-sources-readback.json"),
         &serde_json::to_vec_pretty(&json!({
             "compiled_sources": compiled_sources.record(),
-            "commands": runner.commands,
+            "commands": runner
+                .commands()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != crashed_build)
+                .map(|(_, command)| command)
+                .collect::<Vec<_>>(),
         }))
         .map_err(|e| e.to_string())?,
     )?;
@@ -582,7 +603,7 @@ fn produce_stack_fixture(
         binary: FileIdentity::read(&binary_path)?,
         compiler_version,
         command: runner
-            .commands
+            .commands()
             .last()
             .ok_or("stack fixture compiler command missing")?
             .clone(),
@@ -742,7 +763,7 @@ fn produce(root: &Path) -> Result<()> {
             binary: FileIdentity::read(&warning_guest)?,
             compiler_version: compiler_version.clone(),
             command: runner
-                .commands
+                .commands()
                 .last()
                 .ok_or("missing warning-enabled C compile evidence")?
                 .clone(),
@@ -776,7 +797,7 @@ fn produce(root: &Path) -> Result<()> {
             binary: FileIdentity::read(&guest)?,
             compiler_version,
             command: runner
-                .commands
+                .commands()
                 .last()
                 .ok_or("missing C compile evidence")?
                 .clone(),

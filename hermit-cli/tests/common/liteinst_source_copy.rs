@@ -238,9 +238,9 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
     context.verify_unchanged(runner)?;
     assert!(
         runner
-            .commands
+            .commands()
             .iter()
-            .all(|command| command.program != "git")
+            .all(|command| command.program() != "git")
     );
     Ok(())
 }
@@ -430,9 +430,9 @@ fn transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
     VerifiedCompiledSources::resolve(&expected, runner)?;
     assert!(
         runner
-            .commands
+            .commands()
             .iter()
-            .any(|command| command.program == "git")
+            .any(|command| command.program() == "git")
     );
     Ok(())
 }

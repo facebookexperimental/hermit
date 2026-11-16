@@ -18,18 +18,18 @@ fn need(ok: bool, message: &str) -> Result<(), String> {
 // source identity; the existing factory already selected/retained the outputs.
 fn selected_build_script(archive: &StaticArchive, expected: &SourceExpectation<'_>,
     runner: &Runner) -> Result<(FileIdentity, Vec<FileIdentity>), String> {
-    let builds: Vec<_> = runner.commands.iter().filter(|c|
-        c.program.as_str() == expected.cargo.to_string_lossy().as_ref() && c.status == 0 &&
-        c.cwd == expected.workspace && c.arguments.first().map(String::as_str) == Some("rustc") &&
-        c.stdout.sha256 == archive.cargo_messages_sha256()).collect();
+    let builds: Vec<_> = runner.commands().iter().filter(|c|
+        c.program() == expected.cargo.to_string_lossy().as_ref() && c.status() == 0 &&
+        c.cwd() == expected.workspace && c.arguments().first().map(String::as_str) == Some("rustc") &&
+        c.stdout().sha256 == archive.cargo_messages_sha256()).collect();
     need(builds.len() == 1, "leaf control needs one actual fresh archive Cargo stream")?;
-    let metadata: Vec<_> = runner.commands.iter().filter(|c|
-        c.program.as_str() == expected.cargo.to_string_lossy().as_ref() && c.status == 0 &&
-        c.cwd == expected.workspace && c.arguments.first().map(String::as_str) == Some("metadata") &&
-        c.stdout.sha256 == archive.metadata_sha256()).collect();
+    let metadata: Vec<_> = runner.commands().iter().filter(|c|
+        c.program() == expected.cargo.to_string_lossy().as_ref() && c.status() == 0 &&
+        c.cwd() == expected.workspace && c.arguments().first().map(String::as_str) == Some("metadata") &&
+        c.stdout().sha256 == archive.metadata_sha256()).collect();
     need(metadata.len() == 2, "leaf control needs both actual equal-metadata source streams")?;
-    let mut files = vec![builds[0].stdout.clone()];
-    files.extend(metadata.iter().map(|c| c.stdout.clone()));
+    let mut files = vec![builds[0].stdout().clone()];
+    files.extend(metadata.iter().map(|c| c.stdout().clone()));
     for f in &files { f.verify()?; }
     for f in &files {
         need(std::fs::metadata(&f.path).map_err(|e|e.to_string())?.len() <= 128 * 1024 * 1024,

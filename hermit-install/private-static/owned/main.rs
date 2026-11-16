@@ -297,7 +297,7 @@ fn run() -> Result<(), String> {
         Ok(())
     });
     let detail = write_new(&logs.join("owned-result.debug"), format!("{archive_detail}SELECTED_JOIN={join_detail}\nTERMINAL_OBSERVER={terminal_detail}\nSTARTUP_CENSUS={census_detail}\nNATIVE_LEAVES={leaf_detail}\nOPTIONAL_ZERO={optional_detail}\nORDINARY_GATE={ordinary_detail}\nEXPLICIT_STRUCTURAL_ATTEMPT={structural:#?}\nVIEW_LEAVES={view_leaf_detail}\nSOURCE_FACTORY_RESULT={body:?}\n").as_bytes());
-    let commands = write_new(&logs.join("commands.debug"), format!("{:#?}\n", runner.commands).as_bytes());
+    let commands = write_new(&logs.join("commands.debug"), format!("{:#?}\n", runner.commands()).as_bytes());
     if body.is_err() || detail.is_err() || commands.is_err() {
         return Err(format!("source={body:?}; evidence={detail:?}; commands={commands:?}"));
     }

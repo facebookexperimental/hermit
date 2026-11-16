@@ -35,7 +35,7 @@ pub fn negatives(source:&VerifiedStaticSource, archive:&StaticArchive, expected:
             if other.metadata_sha256()!=archive.metadata_sha256() {
                 return Err("nested actual metadata differs: wrong-owner control not exercised".into());
             }
-            let start=runner.commands.len();
+            let start=runner.commands().len();
             let owner_error="static archive belongs to another source transaction";
             match other.link_and_join_initializer_definitions(archive,&owner_input,runner) {
                 Err(e) if e==owner_error=>{},Err(e)=>return Err(format!("wrong owner refused elsewhere: {e}")),
@@ -62,8 +62,8 @@ pub fn negatives(source:&VerifiedStaticSource, archive:&StaticArchive, expected:
                 Err(e)=>return Err(format!("ordinary owner refused elsewhere: {e}")),
                 Ok(_)=>return Err("ordinary accepted another context's archive".into()),
             }
-            if owner_out.exists() || runner.commands[start..].iter().any(|c|
-                c.program.as_str()==normal.lld.to_string_lossy().as_ref()) {
+            if owner_out.exists() || runner.commands()[start..].iter().any(|c|
+                c.program()==normal.lld.to_string_lossy().as_ref()) {
                 return Err("wrong-owner control reached output/linker".into());
             }
             archive.verify()?;
@@ -83,12 +83,12 @@ pub fn negatives(source:&VerifiedStaticSource, archive:&StaticArchive, expected:
                 libc:if case==0 { &paths[0] } else { normal.libc },supporting_archives:&support,
                 memcpy_source:normal.memcpy_source,musl_source_authority:normal.musl_source_authority,
                 stack_chk_source:if case==1 { &paths[1] } else { normal.stack_chk_source },output_directory:&out };
-            let start=runner.commands.len();
+            let start=runner.commands().len();
             let observed=source.link_and_join_initializer_definitions(archive,&input,runner);
             // Exact error, not any failure: a source close error cannot count.
             match observed { Err(e) if e==message=>{},Err(e)=>return Err(format!("case{case} refused at wrong check: {e}")),
                 Ok(_)=>return Err(format!("case{case} unexpectedly admitted changed actual input")), }
-            if out.exists() || runner.commands[start..].iter().any(|c|c.program.as_str()==normal.lld.to_string_lossy().as_ref()) {
+            if out.exists() || runner.commands()[start..].iter().any(|c|c.program()==normal.lld.to_string_lossy().as_ref()) {
                 return Err(format!("case{case} reached linker instead of its intended refusal"));
             }
             archive.verify()?;

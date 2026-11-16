@@ -594,7 +594,7 @@ def bind_prepared(c, x):
     c['files'][str(tls_source_module)] = x.tls_source_module_sha256
     c['initializer_module_sha256'] = x.initializer_module_sha256
     c['files'][str(module)] = x.initializer_module_sha256
-    need(sha(D / 'factory_controls.rs') == '32f40e1ebd50c2d0273d8d90e91c01cc015717a5e975814f6b7ac8be93da48c3',
+    need(sha(D / 'factory_controls.rs') == '0cf919e1dccc9755ae2d2bfeb14d8b8e32a4c1e4a7b580f08fa2c63466ec28c4',
          'actual eight-assertion factory controls differ')
     for p in [D / 'factory_controls.rs', LEGACY]:
         c['files'][str(p)] = sha(p)

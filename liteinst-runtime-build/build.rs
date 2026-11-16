@@ -307,8 +307,8 @@ fn main() {
             "allocator_fixture": allocator_fixture,
             "qualification": qualification,
             "compiled_sources": Some(compiled_sources.record()),
-            "compiled_source_commands": source_runner.commands,
-            "commands": runner.commands,
+            "compiled_source_commands": source_runner.commands(),
+            "commands": runner.commands(),
             "executed_tests": 0,
         }))
         .expect("failed to serialize actual constructor qualification"),
@@ -357,7 +357,7 @@ fn main() {
         &evidence.join("compiled-sources-readback.json"),
         &serde_json::to_vec_pretty(&serde_json::json!({
             "compiled_sources": compiled_sources.record(),
-            "commands": runner.commands,
+            "commands": runner.commands(),
         }))
         .expect("failed to serialize final compiled-source readback"),
     )

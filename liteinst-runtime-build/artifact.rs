@@ -1220,7 +1220,7 @@ pub(crate) mod native {
         );
         // This producer always builds the liteinst-off runtime, so bind the
         // actual current build as the no-scope qualification witness.
-        let build_command = runner.commands.last().unwrap();
+        let build_command = runner.commands().last().unwrap();
         let sources = sources
             .with_current_build(build_command, &runtime_path, &nested)
             .unwrap_or_else(|error| panic!("actual native compiler evidence refused: {error}"));
@@ -1435,7 +1435,7 @@ pub(crate) mod native {
             "source_digest": source_digest, "compiled_sources": sources.record(), "proof_source": proof_source,
             "native_sources": source_files, "qualification": qualification,
             "bootstrap": bootstrap_identity, "runner": runner_identity, "runtime": runtime_identity,
-            "gate_digest": gate_digest, "commands": runner.commands, "executed_tests": 0,
+            "gate_digest": gate_digest, "commands": runner.commands(), "executed_tests": 0,
         })).unwrap()).unwrap();
     }
 }

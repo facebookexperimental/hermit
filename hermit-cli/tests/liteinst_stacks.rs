@@ -299,7 +299,7 @@ fn qualify(
         &evidence.join(format!("{phase}-compiled-sources.json")),
         &serde_json::to_vec_pretty(&json!({
             "compiled_sources": compiled_sources,
-            "commands": runner.commands,
+            "commands": runner.commands(),
         }))
         .map_err(|e| e.to_string())?,
     )?;
