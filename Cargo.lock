@@ -1908,6 +1908,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-proc-grammar"
+version = "0.5.7"
+
+[[package]]
 name = "reverie-process"
 version = "0.5.7"
 dependencies = [
@@ -1928,6 +1932,7 @@ name = "reverie-procfs"
 version = "0.5.7"
 dependencies = [
  "libc",
+ "reverie-proc-grammar",
  "serde",
 ]
 
