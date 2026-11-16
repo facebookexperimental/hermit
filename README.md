@@ -9,6 +9,11 @@ repository builds against — both the Cargo git dependency and the workspace su
 `https://github.com/facebookexperimental/reverie.git`, where Reverie is
 exported and published.
 
+See also: [website](https://hermetic-infra.org/) ·
+[introductory blog post](https://developers.facebook.com/blog/post/2022/11/22/hermit-deterministic-linux-testing/) ·
+[compatibility tracker](https://hermetic-infra.org/compatibility/latest/) ·
+[backend maturity scorecard](SCORECARD.md).
+
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
 

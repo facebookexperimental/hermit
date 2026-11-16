@@ -1,12 +1,20 @@
 # Compatibility scorecard
 
-This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
+Hermit runs Linux programs reproducibly by controlling thread scheduling, clocks, and randomness. This scorecard summarizes the coverage of its compatibility test suite; the [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded test results.
 
-The count table includes all **17822** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **2437** are selected by full, **1845** are not selected by full, and **13540** are **Not applicable**.
+The suite is a matrix of **(program, mode, backend)** combinations, called cells. Modes test different capabilities: `verify` compares repeated runs, `replay` checks record/replay, and `chaos` explores thread schedules. The `naked` mode runs a program directly on Linux, shown as `native` in the tables rather than a Hermit backend. One program can contribute several cells.
 
-Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1857** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
+A backend is how Hermit observes and controls a running program. `ptrace` is the reference implementation. KVM, LiteInst, and in-guest-trap are maturing alternatives with different trade-offs in execution overhead, host requirements, and program support.
 
-| Backend | Selected by full | Not selected by full | Not applicable | In the manifest |
+The headline counts add together **all modes** for each backend. For example, ptrace's **1195** selected cells comprise **615 verify**, **573 replay**, **7 chaos**. These are counts of tests included in the full regression suite, not counts of unique programs or passing results. A test passes when it completes as expected and meets its mode's checks; see [Methods](#methods).
+
+## Coverage by backend
+
+**Selected by full** means included in the full regression suite. **Not selected by full** means an applicable combination outside that suite. **Not applicable** means the test configuration does not enable that program, mode, and backend combination. Selection is not a test result: an unselected cell may have passed, failed, or never run.
+
+Of **17822** total cells, **2437** are selected by full, **1845** are not selected by full, and **13540** are **Not applicable**.
+
+| Backend | Selected by full | Not selected by full | Not applicable | Total cells |
 | --- | ---: | ---: | ---: | ---: |
 | `ptrace` | 1195 | 359 | 1260 | 2814 |
 | `dbt` | 0 | 561 | 2253 | 2814 |
@@ -17,24 +25,13 @@ Every selected `verify` cell that does not declare the stripped comparator, and 
 | `native` | 0 | 33 | 905 | 938 |
 | **Total** | **2437** | **1845** | **13540** | **17822** |
 
-**Archived:** `sabre` (backend, archived 2026-10-25, nightly only) and `e9patch` (preprocessing with ptrace, not a backend, archived 2026-10-25, nightly only). They get no feature work and their tests left per-commit validation. An archived backend's cells that would be selected by full belong to the `archived-nightly` run type instead, so the table counts them as not selected by full, and the nightly pressure sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per commit.
+**Archived:** `sabre` (backend, archived 2026-10-25, nightly only) and `e9patch` (preprocessing with ptrace, not a backend, archived 2026-10-25, nightly only). These receive no feature development. Their compatibility tests run separately from the full regression suite and therefore do not contribute to its selected counts.
 
-## Denominator, and why the percentage is not comparable across changes to it
+## Coverage by mode
 
-Selected by full is **2437 of 17822**, which is **13.67%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Each backend entry is `selected by full / total cells`, including not-applicable combinations in the total. An em dash means that mode is not defined for that execution path.
 
-- backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
-- modes: `chaos`, `naked`, `replay`, `verify`
-
-⚠️ **13540 of those 17822 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 4282 cells that CAN run, selected by full is **56.91%**.
-
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 2437 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
-
-⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly not selected RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
-
-The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `selected by full / in the manifest`; an em dash means that mode does not exist for that backend. The summary columns use the same selection and applicability facts as the table above.
-
-| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
+| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | Total cells |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `verify` | 615 / 938 | 0 / 938 | 611 / 938 | 0 / 938 | 316 / 938 | 315 / 938 | — | 1857 | 1775 | 1996 | 5628 |
 | `replay` | 573 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | — | 573 | 37 | 5018 | 5628 |
@@ -42,11 +39,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | `naked` | — | — | — | — | — | — | 0 / 938 | 0 | 33 | 905 | 938 |
 | **Total** | | | | | | | | **2437** | **1845** | **13540** | **17822** |
 
-## Ptrace by manifest category
+## Ptrace workloads
 
-This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `selected by full / in the manifest`; `custom` commands are not part of this denominator.
+The reference backend's tests span small syscall exercises, applications, and language runtimes. Each mode entry is `selected by full / total cells`, with the same counts as above.
 
-| Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |
+| Test category | Verify | Replay | Chaos | Selected by full | Total cells |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 7 / 7 | 7 / 7 | 0 / 7 | 14 | 21 |
 | `bin-c` | 2 / 2 | 1 / 2 | 0 / 2 | 3 | 6 |
@@ -64,11 +61,11 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 41 / 41 | 40 / 41 | 0 / 41 | 81 | 123 |
 | `util-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
 
-Ordinary full validation executes 2442 cells: the 2437 comparable compatibility cells selected by full above (including 7 chaos-mode race-exposure checks), and 5 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing selected cell is a regression, not permission to remove it from the plan.
+The full compatibility suite runs 2442 checks: the 2437 selected matrix cells above (including 7 chaos tests), plus 5 additional commands listed below. All must produce a fresh passing result for the validation run to succeed.
 
-### Selected custom commands outside the comparable denominator
+### Additional regression tests
 
-These rows are part of the selected regression denominator even though they are not rows in `ci/compat-envelope/cells.json`. Their exact identities come from `ci/expected-e2e-plan.json`; `scorecard.rs check` refuses any selected row that is not accounted for by either this table or the comparable green cells above.
+These tests use custom commands instead of the common modes. They run in the full regression suite but are outside the matrix and its counts.
 
 | Lane | Category | Test | Mode | Backend |
 | --- | --- | --- | --- | --- |
@@ -78,9 +75,9 @@ These rows are part of the selected regression denominator even though they are 
 | `portable` | `c-programs` | `c-programs/random-device-spellings` | `custom` | `ptrace` |
 | `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `ptrace` |
 
-## Known gaps of validation nodes, outside every count above
+## Known gaps
 
-Each row below is a test that a validation node does not yet require on its backend: a known gap, listed with its tracking issue in the node's known-gap ledger. The node runs a known gap and expects it to FAIL, or, when its row says skipped, leaves it out of the run by name. These **2** rows are not manifest cells, so they are in none of the counts or percentages above. Each one counts as a failing test, never as a pass and never as not applicable. The node records a known gap it runs as `diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it to required) or fails some other way; a skipped one is not run, so nothing shows whether it still fails until its row is deleted. In a signature, `\n` is a newline and `<N>` any run of digits. The same rows, with their tracking URLs, are in `ci/compat-envelope/known-gaps.json`.
+These **2** tests document unresolved backend limitations in additional test suites, outside the matrix and every count above. They are either run with an expected failure or skipped, as shown below; neither status counts as a pass. A skipped test has no current result. The linked issues describe the missing behavior.
 
 ### `privileged-test.deadline_slice_cap_kvm` (`--backend=kvm`)
 
@@ -91,6 +88,25 @@ Each row below is a test that a validation node does not yet require on its back
 | `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4485 | not run | skipped (known gap) |
 | `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4995 | not run | skipped (known gap) |
 
-## Run history
+## Methods
 
-Detailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history.
+### What the counts cover
+
+The matrix includes these execution paths and modes:
+
+- Execution paths: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
+- Modes: `chaos`, `naked`, `replay`, `verify`
+
+The full regression suite selects **2437 / 17822** cells (**13.67%**). Of the total, **13540** are not applicable. Excluding those gives **2437 / 4282** applicable cells (**56.91%**). These describe the same selection with different denominators; neither is a pass rate. Adding programs, backends, or modes changes the denominator, so comparisons over time must use the same population.
+
+### What the tests check
+
+Full `verify` comparisons run the same backend twice and compare exit status, standard output, standard error, and nonempty INFO event logs. Log comparison removes host wall-clock prefixes and consistently renames host addresses while preserving their identity and order; virtual time, branch counts, syscall values, and other event details must match. All **1857** selected `verify` cells require this full comparison.
+
+`replay` checks a recording against its replay. `chaos` checks repeatability for each selected scheduling seed and tests for the expected race behavior. Repeated runs on one backend do not establish agreement with another backend; the tracker reports [cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.
+
+See the [test-suite documentation](ci/compat-envelope/README.md) for the detailed rules.
+
+## Test results over time
+
+The [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded outcomes and trends. Its source results are available in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger).

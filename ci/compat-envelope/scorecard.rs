@@ -426,7 +426,7 @@ fn decode_catalogue(bytes: &[u8]) -> Result<TrackedCells, String> {
 }
 
 fn catalogue_history_notice() -> &'static str {
-    "\n## Run history\n\nDetailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history.\n"
+    "\n## Test results over time\n\nThe [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded outcomes and trends. Its source results are available in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger).\n"
 }
 
 /// Declares that `observations` are a DERIVED PROJECTION, not the source of
@@ -5041,16 +5041,11 @@ fn render_known_gaps(nodes: &[KnownGapNode]) -> String {
     }
     let total = nodes.iter().map(|node| node.rows.len()).sum::<usize>();
     let mut out = format!(
-        "\n## Known gaps of validation nodes, outside every count above\n\n\
-Each row below is a test that a validation node does not yet require on its backend: a known \
-gap, listed with its tracking issue in the node's known-gap ledger. The node runs a known gap and \
-expects it to FAIL, or, when its row says skipped, leaves it out of the run by name. These \
-**{total}** rows are not manifest cells, so they are in none of the counts or percentages above. \
-Each one counts as a failing test, never as a pass and never as not applicable. The node records \
-a known gap it runs as `diagnostic_fail` when it fails the way its row says, and fails outright \
-when it passes (promote it to required) or fails some other way; a skipped one is not run, so \
-nothing shows whether it still fails until its row is deleted. In a signature, `\\n` is a newline \
-and `<N>` any run of digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
+        "\n## Known gaps\n\n\
+These **{total}** tests document unresolved backend limitations in additional test suites, \
+outside the matrix and every count above. They are either run with an expected failure or \
+skipped, as shown below; neither status counts as a pass. A skipped test has no current result. \
+The linked issues describe the missing behavior.\n"
     );
     for node in nodes {
         let skipped = node.rows.iter().filter(|row| !row.outcome.is_run()).count();
@@ -5127,7 +5122,6 @@ fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
 /// so the scorecard says why an archived backend has no cell selected by full.
 fn archived_paragraph() -> String {
     use hermit_manifest_plan::archived::ARCHIVED;
-    use hermit_manifest_plan::archived::ARCHIVED_RUN_TYPE;
     use hermit_manifest_plan::archived::ArchivedKind;
     let entries: Vec<String> = ARCHIVED
         .iter()
@@ -5146,11 +5140,8 @@ fn archived_paragraph() -> String {
         return String::new();
     }
     format!(
-        "**Archived:** {}. They get no feature work and their tests left per-commit validation. \
-An archived backend's cells that would be selected by full belong to the `{ARCHIVED_RUN_TYPE}` \
-run type instead, so the table counts them as not selected by full, and the nightly pressure \
-sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per \
-commit.\n\n",
+        "**Archived:** {}. These receive no feature development. Their compatibility tests run \
+separately from the full regression suite and therefore do not contribute to its selected counts.\n\n",
         entries.join(" and ")
     )
 }
@@ -5164,9 +5155,7 @@ fn stripped_selected_sentence(derived: &Derived) -> String {
         .filter(|id| id.mode == "verify")
         .count();
     if derived.stripped_selected.is_empty() {
-        return format!(
-            "None of the **{verify}** selected `verify` cells declares the stripped comparator."
-        );
+        return format!("All **{verify}** selected `verify` cells require this full comparison.");
     }
     let mut by_group = BTreeMap::<(&str, &str), usize>::new();
     for id in &derived.stripped_selected {
@@ -5180,10 +5169,9 @@ fn stripped_selected_sentence(derived: &Derived) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "**{}** of the **{verify}** selected `verify` cells declare `comparator: stripped` ({groups}). \
-They run Hermit's default `--verify` and pass only on a verified, matched report of a non-empty \
-stripped comparison; they are below L2, never `bitwise_parity`, and are counted in these tables as \
-selected, not as canonical.",
+        "**{}** of the **{verify}** selected `verify` cells use a reduced comparison ({groups}). \
+These discard some log details and provide weaker evidence, below L2. Their inclusion in the \
+suite does not establish full repeatability.",
         derived.stripped_selected.len()
     )
 }
@@ -5623,28 +5611,48 @@ fn render_scorecard(derived: &Derived) -> String {
     let selected_by_full_total = derived.green.len();
     let not_selected_by_full_total = derived.applicable.difference(&derived.green).count();
     let stripped_sentence = stripped_selected_sentence(derived);
+    let mut ptrace_mode_counts = BTreeMap::new();
+    for id in derived.green.iter().filter(|id| id.backend == "ptrace") {
+        *ptrace_mode_counts.entry(id.mode.as_str()).or_insert(0usize) += 1;
+    }
+    let ptrace_selected: usize = ptrace_mode_counts.values().sum();
+    let mut ptrace_modes: Vec<_> = ptrace_mode_counts.into_iter().collect();
+    ptrace_modes.sort_by_key(|(mode, _)| match *mode {
+        "verify" => 0,
+        "replay" => 1,
+        "chaos" => 2,
+        _ => 3,
+    });
+    let ptrace_modes = ptrace_modes
+        .iter()
+        .map(|(mode, count)| format!("**{count} {mode}**"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
-This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
-`./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-The count table includes all **{}** cells in the manifest; no row is omitted. A cell is \
-**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is \
-**Not selected by full** when it is in the manifest but absent from that plan. Selection is not a \
-test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. \
-Of these cells, **{selected_by_full_total}** are selected by full, \
-**{not_selected_by_full_total}** are not selected by full, and **{na_total}** are \
-**Not applicable**.\n\n\
-Every selected `verify` cell that does not declare the stripped comparator, and every seed in a \
-selected `chaos` cell, runs the same backend \
-twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
-accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
-`bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical \
-`record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
-comparison when invoked directly and does not satisfy \
-this regression plan. {stripped_sentence} These same-backend results do not establish \
-cross-backend parity.\n\n\
-| Backend | Selected by full | Not selected by full | Not applicable | In the manifest |\n\
+Hermit runs Linux programs reproducibly by controlling thread scheduling, clocks, and randomness. \
+This scorecard summarizes the coverage of its compatibility test suite; the \
+[compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded test results.\n\n\
+The suite is a matrix of **(program, mode, backend)** combinations, called cells. Modes test different \
+capabilities: `verify` compares repeated runs, `replay` checks record/replay, and `chaos` explores \
+thread schedules. The `naked` mode runs a program directly on Linux, shown as `native` in the \
+tables rather than a Hermit backend. One program can contribute several cells.\n\n\
+A backend is how Hermit observes and controls a running program. `ptrace` is the reference \
+implementation. KVM, LiteInst, and in-guest-trap are maturing alternatives with different trade-offs \
+in execution overhead, host requirements, and program support.\n\n\
+The headline counts add together **all modes** for each backend. For example, ptrace's \
+**{ptrace_selected}** selected cells comprise {ptrace_modes}. These are counts of tests included in \
+the full regression suite, not counts of unique programs or passing results. A test passes when it \
+completes as expected and meets its mode's checks; see [Methods](#methods).\n\n\
+## Coverage by backend\n\n\
+**Selected by full** means included in the full regression suite. **Not selected by full** means \
+an applicable combination outside that suite. **Not applicable** means the test configuration \
+does not enable that program, mode, and backend combination. Selection is not a test result: an \
+unselected cell may have passed, failed, or never run.\n\n\
+Of **{}** total cells, **{selected_by_full_total}** are selected by full, \
+**{not_selected_by_full_total}** are not selected by full, and **{na_total}** are **Not applicable**.\n\n\
+| Backend | Selected by full | Not selected by full | Not applicable | Total cells |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
         derived.population.len()
     );
@@ -5707,24 +5715,27 @@ cross-backend parity.\n\n\
         .iter()
         .map(|id| id.mode.as_str())
         .collect();
-    out.push_str(&format!(
-        "## Denominator, and why the percentage is not comparable across changes to it\n\n\
-Selected by full is **{selected_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
-other. The population is every combination the manifest declares, and it is composed of:\n\n\
-- backends: {}\n\
-- modes: {}\n\n\
-⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not applicable for their \
-mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
-CAN run, selected by full is **{applicable_percent:.2}%**.\n\n\
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {selected_total} cells selected by full \
-measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
-figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
-compare one against the other as though something moved.\n\n\
-⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
-without anything about the product changing.** Removing a backend whose cells are mostly not selected \
-RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before \
-comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
-numbers are not comparable and the difference is not a result.\n\n",
+    let methods = format!(
+        "\n## Methods\n\n\
+### What the counts cover\n\n\
+The matrix includes these execution paths and modes:\n\n\
+- Execution paths: {}\n\
+- Modes: {}\n\n\
+The full regression suite selects **{selected_total} / {total}** cells (**{percent:.2}%**). \
+Of the total, **{na}** are not applicable. Excluding those gives **{selected_total} / {applicable}** \
+applicable cells (**{applicable_percent:.2}%**). These describe the same selection with different \
+denominators; neither is a pass rate. Adding programs, backends, or modes changes the denominator, \
+so comparisons over time must use the same population.\n\n\
+### What the tests check\n\n\
+Full `verify` comparisons run the same backend twice and compare exit status, standard output, \
+standard error, and nonempty INFO event logs. Log comparison removes host wall-clock prefixes \
+and consistently renames host addresses while preserving their identity and order; virtual time, \
+branch counts, syscall values, and other event details must match. {stripped_sentence}\n\n\
+`replay` checks a recording against its replay. `chaos` checks repeatability for each selected \
+scheduling seed and tests for the expected race behavior. Repeated runs on one backend do not \
+establish agreement with another backend; the tracker reports \
+[cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.\n\n\
+See the [test-suite documentation](ci/compat-envelope/README.md) for the detailed rules.\n",
         ordered
             .iter()
             .map(|b| format!("`{b}`"))
@@ -5742,18 +5753,17 @@ numbers are not comparable and the difference is not a result.\n\n",
         } else {
             100.0 * selected_total as f64 / (total - na_total) as f64
         },
-    ));
+    );
     out.push_str(
-        "The mode view makes the current order of work explicit: expand `verify` first, then \
-`replay`, then `chaos`. Each backend cell is `selected by full / in the manifest`; an em dash means \
-that mode does not exist for that backend. The summary columns use the same selection and \
-applicability facts as the table above.\n\n| Mode",
+        "## Coverage by mode\n\n\
+Each backend entry is `selected by full / total cells`, including not-applicable combinations \
+in the total. An em dash means that mode is not defined for that execution path.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
     out.push_str(
-        " | Selected by full | Not selected by full | Not applicable | In the manifest |\n| ---",
+        " | Selected by full | Not selected by full | Not applicable | Total cells |\n| ---",
     );
     for _ in &ordered {
         out.push_str(" | ---:");
@@ -5802,11 +5812,10 @@ applicability facts as the table above.\n\n| Mode",
         total - selected_total - na_total
     ));
     out.push_str(
-        "## Ptrace by manifest category\n\n\
-This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
-workload mix visible. Each entry is `selected by full / in the manifest`; `custom` commands are not part of this \
-denominator.\n\n\
-| Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |\n\
+        "## Ptrace workloads\n\n\
+The reference backend's tests span small syscall exercises, applications, and language runtimes. \
+Each mode entry is `selected by full / total cells`, with the same counts as above.\n\n\
+| Test category | Verify | Replay | Chaos | Selected by full | Total cells |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let categories: BTreeSet<&str> = derived
@@ -5847,19 +5856,16 @@ denominator.\n\n\
         .count();
     let custom = derived.selected_custom.len();
     out.push_str(&format!(
-        "Ordinary full validation executes {} cells: the {selected_total} comparable compatibility \
-cells selected by full above (including {chaos} chaos-mode race-exposure checks), and {custom} \
-explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing selected cell is a regression, not permission to remove it from the plan.\n",
+        "The full compatibility suite runs {} checks: the {selected_total} selected matrix cells above \
+(including {chaos} chaos tests), plus {custom} additional commands listed below. All must produce \
+a fresh passing result for the validation run to succeed.\n",
         derived.selected.len()
     ));
     if !derived.selected_custom.is_empty() {
         out.push_str(
-            "\n### Selected custom commands outside the comparable denominator\n\n\
-These rows are part of the selected regression denominator even though they are not rows in \
-`ci/compat-envelope/cells.json`. Their exact identities come from \
-`ci/expected-e2e-plan.json`; `scorecard.rs check` refuses any selected row that is not accounted \
-for by either this table or the comparable green cells above.\n\n\
+            "\n### Additional regression tests\n\n\
+These tests use custom commands instead of the common modes. They run in the full regression \
+suite but are outside the matrix and its counts.\n\n\
 | Lane | Category | Test | Mode | Backend |\n\
 | --- | --- | --- | --- | --- |\n",
         );
@@ -5871,6 +5877,7 @@ for by either this table or the comparable green cells above.\n\n\
         }
     }
     out.push_str(&render_known_gaps(&derived.known_gaps));
+    out.push_str(&methods);
     out
 }
 
@@ -23501,13 +23508,13 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     };
     let rendered = render_scorecard(&selected_fixture);
     let status_prose = rendered
-        .split("Every selected")
+        .split("## Coverage by mode")
         .next()
         .ok_or("scorecard omitted its status explanation")?;
     for required in [
-        "cells in the manifest; no row is omitted.",
-        "**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`.",
-        "**Not selected by full** when it is in the manifest but absent from that plan.",
+        "**(program, mode, backend)** combinations, called cells.",
+        "**Selected by full** means included in the full regression suite.",
+        "**Not selected by full** means an applicable combination outside that suite.",
         "Selection is not a test result:",
         "**Not applicable**",
     ] {
@@ -41806,13 +41813,13 @@ mod retired_id_join_tests {
         };
         assert_eq!(
             super::stripped_selected_sentence(&derived),
-            "None of the **2** selected `verify` cells declares the stripped comparator."
+            "All **2** selected `verify` cells require this full comparison."
         );
         derived.stripped_selected = BTreeSet::from([cell("compat/a", "verify")]);
         let sentence = super::stripped_selected_sentence(&derived);
         assert!(
             sentence.starts_with(
-                "**1** of the **2** selected `verify` cells declare `comparator: stripped` (`compat` on `ptrace`: 1)."
+                "**1** of the **2** selected `verify` cells use a reduced comparison (`compat` on `ptrace`: 1)."
             ) && sentence.contains("below L2"),
             "{sentence}"
         );
