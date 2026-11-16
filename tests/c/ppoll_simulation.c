@@ -128,6 +128,40 @@ static int run_raw_timeout_copyout(void) {
   return 0;
 }
 
+// One thread, one empty pipe, one finite ppoll timeout: nothing can
+// ever make the descriptor ready, so the wait ends only by expiring.
+// Under record the scheduler must not mistake that lone expiring
+// poller for a deadlock (its deadline hint is suppressed there); the
+// call returns 0 after the timeout, as natively.
+static int run_lone_timed_wait(void) {
+  int pipefd[2];
+  if (pipe(pipefd) != 0) {
+    perror("lone timed wait pipe");
+    return 1;
+  }
+  struct pollfd empty = {.fd = pipefd[0], .events = POLLIN};
+  struct timespec timeout = {.tv_sec = 0, .tv_nsec = 100000000};
+  errno = 0;
+  long result = syscall(
+      SYS_ppoll, &empty, 1, &timeout, NULL, sizeof(uint64_t));
+  int saved_errno = errno;
+  if (result != 0 || saved_errno != 0 || empty.revents != 0) {
+    fprintf(
+        stderr,
+        "lone timed ppoll did not expire with 0: result=%ld errno=%d "
+        "revents=%d\n",
+        result,
+        saved_errno,
+        empty.revents);
+    return 1;
+  }
+  if (close(pipefd[0]) != 0 || close(pipefd[1]) != 0) {
+    perror("close lone timed wait descriptors");
+    return 1;
+  }
+  return 0;
+}
+
 static int run_invalid_nfds(void) {
   struct rlimit limit;
   if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
@@ -844,7 +878,8 @@ int main(int argc, char** argv) {
         "masked-signal-thread-admits|masked-signal-blocked-by-call|"
         "masked-raw-timeout-remaining|masked-raw-signal-remaining|"
         "masked-record-kernel-wait|"
-        "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
+        "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias|"
+        "lone-timed-wait]\n",
         argv[0]);
     return 2;
   }
@@ -946,12 +981,20 @@ int main(int argc, char** argv) {
     }
     return result;
   }
+  if (strcmp(argv[1], "lone-timed-wait") == 0) {
+    int result = run_lone_timed_wait();
+    if (result == 0) {
+      puts("ppoll-simulation-ok");
+    }
+    return result;
+  }
 
   fprintf(
       stderr,
       "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
       "masked-readonly-zero-timeout|masked-fail-closed|"
-      "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
+      "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias|"
+      "lone-timed-wait]\n",
       argv[0]);
   return 2;
 }

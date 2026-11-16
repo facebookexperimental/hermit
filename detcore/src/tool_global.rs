@@ -7435,6 +7435,7 @@ impl GlobalState {
                     upgraded_from_attempt: 0,
                     polls_channel: None,
                     poll_deadline: None,
+                    poll_expires: false,
                     in_guest_sleep_sigalrm: None,
                     signal_state_task: None,
                     decides_signal_interruption_itself: false,
@@ -8688,9 +8689,14 @@ pub enum SignalScope {
 /// its rebase onto main's 58).
 /// 60 retypes `Resources::resources` to `ResourceMap`, a map whose hasher has
 /// fixed keys: the map still crosses the RPC as the same entries, but the
-/// `Resources` definition, which the digest reads as text, changed; it is
-/// current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 60;
+/// `Resources` definition, which the digest reads as text, changed.
+/// 61 adds `Resources.poll_expires`, which a polling wait with a
+/// guest-side deadline carries where its scheduler-visible
+/// `poll_deadline` is suppressed (record/replay); the same change's
+/// open-file model also gained `send_timeout` and `socket_family`
+/// under this revision (60 on its own base, renumbered to 61 at its
+/// rebase onto main's 60). It is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 61;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

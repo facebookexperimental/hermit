@@ -440,6 +440,15 @@ mod tests {
         // digest is unchanged. 58 on main's 57, renumbered to 60 over the
         // import base's 59; digests measured at this head.
         (60, "fb8c186c3fd4a2d2", "73abee5d6e81af44"),
+        // Adds `Resources.poll_expires`: a polling wait whose retry loop
+        // enforces a finite deadline even where the scheduler-visible
+        // `poll_deadline` is suppressed (record/replay), so the scheduler
+        // never counts it as a poller no thread can satisfy. The same
+        // change's open-file model also gained `send_timeout` and
+        // `socket_family`, which travel with it under this revision.
+        // 60 on its own base, renumbered to 61 at its rebase onto main's
+        // 60. Digest measured at this head.
+        (61, "fb8c186c3fd4a2d2", "878bf500cb907b38"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

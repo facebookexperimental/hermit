@@ -330,6 +330,7 @@ static PROC_STATUS_TRACER_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DEATH_TEST_TRACER_CHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_DONTWAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_TIMEOUT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_ERRQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FATAL_SIGNAL_FUTEX_WAITERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -47583,6 +47584,292 @@ fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
         log.contains("Success: replay matched recording."),
         "the replay must match the recording:\n{log}"
     );
+}
+
+/// The guest output `tests/c/socket_timeout.c` prints natively, section by
+/// section. `batched` keeps the recvmmsg and sendmmsg lines record and
+/// replay cannot run.
+fn socket_timeout_expected(batched: bool) -> String {
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let einval = "-1 (Invalid argument)";
+    let edom = "-1 (Numerical argument out of domain)";
+    let mut expected = format!(
+        "setsockopt usec too large: {edom}\n\
+         setsockopt usec negative: {edom}\n\
+         setsockopt short option: {einval}\n\
+         recv keeps good timeout: {eagain}\n\
+         negative seconds setsockopt SO_SNDTIMEO: 0\n\
+         negative seconds setsockopt SO_RCVTIMEO: 0\n\
+         negative seconds recv: {eagain}\n\
+         receive timeout setsockopt SO_SNDTIMEO: 0\n\
+         receive timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed recvfrom empty: {eagain}\n\
+         waited >= timeout: yes\n\
+         timed recvmsg empty: {eagain}\n"
+    );
+    if batched {
+        expected += &format!("timed recvmmsg empty: {eagain}\n");
+    }
+    expected += &format!(
+        "dontwait recv empty: {eagain}\n\
+         timed recv queued: 4\n\
+         timed recv queued data: here\n\
+         mid-wait setsockopt SO_SNDTIMEO: 0\n\
+         mid-wait setsockopt SO_RCVTIMEO: 0\n\
+         mid-wait recv: 4\n\
+         mid-wait data: late\n\
+         no timeout setsockopt SO_SNDTIMEO: 0\n\
+         no timeout setsockopt SO_RCVTIMEO: 0\n\
+         untimed recv waits: 4\n\
+         untimed recv data: late\n\
+         send fill ends after some sends: Resource temporarily unavailable\n\
+         send timeout setsockopt SO_SNDTIMEO: 0\n\
+         send timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed sendto full: {eagain}\n\
+         timed sendmsg full: {eagain}\n"
+    );
+    if batched {
+        expected += &format!("timed sendmmsg full: {eagain}\n");
+    }
+    expected += &format!(
+        "dontwait send full: {eagain}\n\
+         mid-wait send setsockopt SO_SNDTIMEO: 0\n\
+         mid-wait send setsockopt SO_RCVTIMEO: 0\n\
+         mid-wait send: 1\n\
+         send no timeout setsockopt SO_SNDTIMEO: 0\n\
+         send no timeout setsockopt SO_RCVTIMEO: 0\n\
+         untimed send waits: 1\n\
+         accept timeout setsockopt SO_SNDTIMEO: 0\n\
+         accept timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed accept empty: {eagain}\n\
+         inherit tcp listener setsockopt SO_SNDTIMEO: 0\n\
+         inherit tcp listener setsockopt SO_RCVTIMEO: 0\n\
+         accepted tcp recv expires: {eagain}\n\
+         inherit unix listener setsockopt SO_SNDTIMEO: 0\n\
+         inherit unix listener setsockopt SO_RCVTIMEO: 0\n\
+         accepted unix recv waits: 4\n\
+         accepted unix data: late\n\
+         tcp fill ends after some connects: Operation now in progress\n\
+         tcp connect timeout setsockopt SO_SNDTIMEO: 0\n\
+         tcp connect timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed tcp connect full backlog: -1 (Operation now in progress)\n\
+         unix fill ends after some connects: Resource temporarily unavailable\n\
+         unix connect timeout setsockopt SO_SNDTIMEO: 0\n\
+         unix connect timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed unix connect full backlog: {eagain}\n\
+         interrupt send setsockopt SO_SNDTIMEO: 0\n\
+         interrupt send setsockopt SO_RCVTIMEO: 0\n\
+         timed send interrupted: -1 (Interrupted system call)\n\
+         interrupt send handler ran: 1\n\
+         timed write interrupted: -1 (Interrupted system call)\n\
+         interrupt write handler ran: 1\n\
+         interrupt read setsockopt SO_SNDTIMEO: 0\n\
+         interrupt read setsockopt SO_RCVTIMEO: 0\n\
+         timed read interrupted: -1 (Interrupted system call)\n\
+         interrupt read handler ran: 1\n\
+         interrupt connect setsockopt SO_SNDTIMEO: 0\n\
+         interrupt connect setsockopt SO_RCVTIMEO: 0\n\
+         timed connect interrupted: -1 (Interrupted system call)\n\
+         interrupt connect handler ran: 1\n\
+         pending signal setsockopt SO_SNDTIMEO: 0\n\
+         pending signal setsockopt SO_RCVTIMEO: 0\n\
+         expired recv with pending signal: {eagain}\n\
+         pending signal handler ran during call: 0\n\
+         pending signal handler ran after unblock: 1\n\
+         recvmmsg timeout -1 -1: {einval}\n\
+         recvmmsg timeout -1 0: {einval}\n\
+         recvmmsg timeout nsec large: {einval}\n\
+         recvmmsg bad fd timeout -1 -1: {einval}\n"
+    );
+    expected
+}
+
+/// Run the whole socket-timeout guest under strict verification and return
+/// its stdout, requiring canonical bitwise parity with INFO messages
+/// compared on both sides (the L2 envelope).
+fn socket_timeout_at_l2(backend: &[&str]) -> String {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_TIMEOUT_GUEST, "socket_timeout")
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args: Vec<&str> = backend.to_vec();
+    args.extend(["run", "--strict"]);
+    // `--timeout` is not qualified on the KVM backend, which refuses a
+    // bound it cannot enforce; the ptrace run keeps it so a regression
+    // that polls forever fails instead of hanging the suite.
+    if !backend.iter().any(|arg| arg.contains("kvm")) {
+        args.extend(["--timeout", "120"]);
+    }
+    args.extend([
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {verdict}"
+        );
+    }
+    stdout(&output)
+}
+
+/// A blocking socket call waits only as long as the socket's timeout
+/// allows: `SO_RCVTIMEO` bounds a receive and an accept, `SO_SNDTIMEO` a
+/// send (net/core/sock.c at v6.17), and the wait then fails with EAGAIN.
+/// Detcore makes the socket physically nonblocking and polls it, so no
+/// kernel timeout can fire; without a virtual-time deadline the poll
+/// never ended (facebookexperimental/hermit issue 129: a blocking
+/// `sendto` with a 10-microsecond `SO_SNDTIMEO` polled over a hundred
+/// thousand times without returning). A `recvmmsg` timeout Linux cannot
+/// use fails with EINVAL before the descriptor is checked
+/// (net/socket.c:2934-2937). The guest's native output is the oracle;
+/// each timed case sits next to its `MSG_DONTWAIT` twin, which already
+/// returned at once, and to the same call with no timeout, which still
+/// waits for its peer. Identical output under two scheduler seeds shows
+/// the deadline is a function of virtual time, not of scheduling.
+#[test]
+fn blocking_socket_calls_end_with_eagain_when_their_timeout_passes() {
+    let guest_path = futex_c_guest(&SOCKET_TIMEOUT_GUEST, "socket_timeout");
+    let expected = socket_timeout_expected(true);
+    assert_eq!(native_stdout(guest_path), expected);
+    let guest = guest_path.to_str().unwrap();
+    {
+        let _lock = hermit_run_guard();
+        for seed in ["--seed=1", "--seed=2"] {
+            let args = [
+                "run",
+                "--strict",
+                "--timeout",
+                "120",
+                seed,
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+    }
+    assert_eq!(socket_timeout_at_l2(&[]), expected);
+}
+
+/// The KVM half of
+/// `blocking_socket_calls_end_with_eagain_when_their_timeout_passes`.
+/// The one line that differs names a gap this change does not own: the
+/// KVM executor implements no `sendmmsg` at all, timed or not, so the
+/// call fails with ENOSYS before any wait (tracked separately
+/// from this change; the executor has no sendmmsg at all today). When
+/// the executor grows it, this expectation fails and the line joins
+/// the native output.
+#[test]
+fn run_kvm_blocking_socket_calls_end_with_eagain_when_their_timeout_passes() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM socket-timeout cases: /dev/kvm is unavailable");
+        return;
+    }
+    let expected = socket_timeout_expected(true).replace(
+        "timed sendmmsg full: -1 (Resource temporarily unavailable)",
+        "timed sendmmsg full: -1 (Function not implemented)",
+    );
+    assert_eq!(socket_timeout_at_l2(&["--backend=kvm"]), expected);
+}
+
+/// Under record and replay a socketpair call is polled through the
+/// recorder; its virtual-time deadline must end the recording's wait the
+/// same way and the replay must reproduce it. Only the socketpair
+/// sections run here, without the batched calls record does not take.
+#[test]
+fn timed_socketpair_calls_record_and_replay_as_on_linux() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_TIMEOUT_GUEST, "socket_timeout")
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let expected = format!(
+        "receive timeout setsockopt SO_SNDTIMEO: 0\n\
+         receive timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed recvfrom empty: {eagain}\n\
+         waited >= timeout: yes\n\
+         timed recvmsg empty: {eagain}\n\
+         dontwait recv empty: {eagain}\n\
+         timed recv queued: 4\n\
+         timed recv queued data: here\n\
+         mid-wait setsockopt SO_SNDTIMEO: 0\n\
+         mid-wait setsockopt SO_RCVTIMEO: 0\n\
+         mid-wait recv: 4\n\
+         mid-wait data: late\n\
+         no timeout setsockopt SO_SNDTIMEO: 0\n\
+         no timeout setsockopt SO_RCVTIMEO: 0\n\
+         untimed recv waits: 4\n\
+         untimed recv data: late\n\
+         send fill ends after some sends: Resource temporarily unavailable\n\
+         send timeout setsockopt SO_SNDTIMEO: 0\n\
+         send timeout setsockopt SO_RCVTIMEO: 0\n\
+         timed sendto full: {eagain}\n\
+         timed sendmsg full: {eagain}\n\
+         dontwait send full: {eagain}\n\
+         mid-wait send setsockopt SO_SNDTIMEO: 0\n\
+         mid-wait send setsockopt SO_RCVTIMEO: 0\n\
+         mid-wait send: 1\n\
+         send no timeout setsockopt SO_SNDTIMEO: 0\n\
+         send no timeout setsockopt SO_RCVTIMEO: 0\n\
+         untimed send waits: 1\n"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = format!("--verify-json={}", report.display());
+    let data_arg = format!("--data-dir={}", directory.path().join("data").display());
+    let args = [
+        "record",
+        "start",
+        "--strict",
+        "--base-env=minimal",
+        "--verify",
+        "--verify-strict",
+        report_arg.as_str(),
+        data_arg.as_str(),
+        "--",
+        guest,
+        "unbatched",
+        "receive_timeout",
+        "send_timeout",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "{args:?}");
+    assert!(
+        stderr(&output).contains("Success: replay matched recording."),
+        "the replay must match the recording: {output:?}"
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("record --verify wrote no verdict"))
+            .expect("record --verify verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {verdict}"
+        );
+    }
 }
 
 /// `select`'s timeout is read as Linux v7.1 reads it: `kern_select`

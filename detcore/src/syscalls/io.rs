@@ -853,6 +853,38 @@ pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errn
     Ok(Duration::new(seconds, nanoseconds))
 }
 
+/// The argument checks Linux makes at a `recvmmsg` call's entry, before it
+/// looks at the descriptor or receives anything, in Linux's order:
+/// `MSG_CMSG_COMPAT` is EINVAL at the entry point (net/socket.c:3065-3066
+/// at v6.17), then the timeout is copied (EFAULT), then a timeout Linux
+/// cannot use is EINVAL (`do_recvmmsg`, net/socket.c:2934-2937, through
+/// `poll_select_set_timeout`, fs/select.c:271-276: invalid when
+/// `tv_sec < 0` or `tv_nsec` names a billionth count outside `[0, 1e9)`,
+/// `timespec64_valid`, include/linux/time64.h:97-106) -- all before the
+/// descriptor check (net/socket.c:2941-2947), so a bad descriptor with a
+/// bad timeout still fails with EINVAL. The checks must live at the
+/// handler, not in an attempt: an executor that drops the timeout
+/// argument would turn the EINVAL into an EAGAIN the polling retry waits
+/// on forever. A usable timeout bounds only the datagrams after the
+/// first, inside each attempt; the first datagram's wait is bounded by
+/// `SO_RCVTIMEO` as for `recvmsg`.
+fn check_recvmmsg_call<M: MemoryAccess>(
+    memory: &M,
+    call: &syscalls::Recvmmsg,
+) -> Result<(), Error> {
+    // `MSG_CMSG_COMPAT` (include/linux/socket.h at v6.17) names a compat
+    // control layout no native call may ask for; libc does not export it.
+    const MSG_CMSG_COMPAT: u32 = 0x8000_0000;
+    if call.flags() & MSG_CMSG_COMPAT != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    if let Some(timeout) = call.timeout() {
+        let timeout: Timespec = memory.read_value(timeout)?;
+        ppoll_timeout_duration(timeout)?;
+    }
+    Ok(())
+}
+
 /// The start time and deadline of a wait for `timeout`, or neither without
 /// one. Observing the virtual clock asks the scheduler, which publishes the
 /// thread's signal state and can end its turn, so a call whose first mask probe
@@ -2090,6 +2122,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("pselect6");
         resources.poll_deadline = poll_deadline_for(guest, deadline);
+        resources.poll_expires = deadline.is_some();
         if gated {
             resources.blocked_signal_mask = sigmask;
         } else if self.cfg.backend.provides_process_signal_control && self.cfg.sequentialize_threads
@@ -2673,6 +2706,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("select");
         resources.poll_deadline = poll_deadline_for(guest, deadline);
+        resources.poll_expires = deadline.is_some();
         // EINTR records select's interruption result. The scheduler only wakes
         // ERESTARTSYS requests: blocked and ignored signals still need a target-
         // side disposition check before this Signaled path can be used.
@@ -3502,6 +3536,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
         rsrc.poll_deadline = poll_deadline_for(guest, deadline);
+        rsrc.poll_expires = deadline.is_some();
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
             probe.fds().map(|fds| fds.as_raw()),
@@ -3617,6 +3652,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask = sanitize_ppoll_signal_mask(signal_mask);
         let mut rsrc = masked_ppoll_wait_request(guest.thread_state().dettid, signal_mask);
         rsrc.poll_deadline = poll_deadline_for(guest, deadline);
+        rsrc.poll_expires = deadline.is_some();
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
             call.fds().map(|fds| fds.as_raw()),
@@ -6284,6 +6320,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
+        check_recvmmsg_call(&guest.memory(), &call)?;
         let fd = call.fd();
         let Some(messages_address) = call.mmsg() else {
             return self.handle_recvmmsg(guest, call).await;
@@ -6370,6 +6407,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
+        check_recvmmsg_call(&guest.memory(), &call)?;
         // Where the tool discovers received descriptors, what a receive
         // delivered is needed only to mark the inotify instances among them
         // (`Detcore::marks_discovered_inotify_receipts`).

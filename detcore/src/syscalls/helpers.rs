@@ -642,7 +642,72 @@ impl<T: RecordOrReplay> Detcore<T> {
             // replay (see retry_nonblocking_syscall). In plain `hermit run` there is no
             // recorder, so execute directly (subtool = None).
             let subtool = (self.cfg.recordreplay_modes && internal_fd).then_some(self);
-            Ok(retry_nonblocking_syscall(guest, call, rsrc, subtool).await?)
+            // A logically blocking socket call waits only as long as the
+            // socket's timeout allows: `SO_RCVTIMEO` for a receive or an
+            // accept, `SO_SNDTIMEO` for a send or a connect
+            // (`socket_timeout_fd`). The socket is physically nonblocking,
+            // so no kernel timeout can fire; without a deadline the retry
+            // below would poll forever instead of giving Linux's answer
+            // for a wait that outlasts the timeout: EAGAIN for a send
+            // (`sock_alloc_send_pskb`, net/core/sock.c:2936,2951-2956),
+            // a receive (`__unix_dgram_recvmsg`,
+            // net/unix/af_unix.c:2611-2615), an accept and an AF_UNIX
+            // connect (net/unix/af_unix.c:1720-1733) -- but EINPROGRESS
+            // for a TCP connect, which is already in progress when it
+            // gives up waiting and continues in the background
+            // (`inet_stream_connect`, net/ipv4/af_inet.c:690-703), all at
+            // v6.17. The timeout and the connect's family are read once
+            // here and the entry time below, as Linux reads the timeout
+            // once when the call begins; the interrupt class the retry
+            // loop uses derives from this same snapshot (passed to the
+            // retry loop), not from a second read after the entry time's
+            // yield, across which a setsockopt through an alias could
+            // have changed it. An `Unknown` model (a setsockopt whose
+            // value Detcore could not read) keeps the unbounded wait, as
+            // it does for the interrupt errno.
+            let socket_timeout = socket_timeout_fd(wrapped).and_then(|(fd, direction)| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| {
+                        matches!(detfd.ty(), FdType::Socket).then(|| match direction {
+                            SocketTimeoutDirection::Receive => detfd.receive_timeout(),
+                            SocketTimeoutDirection::Send => detfd.send_timeout(),
+                        })
+                    })
+                    .ok()
+                    .flatten()
+            });
+            let entry_interrupt_errno = socket_timeout.map(|timeout| {
+                socket_timeout_interrupt_errno(call.signal_interrupt_errno(), Some(timeout))
+            });
+            let connect_family = match wrapped {
+                Syscall::Connect(connect) => connect
+                    .uservaddr()
+                    .and_then(|addr| guest.memory().read_value(addr.cast::<u16>()).ok()),
+                _ => None,
+            };
+            let expiry = socket_timeout_expiry(wrapped, connect_family);
+            let immediate_expiry = matches!(socket_timeout, Some(ReceiveTimeout::Immediate));
+            let maybe_timeout = match socket_timeout {
+                Some(ReceiveTimeout::After(duration)) => Some((
+                    thread_observe_time(guest).await + duration,
+                    Err(expiry),
+                )),
+                Some(ReceiveTimeout::Immediate) => {
+                    Some((thread_observe_time(guest).await, Err(expiry)))
+                }
+                _ => None,
+            };
+            Ok(retry_nonblocking_syscall_helper(
+                guest,
+                call,
+                rsrc,
+                maybe_timeout,
+                subtool,
+                entry_interrupt_errno,
+                immediate_expiry,
+            )
+            .await?)
         } else {
             assert!(action == IOAction::PassThru);
             tracing::trace!(
@@ -2719,8 +2784,12 @@ impl NonblockableSyscall for reverie::syscalls::Accept4 {
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Accept4 {
+    /// A blocking accept whose wait outlasts the listening socket's
+    /// `SO_RCVTIMEO` fails with `EAGAIN`, as a timed receive does
+    /// (net/core/sock.c at v6.17) -- not EINPROGRESS, which is only a
+    /// TCP connect's answer (`socket_timeout_expiry`).
     fn timeout_return_val(&self) -> Result<i64, Errno> {
-        Ok(0)
+        Err(Errno::EAGAIN)
     }
 }
 
@@ -2778,8 +2847,21 @@ impl NonblockableSyscall for reverie::syscalls::Recvmsg {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
-    // This system call has a timeout argument, but we ignore it because the underlying
-    // socket is nonblocking anyway (in runs where we call this).
+    // This system call has a timeout argument. `handle_recvmmsg` checks it
+    // the way Linux does before the call reaches here. A valid one is
+    // forwarded untouched to each attempt, which is not quite what Linux
+    // does with it: the host kernel treats it as a real-time budget for
+    // the datagrams after the first inside that one attempt, writes the
+    // remaining host time back when it delivered any (`__sys_recvmmsg`'s
+    // `put_timespec64`, net/socket.c at v6.17), and a tiny budget can cut
+    // an attempt's count at a host-chosen point; the retry then returns
+    // that partial count at once where blocking Linux without
+    // MSG_WAITFORONE keeps waiting for the rest of the batch. The first
+    // datagram's wait is the part the virtual deadline bounds, by
+    // `SO_RCVTIMEO` through `execute_nonblockable_fd_syscall`. The
+    // writeback and partial-count differences predate the socket
+    // deadlines and are tracked separately (see the diff that added
+    // this comment).
     async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
@@ -2912,7 +2994,7 @@ where
     G: Guest<Detcore<T>>,
 {
     // Bogus 99 return value is dead code below:
-    retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool).await
+    retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool, None, false).await
 }
 
 /// What a wait that ended with `ERESTART_RESTARTBLOCK` keeps for the
@@ -3255,7 +3337,7 @@ where
     // poll/epoll_wait/futex/rt_sigtimedwait keep their existing execution (raw
     // inject_with_retry): their record/replay handling is out of scope for the internal
     // pipe data-ordering fix, and their fds are not necessarily internal pipes.
-    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
+    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None, None, false).await
 }
 
 /// The task whose signal state the scheduler may read to decide which signal
@@ -3467,59 +3549,112 @@ where
 /// v6.17).
 ///
 /// A receive (`recvfrom`, `recvmsg`, `recvmmsg`, or `read` or `readv` on a
-/// socket) and an `accept` wait by the socket's receive timeout, and Linux
+/// socket) and an `accept` wait by the socket's receive timeout, and a
+/// send and a connect by its send timeout (`socket_timeout_fd`). Linux
 /// ends one that a signal interrupts with `sock_intr_errno(timeo)`
 /// (include/net/sock.h:2627-2630; af_unix.c:3012-3013, tcp.c:2743-2744,
 /// datagram.c:127-128, which AF_UNIX's accept reaches through
 /// `skb_recv_datagram`, af_unix.c:1880, and inet_connection_sock.c:645):
 /// ERESTARTSYS for an untimed wait, which a handler with `SA_RESTART`
-/// restarts, but EINTR for a finite `SO_RCVTIMEO`, whatever the handler's
+/// restarts, but EINTR for a finite timeout, whatever the handler's
 /// flags. So such a call returns EINTR here
 /// (<https://github.com/rrnewton/hermit/issues/4929>, the Codex review of
 /// slice 2, round 2). The timeout is Detcore's model of the description's
-/// `SO_RCVTIMEO` (`DetFd::receive_timeout`), which every alias Detcore
-/// tracks shares; every other call keeps `default`
-/// (`receive_interrupt_errno`).
+/// `SO_RCVTIMEO` or `SO_SNDTIMEO` (`DetFd::receive_timeout`,
+/// `DetFd::send_timeout`), which every alias Detcore tracks shares; every
+/// other call keeps `default` (`socket_timeout_interrupt_errno`).
 fn interrupt_errno_at_entry<T, G, C>(guest: &G, call: &C, default: Errno) -> Errno
 where
     C: NonblockableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let timeout = receive_timeout_fd((*call).into()).and_then(|fd| {
+    let timeout = socket_timeout_fd((*call).into()).and_then(|(fd, direction)| {
         guest
             .thread_state()
             .with_detfd(fd, |detfd| {
-                matches!(detfd.ty(), FdType::Socket).then(|| detfd.receive_timeout())
+                matches!(detfd.ty(), FdType::Socket).then(|| match direction {
+                    SocketTimeoutDirection::Receive => detfd.receive_timeout(),
+                    SocketTimeoutDirection::Send => detfd.send_timeout(),
+                })
             })
             .ok()
             .flatten()
     });
-    receive_interrupt_errno(default, timeout)
+    socket_timeout_interrupt_errno(default, timeout)
 }
 
-/// The descriptor whose receive timeout, if it is a socket, bounds
-/// `syscall`'s wait: a receive's (`recvfrom`, `recvmsg`, `recvmmsg`, `read`,
-/// `readv`) or an accept's. `None` for every other call.
-fn receive_timeout_fd(syscall: Syscall) -> Option<i32> {
-    match syscall {
+/// Which of a socket's two timeouts bounds a call's wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketTimeoutDirection {
+    /// `SO_RCVTIMEO`: a receive's or an accept's wait.
+    Receive,
+    /// `SO_SNDTIMEO`: a send's or a connect's wait.
+    Send,
+}
+
+/// The descriptor whose socket timeout, if it is a socket, bounds
+/// `syscall`'s wait, and which timeout that is. `None` for every other
+/// call. A receive (`recvfrom`, `recvmsg`, `recvmmsg`, `read`, `readv`)
+/// and an accept wait by `SO_RCVTIMEO`; a send (`sendto`, `sendmsg`,
+/// `sendmmsg`, `write`, `writev`) and a connect wait by `SO_SNDTIMEO`
+/// (`sock_sndtimeo` in `unix_stream_connect`, net/unix/af_unix.c:1672,
+/// and `inet_stream_connect`, net/ipv4/af_inet.c:694, at v6.17). A `read`
+/// or `write` on a descriptor that is not a socket never reaches the
+/// timeout: callers check `FdType::Socket` first.
+fn socket_timeout_fd(syscall: Syscall) -> Option<(i32, SocketTimeoutDirection)> {
+    let direction = match syscall {
         Syscall::Recvfrom(_)
         | Syscall::Recvmsg(_)
         | Syscall::Recvmmsg(_)
         | Syscall::Read(_)
         | Syscall::Readv(_)
         | Syscall::Accept(_)
-        | Syscall::Accept4(_) => get_fd(syscall),
-        _ => None,
+        | Syscall::Accept4(_) => SocketTimeoutDirection::Receive,
+        Syscall::Sendto(_)
+        | Syscall::Sendmsg(_)
+        | Syscall::Sendmmsg(_)
+        | Syscall::Write(_)
+        | Syscall::Writev(_)
+        | Syscall::Connect(_) => SocketTimeoutDirection::Send,
+        _ => return None,
+    };
+    get_fd(syscall).map(|fd| (fd, direction))
+}
+
+/// The errno a socket wait that outlasts its timeout returns. Every
+/// timed socket wait fails with EAGAIN -- a send, a receive, an accept
+/// and an AF_UNIX connect (see `execute_nonblockable_fd_syscall`) --
+/// except an Internet connect: a TCP connect is already in progress
+/// when it gives up waiting, so it returns EINPROGRESS and the attempt
+/// continues in the background (`inet_stream_connect` presets
+/// `-EINPROGRESS` and leaves by `goto out` when its wait's timeo runs
+/// out, net/ipv4/af_inet.c:690-703 at v6.17). `family` is the connect
+/// address's `sa_family`, read with the timeout snapshot; an unreadable
+/// or short address fails on its first attempt with its own errno, so
+/// the expiry it never reaches may default to EAGAIN. A non-connect
+/// call ignores `family`.
+fn socket_timeout_expiry(syscall: Syscall, family: Option<u16>) -> Errno {
+    match syscall {
+        Syscall::Connect(_)
+            if matches!(
+                family,
+                Some(family) if family == libc::AF_INET as u16 || family == libc::AF_INET6 as u16
+            ) =>
+        {
+            Errno::EINPROGRESS
+        }
+        _ => Errno::EAGAIN,
     }
 }
 
+
 /// [`interrupt_errno_at_entry`]'s rule: a call that would end with
-/// ERESTARTSYS ends with EINTR when it waits by a socket's finite receive
-/// timeout (`socket_timeout`, `None` for any other call). An `Immediate`
+/// ERESTARTSYS ends with EINTR when it waits by a socket's finite timeout
+/// (`socket_timeout`, `None` for any other call). An `Immediate`
 /// timeout never waits, and an `Unknown` one keeps the untimed call's
 /// ERESTARTSYS.
-fn receive_interrupt_errno(default: Errno, socket_timeout: Option<ReceiveTimeout>) -> Errno {
+fn socket_timeout_interrupt_errno(default: Errno, socket_timeout: Option<ReceiveTimeout>) -> Errno {
     match (default, socket_timeout) {
         (Errno::ERESTARTSYS, Some(ReceiveTimeout::After(_))) => Errno::EINTR,
         _ => default,
@@ -4071,13 +4206,22 @@ fn woken_poll_errno_for(disposition: Option<WaitSignalDisposition>) -> Errno {
     }
 }
 
-// Private helper.
+// Private helper. `entry_interrupt_errno` is the interrupt class a
+// caller already derived from the same entry snapshot as
+// `maybe_timeout` (the socket dispatcher, whose snapshot a yield
+// separates from this loop); `None` derives it here, at entry.
+// `immediate_expiry` is a deadline already passed when the call began
+// (a socket timeout Linux stores as zero): the first would-block
+// attempt returns the timeout result without a signal check, as Linux
+// fails such a call before it ever waits.
 async fn retry_nonblocking_syscall_helper<T, G, C>(
     guest: &mut G,
     call0: C,
     mut rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
     subtool: Option<&Detcore<T>>,
+    entry_interrupt_errno: Option<Errno>,
+    immediate_expiry: bool,
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + Into<Syscall>,
@@ -4103,6 +4247,7 @@ where
     // surviving multiple syscall injections:
     let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
+    rsrc.poll_expires = maybe_timeout.is_some();
     // A restartable call parked in internal IO polling, such as a `read` of an
     // empty pipe, is interrupted by a signal another task sends, as a parked
     // pipe write is (`pipe_writev_resources`). The marker lets the scheduler
@@ -4163,8 +4308,10 @@ where
     // such signals could also replace one another in the single held slot
     // (https://github.com/rrnewton/hermit/issues/4273, stage 2).
     // The errno a signal that ends this call returns, read at its entry
-    // (`interrupt_errno_at_entry`).
-    let interrupt_errno = interrupt_errno_at_entry(guest, &call0, call0.signal_interrupt_errno());
+    // (`interrupt_errno_at_entry`), or the class the caller derived from
+    // the same snapshot as its deadline, which no later read replaces.
+    let interrupt_errno = entry_interrupt_errno
+        .unwrap_or_else(|| interrupt_errno_at_entry(guest, &call0, call0.signal_interrupt_errno()));
     let mut turn_wait =
         checks_at_turn.then(|| KernelSignalWait::new(guest, 0, false, interrupt_errno));
     let mut published = PublishedWaitMask::default();
@@ -4445,6 +4592,21 @@ where
             && let Some(result) = finish_after_read_shutdown(guest, call).await
         {
             break result;
+        }
+        // A deadline already passed when the call began ends it here,
+        // after its first would-block attempt and before any signal
+        // check: Linux with a zero timeo fails at once without looking
+        // at signals (`sock_alloc_send_pskb`'s `if (!timeo) goto
+        // failure` before its signal check, net/core/sock.c:2951-2956;
+        // a datagram receive loops only `while (timeo && ...)`,
+        // net/unix/af_unix.c:2611-2615, both at v6.17), so a pending
+        // signal neither preempts the expiry result nor is consumed
+        // by it. A finite deadline keeps the order below.
+        if immediate_expiry
+            && call.syscall_would_have_blocked(syscall_result)
+            && let Some((_, timeout_result)) = maybe_timeout
+        {
+            break timeout_result.map_err(|e| e.into());
         }
         // A part after progress that would wait while a signal an earlier
         // part completed with is still pending ends, as Linux's next `->read`
@@ -5818,6 +5980,7 @@ where
     let mut published = PublishedWaitMask::default();
     publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
+    rsrc.poll_expires = maybe_timeout.is_some();
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
     // Set when only a signal the scheduler committed in this turn ends the
@@ -8526,62 +8689,85 @@ mod tests {
     /// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
     /// slice 2, round 2): a receive or an accept on a socket with a finite
     /// `SO_RCVTIMEO` ends with EINTR, whatever its handler's `SA_RESTART`, as
-    /// Linux's `sock_intr_errno` ends it; an untimed one keeps ERESTARTSYS,
-    /// which `SA_RESTART` restarts; every other call keeps its errno.
+    /// Linux's `sock_intr_errno` ends it; a send or a connect by a finite
+    /// `SO_SNDTIMEO` ends the same way; an untimed one keeps ERESTARTSYS,
+    /// which `SA_RESTART` restarts; every other call keeps its errno. The
+    /// same mapping picks the deadline a polled socket call waits by
+    /// (`execute_nonblockable_fd_syscall`).
     #[test]
-    fn a_wait_by_a_finite_receive_timeout_is_interrupted_with_eintr() {
+    fn a_wait_by_a_finite_socket_timeout_is_interrupted_with_eintr() {
         use reverie::syscalls;
         let second = ReceiveTimeout::After(std::time::Duration::from_secs(1));
-        for (label, syscall, fd) in [
+        for (label, syscall, expected) in [
             (
                 "recvfrom",
                 Syscall::from(syscalls::Recvfrom::new().with_fd(3)),
-                Some(3),
+                Some((3, SocketTimeoutDirection::Receive)),
             ),
             (
                 "recvmsg",
                 Syscall::from(syscalls::Recvmsg::new().with_sockfd(4)),
-                Some(4),
+                Some((4, SocketTimeoutDirection::Receive)),
             ),
             (
                 "recvmmsg",
                 Syscall::from(syscalls::Recvmmsg::new().with_fd(5)),
-                Some(5),
+                Some((5, SocketTimeoutDirection::Receive)),
             ),
             (
                 "read",
                 Syscall::from(syscalls::Read::new().with_fd(6)),
-                Some(6),
+                Some((6, SocketTimeoutDirection::Receive)),
             ),
             (
                 "readv",
                 Syscall::from(syscalls::Readv::new().with_fd(7)),
-                Some(7),
+                Some((7, SocketTimeoutDirection::Receive)),
             ),
             (
                 "accept",
                 Syscall::from(syscalls::Accept::new().with_sockfd(8)),
-                Some(8),
+                Some((8, SocketTimeoutDirection::Receive)),
             ),
             (
                 "accept4",
                 Syscall::from(syscalls::Accept4::new().with_sockfd(9)),
-                Some(9),
-            ),
-            (
-                "write",
-                Syscall::from(syscalls::Write::new().with_fd(3)),
-                None,
+                Some((9, SocketTimeoutDirection::Receive)),
             ),
             (
                 "sendto",
-                Syscall::from(syscalls::Sendto::new().with_fd(3)),
-                None,
+                Syscall::from(syscalls::Sendto::new().with_fd(10)),
+                Some((10, SocketTimeoutDirection::Send)),
+            ),
+            (
+                "sendmsg",
+                Syscall::from(syscalls::Sendmsg::new().with_fd(11)),
+                Some((11, SocketTimeoutDirection::Send)),
+            ),
+            (
+                "sendmmsg",
+                Syscall::from(syscalls::Sendmmsg::new().with_sockfd(12)),
+                Some((12, SocketTimeoutDirection::Send)),
+            ),
+            (
+                "write",
+                Syscall::from(syscalls::Write::new().with_fd(13)),
+                Some((13, SocketTimeoutDirection::Send)),
+            ),
+            (
+                "writev",
+                Syscall::from(syscalls::Writev::new().with_fd(14)),
+                Some((14, SocketTimeoutDirection::Send)),
+            ),
+            (
+                "connect",
+                Syscall::from(syscalls::Connect::new().with_fd(15)),
+                Some((15, SocketTimeoutDirection::Send)),
             ),
             #[cfg(target_arch = "x86_64")]
             ("poll", Syscall::from(syscalls::Poll::new()), None),
         ] {
-            assert_eq!(receive_timeout_fd(syscall), fd, "{label}");
+            assert_eq!(socket_timeout_fd(syscall), expected, "{label}");
         }
         for (default, timeout, expected) in [
             (Errno::ERESTARTSYS, Some(second), Errno::EINTR),
@@ -8606,10 +8792,40 @@ mod tests {
             (Errno::EINTR, None, Errno::EINTR),
         ] {
             assert_eq!(
-                receive_interrupt_errno(default, timeout),
+                socket_timeout_interrupt_errno(default, timeout),
                 expected,
                 "{default:?} {timeout:?}"
             );
+        }
+    }
+
+    /// Only an Internet connect answers a passed timeout with
+    /// EINPROGRESS (`inet_stream_connect`, net/ipv4/af_inet.c:690-703 at
+    /// v6.17); every other timed socket wait, an AF_UNIX connect
+    /// included (net/unix/af_unix.c:1720-1733), answers EAGAIN.
+    #[test]
+    fn only_an_internet_connect_expires_with_einprogress() {
+        use reverie::syscalls;
+        let connect = Syscall::from(syscalls::Connect::new().with_fd(3));
+        let sendto = Syscall::from(syscalls::Sendto::new().with_fd(3));
+        for (label, syscall, family, expected) in [
+            ("inet", connect, Some(libc::AF_INET as u16), Errno::EINPROGRESS),
+            (
+                "inet6",
+                connect,
+                Some(libc::AF_INET6 as u16),
+                Errno::EINPROGRESS,
+            ),
+            ("unix", connect, Some(libc::AF_UNIX as u16), Errno::EAGAIN),
+            ("unread", connect, None, Errno::EAGAIN),
+            (
+                "sendto inet",
+                sendto,
+                Some(libc::AF_INET as u16),
+                Errno::EAGAIN,
+            ),
+        ] {
+            assert_eq!(socket_timeout_expiry(syscall, family), expected, "{label}");
         }
     }
 
@@ -10352,7 +10568,8 @@ pub(crate) mod kernel_signal_wait_failures {
                 .await
                 .0
         } else if matches!(case, "operand" | "unknown") {
-            retry_nonblocking_syscall_helper(&mut guest, poll_probe, resources, None, None).await
+            retry_nonblocking_syscall_helper(&mut guest, poll_probe, resources, None, None, None, false)
+                .await
         } else {
             retry_nonblocking_syscall_helper(
                 &mut guest,
@@ -10360,6 +10577,8 @@ pub(crate) mod kernel_signal_wait_failures {
                 resources,
                 None,
                 None,
+                None,
+                false,
             )
             .await
         };
@@ -10575,6 +10794,8 @@ pub(crate) mod kernel_signal_wait_failures {
                 resources,
                 None,
                 None,
+                None,
+                false,
             )
             .await
             .map_err(|error| error.into_errno().expect("guest errno"));
@@ -10606,6 +10827,74 @@ pub(crate) mod kernel_signal_wait_failures {
                 if sent && !blocked { 2 } else { 4 }
             );
         }
+    }
+
+    /// An already-expired socket timeout returns its expiry result after
+    /// the first would-block attempt without taking a deliverable pending
+    /// signal first: Linux with a zero timeo fails at once without looking
+    /// at signals (`sock_alloc_send_pskb`'s `if (!timeo) goto failure`
+    /// before its signal check, net/core/sock.c:2951-2956 at v6.17). The
+    /// same scripted late signal that ends the untimed read above with
+    /// ERESTARTSYS here stays pending, and exactly one probe runs. On the
+    /// code before the immediate-expiry break this returned the interrupt
+    /// errno instead, so this test discriminates where a guest with the
+    /// signal blocked cannot.
+    #[tokio::test]
+    async fn an_immediate_expiry_precedes_a_deliverable_signal() {
+        use std::os::fd::AsRawFd;
+
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let own_mask = guest_mask();
+        let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
+        guest.config.sequentialize_threads = true;
+        guest.config.backend.kernel_signal_targets_are_predictable = true;
+        guest.config.backend.kernel_signal_state_is_guests = true;
+        guest.thread.dettid = DetTid::from_raw(3);
+        guest.thread.detpid = Some(DetPid::from_raw(3));
+        let (reader, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+        let fd = reader.as_raw_fd();
+        guest
+            .thread
+            .add_fd(fd, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(fd, |entry| entry.set_physically_nonblocking())
+            .unwrap();
+        let script = Arc::new(Mutex::new(ProofScript::default()));
+        guest.proof_script = Some(script.clone());
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.caught = usr1;
+            // Pending and deliverable when the call begins, so its first
+            // turn is a Signaled one: only the immediate-expiry break,
+            // ahead of the signal checks, keeps the expiry result.
+            kernel.pending = usr1;
+            kernel.stops_for_pending = true;
+            kernel.empty_read_probes = Some(0);
+            kernel.read_ready_after = Some(4);
+            kernel.setter.extend(std::iter::repeat_n(None, 8));
+        }
+        let _proc = scripted_proc(&kernel);
+        let mut resources = Resources::new(guest.thread.dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        let result = retry_nonblocking_syscall_helper(
+            &mut guest,
+            syscalls::Read::new().with_fd(fd).with_len(1),
+            resources,
+            Some((LogicalTime::from_nanos(0), Err(Errno::EAGAIN))),
+            None,
+            Some(Errno::EINTR),
+            true,
+        )
+        .await
+        .map_err(|error| error.into_errno().expect("guest errno"));
+        assert_eq!(result, Err(Errno::EAGAIN));
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(kernel.pending, usr1, "the signal stays pending");
+        assert_eq!(kernel.held_slot, None);
+        assert_eq!(kernel.empty_read_probes, Some(1), "exactly one probe ran");
+        assert_eq!(script.lock().unwrap().requests.len(), 1);
     }
 
     /// Run the real generic read loop, including its retry TraceSchedEvent.
@@ -10666,6 +10955,8 @@ pub(crate) mod kernel_signal_wait_failures {
             resources,
             None,
             None,
+            None,
+            false,
         )
         .await;
         (result, kernel, script)

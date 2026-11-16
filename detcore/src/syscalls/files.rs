@@ -17329,6 +17329,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             self.mark_sock_diag_fd(guest, fd, &call);
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_socket_family(call.family()));
             self.note_unix_socket(guest, fd, call.family(), call.r#type());
             self.mark_error_queue_reads(guest, fd, &call)?;
             // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
@@ -17359,6 +17362,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
             self.maybe_set_nonblocking_fd(guest, fd);
             self.mark_sock_diag_fd(guest, fd, &call);
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_socket_family(call.family()));
             self.note_unix_socket(guest, fd, call.family(), call.r#type());
             self.mark_error_queue_reads(guest, fd, &call)?;
             // A guest made it (`DetFd::is_guest_created`).
@@ -17490,9 +17496,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // A guest made both ends (`DetFd::is_guest_created`).
             for fd in fds {
-                let _ = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.set_guest_created());
+                let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.set_guest_created();
+                    detfd.set_socket_family(call.family());
+                });
             }
             self.note_socketpair(guest, fds, call.family(), call.r#type());
 
@@ -17513,8 +17520,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// waits by under record and replay, and which decides, in every mode,
     /// whether a signal that interrupts a receive or an accept ends it with
     /// EINTR (a finite timeout) or a restart (`interrupt_errno_at_entry`,
-    /// <https://github.com/rrnewton/hermit/issues/4929>). The value is read
-    /// before the call, from the same guest memory in both phases.
+    /// <https://github.com/rrnewton/hermit/issues/4929>). A successful
+    /// `SO_SNDTIMEO` sets the modeled send timeout the same way
+    /// (`DetFd::send_timeout`). Together the two models bound the internal
+    /// polling a logically blocking socket call waits by
+    /// (`execute_nonblockable_fd_syscall`), because the physically
+    /// nonblocking socket's own kernel timeout can never fire. The values
+    /// are read before the call, from the same guest memory in both phases,
+    /// and a model is installed only when the call succeeded: Linux refuses
+    /// a short option with EINVAL and a microsecond count out of range with
+    /// EDOM (`sock_set_timeout`, net/core/sock.c at v6.17), and such a call
+    /// leaves the previous timeout in place.
     pub async fn handle_setsockopt<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -17522,24 +17538,40 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // TODO-HUMAN-REVIEW(PR-3908)
         const SO_RCVTIMEO_NEW: i32 = 66;
-        let receive_timeout = (call.level() == libc::SOL_SOCKET
-            && matches!(call.optname(), libc::SO_RCVTIMEO | SO_RCVTIMEO_NEW))
-        .then(|| {
-            // On x86_64 both forms take 16 bytes: seconds, then microseconds.
-            call.optval()
-                .and_then(|value| {
-                    guest
-                        .memory()
-                        .read_value::<_, libc::timeval>(value.cast())
-                        .ok()
-                })
-                .map_or(ReceiveTimeout::Unknown, ReceiveTimeout::set_by)
-        });
+        const SO_SNDTIMEO_NEW: i32 = 67;
+        let socket_timeout = |matching: bool| {
+            (call.level() == libc::SOL_SOCKET && matching).then(|| {
+                // On x86_64 both forms take 16 bytes: seconds, then microseconds.
+                call.optval()
+                    .and_then(|value| {
+                        guest
+                            .memory()
+                            .read_value::<_, libc::timeval>(value.cast())
+                            .ok()
+                    })
+                    .map_or(ReceiveTimeout::Unknown, ReceiveTimeout::set_by)
+            })
+        };
+        let receive_timeout = socket_timeout(matches!(
+            call.optname(),
+            libc::SO_RCVTIMEO | SO_RCVTIMEO_NEW
+        ));
+        let send_timeout = socket_timeout(matches!(
+            call.optname(),
+            libc::SO_SNDTIMEO | SO_SNDTIMEO_NEW
+        ));
         let result = self.record_or_replay(guest, call).await?;
-        if let Some(timeout) = receive_timeout {
-            let _ = guest
-                .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.set_receive_timeout(timeout));
+        if result == 0 {
+            if let Some(timeout) = receive_timeout {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.set_receive_timeout(timeout));
+            }
+            if let Some(timeout) = send_timeout {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.set_send_timeout(timeout));
+            }
         }
         Ok(result)
     }
@@ -19112,6 +19144,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.sockfd(), |detfd| detfd.error_queue_never_waits())
             .unwrap_or(false);
+        // An accepted Internet socket also starts with its listener's
+        // timeouts: cloning a listening socket copies them with the
+        // rest of the socket (`sock_copy`, net/core/sock.c:2197-2217 at
+        // v6.17, from `sk_clone_lock`). An AF_UNIX accept does not: its
+        // socket is created fresh by `unix_create1`
+        // (net/unix/af_unix.c:1680), whose `sock_init_data` sets no
+        // timeout, and no later step copies the listener's. Other
+        // families, and a listener whose family Detcore did not see
+        // created, keep the fresh socket's no timeout here too, so the
+        // model never claims a timeout the kernel value does not have.
+        // Read with the error-queue fact above, for the same reason.
+        let (listener_family, inherited_timeouts) = guest
+            .thread_state()
+            .with_detfd(call.sockfd(), |detfd| {
+                (
+                    detfd.socket_family(),
+                    (detfd.receive_timeout(), detfd.send_timeout()),
+                )
+            })
+            .unwrap_or((0, (ReceiveTimeout::Unknown, SendTimeout::Unknown)));
+        let inherited_timeouts = if matches!(listener_family, libc::AF_INET | libc::AF_INET6) {
+            inherited_timeouts
+        } else {
+            (ReceiveTimeout::None, SendTimeout::None)
+        };
         let fd = if in_turn {
             // Record and replay run the accept in the caller's turn, so the new descriptor's
             // number is allocated deterministically (https://github.com/rrnewton/hermit/issues/3880).
@@ -19136,6 +19193,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_accepted_connection();
             detfd.set_error_queue_never_waits(error_queue_never_waits);
+            detfd.set_socket_family(listener_family);
+            detfd.set_receive_timeout(inherited_timeouts.0);
+            detfd.set_send_timeout(inherited_timeouts.1);
         })?;
         // Guests alone hold both ends only where the listener and the socket
         // whose connection this took are sockets guests made and never passed

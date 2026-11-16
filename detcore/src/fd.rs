@@ -723,6 +723,9 @@ pub(crate) struct TakenRights {
 }
 
 /// A socket's receive timeout (`SO_RCVTIMEO`, socket(7)), as the guest set it.
+/// The send timeout (`SO_SNDTIMEO`) stores by the same Linux rules
+/// (`sock_set_timeout`, net/core/sock.c at v6.17), so one model serves both:
+/// see [`SendTimeout`].
 // TODO-HUMAN-REVIEW(PR-3908)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ReceiveTimeout {
@@ -763,6 +766,12 @@ impl ReceiveTimeout {
         }
     }
 }
+
+/// A socket's send timeout (`SO_SNDTIMEO`, socket(7)), as the guest set it.
+/// Linux stores it by the same `sock_set_timeout` rules as the receive
+/// timeout, and a blocking send whose wait outlasts it fails with `EAGAIN`
+/// the same way, so the two share [`ReceiveTimeout`]'s model.
+pub(crate) type SendTimeout = ReceiveTimeout;
 
 /// Where the model of one open file description lives.
 ///
@@ -1143,6 +1152,18 @@ struct OpenFileDescription {
     /// `receive_timeout`.
     #[serde(default)]
     receive_timeout: ReceiveTimeout,
+    /// The send timeout the last successful `setsockopt(SO_SNDTIMEO)` on
+    /// this socket set, which a blocking send waits by. See `send_timeout`.
+    #[serde(default)]
+    send_timeout: SendTimeout,
+    /// The address family the `socket` or `socketpair` call that created
+    /// this description named, or 0 (`AF_UNSPEC`) where Detcore did not
+    /// see that call (an inherited or received descriptor). Whether an
+    /// accepted socket starts with its listener's timeouts depends on
+    /// it: cloning an Internet listener copies them, an AF_UNIX accept
+    /// creates its socket fresh with none. See `socket_family`.
+    #[serde(default)]
+    socket_family: i32,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -1398,6 +1419,8 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("read_shutdown_requested", &self.read_shutdown_requested);
         debug.field("exported", &self.exported);
         debug.field("receive_timeout", &self.receive_timeout);
+        debug.field("send_timeout", &self.send_timeout);
+        debug.field("socket_family", &self.socket_family);
         debug.field("flock_mode", &self.flock_mode);
         debug.field("flock_mode_known", &self.flock_mode_known);
         debug.field("flock_mode_ever_known", &self.flock_mode_ever_known);
@@ -1786,6 +1809,8 @@ impl DetFd {
                 read_shutdown_requested: false,
                 exported: false,
                 receive_timeout: ReceiveTimeout::None,
+                send_timeout: SendTimeout::None,
+                socket_family: 0,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -3997,6 +4022,29 @@ impl DetFd {
         self.with_description(|d| d.receive_timeout)
     }
 
+    /// Record the send timeout a successful `setsockopt(SO_SNDTIMEO)` set.
+    pub(crate) fn set_send_timeout(&self, timeout: SendTimeout) {
+        self.with_description(|d| d.send_timeout = timeout);
+    }
+
+    /// The send timeout `setsockopt(SO_SNDTIMEO)` calls set through any
+    /// descriptor Detcore tracks for this open file description, as
+    /// `receive_timeout` reads the receive timeout.
+    pub(crate) fn send_timeout(&self) -> SendTimeout {
+        self.with_description(|d| d.send_timeout)
+    }
+
+    /// Record the address family of the call that created this socket.
+    pub(crate) fn set_socket_family(&self, family: i32) {
+        self.with_description(|d| d.socket_family = family);
+    }
+
+    /// The address family of the call that created this socket, or 0
+    /// where Detcore did not see that call.
+    pub(crate) fn socket_family(&self) -> i32 {
+        self.with_description(|d| d.socket_family)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// Return the known `flock(2)` state for this open file description.
@@ -4144,6 +4192,48 @@ pub(crate) fn install_test_shared_open_file_channel() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux stores a socket timeout (`sock_set_timeout`, net/core/sock.c
+    /// at v6.17) as: no timeout for `{0, 0}` or a second count too large to
+    /// count in scheduler ticks, an already-expired timeout for a negative
+    /// second count, and the value itself otherwise. Both `SO_RCVTIMEO`
+    /// and `SO_SNDTIMEO` store this way, so both read the model from
+    /// `ReceiveTimeout::set_by` (`SendTimeout` is the same model).
+    #[test]
+    fn a_socket_timeout_stores_as_linux_stores_it() {
+        let timeval = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
+        for (label, value, expected) in [
+            ("zero", timeval(0, 0), ReceiveTimeout::None),
+            (
+                "negative seconds",
+                timeval(-1, 0),
+                ReceiveTimeout::Immediate,
+            ),
+            (
+                "negative seconds with usec",
+                timeval(-2, 500_000),
+                ReceiveTimeout::Immediate,
+            ),
+            (
+                "ten microseconds",
+                timeval(0, 10),
+                ReceiveTimeout::After(Duration::from_micros(10)),
+            ),
+            (
+                "seconds and usec",
+                timeval(2, 250_000),
+                ReceiveTimeout::After(Duration::from_millis(2_250)),
+            ),
+            (
+                "too large to count",
+                timeval(libc::time_t::MAX / 1000 - 1, 0),
+                ReceiveTimeout::None,
+            ),
+        ] {
+            assert_eq!(ReceiveTimeout::set_by(value), expected, "{label}");
+            assert_eq!(SendTimeout::set_by(value), expected, "send {label}");
+        }
+    }
 
     #[test]
     fn random_devices_are_character_devices_one_eight_and_one_nine() {

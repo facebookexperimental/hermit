@@ -759,6 +759,16 @@ pub struct Resources {
     /// request, and always under record/replay.
     #[serde(default)]
     pub(crate) poll_deadline: Option<LogicalTime>,
+    /// The polling wait has a finite deadline its own retry loop enforces
+    /// (`retry_nonblocking_syscall_helper`'s timeout), whether or not the
+    /// scheduler may act on it through `poll_deadline` -- under
+    /// record/replay that hint is suppressed, but the wait still ends on
+    /// its own once virtual time reaches the deadline, one turn charge at
+    /// a time. Such a poller can make progress by expiring, so it is
+    /// never one no remaining thread can satisfy
+    /// (`Scheduler::only_idle_guest_pollers_remain`).
+    #[serde(default)]
+    pub(crate) poll_expires: bool,
     /// The action and guest mask read in this exact emulated sleep's own turn.
     /// Only its singleton SleepUntil request may use this snapshot.
     #[serde(default)]
@@ -1002,6 +1012,7 @@ impl Resources {
             upgraded_from_attempt: 0,
             polls_channel: None,
             poll_deadline: None,
+            poll_expires: false,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
@@ -1079,6 +1090,9 @@ impl Resources {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),
         };
+        // Either part expiring on its own is progress the merged wait can
+        // still make, as for the deadline above.
+        self.poll_expires |= other.poll_expires;
     }
 
     /// The deadline at which this request, still queued for a turn, would

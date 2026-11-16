@@ -8692,6 +8692,7 @@ impl<T> ThreadState<T> {
             upgraded_from_attempt: 0,
             polls_channel: None,
             poll_deadline: None,
+            poll_expires: false,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,

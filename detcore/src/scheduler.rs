@@ -21664,6 +21664,7 @@ impl Scheduler {
                 self.request_satisfies(tid, |rs| {
                     self.waits_on_guest_state(rs)
                         && rs.poll_deadline.is_none()
+                        && !rs.poll_expires
                         && !rs.polls_a_named_fifo
                         && !rs.waits_until_nothing_else_can_run
                         && !self.poller_may_run_external_handler(tid, rs)
@@ -26088,6 +26089,28 @@ mod test {
         grant_guest_poll(&mut sched, reader, 1);
         queue_guest_poll(&mut sched, reader, 2);
         assert!(sched.only_idle_guest_pollers_remain());
+    }
+
+    /// A poller whose wait carries a finite deadline its retry loop
+    /// enforces (`poll_expires`, with no scheduler-visible
+    /// `poll_deadline`, as under record/replay) can still finish by
+    /// expiring as turn charges advance virtual time, so it alone in the
+    /// queue is not a deadlock. The same poller without the deadline is:
+    /// a single thread's timed socket receive on an empty socketpair
+    /// under record was reported deadlocked at its first retry.
+    #[test]
+    fn an_expiring_poller_alone_is_not_a_deadlock() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        sched.thread_tree.add_child(reader, reader, true);
+        grant_guest_poll(&mut sched, reader, 0);
+        let mut expiring = guest_poll_request(reader, 1);
+        expiring.poll_expires = true;
+        sched.next_turns[&reader].req.put(Ok(expiring));
+        sched.run_queue.push_poller(reader, DEFAULT_PRIORITY, 1);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(polls_on(&mut sched, &global_time));
     }
 
     /// Whether step2d let the run go on: no deadlock report.

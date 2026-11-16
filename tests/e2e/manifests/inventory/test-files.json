@@ -3307,6 +3307,12 @@
       "why": "tests/c/socket_reader_beside_spinner.c is owned by hermit-cli/tests/cli.rs: The integration test a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period runs this guest under run --strict, without chaos and at three chaos seeds (one with --verify --verify-strict), requires all five socket round trips to finish before the guest's 10 s deadline while main spins without system calls, and replays a chaos recording under --replay-schedule-from without a desync; a generic manifest cannot express the deadline, the parity check or the replay."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/socket_timeout.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/socket_timeout.c is owned by hermit-cli/tests/cli.rs: blocking_socket_calls_end_with_eagain_when_their_timeout_passes runs it natively, under ptrace --strict at two scheduler seeds and under --verify --verify-strict, run_kvm_blocking_socket_calls_end_with_eagain_when_their_timeout_passes runs it under KVM --verify --verify-strict, and timed_socketpair_calls_record_and_replay_as_on_linux runs its socketpair sections under record start --verify; each requires byte-identical output with a fixed expectation: on blocking AF_UNIX datagram sockets and a TCP listener, recvfrom, recvmsg, recvmmsg, accept, sendto, sendmsg and sendmmsg bounded by SO_RCVTIMEO or SO_SNDTIMEO return -1 EAGAIN once the timeout passes, a recvmmsg timeout Linux cannot use returns -1 EINVAL before the descriptor is checked, a setsockopt microsecond count out of range returns EDOM and a short option EINVAL without replacing the timeout, and the same calls with no timeout still wait for the peer. It stays a fixture because the tests compare native and Hermit output and assert canonical bitwise parity per backend."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/socket_timestamp_edge_cases.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

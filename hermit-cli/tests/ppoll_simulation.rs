@@ -509,3 +509,86 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         "ppoll record/replay did not meet canonical INFO parity: {verdict}",
     );
 }
+
+/// One thread polling an empty pipe with a finite timeout under record:
+/// nothing can ever make the descriptor ready, so the wait ends only by
+/// expiring. Record suppresses the scheduler-visible poll deadline, so
+/// the scheduler once reported this lone expiring poller as a deadlock
+/// at its first retry; it must instead let the retry loop reach its
+/// deadline and return 0, as natively and as a plain run does. The same
+/// classification covers every timed poll through the shared retry
+/// helpers, not only the socket deadlines that exposed it.
+#[test]
+fn ppoll_lone_timed_wait_expires_under_record() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ppoll-lone-timed-wait-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "ppoll lone-timed-wait guest compilation");
+
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after", "5s", "30s"])
+        .arg(&guest)
+        .arg("lone-timed-wait");
+    let native_output = command_output(native, "native lone timed ppoll");
+    assert!(
+        String::from_utf8_lossy(&native_output.stdout).contains("ppoll-simulation-ok"),
+        "native lone timed ppoll failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&native_output.stdout),
+        String::from_utf8_lossy(&native_output.stderr),
+    );
+
+    let recording = tempfile::tempdir().expect("failed to create ppoll recording directory");
+    let verdict_directory = tempfile::tempdir().expect("failed to create ppoll verdict directory");
+    let verdict = verdict_directory.path().join("verify.json");
+    let mut record_command = Command::new("timeout");
+    record_command
+        .args(["--kill-after", "5s", "60s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--record-timeout=30",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", recording.path().display()))
+        .arg("--")
+        .arg(&guest)
+        .arg("lone-timed-wait");
+    let output = command_output(record_command, "strict ptrace lone timed ppoll record");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ppoll-simulation-ok"),
+        "lone timed ppoll guest failed under record\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout.contains("Success: replay matched recording.")
+            || stderr.contains("Success: replay matched recording."),
+        "Hermit omitted its replay marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    let verdict = fs::read_to_string(&verdict).expect("failed to read lone timed ppoll verdict");
+    assert!(
+        verdict.contains("\"bitwise_parity\":true"),
+        "lone timed ppoll record did not meet canonical INFO parity: {verdict}",
+    );
+}

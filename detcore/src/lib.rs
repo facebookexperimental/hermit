@@ -8278,9 +8278,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
                     // recvmsg and shares its NonblockableSyscall impl. The fd is made
                     // temporarily nonblocking, the kernel fills the mmsghdr array
-                    // atomically, and the Detcore scheduler owns any blocking, so the
-                    // timeout argument (deliberately ignored, see helpers.rs) does not
-                    // introduce nondeterminism.
+                    // atomically, and the Detcore scheduler owns any blocking.
+                    // `handle_recvmmsg` checks the timeout argument the way Linux
+                    // does (EINVAL for one it cannot use) before any of that.
                     // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
                     Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                         self.handle_sock_diag_recvmmsg(guest, s).await
