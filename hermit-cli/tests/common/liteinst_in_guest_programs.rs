@@ -6068,12 +6068,15 @@ fn liteinst_in_guest_dup_aliases_share_one_cursor_after_fork() {
 }
 
 /// close_range(3, ~0U, 0) closes a bound socket, and Detcore must account
-/// for it like a close: the socket's port goes back to the allocator, so the
-/// next bind to port 0 gets the same port. Under in-guest LiteInst the range
-/// also covers the runtime's coordinator connection, and the runtime once
-/// answered such a call itself, before Detcore saw it: the port was never
-/// released and the second bind got the next port. Both backends must reuse
-/// the port and print the same output.
+/// for it like a close: the socket's port is released, so binding a new
+/// socket explicitly to that port succeeds. Which port a later port-0 bind
+/// would get says nothing here, since the allocator advances past each
+/// assignment as Linux's ephemeral search moves on; the explicit bind is
+/// the release check that still discriminates. Under in-guest LiteInst
+/// the range also covers the runtime's coordinator connection, and the
+/// runtime once answered such a call itself, before Detcore saw it: the
+/// call must still reach Detcore. Both backends must print the same
+/// output.
 #[test]
 fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
     let _guard = hermit_run_guard();
@@ -6095,7 +6098,7 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(stdout, "port reused=1\n", "{backend}: {output:?}");
+        assert_eq!(stdout, "port released=1\n", "{backend}: {output:?}");
         outputs.push(stdout);
     }
     assert_eq!(

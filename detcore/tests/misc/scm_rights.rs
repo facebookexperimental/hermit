@@ -77,6 +77,33 @@ fn configs() -> [(&'static str, Config); 2] {
 /// (`RandomDeviceStream`). In the test process's own PID namespace those ids
 /// are host PIDs, new in every run, and a random device received from a child
 /// read different bytes each time.
+/// Runs `guest` like `run_deterministically`, with the test-only
+/// three-port ephemeral range (`Config::ephemeral_port_range_override`),
+/// so a guest can fill the range, close one socket, and require the next
+/// port-0 bind to return exactly the released port after wraparound.
+/// Three guest binds to 40100..=40102 on the private [`loopback`]
+/// address cannot collide with host binds there.
+fn run_with_tiny_port_range(guest: fn()) {
+    let config = Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ephemeral_port_range_override: Some((40100, 40102)),
+        ..Default::default()
+    };
+    det_test_fn_with_config_repetitions(RUNS, true, guest, config, |output, _state| {
+        assert_eq!(
+            output.status,
+            ExitStatus::Exited(0),
+            "tiny port range: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "tiny port range: the guest printed nothing"
+        );
+    });
+}
+
 fn run_deterministically(guest: fn()) {
     for (name, config) in configs() {
         det_test_fn_with_config_repetitions(RUNS, true, guest, config, |output, _state| {
@@ -1348,16 +1375,16 @@ fn loopback() -> [u8; 4] {
     })
 }
 
-/// A UDP socket bound to port 0 of [`loopback`], and its port, or the
-/// `bind` errno.
-fn bound_udp_socket() -> (c_int, Result<u16, i32>) {
+/// A UDP socket bound to `port` (0 for an ephemeral assignment) of
+/// [`loopback`], and its port, or the `bind` errno.
+fn bind_udp_to(port: u16) -> (c_int, Result<u16, i32>) {
     let socket = check(
         unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) },
         "socket",
     );
     let mut address = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0,
+        sin_port: port.to_be(),
         sin_addr: libc::in_addr {
             s_addr: u32::from_ne_bytes(loopback()),
         },
@@ -1378,6 +1405,24 @@ fn bound_udp_socket() -> (c_int, Result<u16, i32>) {
     (socket, Ok(u16::from_be(address.sin_port)))
 }
 
+/// A UDP socket bound to port 0 of [`loopback`], and its port, or the
+/// `bind` errno.
+fn bound_udp_socket() -> (c_int, Result<u16, i32>) {
+    bind_udp_to(0)
+}
+
+/// Whether `port` can be bound explicitly right now: the release check
+/// the port-freed tests below use. Which port a later port-0 bind gets
+/// says nothing about release once the allocator advances past each
+/// assignment (as Linux's ephemeral search does), so they bind the old
+/// port by number and expect success - or, while a socket still holds
+/// it, `EADDRINUSE`.
+fn port_bindable(port: u16) -> bool {
+    let (socket, bound) = bind_udp_to(port);
+    check(unsafe { libc::close(socket) }, "close");
+    bound == Ok(port)
+}
+
 /// A socket in flight is still bound, as Linux's in-flight reference keeps
 /// it: a later `bind` to port 0 succeeds with another port, although the
 /// sender closed its descriptor.
@@ -1390,6 +1435,10 @@ fn a_socket_in_flight_keeps_its_port() {
     let (other, other_port) = bound_udp_socket();
     let other_port = other_port.expect("a bind to port 0 while a bound socket is in flight");
     assert_ne!(other_port, port, "the socket in flight keeps its port");
+    assert!(
+        !port_bindable(port),
+        "an explicit bind to the in-flight socket's port fails"
+    );
     let [received] = recv_fds(right, 0)[..] else {
         panic!("expected one descriptor");
     };
@@ -1404,8 +1453,9 @@ fn a_socket_in_flight_keeps_its_port() {
 /// Linux frees the message: by the close of the receiving socket's last
 /// descriptor (`unix_release_sock`), or by a send through a datagram socket
 /// whose peer has gone (`ECONNREFUSED`, `unix_dgram_disconnected`), which
-/// purges that socket's own queue. Detcore hands the next `bind` to port 0
-/// the port it freed last, so each comes back at once.
+/// purges that socket's own queue. Each port is checked the way Linux
+/// frees it: by binding it explicitly (which port a later port-0 bind
+/// gets no longer witnesses release now the allocator advances).
 fn a_freed_message_frees_its_sockets_port() {
     let (sent, port) = bound_udp_socket();
     let port = port.expect("bind the first socket");
@@ -1413,16 +1463,13 @@ fn a_freed_message_frees_its_sockets_port() {
     send_fds(left, &[sent]);
     check(unsafe { libc::close(sent) }, "close");
     check(unsafe { libc::close(right) }, "close the receiving socket");
-    let (reused, reused_port) = bound_udp_socket();
-    assert_eq!(
-        reused_port,
-        Ok(port),
+    assert!(
+        port_bindable(port),
         "the receiving socket's close freed the port"
     );
-    check(unsafe { libc::close(reused) }, "close");
 
     let (sent, again) = bound_udp_socket();
-    assert_eq!(again, Ok(port));
+    let port = again.expect("bind the second socket");
     let (receiver, sender) = socketpair(libc::SOCK_DGRAM);
     send_fds(sender, &[sent]);
     check(unsafe { libc::close(sent) }, "close");
@@ -1430,10 +1477,8 @@ fn a_freed_message_frees_its_sockets_port() {
     let refused = unsafe { libc::send(receiver, b"x".as_ptr().cast(), 1, 0) };
     let errno = io::Error::last_os_error().raw_os_error();
     assert_eq!((refused, errno), (-1, Some(libc::ECONNREFUSED)));
-    let (reused, reused_port) = bound_udp_socket();
-    assert_eq!(reused_port, Ok(port), "the purge freed the port");
+    assert!(port_bindable(port), "the purge freed the port");
     unsafe {
-        libc::close(reused);
         libc::close(left);
         libc::close(receiver);
     }
@@ -1475,6 +1520,10 @@ fn a_plain_read_frees_the_port_of_the_socket_it_discards() {
             let mut buffer = [0u8; 8];
             let read = unsafe { libc::read(right, buffer.as_mut_ptr().cast(), 4) };
             assert_eq!(read, 4, "read: {}", io::Error::last_os_error());
+            assert!(
+                !port_bindable(port),
+                "socket type {ty}: the read of data alone released nothing"
+            );
             let held = bind_between.then(|| {
                 let (held, held_port) = bound_udp_socket();
                 assert_ne!(
@@ -1488,15 +1537,11 @@ fn a_plain_read_frees_the_port_of_the_socket_it_discards() {
             assert_eq!(read, 1, "read: {}", io::Error::last_os_error());
             if let Some(held) = held {
                 check(unsafe { libc::close(held) }, "close");
-            } else {
-                let (reused, reused_port) = bound_udp_socket();
-                assert_eq!(
-                    reused_port,
-                    Ok(port),
-                    "socket type {ty}: the read released the socket its message carried"
-                );
-                check(unsafe { libc::close(reused) }, "close");
             }
+            assert!(
+                port_bindable(port),
+                "socket type {ty}: the read released the socket its message carried"
+            );
             unsafe {
                 libc::close(left);
                 libc::close(right);
@@ -1513,14 +1558,11 @@ fn a_plain_read_frees_the_port_of_the_socket_it_discards() {
     let mut buffer = [0u8; 8];
     let read = unsafe { libc::read(right, buffer.as_mut_ptr().cast(), buffer.len()) };
     assert_eq!(read, 5, "read: {}", io::Error::last_os_error());
-    let (reused, reused_port) = bound_udp_socket();
-    assert_eq!(
-        reused_port,
-        Ok(port),
+    assert!(
+        port_bindable(port),
         "one stream read of both messages released the socket"
     );
     unsafe {
-        libc::close(reused);
         libc::close(left);
         libc::close(right);
     }
@@ -1768,10 +1810,8 @@ fn a_write_to_a_gone_peer_frees_the_queued_sockets_port() {
         };
         let errno = io::Error::last_os_error().raw_os_error();
         assert_eq!((refused, errno), (-1, Some(libc::ECONNREFUSED)), "{how}");
-        let (reused, reused_port) = bound_udp_socket();
-        assert_eq!(reused_port, Ok(port), "{how}: the purge freed the port");
+        assert!(port_bindable(port), "{how}: the purge freed the port");
         unsafe {
-            libc::close(reused);
             libc::close(receiver);
         }
         println!("{how}: the purge freed port {port}");
@@ -1912,19 +1952,52 @@ fn the_queue_of_an_exited_childs_socket_goes_with_it() {
         if shared {
             check(unsafe { libc::close(right) }, "close the receiving socket");
         }
-        let (reused, reused_port) = bound_udp_socket();
-        assert_eq!(
-            reused_port,
-            Ok(port),
+        assert!(
+            port_bindable(port),
             "shared={shared}: the receiving socket's last reference freed its queue"
         );
         unsafe {
-            libc::close(reused);
             libc::close(left);
             libc::close(go_write);
         }
         println!("shared={shared}: port {port} free again");
     }
+}
+/// With a three-port ephemeral range, fill it, see exhaustion answer
+/// `EADDRINUSE` (Linux's bind answer when the range is exhausted; the
+/// `EADDRNOTAVAIL` case is connect's autobind), close the middle
+/// socket, and require the next port-0 bind to return exactly its port:
+/// the allocator wraps from the range end back to its start and skips
+/// the still-held first port. This is the guest-level ledger check the
+/// explicit-bind checks above cannot make: if the close does not
+/// release the port in Detcore's ledger, the range stays full and the
+/// last bind fails `EADDRINUSE` instead.
+fn a_tiny_range_reuses_the_released_port_after_wraparound() {
+    let (first_socket, first) = bound_udp_socket();
+    assert_eq!(first, Ok(40100));
+    let (second_socket, second) = bound_udp_socket();
+    assert_eq!(second, Ok(40101));
+    let (third_socket, third) = bound_udp_socket();
+    assert_eq!(third, Ok(40102));
+    let (overflow_socket, overflow) = bound_udp_socket();
+    assert_eq!(overflow, Err(libc::EADDRINUSE), "the range is exhausted");
+    check(unsafe { libc::close(overflow_socket) }, "close");
+    check(
+        unsafe { libc::close(second_socket) },
+        "close the middle socket",
+    );
+    let (reused_socket, reused) = bound_udp_socket();
+    assert_eq!(
+        reused,
+        Ok(40101),
+        "after wraparound the released port is the next candidate"
+    );
+    unsafe {
+        libc::close(first_socket);
+        libc::close(third_socket);
+        libc::close(reused_socket);
+    }
+    println!("tiny range: filled, exhausted, released, and reused after wraparound");
 }
 
 /// A message of data alone, then one carrying an eventfd holding 5, whose
@@ -2130,6 +2203,141 @@ fn scm_rights_peek_past_the_first_message_names_it() {
 fn scm_rights_queue_of_an_exited_childs_socket_goes_with_it() {
     loopback();
     run_deterministically(the_queue_of_an_exited_childs_socket_goes_with_it);
+}
+#[test]
+fn scm_rights_tiny_range_reuses_the_released_port_after_wraparound() {
+    loopback();
+    run_with_tiny_port_range(a_tiny_range_reuses_the_released_port_after_wraparound);
+}
+
+/// The same tiny range through `close_range`: fill the range, close the
+/// last socket by range, and the next port-0 bind returns exactly its
+/// port. If the range close does not release the port in Detcore's
+/// ledger (the in-guest close_range regression), the range stays full
+/// and the bind answers EADDRINUSE instead.
+fn a_tiny_range_close_range_releases_the_port() {
+    let (first_socket, first) = bound_udp_socket();
+    assert_eq!(first, Ok(40100));
+    let (second_socket, second) = bound_udp_socket();
+    assert_eq!(second, Ok(40101));
+    let (third_socket, third) = bound_udp_socket();
+    assert_eq!(third, Ok(40102));
+    let ranged = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            third_socket as u32,
+            third_socket as u32,
+            0u32,
+        )
+    };
+    assert_eq!(ranged, 0, "close_range: {}", io::Error::last_os_error());
+    let (reused_socket, reused) = bound_udp_socket();
+    assert_eq!(reused, Ok(40102), "close_range released the port");
+    unsafe {
+        libc::close(first_socket);
+        libc::close(second_socket);
+        libc::close(reused_socket);
+    }
+    println!("tiny range: close_range released the last port");
+}
+
+#[test]
+fn scm_rights_tiny_range_close_range_releases_the_port() {
+    loopback();
+    run_with_tiny_port_range(a_tiny_range_close_range_releases_the_port);
+}
+
+/// The tiny range through a queued socket whose receiver exits (the
+/// issue 4930 shape): fill the first two ports, queue a bound socket
+/// on the last port to a child-held receiver, and after the child
+/// exits the next port-0 bind returns exactly that port. If the exit
+/// does not free the queue in Detcore's ledger, the range stays full
+/// and the bind answers EADDRINUSE instead.
+fn a_tiny_range_exited_childs_queue_releases_the_port() {
+    let (first_socket, first) = bound_udp_socket();
+    assert_eq!(first, Ok(40100));
+    let (second_socket, second) = bound_udp_socket();
+    assert_eq!(second, Ok(40101));
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    let (go_read, go_write) = pipe();
+    let child = check(unsafe { libc::fork() }, "fork");
+    if child == 0 {
+        unsafe {
+            libc::close(left);
+            libc::close(go_write);
+        }
+        let mut byte = [0u8];
+        let read = unsafe { libc::read(go_read, byte.as_mut_ptr().cast(), 1) };
+        unsafe { libc::_exit(if read == 1 { 0 } else { 1 }) };
+    }
+    unsafe {
+        libc::close(go_read);
+        libc::close(right);
+    }
+    let (sent, sent_port) = bound_udp_socket();
+    assert_eq!(sent_port, Ok(40102));
+    send_fds(left, &[sent]);
+    check(unsafe { libc::close(sent) }, "close");
+    write_all(go_write, b"g");
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    let (reused_socket, reused) = bound_udp_socket();
+    assert_eq!(
+        reused,
+        Ok(40102),
+        "the exited child's queue freed the port in the ledger"
+    );
+    unsafe {
+        libc::close(first_socket);
+        libc::close(second_socket);
+        libc::close(reused_socket);
+        libc::close(left);
+        libc::close(go_write);
+    }
+    println!("tiny range: the exited child's queue released the last port");
+}
+
+#[test]
+fn scm_rights_tiny_range_exited_childs_queue_releases_the_port() {
+    loopback();
+    run_with_tiny_port_range(a_tiny_range_exited_childs_queue_releases_the_port);
+}
+
+/// The tiny range through a purge: fill the first two ports, queue a
+/// bound socket on the last port, and a write to the gone peer purges
+/// the queue; the next port-0 bind returns exactly that port. If the
+/// purge does not release it in Detcore's ledger, the range stays full
+/// and the bind answers EADDRINUSE instead.
+fn a_tiny_range_purge_releases_the_port() {
+    let (first_socket, first) = bound_udp_socket();
+    assert_eq!(first, Ok(40100));
+    let (second_socket, second) = bound_udp_socket();
+    assert_eq!(second, Ok(40101));
+    let (receiver, sender) = socketpair(libc::SOCK_DGRAM);
+    let (sent, sent_port) = bound_udp_socket();
+    assert_eq!(sent_port, Ok(40102));
+    send_fds(sender, &[sent]);
+    check(unsafe { libc::close(sent) }, "close");
+    check(unsafe { libc::close(sender) }, "close the peer");
+    let refused = unsafe { libc::write(receiver, b"x".as_ptr().cast(), 1) };
+    let errno = io::Error::last_os_error().raw_os_error();
+    assert_eq!((refused, errno), (-1, Some(libc::ECONNREFUSED)));
+    let (reused_socket, reused) = bound_udp_socket();
+    assert_eq!(reused, Ok(40102), "the purge freed the port in the ledger");
+    unsafe {
+        libc::close(first_socket);
+        libc::close(second_socket);
+        libc::close(reused_socket);
+        libc::close(receiver);
+    }
+    println!("tiny range: the purge released the last port");
+}
+
+#[test]
+fn scm_rights_tiny_range_purge_releases_the_port() {
+    loopback();
+    run_with_tiny_port_range(a_tiny_range_purge_releases_the_port);
 }
 
 #[test]

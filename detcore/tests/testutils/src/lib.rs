@@ -143,6 +143,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_signal_delivery: false,
         annotated_priority_replay: false,
         launch_image: None,
+        ephemeral_port_range_override: None,
         rewrite_exclusives_unmarked: Vec::new(),
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: false,
@@ -298,6 +299,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_signal_delivery: false,
         annotated_priority_replay: false,
         launch_image: None,
+        ephemeral_port_range_override: None,
         rewrite_exclusives_unmarked: Vec::new(),
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true, // stat* could depends on this
@@ -453,6 +455,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_signal_delivery: false,
         annotated_priority_replay: false,
         launch_image: None,
+        ephemeral_port_range_override: None,
         rewrite_exclusives_unmarked: Vec::new(),
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true,

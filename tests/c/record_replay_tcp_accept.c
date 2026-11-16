@@ -323,10 +323,10 @@ int main(int argc, char** argv) {
   failed |= truncated_round(listener, &server);
   failed |= nonblock_round(listener, &server);
   /* The first listener stays open through the error round. Hermit gives a
-   * port-0 bind a deterministic port and reuses a port as soon as its socket
-   * closes, but the server's side of each connection above is in TIME_WAIT
-   * on that port, so a second listener there would fail with EADDRINUSE
-   * (https://github.com/rrnewton/hermit/issues/1819). */
+   * port-0 bind a deterministic port; the server's side of each connection
+   * above is in TIME_WAIT on the first listener's port, so the error round
+   * binds port 0 anew rather than that exact port, which would fail with
+   * EADDRINUSE. */
   failed |= error_round();
   close(listener);
   return failed ? 16 : 0;

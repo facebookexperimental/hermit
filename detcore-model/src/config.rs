@@ -569,6 +569,17 @@ pub struct Config {
     #[clap(skip)]
     pub launch_image: Option<LaunchImage>,
 
+    /// Test-only override of the ephemeral port range Detcore assigns
+    /// port-0 binds from, as `(first, last)` inclusive. `None` (every
+    /// production caller) reads the host's
+    /// `/proc/sys/net/ipv4/ip_local_port_range`. A test that must fill
+    /// the range to observe reuse and wraparound sets a range of a few
+    /// ports instead of binding tens of thousands of sockets. Like
+    /// `launch_image` it has no legacy key and is never a flag.
+    #[serde(default)]
+    #[clap(skip)]
+    pub ephemeral_port_range_override: Option<(u16, u16)>,
+
     /// The mount IDs and filesystem types of the mount namespace hermit-cli
     /// was launched in, read in its outer process before it creates its
     /// container ([`crate::host_input::LaunchNamespaceMounts`]). A descriptor
@@ -4422,7 +4433,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 65] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 66] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4432,6 +4443,7 @@ mod legacy_backend_json {
         "in_guest_reserved_signals",
         "in_guest_refuses_host_timed_producers",
         "launch_image",
+        "ephemeral_port_range_override",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
         "pipe_wake_latency",
@@ -4673,6 +4685,7 @@ mod legacy_backend_json {
                 Some(
                     "in_guest_detlog_forward_policy"
                     | "launch_image"
+                    | "ephemeral_port_range_override"
                     | "detlog_anon"
                     | "scheduler_turn_cost"
                     | "virtual_timeout"
@@ -4981,6 +4994,7 @@ mod legacy_backend_json {
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
+                | "ephemeral_port_range_override"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -6063,6 +6077,7 @@ mod tests {
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
+                | "ephemeral_port_range_override"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -6161,12 +6176,13 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty-four fewer (lenient_replay joined them in dh-mvz7y,
+        // sixty-five fewer (lenient_replay joined them in dh-mvz7y,
         // chaos_timed_wait_spread later, `autofs_roots` and
-        // `notice_autofs_eloop` later still), so fifty keys fewer
+        // `notice_autofs_eloop` later still, then
+        // `ephemeral_port_range_override`), so fifty-one keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 50);
+        assert_eq!(fields.len(), keys.len() + 51);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6728,6 +6744,41 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .target_timeslice_syscalls_only
+        );
+    }
+
+    /// `ephemeral_port_range_override` never enters the legacy form,
+    /// whatever its value: the legacy string keeps its bytes, and it
+    /// reads back unset from both the object and the array form.
+    #[test]
+    fn ephemeral_port_range_override_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            ephemeral_port_range_override: Some((40100, 40102)),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("ephemeral_port_range_override"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .ephemeral_port_range_override
+                .is_none()
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .ephemeral_port_range_override
+                .is_none()
         );
     }
 

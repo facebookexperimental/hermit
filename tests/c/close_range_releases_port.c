@@ -9,13 +9,17 @@
 /*
  * close_range(3, ~0U, 0) closes every descriptor above stdio, a bound socket
  * included, and Hermit must account for it as for a close: the socket's
- * deterministic port goes back to the allocator, so the next bind to port 0
- * gets the same port. Under in-guest LiteInst the range also covers the
+ * port is released, so binding a new socket explicitly to that port
+ * succeeds. Which port a later port-0 bind would get says nothing here:
+ * Detcore's allocator advances past each assignment, as Linux's ephemeral
+ * search does, so the explicit bind is the release check that still
+ * discriminates. Under in-guest LiteInst the range also covers the
  * runtime's own coordinator connection; the call must still reach Detcore.
  */
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +57,18 @@ int main(void) {
     perror("close_range");
     return 1;
   }
-  unsigned second = bind_ephemeral();
-  printf("port reused=%d\n", first == second);
-  return 0;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  struct sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = htons((unsigned short)first);
+  errno = 0;
+  int released = bind(fd, (struct sockaddr*)&address, sizeof(address)) == 0;
+  printf("port released=%d\n", released);
+  return released ? 0 : 1;
 }

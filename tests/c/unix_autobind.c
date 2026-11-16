@@ -13,9 +13,9 @@
  * check of run_unix_autobind_probe still runs for every type. A unix
  * autobind takes a port from Detcore's container-wide allocator (the state
  * probe_family.h warns about), but each member binds one socket and closes
- * it, which releases the port, and the allocator hands the same port out
- * next, so each child sees the name a fresh run would (08000 under Hermit
- * on 2026-10-17, ptrace and KVM). No check depends on the name.
+ * it, which releases the port. The allocator advances past each
+ * assignment, so later children see later ports (08000, 08001, ... as hex
+ * under Hermit, ptrace and KVM). No check depends on the name.
  */
 
 #include "probe_family.h"

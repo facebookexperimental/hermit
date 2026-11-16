@@ -165,7 +165,6 @@ int main(int argc, char** argv) {
     die("socketpair");
   }
   unsigned short first;
-  unsigned short second;
   if (strcmp(mode, "inherited") == 0) {
     int bound = bound_udp(&first);
     pid_t child = exiting_child(-1, go);
@@ -187,10 +186,32 @@ int main(int argc, char** argv) {
       close(pair[1]);
     }
   }
-  int next = bound_udp(&second);
-  printf("%s: the next bind %s the first's port\n", mode,
-         second == first ? "reuses" : "does not reuse");
+  // The first socket's port must be free again: bind a new socket to that
+  // exact port. (Which port a port-0 bind gets says nothing any more:
+  // Detcore's allocator advances past each assignment, as Linux's
+  // ephemeral search does, so reuse of the number is not the evidence
+  // that the port was released. An explicit bind is: it succeeds only if
+  // the first socket is really gone.)
+  int next = socket(AF_INET, SOCK_DGRAM, 0);
+  if (next < 0) {
+    die("socket");
+  }
+  struct sockaddr_in name = {.sin_family = AF_INET,
+                             .sin_port = htons(first)};
+  if (inet_pton(AF_INET, address, &name.sin_addr) != 1) {
+    die("inet_pton");
+  }
+  errno = 0;
+  int rebound = bind(next, (struct sockaddr*)&name, sizeof(name)) == 0;
+  socklen_t length = sizeof(name);
+  if (rebound &&
+      (getsockname(next, (struct sockaddr*)&name, &length) != 0 ||
+       ntohs(name.sin_port) != first)) {
+    rebound = 0;
+  }
+  printf("%s: the first's port %s free again\n", mode,
+         rebound ? "is" : "is not");
   close(next);
   close(pair[0]);
-  return 0;
+  return rebound ? 0 : 1;
 }

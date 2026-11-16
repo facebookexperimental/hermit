@@ -127,6 +127,18 @@
       "why": "tests/c/autofs_probe.c is owned by hermit-cli/tests/mount_introspection.rs: The integration tests autofs_missing_name_is_enoent_under_hermit and autofs_privileged_fixture_measures_triggers_and_eloop_notice compile this stat/lstat/O_PATH/statx/readdir probe and compare its per-path errno output natively, under run --strict, and inside the synthetic autofs fixture (including the pinned ELOOP for an unlisted real key); a generic manifest cannot assert this exact errno output or the fixture's namespace setup."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/bind_ephemeral_after_loopback_close.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/bind_ephemeral_after_loopback_close.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this completed-loopback-connection rebind probe on ptrace and KVM for IPv4 and IPv6 and compares its output against a native run; it remains a guest fixture because a generic manifest cannot express the native comparison or the allocator port sequence it checks."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/bind_ephemeral_retry.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/bind_ephemeral_retry.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this TIME_WAIT-skipping ephemeral-retry probe on ptrace and KVM for IPv4 and IPv6 and compares its output against a native run; it remains a guest fixture because a generic manifest cannot express the native comparison or the held-neighbour-port setup it needs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/bind_getsockname.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

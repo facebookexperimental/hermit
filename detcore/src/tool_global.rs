@@ -1925,6 +1925,9 @@ impl GlobalState {
         // Phases 1 to 3 of `crate::clock_identity` (qualify, admit every
         // replay input, pin), then phase 4 from the admitted inputs.
         crate::scheduler::refuse_invalid_strict_boundary_config(cfg);
+        if let Err(refusal) = Self::validate_ephemeral_range(cfg) {
+            crate::scheduler::exit_on_scheduler_refusal(&anyhow::anyhow!(refusal));
+        }
         let prepared = crate::clock_identity::prepare_run(cfg);
         let sched = Arc::new(Mutex::new(Scheduler::new_admitted(
             cfg,
@@ -2004,7 +2007,7 @@ impl GlobalState {
         let recorded_stdio = recorded_host_inputs.as_ref().and_then(|set| set.stdio);
         let replay_host_inputs = recorded_host_inputs
             .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
-        let range = Self::read_port_range();
+        let range = Self::port_range(cfg);
         let network = Self::network_engine(cfg).map(Mutex::new);
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
@@ -6547,26 +6550,48 @@ impl GlobalState {
                 let _sched = self.lock_rpc_scheduler(false).await;
                 let mut mut_used_ports = self.used_ports.lock().unwrap();
                 self.update_port_range();
-                let total_available =
-                    self.port_end_range.load(SeqCst) - self.port_start_range.load(SeqCst);
-                let mut index = 0;
+                // The range is inclusive: that many candidates to try
+                // before the range is exhausted.
+                let total_available = u32::from(self.port_end_range.load(SeqCst))
+                    - u32::from(self.port_start_range.load(SeqCst))
+                    + 1;
+                let mut index: u32 = 0;
                 while (*mut_used_ports).contains(&self.next_port.load(SeqCst))
                     && index < total_available
                 {
-                    self.next_port.fetch_add(1, SeqCst);
-                    if self.next_port.load(SeqCst) > self.port_end_range.load(SeqCst) {
-                        self.next_port
-                            .store(self.port_start_range.load(SeqCst), SeqCst);
-                    }
+                    // Advance with wraparound computed, not `fetch_add`:
+                    // at a 65535 range end the atomic addition itself
+                    // wraps to 0, before a past-the-end check can run.
+                    let candidate = self.next_port.load(SeqCst);
+                    let next = if candidate >= self.port_end_range.load(SeqCst) {
+                        self.port_start_range.load(SeqCst)
+                    } else {
+                        candidate + 1
+                    };
+                    self.next_port.store(next, SeqCst);
                     index += 1;
                 }
                 if index == total_available {
                     R::PortFull
                 } else {
-                    (*mut_used_ports).insert(self.next_port.load(SeqCst));
+                    let assigned = self.next_port.load(SeqCst);
+                    (*mut_used_ports).insert(assigned);
                     let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
-                    R::RequestPort(self.next_port.load(SeqCst))
+                    open_file_to_port.insert(open_file_id, assigned);
+                    // Advance past the assignment, as Linux's ephemeral
+                    // search moves on rather than re-offering the same
+                    // candidate first (`inet_csk_find_open_port`): once the
+                    // holder closes, the ledger releases the port at once,
+                    // but a completed connection leaves a host TIME_WAIT on
+                    // it, so handing it straight to the next port-0 bind
+                    // fails EADDRINUSE where Linux would pick another port.
+                    let next = if assigned >= self.port_end_range.load(SeqCst) {
+                        self.port_start_range.load(SeqCst)
+                    } else {
+                        assigned + 1
+                    };
+                    self.next_port.store(next, SeqCst);
+                    R::RequestPort(assigned)
                 }
             }
             GlobalRequest::AddUsedPort(port, open_file_id) => {
@@ -8285,9 +8310,33 @@ impl GlobalState {
         range
     }
 
+    /// The ephemeral range to assign from: the test-only override when
+    /// the configuration sets one (`Config::ephemeral_port_range_override`),
+    /// else the host range `read_port_range` reads. The caller has
+    /// already refused an inverted override
+    /// (`Self::validate_ephemeral_range`).
+    fn port_range(cfg: &Config) -> Vec<u16> {
+        match cfg.ephemeral_port_range_override {
+            Some((first, last)) => vec![first, last],
+            None => Self::read_port_range(),
+        }
+    }
+
+    /// An override whose first port is past its last names no range at
+    /// all; refuse it instead of assigning from an empty range.
+    pub(crate) fn validate_ephemeral_range(cfg: &Config) -> Result<(), String> {
+        match cfg.ephemeral_port_range_override {
+            Some((first, last)) if first > last => Err(format!(
+                "ephemeral_port_range_override ({first}, {last}) is inverted: \
+                 its first port is past its last"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     // Reflect ephemeral port range updated outside of the tracer program internally.
     fn update_port_range(&self) {
-        let range = Self::read_port_range();
+        let range = Self::port_range(&self.cfg);
         self.port_start_range.store(range[0], SeqCst);
         self.port_end_range.store(range[1], SeqCst);
     }
@@ -16859,6 +16908,7 @@ mod tests {
     mod guest_mask_publication_tests;
     mod other_process_procfs_tests;
     mod pipe_status_retention_tests;
+    mod port_allocator_tests;
     mod priority_custody_tests;
     mod replay_departure_tests;
     mod replay_departure_transport;

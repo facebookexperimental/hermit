@@ -312,6 +312,8 @@ static CWD_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ABSENT_CPU_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCM_RIGHTS_RECEIVED_ANON_INODES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static BIND_EPHEMERAL_AFTER_LOOPBACK_CLOSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static BIND_EPHEMERAL_RETRY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCM_RIGHTS_EXITED_RECEIVER_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -11197,6 +11199,181 @@ fn run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first() {
     receive_from_an_exited_sender_in_both_orders("kvm", SCM_RIGHTS_RECEIVED_ANON_INODES_KVM);
 }
 
+/// The port-allocator guests below take a loopback address argument: a
+/// private 127.192.0.0/10 address for IPv4 (as
+/// [`exited_receiver_loopback`]) so a neighbour port is uncontended on
+/// the host, and `::1` for IPv6. Each prints the same line natively and
+/// under Hermit, so the native run is the comparison.
+fn bind_allocator_guest(
+    backend: &str,
+    guest: &str,
+    native_prefix: &str,
+    hermit_expected: &str,
+) {
+    for address in [exited_receiver_loopback(), "::1".to_owned()] {
+        let native = Command::new(guest)
+            .arg(&address)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the guest natively");
+        assert!(
+            native.status.success(),
+            "native guest on {address}: {native:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&native.stdout).starts_with(native_prefix),
+            "native guest on {address}: {native:?}"
+        );
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest,
+            address.as_str(),
+        ];
+        let mut command = hermit_command(&args);
+        command.stdin(Stdio::null());
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), hermit_expected, "{backend} on {address}");
+    }
+}
+
+/// `tests/c/bind_ephemeral_after_loopback_close.c` completes a loopback
+/// connection, closes accepted/client/listener, then binds port 0 again.
+/// Linux's ephemeral search skips the closed connection's TIME_WAIT port
+/// and binds a different free port. Detcore assigns the deterministic
+/// ephemeral port itself; it used to re-offer the just-released port, so
+/// the second bind failed EADDRINUSE against the host TIME_WAIT.
+fn bind_ephemeral_after_loopback_close(backend: &str) {
+    let guest = compiled_c_guest(
+        &BIND_EPHEMERAL_AFTER_LOOPBACK_CLOSE_GUEST,
+        "bind_ephemeral_after_loopback_close",
+    )
+    .to_str()
+    .expect("guest path is UTF-8");
+    bind_allocator_guest(backend, guest, "rebind ok=1", "rebind ok=1 port_differs=1\n");
+}
+
+/// `tests/c/bind_ephemeral_retry.c` holds the allocator's first port P,
+/// puts P+1 into TIME_WAIT with a completed connection, then binds port
+/// 0: the candidate is P+1, still host-busy, so the bind must move to
+/// the next candidate (exactly one retry) instead of answering
+/// EADDRINUSE, as Linux's search does.
+fn bind_ephemeral_retry(backend: &str) {
+    let guest = compiled_c_guest(&BIND_EPHEMERAL_RETRY_GUEST, "bind_ephemeral_retry")
+        .to_str()
+        .expect("guest path is UTF-8");
+    bind_allocator_guest(
+        backend,
+        guest,
+        "retry ok=1 skipped_time_wait=1",
+        "retry ok=1 skipped_time_wait=1 third_minus_first=2\n",
+    );
+}
+
+/// The retry guest under --verify-strict (both backends, both families)
+/// and under record/replay (ptrace; KVM record is unavailable by
+/// design). Checked in so the round-trip evidence cannot rot into
+/// one-off runs: the retry count is driven by the recorded bind
+/// outcomes, so a replay retries exactly as many times and assigns the
+/// same ports.
+fn bind_ephemeral_retry_verifies_and_replays(backend: &str) {
+    let guest = compiled_c_guest(&BIND_EPHEMERAL_RETRY_GUEST, "bind_ephemeral_retry")
+        .to_str()
+        .expect("guest path is UTF-8");
+    let expected = "retry ok=1 skipped_time_wait=1 third_minus_first=2\n";
+    for address in [exited_receiver_loopback(), "::1".to_owned()] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = format!("--verify-json={}", report.display());
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            report_arg.as_str(),
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest,
+            address.as_str(),
+        ];
+        let verified = hermit(&args);
+        assert_success(&verified, &args);
+        assert_eq!(stdout(&verified), expected, "{backend} on {address}");
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{backend} on {address}: {verdict}"
+        );
+        if backend == "ptrace" {
+            let record_args = [
+                "record",
+                "--verify",
+                "--verify-strict",
+                "--",
+                guest,
+                address.as_str(),
+            ];
+            let recorded = hermit(&record_args);
+            assert_success(&recorded, &record_args);
+            assert!(
+                stderr(&recorded).contains("Success: replay matched recording."),
+                "ptrace record on {address}: {recorded:?}"
+            );
+            assert_eq!(stdout(&recorded), expected, "ptrace record on {address}");
+        }
+    }
+}
+
+#[test]
+fn bind_ephemeral_retry_verifies_and_replays_ptrace() {
+    bind_ephemeral_retry_verifies_and_replays("ptrace");
+}
+
+#[test]
+fn run_kvm_bind_ephemeral_retry_verifies() {
+    if kvm_unavailable("run_kvm_bind_ephemeral_retry_verifies") {
+        return;
+    }
+    bind_ephemeral_retry_verifies_and_replays("kvm");
+}
+
+#[test]
+fn bind_ephemeral_retry_skips_time_wait() {
+    bind_ephemeral_retry("ptrace");
+}
+
+#[test]
+fn run_kvm_bind_ephemeral_retry_skips_time_wait() {
+    if kvm_unavailable("run_kvm_bind_ephemeral_retry_skips_time_wait") {
+        return;
+    }
+    bind_ephemeral_retry("kvm");
+}
+
+#[test]
+fn bind_ephemeral_after_loopback_close_binds_another_port() {
+    bind_ephemeral_after_loopback_close("ptrace");
+}
+
+#[test]
+fn run_kvm_bind_ephemeral_after_loopback_close_binds_another_port() {
+    if kvm_unavailable("run_kvm_bind_ephemeral_after_loopback_close_binds_another_port") {
+        return;
+    }
+    bind_ephemeral_after_loopback_close("kvm");
+}
+
 /// What `tests/c/scm_rights_overlapping_receipt.c` prints natively, where it
 /// runs to the end.
 const SCM_RIGHTS_OVERLAPPING_RECEIPT_LINUX: &str = "sent\nreceived\n\
@@ -11759,13 +11936,16 @@ fn exited_receiver_loopback() -> String {
 /// A bound UDP socket rides an `SCM_RIGHTS` message queued to a socket a
 /// child holds, or the child inherits the bound socket itself, and the child
 /// exits; the parent then lets go of its own descriptors and binds a new
-/// socket to port 0 (`tests/c/scm_rights_exited_receiver_port.c`'s modes
+/// socket explicitly to the first socket's port
+/// (`tests/c/scm_rights_exited_receiver_port.c`'s modes
 /// `alone`, `shared`, `inherited` and `threaded`, where two threads of the
 /// child hold its table and one exits first). Linux releases the child's
 /// descriptors at its exit, so the parent's close is the last reference to
-/// the bound socket, and its port is free again: Detcore hands that port to
-/// the next bind to port 0, as it hands out the port it allocated last once
-/// that one is free again (https://github.com/rrnewton/hermit/issues/4930).
+/// the bound socket, and its port is free again for that explicit bind
+/// (https://github.com/rrnewton/hermit/issues/4930). Which port a port-0
+/// bind would get says nothing here: Detcore's allocator advances past
+/// each assignment, as Linux's ephemeral search does, so the explicit
+/// bind is the release check that still discriminates.
 /// Detcore lets the child's descriptor table go at the exit of its last
 /// holder, in that thread's turn, counting the holders by guest calls alone,
 /// so the answer does not depend on when the backend tears the child's
@@ -11774,7 +11954,7 @@ fn exited_receiver_loopback() -> String {
 /// a socket in flight to the exited child stayed reserved whenever the
 /// teardown came after the parent's close, and a table two threads held was
 /// let go at the exit only where the backend had already torn the first
-/// thread's state down. Linux 7.1.3 rebinds the exact port in every mode
+/// thread's state down. Linux 7.1.3 binds the exact port again in every mode
 /// (its own port-0 choice is random, so its output says nothing).
 fn exited_receivers_queue_goes_with_its_exit(backend: &str) {
     let guest = compiled_c_guest(
@@ -11816,7 +11996,7 @@ fn exited_receivers_queue_goes_with_its_exit(backend: &str) {
             }
             assert_eq!(
                 stdout(&output),
-                format!("{mode}: the next bind reuses the first's port\n"),
+                format!("{mode}: the first's port is free again\n"),
                 "{backend} {mode} under {probe:?}; stderr:\n{}",
                 stderr(&output)
             );

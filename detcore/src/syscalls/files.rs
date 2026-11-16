@@ -17730,6 +17730,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
+        // The deterministic ephemeral port this call assigned for a port-0
+        // INET bind, when it did: the only binds that may move to the next
+        // candidate on EADDRINUSE (a nonzero guest port is the guest's
+        // exact request, and Linux answers it with the conflict).
+        let mut assigned_port: Option<u16> = None;
         // The abstract name to notice once the bind returns. Read only to word
         // the notice: the bind itself is unchanged, and an unreadable address
         // is left to fail as Linux fails it.
@@ -17842,6 +17847,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
+                        assigned_port = Some(port_assigned);
                         sockaddr_in.sin_port = port_assigned.to_be();
                         guest
                             .memory()
@@ -17881,6 +17887,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
+                        assigned_port = Some(port_assigned);
                         sockfaddr_in.sin6_port = port_assigned.to_be();
                         guest
                             .memory()
@@ -17905,7 +17912,55 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             })
             .flatten();
-        let res = self.record_or_replay(guest, call).await;
+        let mut res = self.record_or_replay(guest, call).await;
+        // A port-0 INET bind whose assigned candidate is still host-busy
+        // (a just-closed connection's TIME_WAIT on that port) moves to the
+        // next candidate instead of answering EADDRINUSE: Linux's
+        // ephemeral search skips conflicting ports and binds the first
+        // free one, failing only when the range is exhausted. The retry
+        // count is driven by the bind outcomes themselves, which replay
+        // from the record, and every candidate comes from the same
+        // deterministic allocator, so a replay assigns the same ports.
+        // Trying a candidate twice means the allocator has cycled the
+        // whole range without a host-free port: answer EADDRINUSE then.
+        let mut tried: Vec<u16> = Vec::new();
+        while matches!(res, Err(Errno::EADDRINUSE)) {
+            let Some(failed) = assigned_port else { break };
+            if tried.contains(&failed) {
+                break;
+            }
+            tried.push(failed);
+            self.release_port_for_open_file(guest, open_file_id).await;
+            let resp = send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
+            let candidate = match resp.1 {
+                GlobalResponse::RequestPort(port) => port,
+                GlobalResponse::PortFull => break,
+                _ => unreachable!(),
+            };
+            if tried.contains(&candidate) {
+                self.release_port_for_open_file(guest, open_file_id).await;
+                break;
+            }
+            assigned_port = Some(candidate);
+            if sockaddr_family == libc::AF_INET as u16 {
+                let mut sockaddr_in: libc::sockaddr_in = guest
+                    .memory()
+                    .read_value(addr.cast::<libc::sockaddr_in>())?;
+                sockaddr_in.sin_port = candidate.to_be();
+                guest
+                    .memory()
+                    .write_value(addr.cast::<libc::sockaddr_in>(), &sockaddr_in)?;
+            } else {
+                let mut sockaddr_in6: libc::sockaddr_in6 = guest
+                    .memory()
+                    .read_value(addr.cast::<libc::sockaddr_in6>())?;
+                sockaddr_in6.sin6_port = candidate.to_be();
+                guest
+                    .memory()
+                    .write_value(addr.cast::<libc::sockaddr_in6>(), &sockaddr_in6)?;
+            }
+            res = self.record_or_replay(guest, call).await;
+        }
         // Named in any form, the socket can be sent to by other sockets.
         if res.is_ok() && sockaddr_family == libc::AF_UNIX as u16 {
             self.note_unix_socket_reachable(guest, sock_fd);
