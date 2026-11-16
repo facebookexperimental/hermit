@@ -336,10 +336,14 @@ class VerdictTest(unittest.TestCase):
     def test_the_refusal_opt_in_reaches_every_bucket_and_each_recorded_refusal_is_printed(self):
         """Without --record-host-image-interpreter-refusals no bucket's harness gets it, so a
         recorded row is an ERROR there; with it, every bucket's harness gets the baseline as
-        an absolute path, and each recorded refusal is printed and counted, never dropped."""
+        an absolute path, and each recorded refusal is printed and counted, never dropped.
+        A recorded cell measured nothing, so the run is INCOMPLETE: it exits 1 although
+        every bucket passed, whether the summary counts the cell or only lists it."""
         process, calls = self.verdict({})
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertTrue(all("--record-host-image-interpreter-refusals" not in c["argv"] for c in calls), calls)
+        self.assertIs(json.loads(process.stdout)["incomplete"], False)
+        self.assertNotIn("INCOMPLETE", process.stderr)
         refusal = {"test": "t/r", "mode": "verify", "backend": "ptrace", "recorded": True,
                    "reason": "NOT RUN, NOT a pass, no coverage: this host's own program interpreter refused it\nmore"}
         kept = dict(refusal, test="t/k", recorded=False, reason="kept as its FAIL")
@@ -347,11 +351,14 @@ class VerdictTest(unittest.TestCase):
             2, passed=1, host_inapplicable=1, host_image_interpreter_refusals=1,
             host_image_interpreter_refusal_cells=[refusal, kept])}
         relative = os.path.relpath(self.root / "baseline", Path.cwd())
+        incomplete = ("verdict: INCOMPLETE: 1 cell(s) recorded HOST-INAPPLICABLE as host-image interpreter "
+                      "refusals, which measured nothing about Hermit, so this run is not a pass whatever its "
+                      "buckets say (a validation run that holds one is not complete either)\n")
         shutil.rmtree(self.out, ignore_errors=True)
         self.calls.unlink(missing_ok=True)
         process, calls = self.verdict({"portable/compat": report},
                                       "--record-host-image-interpreter-refusals", relative)
-        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.returncode, 1, process.stderr)
         self.assertEqual(len(calls), 3)
         for call in calls:
             flag = call["argv"].index("--record-host-image-interpreter-refusals")
@@ -360,8 +367,22 @@ class VerdictTest(unittest.TestCase):
                       "interpreter refusal, not a pass: NOT RUN, NOT a pass, no coverage: this host's own program "
                       "interpreter refused it\n", process.stderr)
         self.assertNotIn("t/k/verify/ptrace", process.stderr)
+        self.assertNotIn("did not pass", process.stderr)
+        self.assertIn(incomplete, process.stderr)
         printed = json.loads(process.stdout)
+        self.assertEqual((printed["failed_buckets"], printed["incomplete"]), ([], True))
         self.assertEqual((printed["host_inapplicable"], printed["host_image_interpreter_refusals"]), (1, 1))
+        # Either record of a recorded cell alone makes the run INCOMPLETE.
+        for name, changes in [("counted only", {"host_image_interpreter_refusal_cells": [kept]}),
+                              ("listed only", {"host_image_interpreter_refusals": 0})]:
+            with self.subTest(name):
+                shutil.rmtree(self.out, ignore_errors=True)
+                one = {**report, "summary": {**report["summary"], **changes}}
+                process, _ = self.verdict({"portable/compat": one},
+                                          "--record-host-image-interpreter-refusals", relative)
+                self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+                self.assertIn(incomplete, process.stderr)
+                self.assertIs(json.loads(process.stdout)["incomplete"], True)
 
     def test_an_error_on_an_excused_diagnostic_cell_is_still_listed(self):
         erroring = {"rc": 1, "summary": summary(2, errors=1, failed=1, passed=0, diagnostic=[(E, "exit status 3")]),

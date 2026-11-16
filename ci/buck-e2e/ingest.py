@@ -42,9 +42,9 @@ The one exception is an execution that withheld its cell on an RE worker: it wro
 its summary.json claims the cell host-inapplicable, and its result.json records route "re".
 That harness started no hermit, because the worker it landed on cannot run the cell (a
 worker without an exact branch counter, which the plan cannot route around: RE workers
-differ in CPU model). It is not an attempt and takes no number; the cell's next execution,
-on another worker, is attempt 1. Any other claim followed by a later execution still takes
-its number.
+differ in CPU model). It is not an attempt and takes no number; the cell's next execution
+(in ci/buck-e2e/run, its local rerun: Tpx retries are off) is attempt 1. Any other claim
+followed by a later execution still takes its number.
 An execution on an RE worker whose every run that worker's own program interpreter
 refused is the same kind of exception: its summary.json names the cell in
 host_image_interpreter_refusal_cells (recorded HOST-INAPPLICABLE under the harness's

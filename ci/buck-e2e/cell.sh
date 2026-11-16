@@ -47,10 +47,13 @@
 #                                  interpreter refused is one HOST-INAPPLICABLE row of
 #                                  kind host-image-interpreter-refusal (its attempts' rows
 #                                  are the host-image-interpreter-refusals.jsonl
-#                                  artifact), and one that passed in the baseline, or
-#                                  that the baseline has no row for, fails (PASS ->
-#                                  HOST-INAPPLICABLE). Unset or empty, the default, and
-#                                  on every other route: the option is not passed and
+#                                  artifact), and one whose final row in the baseline
+#                                  is not a FAIL with a run (a PASS, no row, a recorded
+#                                  or withheld HOST-INAPPLICABLE, an ERROR, a FAIL
+#                                  without a run) fails (PASS -> HOST-INAPPLICABLE
+#                                  cannot be ruled out). Every baseline line must be a
+#                                  test-harness result row. Unset or empty, the default,
+#                                  and on every other route: the option is not passed and
 #                                  such a cell keeps the FAIL its attempts measured. A
 #                                  value that names nothing readable fails the cell.
 #        HERMIT_E2E_KEEP_ARTIFACTS "1": copy this cell's artifact directory (one cell's, its
@@ -71,8 +74,9 @@
 #         the harness wrote.
 #         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
 #         skipped, with the harness's reason (failed, naming that reason, under
-#         HERMIT_E2E_REQUIRE_HOST_CAPS=1); on RE it stays failed, so Tpx retries it on
-#         another worker (see ci/buck-e2e/run).
+#         HERMIT_E2E_REQUIRE_HOST_CAPS=1); on RE it stays failed, never skipped. No Tpx
+#         retry follows (--retry 0): ci/buck-e2e/run's local rerun gives the cell its
+#         next execution.
 #         A cell whose every run this host's own program interpreter refused is a FAIL,
 #         as its attempts measured, unless HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS
 #         had the harness record it HOST-INAPPLICABLE; a recorded one is reported as a
@@ -158,11 +162,12 @@ esac
 # HOST-INAPPLICABLE, checked against its PASS baseline: on a local route only. Off it
 # the option is not passed, so a refusal there stays a failure and the cell runs again
 # on another machine (ingest.py); the harness's stderr artifact says so.
-refusal_baseline= refusal_args=()
+refusal_baseline='' refusal_args=()
 if [[ -n ${HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS:-} && ${HERMIT_E2E_ROUTE:-} == local ]]; then
-    refusal_baseline=$(realpath -e -- "$HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS" 2>/dev/null) &&
-        [[ -r $refusal_baseline ]] ||
+    if ! refusal_baseline=$(realpath -e -- "$HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS" 2>/dev/null) ||
+        [[ ! -r $refusal_baseline ]]; then
         emit_fatal "HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS names '$HERMIT_E2E_RECORD_HOST_IMAGE_INTERPRETER_REFUSALS', which is not a readable results.jsonl or directory"
+    fi
     refusal_args=(--record-host-image-interpreter-refusals "$refusal_baseline")
 fi
 if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
@@ -601,7 +606,7 @@ for f in result.json tpx.jsonl summary.json results.jsonl host-image-interpreter
 done
 # HERMIT_E2E_KEEP_ARTIFACTS=1: this one cell's artifact directory outlives the scratch
 # directory, for a person reading a local run. RE workers keep nothing past the action.
-kept= kept_note=
+kept='' kept_note=''
 if [[ ${HERMIT_E2E_KEEP_ARTIFACTS:-} == 1 ]]; then
     if [[ ${HERMIT_E2E_ROUTE:-} != local ]]; then
         kept_note="not kept: HERMIT_E2E_KEEP_ARTIFACTS applies to local cells, this one ran on '${HERMIT_E2E_ROUTE:-}'"
@@ -740,7 +745,8 @@ def withheld_here(pair):
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
-    qualifies: an RE worker that lacks the capability is retried on another worker.
+    qualifies: on RE the cell fails, and ci/buck-e2e/run's local rerun gives it its next
+    execution (Tpx retries are off).
     Under HERMIT_E2E_REQUIRE_HOST_CAPS=1 nothing qualifies: required_here fails it."""
     if route != "local" or pair is None or require_host_caps == "1":
         return None

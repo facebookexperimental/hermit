@@ -10013,7 +10013,8 @@ const HIGHEST_AUTO_PROFILE_LEVEL: u8 = 3;
 /// (hermit-cli/src/cpu_profile_admission.rs, `ProfileReason::host_dependent`:
 /// `admitted`, `hypervisor`, `qualification-refused`). Under any other reason
 /// (`explicit`, `declared`, `request-not-admissible`) the same command
-/// presents the same CPU on every host, so its refusal is the cell's own.
+/// presents the same CPU on every host, so its refusal is the cell's own. A
+/// test pins this copy to hermit-cli's source.
 const HOST_DEPENDENT_PROFILE_REASONS: [&str; 3] =
     ["admitted", "hypervisor", "qualification-refused"];
 
@@ -10382,16 +10383,30 @@ pub fn host_image_interpreter_refusal(
         .map(|evidence| host_image_interpreter_refusal_row(context, cell, &evidence))
 }
 
-/// The final outcome of each cell in an earlier run's rows: the PASS
-/// baseline a recorded host-image interpreter refusal is checked against
+/// The final row of each cell in an earlier run's rows: the PASS baseline a
+/// recorded host-image interpreter refusal is checked against
 /// ([`RECORD_INTERPRETER_REFUSALS_ARG`]). It is read from a `results.jsonl`
 /// file or from every `results.jsonl` below a directory (an E2E result root,
-/// an import root, a Buck verdict directory); a cell's final outcome is its
-/// last row's, and a cell with rows in two files is refused as ambiguous.
+/// an import root, a Buck verdict directory). Every line must be a
+/// test-harness result row ([`CellResult`]) of [`CELL_RESULT_SCHEMA`], the
+/// rows a run writes; anything else refuses the baseline. A cell's final row
+/// is its last, and a cell with rows in two files is refused as ambiguous.
 #[derive(Debug, Default)]
 pub struct PassBaseline {
     pub path: PathBuf,
-    finals: BTreeMap<(String, String, Option<String>), (String, PathBuf)>,
+    finals: BTreeMap<(String, String, Option<String>), BaselineFinal>,
+}
+
+/// What a cell's final row in a [`PassBaseline`] shows of it.
+#[derive(Debug)]
+struct BaselineFinal {
+    outcome: String,
+    /// The row records a host-image interpreter refusal: a HOST-INAPPLICABLE
+    /// row of kind [`HOST_IMAGE_INTERPRETER_REFUSAL`].
+    recorded_refusal: bool,
+    /// The row retains at least one attempt's run.
+    ran: bool,
+    file: PathBuf,
 }
 
 impl PassBaseline {
@@ -10419,8 +10434,7 @@ impl PassBaseline {
         } else {
             files.push(path.to_path_buf());
         }
-        let mut finals: BTreeMap<(String, String, Option<String>), (String, PathBuf)> =
-            BTreeMap::new();
+        let mut finals: BTreeMap<(String, String, Option<String>), BaselineFinal> = BTreeMap::new();
         for file in &files {
             let text = fs::read_to_string(file)
                 .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
@@ -10429,32 +10443,51 @@ impl PassBaseline {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let row: JsonValue = serde_json::from_str(line)
-                    .map_err(|error| format!("{}:{}: {error}", file.display(), number + 1))?;
-                let text = |key: &str| row.get(key).and_then(JsonValue::as_str).map(str::to_owned);
-                let (Some(test), Some(mode), Some(outcome)) =
-                    (text("test"), text("mode"), text("outcome"))
-                else {
-                    return Err(format!(
-                        "{}:{}: a row without test, mode and outcome",
-                        file.display(),
-                        number + 1
-                    ));
+                let row = match serde_json::from_str::<CellResult>(line) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        return Err(format!(
+                            "{}:{}: not a test-harness result row ({error}), so it cannot serve \
+                             as a PASS baseline",
+                            file.display(),
+                            number + 1
+                        ));
+                    }
                 };
-                seen.insert((test, mode, text("backend")), outcome);
+                if row.schema != CELL_RESULT_SCHEMA {
+                    return Err(format!(
+                        "{}:{}: a result row of schema {}, not {CELL_RESULT_SCHEMA}, so it cannot \
+                         serve as a PASS baseline",
+                        file.display(),
+                        number + 1,
+                        row.schema
+                    ));
+                }
+                let recorded_refusal = row.outcome == "HOST-INAPPLICABLE"
+                    && row.error_kind.as_deref() == Some(HOST_IMAGE_INTERPRETER_REFUSAL);
+                let ran = !row.attempts.is_empty();
+                seen.insert(
+                    (row.test, row.mode, row.backend),
+                    BaselineFinal {
+                        outcome: row.outcome,
+                        recorded_refusal,
+                        ran,
+                        file: file.clone(),
+                    },
+                );
             }
-            for (cell, outcome) in seen {
-                if let Some((_, other)) = finals.get(&cell) {
+            for (cell, last) in seen {
+                if let Some(other) = finals.get(&cell) {
                     return Err(format!(
                         "{} and {} both hold rows of {}/{}@{}, so its final outcome is ambiguous",
-                        other.display(),
+                        other.file.display(),
                         file.display(),
                         cell.0,
                         cell.1,
                         cell.2.as_deref().unwrap_or("native")
                     ));
                 }
-                finals.insert(cell, (outcome, file.clone()));
+                finals.insert(cell, last);
             }
         }
         if finals.is_empty() {
@@ -10470,28 +10503,52 @@ impl PassBaseline {
     }
 
     /// Why recording `cell` HOST-INAPPLICABLE fails against this baseline, if
-    /// it does: its final row there was a PASS, or the baseline has no row
-    /// for it, which cannot rule a PASS out.
+    /// it does. Only a measured FAIL licenses it: a final row there that is a
+    /// FAIL retaining an attempt's run. A PASS there is the flip this check
+    /// exists for (PASS -> HOST-INAPPLICABLE). No row, or a final row that
+    /// measured nothing, cannot rule a PASS out: a recorded HOST-INAPPLICABLE
+    /// (an earlier run recorded the cell rather than measured it, so a chain
+    /// of recording runs never stands on a measurement), a withheld
+    /// HOST-INAPPLICABLE, an ERROR, a FAIL that retains no run, or an outcome
+    /// no run writes.
     pub fn refuses(&self, cell: &CellId) -> Option<String> {
         let key = (cell.test.clone(), cell.mode.clone(), cell.backend.clone());
-        match self.finals.get(&key) {
-            Some((outcome, file)) if outcome == "PASS" => Some(format!(
-                "PASS -> HOST-INAPPLICABLE against the baseline {}: {}/{}@{} passed there ({})",
-                self.path.display(),
-                cell.test,
-                cell.mode,
-                cell.backend.as_deref().unwrap_or("native"),
-                file.display()
-            )),
-            Some(_) => None,
-            None => Some(format!(
-                "the baseline {} has no row for {}/{}@{}, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
-                self.path.display(),
-                cell.test,
-                cell.mode,
-                cell.backend.as_deref().unwrap_or("native")
-            )),
-        }
+        let name = format!(
+            "{}/{}@{}",
+            cell.test,
+            cell.mode,
+            cell.backend.as_deref().unwrap_or("native")
+        );
+        let Some(last) = self.finals.get(&key) else {
+            return Some(format!(
+                "the baseline {} has no row for {name}, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
+                self.path.display()
+            ));
+        };
+        let unmeasured = match last.outcome.as_str() {
+            "PASS" => {
+                return Some(format!(
+                    "PASS -> HOST-INAPPLICABLE against the baseline {}: {name} passed there ({})",
+                    self.path.display(),
+                    last.file.display()
+                ));
+            }
+            "FAIL" if last.ran => return None,
+            "FAIL" => "a FAIL that retains no run",
+            "HOST-INAPPLICABLE" if last.recorded_refusal => {
+                "itself a recorded HOST-INAPPLICABLE (host-image-interpreter-refusal), which an \
+                 earlier run recorded rather than measured"
+            }
+            "HOST-INAPPLICABLE" => "a HOST-INAPPLICABLE cell that run withheld",
+            "ERROR" => "an ERROR, which measured nothing about the cell",
+            _ => "an outcome no run writes",
+        };
+        Some(format!(
+            "the baseline {}'s final row for {name} is {unmeasured} ({}); only a measured FAIL \
+             there licenses recording it, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
+            self.path.display(),
+            last.file.display()
+        ))
     }
 }
 
@@ -27187,7 +27244,7 @@ backends_disabled:
 
     /// Red twin: only a FAIL row with runs is evidence. An ERROR row keeps its
     /// result although its run shows the refusal, and so does a FAIL row that
-    /// retains no run, alone or after a refused attempt. The same row as a
+    /// retains no run, after a refused attempt or alone. The same row as a
     /// FAIL with its run is a refusal.
     #[test]
     fn a_row_that_is_not_a_fail_with_runs_keeps_its_result() {
@@ -27217,14 +27274,20 @@ backends_disabled:
         let mut without_runs = refused.clone();
         without_runs.attempt = 2;
         without_runs.attempts.clear();
+        // After a refused attempt first: there a decision that let a FAIL with
+        // no run through would count it as one more refused attempt and
+        // return a row, which this assertion sees. Alone, the same row would
+        // reach the decision's own invariant (`a FAIL with runs sets it`)
+        // instead of this test's assertion.
+        assert!(
+            host_image_interpreter_refusal(&context, &cell, &[refused, without_runs.clone()])
+                .is_none(),
+            "a FAIL that retains no run, after a refused attempt"
+        );
         assert!(
             host_image_interpreter_refusal(&context, &cell, std::slice::from_ref(&without_runs))
                 .is_none(),
             "a FAIL that retains no run"
-        );
-        assert!(
-            host_image_interpreter_refusal(&context, &cell, &[refused, without_runs]).is_none(),
-            "a FAIL that retains no run, after a refused attempt"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -27267,6 +27330,112 @@ backends_disabled:
             assert!(decide(reason).is_none(), "{reason:?}");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The reasons hermit-cli's `ProfileReason::host_dependent` names, read
+    /// from `source`, its hermit-cli/src/cpu_profile_admission.rs: the
+    /// variants of the one `matches!(self, ...)` that function is, each by the
+    /// name `ProfileReason::name` gives it, which is what a run manifest
+    /// writes. Whatever it cannot read that way is an error, never an empty or
+    /// partial answer.
+    fn hermit_cli_host_dependent_reasons(
+        source: &str,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        // The text inside the block that follows the one occurrence of
+        // `signature` in `text`.
+        fn block<'a>(text: &'a str, signature: &str) -> Result<&'a str, String> {
+            let mut found = text.match_indices(signature);
+            let (start, _) = found.next().ok_or_else(|| format!("no `{signature}`"))?;
+            if found.next().is_some() {
+                return Err(format!("more than one `{signature}`"));
+            }
+            let open = start
+                + text[start..]
+                    .find('{')
+                    .ok_or_else(|| format!("`{signature}` opens no block"))?;
+            let mut depth = 0usize;
+            for (offset, character) in text[open..].char_indices() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(&text[open + 1..open + offset]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(format!("the block after `{signature}` does not close"))
+        }
+        let reason_impl = block(source, "impl ProfileReason {")?;
+        let mut names = std::collections::BTreeMap::new();
+        for line in block(reason_impl, "pub fn name(self) -> &'static str")?.lines() {
+            let line = line.trim();
+            let Some(arm) = line.strip_prefix("ProfileReason::") else {
+                continue;
+            };
+            let (variant, name) = arm
+                .split_once(" => ")
+                .ok_or_else(|| format!("name(): `{line}` is not `Variant => \"name\"`"))?;
+            let name = name
+                .strip_suffix(',')
+                .unwrap_or(name)
+                .strip_prefix('"')
+                .and_then(|name| name.strip_suffix('"'))
+                .ok_or_else(|| format!("name(): {variant}'s name is not a string literal"))?;
+            names.insert(variant.to_string(), name.to_string());
+        }
+        let host_dependent = block(reason_impl, "pub fn host_dependent(self) -> bool")?.trim();
+        let alternatives = host_dependent
+            .strip_prefix("matches!(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|rest| rest.trim().strip_prefix("self,"))
+            .ok_or_else(|| {
+                format!("host_dependent() is not one `matches!(self, ...)`: {host_dependent}")
+            })?;
+        let mut reasons = std::collections::BTreeSet::new();
+        for alternative in alternatives.split('|') {
+            let alternative = alternative.trim().trim_end_matches(',').trim();
+            let variant = alternative.strip_prefix("ProfileReason::").ok_or_else(|| {
+                format!("host_dependent(): `{alternative}` is not a ProfileReason variant")
+            })?;
+            let name = names.get(variant).ok_or_else(|| {
+                format!("host_dependent() names {variant}, which name() does not")
+            })?;
+            reasons.insert(name.clone());
+        }
+        Ok(reasons)
+    }
+
+    /// HOST_DEPENDENT_PROFILE_REASONS is a copy of hermit-cli's
+    /// `ProfileReason::host_dependent` (hermit-cli/src/cpu_profile_admission.rs),
+    /// which this crate does not depend on. Every reason the copy admits must
+    /// be one hermit-cli still calls host-dependent: were hermit-cli to drop
+    /// one, the copy would record a refusal under a profile the host did not
+    /// choose. A reason hermit-cli adds and the copy lacks only keeps such a
+    /// refusal a FAIL, so it is allowed. The source is read when the test is
+    /// compiled, and a parse that cannot read it fails rather than passing.
+    #[test]
+    fn host_dependent_profile_reasons_are_reasons_hermit_cli_calls_host_dependent() {
+        let source = include_str!("../../../hermit-cli/src/cpu_profile_admission.rs");
+        let hermit_cli = hermit_cli_host_dependent_reasons(source)
+            .unwrap_or_else(|error| panic!("hermit-cli/src/cpu_profile_admission.rs: {error}"));
+        for reason in HOST_DEPENDENT_PROFILE_REASONS {
+            assert!(
+                hermit_cli.contains(reason),
+                "HOST_DEPENDENT_PROFILE_REASONS admits {reason:?}, which hermit-cli's \
+                 ProfileReason::host_dependent does not name: {hermit_cli:?}"
+            );
+        }
+        // The parse refuses what it cannot read instead of answering.
+        assert!(hermit_cli_host_dependent_reasons("").is_err());
+        let unnamed = source.replace(
+            "ProfileReason::Hypervisor => \"hypervisor\",",
+            "ProfileReason::Virtualized => \"hypervisor\",",
+        );
+        assert_ne!(unnamed, source);
+        assert!(hermit_cli_host_dependent_reasons(&unnamed).is_err());
     }
 
     /// An interpreter built for more than x86-64-v3 is refused under every
@@ -27476,11 +27645,16 @@ backends_disabled:
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The PASS baseline: a cell whose final row in the earlier run was a PASS
-    /// is refused, and so is a cell the baseline has no row for; a cell that
-    /// ended in anything else there is not. A directory is read through every
-    /// results.jsonl below it, a cell's final row is its last, and a cell in
-    /// two files, or a baseline with no row, is refused.
+    /// The PASS baseline: only a cell whose final row in the earlier run is a
+    /// measured FAIL (a FAIL that retains a run) may be recorded. A PASS there
+    /// is refused as PASS -> HOST-INAPPLICABLE, and so is a cell the baseline
+    /// has no row for, or one whose final row measured nothing: a recorded
+    /// HOST-INAPPLICABLE (so one recording run cannot license the next), a
+    /// withheld HOST-INAPPLICABLE, an ERROR, a FAIL without a run, or an
+    /// outcome no run writes. Every line must be a test-harness result row of
+    /// the current schema. A directory is read through every results.jsonl
+    /// below it, a cell's final row is its last, and a cell in two files, or a
+    /// baseline with no row, is refused.
     #[test]
     fn a_pass_baseline_refuses_a_cell_that_passed_there_or_that_it_lacks() {
         let root = refusal_dir("baseline");
@@ -27489,18 +27663,35 @@ backends_disabled:
             mode: "verify".into(),
             backend: Some("ptrace".into()),
         };
-        let row = |test: &str, outcome: &str| {
-            serde_json::json!({"test": test, "mode": "verify", "backend": "ptrace", "outcome": outcome})
-                .to_string()
+        // A test-harness row of `test` that ended `outcome` and retains a run.
+        let measured = |test: &str, outcome: &str| {
+            let mut row = cell_result_that_located_nothing();
+            row.test = test.into();
+            row.outcome = outcome.into();
+            row
         };
+        let line = |row: CellResult| serde_json::to_string(&row).unwrap();
+        let mut recorded = measured("recorded", "HOST-INAPPLICABLE");
+        recorded.error_kind = Some(HOST_IMAGE_INTERPRETER_REFUSAL.into());
+        recorded.attempts.clear();
+        let mut withheld = measured("withheld", "HOST-INAPPLICABLE");
+        withheld.error_kind = Some("host-inapplicable".into());
+        withheld.attempts.clear();
+        let mut without_runs = measured("without-runs", "FAIL");
+        without_runs.attempts.clear();
         let bucket = root.join("portable/manifest_a");
         fs::create_dir_all(&bucket).unwrap();
         fs::write(
             bucket.join("results.jsonl"),
             [
-                row("passed", "FAIL"),
-                row("passed", "PASS"),
-                row("failed", "FAIL"),
+                line(measured("passed", "FAIL")),
+                line(measured("passed", "PASS")),
+                line(measured("failed", "FAIL")),
+                line(recorded),
+                line(withheld),
+                line(measured("errored", "ERROR")),
+                line(without_runs),
+                line(measured("unknown", "NOT-AN-OUTCOME")),
             ]
             .join("\n"),
         )
@@ -27517,11 +27708,31 @@ backends_disabled:
             absent.contains("has no row for absent/verify@ptrace"),
             "{absent}"
         );
+        for (test, unmeasured) in [
+            ("recorded", "is itself a recorded HOST-INAPPLICABLE"),
+            ("withheld", "is a HOST-INAPPLICABLE cell that run withheld"),
+            ("errored", "is an ERROR"),
+            ("without-runs", "is a FAIL that retains no run"),
+            ("unknown", "is an outcome no run writes"),
+        ] {
+            let refusal = baseline
+                .refuses(&id(test))
+                .unwrap_or_else(|| panic!("{test}: a row that measured nothing licensed it"));
+            assert!(
+                refusal.contains(&format!("final row for {test}/verify@ptrace {unmeasured}"))
+                    && refusal.ends_with("so PASS -> HOST-INAPPLICABLE cannot be ruled out"),
+                "{test}: {refusal}"
+            );
+        }
         let file = PassBaseline::load(&bucket.join("results.jsonl")).unwrap();
         assert!(file.refuses(&id("passed")).is_some());
         let other = root.join("portable/manifest_b");
         fs::create_dir_all(&other).unwrap();
-        fs::write(other.join("results.jsonl"), row("failed", "PASS")).unwrap();
+        fs::write(
+            other.join("results.jsonl"),
+            line(measured("failed", "PASS")),
+        )
+        .unwrap();
         assert!(
             PassBaseline::load(&root).unwrap_err().contains("ambiguous"),
             "a cell in two files"
@@ -27532,6 +27743,33 @@ backends_disabled:
             PassBaseline::load(&empty)
                 .unwrap_err()
                 .contains("holds no result row")
+        );
+        // Rows a run writes, only: a hand-made row with only the fields the
+        // check reads, or a row of another result schema, refuses the baseline.
+        let bare = root.join("bare.jsonl");
+        fs::write(
+            &bare,
+            serde_json::json!({"test": "failed", "mode": "verify", "backend": "ptrace",
+                "outcome": "FAIL"})
+            .to_string(),
+        )
+        .unwrap();
+        let refused = PassBaseline::load(&bare).map(|_| ());
+        assert!(
+            matches!(&refused, Err(error) if error.contains(":1: not a test-harness result row (")),
+            "{refused:?}"
+        );
+        let mut older = measured("failed", "FAIL");
+        older.schema = CELL_RESULT_SCHEMA - 1;
+        let older_file = root.join("older.jsonl");
+        fs::write(&older_file, line(older)).unwrap();
+        let refused = PassBaseline::load(&older_file).map(|_| ());
+        assert!(
+            matches!(&refused, Err(error) if error.contains(&format!(
+                ":1: a result row of schema {}, not {CELL_RESULT_SCHEMA}",
+                CELL_RESULT_SCHEMA - 1
+            ))),
+            "{refused:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }

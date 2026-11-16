@@ -152,10 +152,14 @@ Execution and output options:
                                    counts the node incomplete). Without it the cell
                                    keeps its FAIL. BASELINE is an earlier run's rows
                                    (a results.jsonl, or a directory searched for
-                                   them): a recorded cell whose final row there is a
-                                   PASS, or that it has no row for, fails the run
-                                   (PASS -> HOST-INAPPLICABLE). The attempts' rows go
-                                   to host-image-interpreter-refusals.jsonl beside
+                                   them), each a test-harness result row. Only a
+                                   final row there that is a FAIL with a run lets a
+                                   cell be recorded; a PASS (PASS ->
+                                   HOST-INAPPLICABLE), no row, or a row that measured
+                                   nothing (a recorded or withheld HOST-INAPPLICABLE,
+                                   an ERROR, a FAIL without a run) fails the run. The
+                                   attempts' rows go to
+                                   host-image-interpreter-refusals.jsonl beside
                                    results.jsonl (run only)
   --allow-empty                    Permit an empty explicit CI selection
   --no-retry                       Run each selected cell exactly once: a product
@@ -4095,9 +4099,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         }
     }
     // Every recorded refusal is checked against the PASS baseline the run
-    // was given: one whose cell passed there, or that it has no row for,
-    // fails the run (PASS -> HOST-INAPPLICABLE), though the row stays the
-    // cell's record.
+    // was given: one whose cell's final row there is not a measured FAIL (a
+    // PASS, no row, or a row that measured nothing; PassBaseline::refuses)
+    // fails the run, though the row stays the cell's record.
     let mut baseline_refusals = Vec::new();
     if let Some(baseline) = &refusal_baseline {
         for (index, (recorded, _)) in &refusal_cells {
@@ -12836,32 +12840,61 @@ sys.exit(1 if refused else 0)
     /// refuse it in every cell whose name starts with `refused`. No v2 rootfs
     /// is given, so a refused cell gets no retry. Without `baseline` the run
     /// is not given `--record-host-image-interpreter-refusals`; with it, it is,
-    /// naming a baseline results.jsonl of one row per `(cell name, outcome)`.
+    /// naming a baseline results.jsonl of one row per `(cell name, outcome)`
+    /// ([`refusal_baseline`]).
     fn interpreter_refusal_run(
         test: &str,
         cells: &[&str],
         baseline: Option<&[(&str, &str)]>,
     ) -> RefusalRun {
         let dir = refusal_fixture(test, cells);
-        let mut env = Vec::new();
-        if let Some(rows) = baseline {
-            let file = dir.join("baseline/results.jsonl");
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            fs::write(
-                &file,
-                rows.iter()
-                    .map(|(name, outcome)| {
-                        serde_json::json!({"test": format!("loader/{name}"), "mode": "verify",
-                            "backend": "ptrace", "outcome": outcome})
-                        .to_string()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .unwrap();
-            env.push((REFUSAL_BASELINE_CHILD, file.into_os_string()));
-        }
+        let env = baseline
+            .map(|rows| {
+                let file = refusal_baseline(test, &dir, rows);
+                vec![(REFUSAL_BASELINE_CHILD, file.into_os_string())]
+            })
+            .unwrap_or_default();
         refusal_child_run(test, dir, &env)
+    }
+
+    /// Write `dir`/baseline/results.jsonl, a PASS baseline of the rows a real
+    /// run writes: test `test`'s child harness runs the cells `rows` names
+    /// without the opt-in, and without fail-fast so every cell runs; a refused
+    /// cell keeps its FAIL and its run. Each cell's last row there, given the
+    /// outcome `rows` names, is its row.
+    fn refusal_baseline(
+        test: &str,
+        dir: &std::path::Path,
+        rows: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let names = rows.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let measured = refusal_child_run(
+            test,
+            refusal_fixture(&format!("{test}-baseline"), &names),
+            &[("HERMIT_E2E_FAIL_FAST", "0".into())],
+        );
+        let mut last = measured
+            .rows()
+            .into_iter()
+            .map(|row| (row.test.clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        let file = dir.join("baseline/results.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            rows.iter()
+                .map(|(name, outcome)| {
+                    let mut row = last
+                        .remove(&format!("loader/{name}"))
+                        .unwrap_or_else(|| panic!("the baseline run wrote no row for {name}"));
+                    row.outcome = (*outcome).into();
+                    serde_json::to_string(&row).unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        file
     }
 
     /// Run test `test`'s child harness over the fixture `dir` with `env`.
@@ -13318,28 +13351,66 @@ sys.exit(1 if refused else 0)
     }
 
     /// F3: a recorded refusal of a cell that passed in the PASS baseline, or
-    /// that the baseline has no row for, fails the run: a failed run-verdict
-    /// record naming PASS -> HOST-INAPPLICABLE, exit 1. The cell is still its
-    /// one HOST-INAPPLICABLE row, and summary.json names the refusal.
+    /// that the baseline has no row for, or whose final row there is itself a
+    /// recorded refusal (the results of an earlier run under the opt-in), fails
+    /// the run: a failed run-verdict record naming why PASS ->
+    /// HOST-INAPPLICABLE is not ruled out, exit 1. The cell is still its one
+    /// HOST-INAPPLICABLE row, and summary.json names the refusal.
     #[test]
     fn a_recorded_refusal_against_a_baseline_pass_fails_the_run() {
         use serde_json::json;
 
         const TEST: &str = "tests::a_recorded_refusal_against_a_baseline_pass_fails_the_run";
         interpreter_refusal_child();
+        // The earlier run under the opt-in recorded the cell against a
+        // baseline in which it failed; its results are the next run's baseline.
+        let dir = refusal_fixture(&format!("{TEST}-earlier"), &["refused", "passing"]);
+        let baseline = refusal_baseline(TEST, &dir, &[("refused", "FAIL"), ("passing", "PASS")]);
+        let earlier = refusal_child_run(
+            TEST,
+            dir,
+            &[(REFUSAL_BASELINE_CHILD, baseline.into_os_string())],
+        );
+        assert_eq!(
+            earlier.code,
+            Some(0),
+            "{}\n{}",
+            earlier.stdout,
+            earlier.stderr
+        );
+        let chained = || {
+            refusal_child_run(
+                TEST,
+                refusal_fixture(&format!("{TEST}-chained"), &["refused", "passing"]),
+                &[(
+                    REFUSAL_BASELINE_CHILD,
+                    earlier.dir.join("results.jsonl").into_os_string(),
+                )],
+            )
+        };
         for (label, baseline, wanted) in [
             (
                 "passed in the baseline",
-                &[("refused", "PASS"), ("passing", "PASS")][..],
+                Some(&[("refused", "PASS"), ("passing", "PASS")][..]),
                 "PASS -> HOST-INAPPLICABLE against the baseline ",
             ),
             (
                 "absent from the baseline",
-                &[("passing", "PASS")][..],
+                Some(&[("passing", "PASS")][..]),
                 "has no row for loader/refused/verify@ptrace, so PASS -> HOST-INAPPLICABLE cannot be ruled out",
             ),
+            (
+                "recorded in the baseline",
+                None,
+                "final row for loader/refused/verify@ptrace is itself a recorded HOST-INAPPLICABLE",
+            ),
         ] {
-            let run = interpreter_refusal_run(TEST, &["refused", "passing"], Some(baseline));
+            let run = match baseline {
+                Some(baseline) => {
+                    interpreter_refusal_run(TEST, &["refused", "passing"], Some(baseline))
+                }
+                None => chained(),
+            };
             assert_eq!(run.code, Some(1), "{label}\n{}\n{}", run.stdout, run.stderr);
             let records = read_tpx(&run.dir.join("tpx.jsonl"));
             let verdict = records
@@ -13469,6 +13540,14 @@ sys.exit(1 if refused else 0)
         summary["evidence_complete_executions"] = json!([{"test": "loader/passing",
             "mode": "verify", "backend": "ptrace", "run_id": passing.run_id}]);
         let rows = fs::read(producer.dir.join("results.jsonl")).unwrap();
+        // The producer's own baseline row for the refused cell: its FAIL, with
+        // the run a real run kept.
+        let measured = fs::read_to_string(producer.dir.join("baseline/results.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .find(|row| row.test == "loader/refused")
+            .unwrap();
         // An import under the opt-in when `baseline` names the refused cell's
         // outcome there, with `claims` as the producer's summary claims.
         let import = |label: &str, baseline: Option<&str>, claims: &serde_json::Value| {
@@ -13489,13 +13568,9 @@ sys.exit(1 if refused else 0)
             )];
             if let Some(outcome) = baseline {
                 let file = dir.join("baseline.jsonl");
-                fs::write(
-                    &file,
-                    json!({"test": "loader/refused", "mode": "verify", "backend": "ptrace",
-                        "outcome": outcome})
-                    .to_string(),
-                )
-                .unwrap();
+                let mut row = measured.clone();
+                row.outcome = outcome.into();
+                fs::write(&file, serde_json::to_string(&row).unwrap()).unwrap();
                 env.push((REFUSAL_BASELINE_CHILD, file.into_os_string()));
             }
             refusal_child_run(TEST, dir, &env)

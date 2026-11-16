@@ -1072,8 +1072,8 @@ class CellTest(unittest.TestCase):
                          "SKIP: NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter")
         self.assertEqual(result["harness_rc"], 1)
 
-    def test_re_host_inapplicable_cell_still_fails_so_tpx_retries_it(self) -> None:
-        # ci/buck-e2e/run relies on the failure: Tpx retries the cell on another RE worker.
+    def test_re_host_inapplicable_cell_still_fails_for_the_local_rerun(self) -> None:
+        # ci/buck-e2e/run relies on the failure: it reruns the cell locally (Tpx retries are off).
         done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("produced 2 test_done records", details_json(done)["reason"])
@@ -1767,7 +1767,7 @@ class CellTest(unittest.TestCase):
             self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
             self.assert_ingest_accepts()
         with self.subTest("withheld on RE, rc 1"):
-            # Failed, so Tpx retries it; ingest.py names it for a local rerun.
+            # Failed, never skipped; ingest.py names it for the local rerun (Tpx retries are off).
             done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
             self.assertEqual(done["status"], "failed", done)
             self.assertIn("produced 2 test_done records", details_json(done)["reason"])

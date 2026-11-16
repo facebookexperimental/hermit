@@ -32,16 +32,21 @@ attempts measured, unless the cells ran with HERMIT_E2E_RECORD_HOST_IMAGE_INTERP
 under --record-host-image-interpreter-refusals BASELINE, which this passes on to every
 bucket (give the BASELINE the cells were given); without it the row is an ERROR. Each
 recorded one is printed as HOST-INAPPLICABLE, counted in host_inapplicable and in
-host_image_interpreter_refusals, and checked against BASELINE: one that passed there, or
-that BASELINE has no row for, fails its bucket (PASS -> HOST-INAPPLICABLE).
+host_image_interpreter_refusals, and checked against BASELINE: unless its final row there
+is a FAIL with a run, it fails its bucket (a PASS there is PASS -> HOST-INAPPLICABLE). A
+recorded cell measured nothing about Hermit, so a run that counts one is INCOMPLETE: it
+does not pass even when every bucket does, as a validation run that holds one is not
+complete either.
 
 A bucket passes only when the harness exits 0 and its summary.json reports an import of
 exactly the bucket's plan cells, with no ERROR and no FAIL beyond the excused diagnostic
 ones. An excused diagnostic failure is printed as DIAGNOSTIC; as in the cargo flow, a
-run that has one is not a qualifying receipt. Exit status: 0 when every bucket passes;
-1 when any bucket does not (each failing cell, or why the bucket has no verdict, goes to
-stderr); 2 when judging could not run: bad arguments, an unreadable plan, a DIR that
-already holds files, or a harness that cannot be executed. Prints one JSON summary line.
+run that has one is not a qualifying receipt. Exit status: 0 when every bucket passes and
+no cell was recorded; 1 when any bucket does not (each failing cell, or why the bucket has
+no verdict, goes to stderr) or the run is INCOMPLETE (stderr says so); 2 when judging could
+not run: bad arguments, an unreadable plan, a DIR that already holds files, or a harness
+that cannot be executed. Prints one JSON summary line; its "incomplete" is true when any
+cell was recorded.
 
 The environment is passed on except DAGRUN_TEST_COUNTS_PATH: one file cannot hold the
 counts of several harness runs, and this reports to no scheduler. The harness compares
@@ -168,6 +173,7 @@ def main():
     env.pop("DAGRUN_TEST_COUNTS_PATH", None)
     totals = collections.Counter()
     failed = []
+    listed = 0  # the recorded refusals the buckets' summaries list
     for (lane, category), (planned, diagnostic) in sorted(buckets.items()):
         if diagnostic and category not in DIAGNOSTIC_BUCKETS:
             failed.append(f"{lane}/{category}")
@@ -200,6 +206,7 @@ def main():
             totals[key] += imported.get(key) if type(imported.get(key)) is int else 0
         for cell in counted.get("host_image_interpreter_refusal_cells") or []:
             if isinstance(cell, dict) and cell.get("recorded") is True:
+                listed += 1
                 print(f"verdict: HOST-INAPPLICABLE {lane}/{category} {junit_name(cell)}: recorded as a "
                       f"host-image interpreter refusal, not a pass: {first_line(cell.get('reason'))}",
                       file=sys.stderr)
@@ -224,8 +231,16 @@ def main():
             print(f"verdict:   no failing cell in junit.xml; the end of {d}/harness.log:", file=sys.stderr)
             for line in tail:
                 print(f"verdict:   | {line}", file=sys.stderr)
-    print(json.dumps({"buckets": len(buckets), "failed_buckets": failed, **{k: totals[k] for k in COUNTS + IMPORTED}}))
-    sys.exit(1 if failed else 0)
+    # Fail closed on either record of one: the count or a listed cell.
+    incomplete = max(listed, totals["host_image_interpreter_refusals"])
+    if incomplete:
+        print(f"verdict: INCOMPLETE: {incomplete} cell(s) recorded HOST-INAPPLICABLE as host-image "
+              "interpreter refusals, which measured nothing about Hermit, so this run is not a pass "
+              "whatever its buckets say (a validation run that holds one is not complete either)",
+              file=sys.stderr)
+    print(json.dumps({"buckets": len(buckets), "failed_buckets": failed, "incomplete": incomplete > 0,
+                      **{k: totals[k] for k in COUNTS + IMPORTED}}))
+    sys.exit(1 if failed or incomplete else 0)
 
 if __name__ == "__main__":
     main()
