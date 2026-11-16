@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>afs_syscall | Per-syscall Detcore pages</title>
+<link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
+<header><p><a href="./">All syscalls</a></p><h1><code>afs_syscall</code> (183)</h1>
+<p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>pred:is_unimplemented_enosys_syscall</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+afs_syscall&amp;body=Discussion+for+the+%60afs_syscall%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fafs_syscall.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60afs_syscall%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
+<h2>Strategy</h2>
+<p>Detcore classifies <code>afs_syscall</code> (183) as determinized-refused via pred:is_unimplemented_enosys_syscall dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
+<ul>
+<li>Reviewed list: <code>detcore/src/syscall_classification.rs:1616</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:7420</code></li>
+</ul>
+<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+afs_syscall&amp;body=Discussion+for+the+%60afs_syscall%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fafs_syscall.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60afs_syscall%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `afs_syscall`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Status</h2>
+<ul>
+<li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
+</ul>
+</body></html>
