@@ -42,12 +42,30 @@ pub(crate) fn constructor_qualifier_source(
     let version = helper["version"]
         .as_str()
         .ok_or("constructor qualifier has no version")?;
-    if helper["source"] != format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#{revision}")
-        || helper["id"]
-            != format!(
+    // Two forms name the same checkout, and no third: the git form
+    // carries the revision; the path form (since the path-dependency
+    // migration) is bound by the verified constructor sources above,
+    // which required this checkout's clean HEAD and the Hermit
+    // gitlink to equal the pin before this metadata was read.
+    let git_form = helper["source"]
+        == format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#{revision}")
+        && helper["id"]
+            == format!(
                 "git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-artifact@{version}"
-            )
-    {
+            );
+    let path_form = helper["source"].is_null()
+        && helper["id"]
+            == format!(
+                "path+file://{}#{}",
+                preload_manifest
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or("preload manifest has no checkout root")?
+                    .join("reverie-liteinst-artifact")
+                    .display(),
+                version
+            );
+    if !git_form && !path_form {
         return Err("constructor qualifier differs from the exact preload Git source".into());
     }
     let preload_manifest = fs::canonicalize(preload_manifest)

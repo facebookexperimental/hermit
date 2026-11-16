@@ -158,35 +158,50 @@ fn main() {
         "expected one resolved standalone preload leaf"
     );
     let package = packages[0];
-    let source = package["source"]
-        .as_str()
-        .expect("preload leaf must have a Git source");
-    let revision = source
-        .strip_prefix(&format!("git+{REVERIE_GIT_REPOSITORY}?rev="))
-        .and_then(|suffix| suffix.split_once('#'))
-        .filter(|(pin, commit)| {
-            pin == commit
-                && pin.len() == 40
-                && pin
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        })
-        .map(|(pin, _)| pin)
-        .expect("preload leaf must resolve the exact full Reverie revision");
-    assert_eq!(
-        requested_pin, revision,
-        "staged revision differs from the resolved leaf"
-    );
     let package_id = package["id"]
         .as_str()
         .expect("preload leaf has no package ID");
     let version = package["version"]
         .as_str()
         .expect("preload leaf has no version");
-    assert_eq!(
-        package_id,
-        format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-preload@{version}")
-    );
+    // Two leaf forms name the same pin, and no third: the git form
+    // carries the revision itself; the path form (since the
+    // path-dependency migration) is bound by resolve_content above,
+    // which required the Hermit gitlink and the Reverie checkout HEAD
+    // to equal HERMIT_LITEINST_REVERIE_PIN before this metadata was
+    // read, and by the package-identity equality with the verified
+    // constructor package below. The revision reported downstream is
+    // that checked pin in both forms.
+    let revision = requested_pin.as_str();
+    if let Some(source) = package["source"].as_str() {
+        let revision = source
+            .strip_prefix(&format!("git+{REVERIE_GIT_REPOSITORY}?rev="))
+            .and_then(|suffix| suffix.split_once('#'))
+            .filter(|(pin, commit)| {
+                pin == commit
+                    && pin.len() == 40
+                    && pin
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .map(|(pin, _)| pin)
+            .expect("preload leaf must resolve the exact full Reverie revision");
+        assert_eq!(
+            requested_pin, revision,
+            "staged revision differs from the resolved leaf"
+        );
+        assert_eq!(
+            package_id,
+            format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-preload@{version}")
+        );
+    } else {
+        let leaf_dir = source_root.join("reverie/reverie-liteinst-preload");
+        assert_eq!(
+            package_id,
+            format!("path+file://{}#{}", leaf_dir.display(), version),
+            "path-form preload leaf must resolve the pinned submodule crate directory"
+        );
+    }
     let package_manifest = PathBuf::from(
         package["manifest_path"]
             .as_str()
