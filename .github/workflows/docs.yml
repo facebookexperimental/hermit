@@ -2,7 +2,7 @@ name: Docs
 
 # Build the rustdoc API documentation for the workspace and publish it to the
 # `gh-pages` branch, which GitHub Pages serves at https://hermetic-infra.org/
-# (https://rrnewton.github.io/hermit/ redirects there). The workspace rustdoc remains available
+# (the custom domain moves with this workflow; see the deploy preflight). The workspace rustdoc remains available
 # below the landing page at `hermit/index.html`.
 
 on:
@@ -37,10 +37,11 @@ concurrency:
   group: hermit-docs-pages
   cancel-in-progress: false
 
-# peaceiris/actions-gh-pages pushes the built docs to the gh-pages branch using
-# GITHUB_TOKEN, which needs write access to repository contents.
+# Write access is granted per job below: build uploads release
+# assets and deploy pushes the gh-pages branch; every other job
+# only reads.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,8 +49,12 @@ env:
   RUSTDOCFLAGS: -D warnings
 
 jobs:
-  build-and-deploy:
-    name: Build rustdoc and deploy to GitHub Pages
+  build:
+    name: Build rustdoc and site
+    permissions:
+      contents: write
+    outputs:
+      rustdoc_outcome: ${{ steps.rustdoc.outcome }}
     # Source delivery is safe before private-source access is installed. A
     # skipped scheduled job is inactive, not a successful ledger rebuild.
     # Manual Docs remains available; an explicit rebuild still checks access.
@@ -58,7 +63,7 @@ jobs:
     # counts as canonical by its event name, without relying on the schedule
     # payload to name the repository's default branch.
     if: >-
-      github.repository == 'rrnewton/hermit' &&
+      github.repository == 'facebookexperimental/hermit' &&
       (github.event_name == 'schedule' ||
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) &&
       (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
@@ -95,8 +100,8 @@ jobs:
         GUARD_ACTOR: ${{ github.actor }}
       run: |
         case "$GUARD_ACTOR" in
-          hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
-          *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          hermit-bot3|rrnewton|meta-codesync\[bot\]) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+          *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton, meta-codesync[bot])"; exit 1 ;;
         esac
     # Before any git command: the runner's user has git URL rewrites in its
     # global configuration that serve some GitHub URLs from stale local mirrors,
@@ -141,7 +146,15 @@ jobs:
       if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
       env:
         GITHUB_ACTOR: ${{ github.actor }}
-      run: bash scripts/check-runner-trust.sh
+        # Exported commits keep their original author emails, so the
+        # author allowlist comes from a repository variable here
+        # rather than the script's rrnewton-era defaults.
+        RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS: ${{ vars.RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS }}
+      # Only this workflow extends the actor allowlist: on
+      # facebookexperimental every push to main (and so the schedule
+      # actor) is meta-codesync[bot]. No other workflow passes
+      # --extra-actors, so their trust checks are unchanged.
+      run: bash scripts/check-runner-trust.sh --extra-actors 'meta-codesync[bot]'
     - name: Save the dispatched builder pin
       # The workspace stays at the DISPATCHED commit for the whole job;
       # only the builder source moves, into its own checkout.  So the
@@ -577,12 +590,12 @@ jobs:
         # digest/history gates. Neither starts Hermit validation or PR tests.
         # Always preserve the registry already served by Pages, even on an
         # ordinary manual docs rebuild with no new compatibility artifact.
-        pages_sha=$(gh api repos/rrnewton/hermit/git/ref/heads/gh-pages --jq .object.sha)
-        gh api "repos/rrnewton/hermit/contents/compatibility?ref=$pages_sha" > "$scratch/served.json"
+        pages_sha=$(gh api "repos/${{ github.repository }}/git/ref/heads/gh-pages" --jq .object.sha)
+        gh api "repos/${{ github.repository }}/contents/compatibility?ref=$pages_sha" > "$scratch/served.json"
         previous="$scratch/previous.json"
         if jq -e 'any(.[]; .name == "releases.json" and .type == "file")' "$scratch/served.json" >/dev/null; then
           gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/rrnewton/hermit/contents/compatibility/releases.json?ref=$pages_sha" > "$previous"
+            "repos/${{ github.repository }}/contents/compatibility/releases.json?ref=$pages_sha" > "$previous"
         else
           # One-time adoption of the old checked-in registry is allowed only
           # when it accounts for every already-public content-addressed tree.
@@ -674,28 +687,30 @@ jobs:
         python3 .github/scripts/publish-compatibility-site.py \
           finalize "$pins" target/doc/compatibility "$releases" \
           .github/compatibility-site-builder.json
-    - name: Deploy to GitHub Pages
-      # Only publish from the canonical branch (the repository's default
-      # branch), not from manual dispatch on a feature branch.
+    - name: Upload the built site for the consistency check and deploy
       if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      uses: peaceiris/actions-gh-pages@v4
+      uses: actions/upload-artifact@v4
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./target/doc
-        # Overwrite the branch each run instead of accumulating history.
-        force_orphan: true
-        # force_orphan rewrites gh-pages from scratch, so the custom domain's
-        # CNAME file must be written by every deploy: without it GitHub Pages
-        # drops hermetic-infra.org (the crates.io homepage of every Hermit
-        # crate) and leaves the domain unclaimed (dev-hermit dh-0393py).
-        cname: hermetic-infra.org
-    - name: Verify the rebuilt website at ordinary public URLs
-      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
-      timeout-minutes: 11
-      run: |
-        python3 -B .github/scripts/rebuild-compatibility-site.py verify-public \
-          --receipt "$RUNNER_TEMP/compatibility-rebuild.json"
-        echo 'Nine ordinary public files (manifest, page, CSS, JavaScript and browser data) match this rebuild.' >> "$GITHUB_STEP_SUMMARY"
+        name: site
+        path: target/doc
+        retention-days: 1
+        overwrite: true
+    - name: Upload the site tools for the consistency and deploy jobs
+      uses: actions/upload-artifact@v4
+      with:
+        name: site-tools
+        path: |
+          .github/scripts/check-site-data-consistency.py
+          .github/scripts/rebuild-compatibility-site.py
+        retention-days: 1
+        overwrite: true
+    - name: Upload the deployment receipt for the deploy job
+      if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+      uses: actions/upload-artifact@v4
+      with:
+        name: site-receipt
+        path: ${{ runner.temp }}/compatibility-rebuild.json
+        if-no-files-found: ignore
     - name: Retain exact website source and deployment receipt
       if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       uses: actions/upload-artifact@v4
@@ -709,17 +724,6 @@ jobs:
           ${{ runner.temp }}/compatibility-rebuild.resources.json
         if-no-files-found: ignore
         retention-days: 30
-    - name: Fail on the documentation lint after deployment
-      # Keeps a documentation lint visible as a red run (tick-hub's website
-      # rebuild check reports it) without discarding the deployed website.
-      if: steps.rustdoc.outcome == 'failure'
-      run: |
-        echo '::error::cargo doc --workspace --no-deps failed under RUSTDOCFLAGS=-D warnings; see the "Build documentation" step. The website was deployed from the lint-free rebuild of the same documentation.'
-        {
-          echo '### Documentation lint'
-          echo 'cargo doc failed under -D warnings. The website was still deployed; fix the lint named in the "Build documentation" step.'
-        } >> "$GITHUB_STEP_SUMMARY"
-        exit 1
     - name: Remove the self-hosted run's scratch directory
       if: always() && runner.environment == 'self-hosted' && env.COMPATIBILITY_SCRATCH_PARENT != ''
       # The built website is read-only (directories 0555, files 0444), so a
@@ -732,3 +736,99 @@ jobs:
         if [[ -d target/doc ]]; then
           chmod -R u+w -- target/doc
         fi
+
+  site-data-consistency:
+    # Checks build.json against the published summary before deploy.
+    needs: [build]
+    permissions:
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-tools
+          path: site-tools
+      - name: build.json vs summary consistency
+        run: python3 site-tools/check-site-data-consistency.py site
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: [build, site-data-consistency]
+    if: >-
+      github.repository == 'facebookexperimental/hermit' &&
+      (github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    permissions:
+      contents: write
+      actions: read
+      pages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Refuse to deploy where Pages cannot serve it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! pages=$(gh api "repos/${{ github.repository }}/pages" 2>&1); then
+            echo "::error::Pages preflight failed for ${{ github.repository }}: $pages"
+            exit 1
+          fi
+          cname=$(printf '%s' "$pages" | jq -r '.cname // ""')
+          if [ "$cname" != "hermetic-infra.org" ]; then
+            echo "::error::Pages custom domain is '$cname', not hermetic-infra.org; deploying would not serve the site"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: target/doc
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-tools
+          path: ${{ runner.temp }}/site-tools
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/doc
+          force_orphan: true
+          # force_orphan rewrites gh-pages from scratch, so the custom
+          # domain's CNAME file must be written by every deploy: without
+          # it GitHub Pages drops hermetic-infra.org (the crates.io
+          # homepage of every Hermit crate) and leaves the domain
+          # unclaimed. Do not remove this input.
+          cname: hermetic-infra.org
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+        with:
+          name: site-receipt
+          path: ${{ runner.temp }}
+      - name: Verify the rebuilt website at ordinary public URLs
+        if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+        timeout-minutes: 11
+        run: |
+          python3 -B "$RUNNER_TEMP/site-tools/rebuild-compatibility-site.py" verify-public \
+            --receipt "$RUNNER_TEMP/compatibility-rebuild.json" \
+            --website target/doc/compatibility/latest
+          echo 'Nine ordinary public files (manifest, page, CSS, JavaScript and browser data) match this rebuild.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the verified deployment receipt
+        if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-website-receipt-verified-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compatibility-rebuild.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Fail on the documentation lint after deployment
+        if: needs.build.outputs.rustdoc_outcome == 'failure'
+        run: |
+          echo '::error::cargo doc --workspace --no-deps failed under RUSTDOCFLAGS=-D warnings; see the "Build documentation" step. The website was deployed from the lint-free rebuild of the same documentation.'
+          {
+            echo '### Documentation lint'
+            echo 'cargo doc failed under -D warnings. The website was still deployed; fix the lint named in the "Build documentation" step.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

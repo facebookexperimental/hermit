@@ -31,6 +31,59 @@ class HostedAdapterTests(unittest.TestCase):
         self.baseline = json.loads(ADAPTER.CHECKED_IN.read_bytes())
         self.pin = copy.deepcopy(self.baseline["releases"][0])
 
+    def test_verify_public_refuses_latest_that_is_not_the_receipt_identity(self):
+        # G1: with a --website override (deploy job), latest must be an
+        # exact copy of the receipt's identity directory before any
+        # public byte is compared.
+        site = self.root / "site" / "compatibility"
+        latest = site / "latest"
+        identity = site / "abc123"
+        for base in (latest, identity):
+            (base / "assets").mkdir(parents=True)
+            (base / "data").mkdir(parents=True)
+            for name in ADAPTER.PUBLIC_FILES:
+                (base / name).write_bytes(name.encode())
+        receipt = self.root / "receipt.json"
+        receipt.write_text(json.dumps({"website": str(latest), "identity": "abc123"}))
+        with patch.object(ADAPTER.urllib.request, "urlopen") as urlopen:
+            urlopen.side_effect = AssertionError("network reached")
+            (latest / "build.json").write_bytes(b"older")
+            with self.assertRaisesRegex(ValueError, "not an exact copy"):
+                ADAPTER.verify_public(receipt, website=latest)
+
+    def test_verify_public_accepts_latest_identical_to_receipt_identity(self):
+        # G1 pass side: latest is an exact copy of the identity tree
+        # and the public URLs serve those bytes.
+        import io as _io
+        site = self.root / "site" / "compatibility"
+        latest = site / "latest"
+        identity = site / "abc123"
+        for base in (latest, identity):
+            (base / "assets").mkdir(parents=True)
+            (base / "data").mkdir(parents=True)
+            for name in ADAPTER.PUBLIC_FILES:
+                (base / name).write_bytes(name.encode())
+        receipt = self.root / "receipt.json"
+        receipt.write_text(json.dumps({"website": str(latest), "identity": "abc123"}))
+
+        class Resp:
+            def __init__(self, body):
+                self._bio = _io.BytesIO(body)
+            def read(self, n=-1):
+                return self._bio.read(n)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def serve(url, timeout=None):
+            name = url[len(ADAPTER.PUBLIC):]
+            return Resp((latest / name).read_bytes())
+
+        with patch.object(ADAPTER.urllib.request, "urlopen", side_effect=serve):
+            result = ADAPTER.verify_public(receipt, website=latest)
+        self.assertEqual(result["state"], "deployed-and-verified")
+
     def test_config_accepts_exact_source_and_refuses_floating_unknown_or_foreign(self):
         path = self.root / "config.json"
         path.write_text(json.dumps(self.config))

@@ -64,10 +64,17 @@ if [ -n "${RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS:-}" ]; then
 fi
 
 actor="${GITHUB_ACTOR:-}"
+# Per-workflow actor extension: empty by default, so every existing
+# caller keeps today's allowlist exactly. Only a workflow that
+# passes --extra-actors widens its own actor check; there is no
+# environment-variable route, so a runner's environment or an
+# earlier step cannot widen trust for other workflows. Author
+# checks are unaffected.
+extra_actors=""
 base_arg="${RUNNER_TRUST_BASE:-}"
 head_arg="HEAD"
 
-usage() { echo "usage: $0 [--actor NAME] [--base REV] [--head REV] | --self-test" >&2; }
+usage() { echo "usage: $0 [--actor NAME] [--extra-actors A[,A...]] [--base REV] [--head REV] | --self-test" >&2; }
 
 in_list() { local needle="$1"; shift; local x; for x in "$@"; do [ "$x" = "$needle" ] && return 0; done; return 1; }
 
@@ -75,7 +82,13 @@ check_actor() {
   if [ -z "$actor" ]; then
     echo "::error::runner-trust: no actor supplied (--actor or GITHUB_ACTOR); refusing" >&2; return 1
   fi
-  if in_list "$actor" "${ALLOWED_ACTORS[@]}"; then
+  local extras=()
+  if [ -n "$extra_actors" ]; then
+    local flat="${extra_actors//,/ }"
+    # shellcheck disable=SC2206 # deliberate word splitting of the extra list
+    extras=($flat)
+  fi
+  if in_list "$actor" "${ALLOWED_ACTORS[@]}" "${extras[@]}"; then
     echo "runner-trust: actor '$actor' is allow-listed"
   else
     echo "::error::runner-trust: actor '$actor' is not allow-listed for self-hosted runners (allowlist: ${ALLOWED_ACTORS[*]})" >&2; return 1
@@ -147,8 +160,8 @@ self_test() {
   expect() { # name want-exit actual-exit
     if [ "$2" = "$3" ]; then echo "self-test PASS: $1"; else echo "self-test FAIL: $1 (want exit $2, got $3)" >&2; failures=$((failures + 1)); fi
   }
-  (
-    cd "$repo"
+  cd "$repo"
+  {
     # 1. allow-listed actor + allow-listed authors passes
     commit_as "Repo Owner" "rrnewton@gmail.com" "owner work"
     guard hermit-bot3 >/dev/null 2>&1 && rc=0 || rc=$?; expect "allowlisted actor+authors passes" 0 "$rc"
@@ -161,13 +174,21 @@ self_test() {
     # 4. empty range (schedule on main: HEAD == base tip) passes
     git checkout -q base-tip
     guard rrnewton >/dev/null 2>&1 && rc=0 || rc=$?; expect "empty range passes with allowlisted actor" 0 "$rc"
-  )
+    # 5. extra-actors admits exactly the named extra actor
+    bash "$SCRIPT_PATH" --actor "meta-codesync[bot]" --extra-actors "meta-codesync[bot]" --base base-tip --head HEAD >/dev/null 2>&1 && rc=0 || rc=$?; expect "extra-actors admits named bot" 0 "$rc"
+    # 6. without extra-actors the same bot still refuses (default unchanged)
+    guard "meta-codesync[bot]" >/dev/null 2>&1 && rc=0 || rc=$?; expect "bot refused without extra-actors" 1 "$rc"
+    # 7. the environment cannot widen trust: env var set, bot still refuses
+    RUNNER_TRUST_EXTRA_ACTORS="meta-codesync[bot]" guard "meta-codesync[bot]" >/dev/null 2>&1 && rc=0 || rc=$?; expect "env var does not widen actor trust" 1 "$rc"
+  }
+  cd - >/dev/null
   if [ "$failures" -eq 0 ]; then echo "runner-trust self-test: all cases passed"; else echo "runner-trust self-test: $failures failure(s)" >&2; return 1; fi
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --actor) actor="$2"; shift 2 ;;
+    --extra-actors) extra_actors="$2"; shift 2 ;;
     --base) base_arg="$2"; shift 2 ;;
     --head) head_arg="$2"; shift 2 ;;
     --self-test) self_test; exit $? ;;

@@ -20,9 +20,15 @@ import time
 import urllib.request
 from pathlib import Path
 
-REPOSITORY = "rrnewton/hermit"
+# Releases stay on rrnewton/hermit: every pinned tag and asset lives
+# there and the publisher's append-only gates protect that history.
+# Only the gh-pages deploy moved (the repository this workflow runs
+# in). Moving the releases is a separate, reviewed migration.
+RELEASE_REPOSITORY = "rrnewton/hermit"
+REPOSITORY = RELEASE_REPOSITORY
+DEPLOY_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", RELEASE_REPOSITORY)
 LEDGER = "https://github.com/rrnewton/hermit_test_ledger.git"
-PUBLIC = "https://rrnewton.github.io/hermit/compatibility/latest/"
+PUBLIC = "https://hermetic-infra.org/compatibility/latest/"
 PUBLIC_FILES = (
     "build.json",
     "index.html",
@@ -404,11 +410,11 @@ def fetch_ledger(ledger, ledger_commit):
 
 
 def published_registry(scratch):
-    pages = json.loads(gh("api", f"repos/{REPOSITORY}/git/ref/heads/gh-pages"))[
+    pages = json.loads(gh("api", f"repos/{DEPLOY_REPOSITORY}/git/ref/heads/gh-pages"))[
         "object"
     ]["sha"]
     entries = json.loads(
-        gh("api", f"repos/{REPOSITORY}/contents/compatibility?ref={pages}")
+        gh("api", f"repos/{DEPLOY_REPOSITORY}/contents/compatibility?ref={pages}")
     )
     previous = scratch / "previous-registry.json"
     if any(
@@ -419,7 +425,7 @@ def published_registry(scratch):
                 "api",
                 "-H",
                 "Accept: application/vnd.github.raw+json",
-                f"repos/{REPOSITORY}/contents/compatibility/releases.json?ref={pages}",
+                f"repos/{DEPLOY_REPOSITORY}/contents/compatibility/releases.json?ref={pages}",
             )
         )
     else:
@@ -721,9 +727,20 @@ def rebuild(
         website.close()
 
 
-def verify_public(receipt, *, timeout=600):
+def verify_public(receipt, *, timeout=600, website=None):
     result = json.loads(receipt.read_bytes())
-    root = Path(result["website"])
+    root = Path(website) if website is not None else Path(result["website"])
+    if website is not None:
+        # The override tree must be THIS receipt's identity, not
+        # whatever an older latest still points at: compare every
+        # public file against the sibling identity directory.
+        identity = root.parent / result["identity"]
+        for name in PUBLIC_FILES:
+            if (root / name).read_bytes() != (identity / name).read_bytes():
+                raise ValueError(
+                    "compatibility/latest is not an exact copy of "
+                    f"compatibility/{result['identity']} ({name} differs)"
+                )
     expected = {name: (root / name).read_bytes() for name in PUBLIC_FILES}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -810,6 +827,10 @@ def main(argv=None):
         help="require ordinary public URLs to serve the exact rebuilt bytes",
     )
     verify.add_argument("--receipt", type=Path, required=True)
+    verify.add_argument(
+        "--website", type=Path, default=None,
+        help="built website root (default: the receipt's recorded path; "
+        "the deploy job passes the downloaded site artifact root)")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "source-config":
@@ -844,7 +865,7 @@ def main(argv=None):
                 with resource_path.open("xb") as output:
                     output.write(canonical(resources))
         else:
-            result = verify_public(arguments.receipt)
+            result = verify_public(arguments.receipt, website=arguments.website)
         print(canonical(result).decode(), end="")
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
