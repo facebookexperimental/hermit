@@ -3,7 +3,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "e19d3ac4fa469464692355398d0303d4bda3ec82" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bb4633bc520b2ce9bbd12834b6dceb40c37ead24" }
 //! serde_json = "1"
 //! ```
 
