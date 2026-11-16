@@ -3792,6 +3792,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.procfs_drop_schedstat_snapshot_for_read_at(position as u64)
             })?;
         }
+        // A refusal recorded by an earlier read of this description
+        // refuses this read too, before any bytes are taken.
+        self.procfs_sanitize_refusal_gate(guest, fd).await?;
         // A file the kernel opened takes its snapshot at its first read.
         if guest
             .thread_state()
@@ -10328,6 +10331,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             );
         })?;
+        // A sanitize refusal is a named stop, never an empty file.
+        // (The snapshot was taken at this first read; there is no
+        // earlier open-time point at which its bytes are known.)
+        self.procfs_sanitize_refusal_gate(guest, call.fd()).await
+    }
+
+    /// The sanitize-refusal outcome for `fd`, when its snapshot
+    /// sanitize step refused: strict mode stops the run with the
+    /// named policy refusal, or, where the run allows unsupported
+    /// operations, the read fails with `EIO` after printing the same
+    /// named message. Every read entry checks this before taking any
+    /// bytes, not only the read that takes the snapshot, so the
+    /// refusal is sticky for the open file description -- repeat
+    /// reads, positioned reads and dup'd aliases included -- and no
+    /// read ever serves the refused snapshot as an empty file.
+    pub(crate) async fn procfs_sanitize_refusal_gate<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        if let Some(reason) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_sanitize_refusal())?
+        {
+            if self.cfg.panic_on_unsupported_syscalls {
+                crate::syscalls::helpers::report_refusal_reason(true, &reason);
+                crate::tool_global::report_policy_refusal(guest, reason).await;
+                crate::tool_global::unrecoverable_shutdown(
+                    guest,
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                )
+                .await;
+            }
+            crate::syscalls::helpers::report_refusal_reason(false, &reason);
+            return Err(Errno::EIO.into());
+        }
         Ok(())
     }
 
@@ -10742,6 +10781,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let cursor = detfd.procfs_position().map_or(0, |(offset, _)| offset);
             detfd.procfs_drop_schedstat_snapshot_for_read_at(cursor as u64)
         })?;
+        // A refusal recorded by an earlier read of this description
+        // refuses this read too, before any bytes are taken.
+        self.procfs_sanitize_refusal_gate(guest, call.fd()).await?;
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
@@ -11136,6 +11178,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.procfs_drop_schedstat_snapshot_for_read_at(offset as u64)
         })?;
+        // A refusal recorded by an earlier read of this description
+        // refuses this read too, before any bytes are taken.
+        self.procfs_sanitize_refusal_gate(guest, call.fd()).await?;
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
@@ -21270,6 +21315,30 @@ mod procfs_wiring_guard {
         }
     }
 
+    #[test]
+    fn every_read_path_checks_the_sanitize_refusal_gate() {
+        // A refusal was once checked only where the snapshot is taken,
+        // so a second read of a refused status/sched/fdinfo served an
+        // empty file. Every entry that can take snapshot bytes must
+        // check the sticky gate first.
+        for handler in ["handle_read", "handle_pread64", "readv_rendered_procfs"] {
+            assert!(
+                handler_body(handler).contains("self.procfs_sanitize_refusal_gate("),
+                "MISSING MECHANISM: `{handler}` does not check the sanitize \
+                 refusal gate; a repeat read of a refused snapshot would \
+                 serve it as an empty file."
+            );
+        }
+        let n = production_source()
+            .matches("async fn procfs_sanitize_refusal_gate")
+            .count();
+        assert_eq!(
+            n, 1,
+            "MISSING MECHANISM: expected exactly ONE `procfs_sanitize_refusal_gate` \
+             definition shared by every read path; found {n}."
+        );
+    }
+
     /// Both mountinfo captures in the snapshot initializer must drop ephemeral
     /// host seed rows (https://github.com/rrnewton/hermit/pull/3219): the guest
     /// read's capture, for the files that carry mountinfo identities, and the
@@ -26343,6 +26412,79 @@ mod inject_fstat_scratch {
             })
             .unwrap();
         assert_eq!(guest.take_scratch_page(), vec![0xa5; 4096]);
+    }
+
+    /// A sanitize refusal is sticky for its open file description: after
+    /// the snapshot sanitize step refused, every read handler entry --
+    /// a repeat `read`, a `pread64`, and a read through a dup'd alias --
+    /// fails with `EIO` under `--allow-unsupported-syscalls` instead of
+    /// serving the empty placeholder snapshot. (The first read's EIO is
+    /// `initialize_procfs_snapshot`'s own refusal branch; this test
+    /// starts from the refused snapshot that first read leaves behind,
+    /// for a kernel-opened `status`, whose snapshot no task-record
+    /// reset drops.) The strict-mode twin of this contract (exit 122)
+    /// ends the process, so it is covered end to end by
+    /// `procfs_sanitize_refusal_stops_strict_and_fails_every_allow_mode_read`
+    /// in `hermit-cli/tests/procfs_positioned_determinism.rs`.
+    #[tokio::test]
+    async fn procfs_sanitize_refusal_is_sticky_across_read_pread_and_dup() {
+        let (_, mut guest) = ScriptedGuest::with_scratch_page(true);
+        guest.config.sequentialize_threads = true;
+        assert!(!guest.config.panic_on_unsupported_syscalls);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        let fd = 9;
+        guest
+            .thread
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        file.initialize(
+            b"Name:\tx\nSigBlk:\tZZZZ\n".to_vec(),
+            crate::procfs::ProcfsSnapshotContext::default(),
+        );
+        assert!(
+            file.sanitize_refusal()
+                .is_some_and(|reason| reason.contains("status")),
+            "{:?}",
+            file.sanitize_refusal()
+        );
+        guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.set_procfs(file.clone()))
+            .unwrap();
+        let dup_fd = 10;
+        guest.thread.dup_fd(fd, dup_fd, OFlag::empty()).unwrap();
+
+        let mut output = [0xa5_u8; 512];
+        let expect_eio = |label: &str, result: Result<i64, Error>| {
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::EIO))),
+                "{label}: {result:?}"
+            );
+        };
+        for attempt in 0..2 {
+            let call = syscalls::Read::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(output.as_mut_ptr() as usize))
+                .with_len(output.len());
+            expect_eio(
+                &format!("read {attempt}"),
+                tool.handle_read(&mut guest, call).await,
+            );
+        }
+        let call = syscalls::Pread64::new()
+            .with_fd(fd)
+            .with_buf(AddrMut::from_raw(output.as_mut_ptr() as usize))
+            .with_len(output.len())
+            .with_offset(0);
+        expect_eio("pread", tool.handle_pread64(&mut guest, call).await);
+        let call = syscalls::Read::new()
+            .with_fd(dup_fd)
+            .with_buf(AddrMut::from_raw(output.as_mut_ptr() as usize))
+            .with_len(output.len());
+        expect_eio("dup read", tool.handle_read(&mut guest, call).await);
+        assert_eq!(output, [0xa5; 512], "a refused read copied bytes");
+        let _ = guest.take_scratch_page();
     }
 
     /// A real descriptor the test owns by number, and its inode. Ownership is

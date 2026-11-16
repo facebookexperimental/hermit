@@ -24604,6 +24604,9 @@ impl Scheduler {
                 syscall_histogram: Some(
                     syscall_histogram.summary(SyscallObservationScope::Complete),
                 ),
+                // GlobalState snapshots the sanitizer refusal counts.
+                procfs_sanitize_refusals: Default::default(),
+                procfs_status_unknown_dropped: 0,
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),

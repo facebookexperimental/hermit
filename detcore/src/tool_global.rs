@@ -3045,6 +3045,8 @@ impl GlobalState {
             }
             histogram.observation_scope = SyscallObservationScope::from_gaps(gaps);
         }
+        summary.procfs_sanitize_refusals = crate::procfs::sanitize_refusal_counts();
+        summary.procfs_status_unknown_dropped = crate::procfs::sanitize_status_unknown_dropped();
 
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();

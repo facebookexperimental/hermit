@@ -16,11 +16,35 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::procfs::Bitmap;
+use detcore_model::procfs::FdinfoKind;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
+use detcore_model::procfs::ProcessIo;
+use detcore_model::procfs::SchedEntry;
+use detcore_model::procfs::SchedValue;
+use detcore_model::procfs::Stat;
+use detcore_model::procfs::Statm;
+use detcore_model::procfs::StatusLabel;
+use detcore_model::procfs::StatusLine;
+use detcore_model::procfs::StatusValue;
 pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_mounts;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
+use detcore_model::procfs::parse_bitmap_token;
+use detcore_model::procfs::parse_fdinfo;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
+use detcore_model::procfs::parse_process_io;
+use detcore_model::procfs::parse_range_list_token;
+use detcore_model::procfs::parse_sched;
+use detcore_model::procfs::parse_stat;
+use detcore_model::procfs::parse_statm;
+use detcore_model::procfs::parse_status_preserving_unknown;
+use detcore_model::procfs::render_fdinfo;
+use detcore_model::procfs::render_process_io;
+use detcore_model::procfs::render_sched;
+use detcore_model::procfs::render_stat as render_stat_snapshot;
+use detcore_model::procfs::render_statm;
+use detcore_model::procfs::render_status as render_status_snapshot;
 pub(crate) use fixed::FixedProcfsFile;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1523,6 +1547,15 @@ pub(crate) struct ProcfsFile {
     #[serde(default)]
     mount_view_kernel: Option<bool>,
     contents: Option<Vec<u8>>,
+    /// Why this file's snapshot sanitize step refused, when it did
+    /// (`Self::initialize`): the read path turns it into the named
+    /// policy refusal (or, under `--allow-unsupported-syscalls`, an
+    /// `EIO` for the guest) instead of serving the placeholder empty
+    /// snapshot beside it. Never serialized for the reason
+    /// [`Self::read_pos`] is not: a rebuilt description re-takes its
+    /// snapshot and re-derives this.
+    #[serde(skip)]
+    sanitize_refusal: Option<String>,
     offset: usize,
     /// For a file that follows its record's sequence
     /// ([`Self::follows_record_sequence`]), where the sequence is (Linux's
@@ -2162,6 +2195,7 @@ impl ProcfsFile {
             guest_numbers: None,
             mount_view_kernel: None,
             contents: None,
+            sanitize_refusal: None,
             offset: 0,
             read_pos: None,
             sequence_shared: false,
@@ -3011,6 +3045,15 @@ impl ProcfsFile {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
 
+    /// Why this file's snapshot sanitize step refused, when it did:
+    /// every read path stops the run with this named reason (or
+    /// fails the guest's read with `EIO` under
+    /// `--allow-unsupported-syscalls`); no snapshot is held while
+    /// refused, so there are no placeholder bytes to serve.
+    pub(crate) fn sanitize_refusal(&self) -> Option<&str> {
+        self.sanitize_refusal.as_deref()
+    }
+
     /// The kernel process and thread numbers in `contents`, a process's
     /// `stat` or `status` named by number, where they name processes: the
     /// pid, parent, process group, session and terminal group of `stat`, and
@@ -3019,38 +3062,51 @@ impl ProcfsFile {
     /// Detcore (DBT), the caller learns the guest's numbers for them
     /// ([`ProcfsFile::set_guest_numbers`]) before the snapshot is taken.
     pub(crate) fn kernel_numbers_held(&self, contents: &[u8]) -> Vec<i32> {
-        let positive = |text: &str| text.parse::<i32>().ok().filter(|id| *id > 0);
+        // Grammar parses over bytes: a non-UTF-8 comm no longer hides
+        // every held number (which made the renumber pass map them
+        // all to 0 where numbers are translated, e.g. under DBT).
+        let positive = |id: i32| (id > 0).then_some(id);
         match self.kind {
-            ProcfsKind::ProcessStat => {
-                let Ok(text) = std::str::from_utf8(contents) else {
-                    return Vec::new();
-                };
-                let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
-                    return Vec::new();
-                };
-                let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
-                std::iter::once(&text[..comm_start])
-                    .chain(
-                        [1, 2, 3, 5]
-                            .into_iter()
-                            .filter_map(|index| fields.get(index).copied()),
-                    )
-                    .filter_map(positive)
-                    .collect()
-            }
-            ProcfsKind::ProcessStatus => String::from_utf8_lossy(contents)
-                .lines()
-                .filter_map(|line| {
-                    let (label, value) = line.split_once(':')?;
-                    STATUS_NUMBER_LABELS.contains(&label).then(|| {
-                        value
-                            .split_whitespace()
-                            .filter_map(positive)
-                            .collect::<Vec<_>>()
-                    })
+            ProcfsKind::ProcessStat => parse_stat(contents)
+                .map(|stat| {
+                    [stat.pid, stat.ppid, stat.pgrp, stat.session, stat.tpgid]
+                        .into_iter()
+                        .filter_map(positive)
+                        .collect()
                 })
-                .flatten()
-                .collect(),
+                .unwrap_or_default(),
+            ProcfsKind::ProcessStatus => parse_status_preserving_unknown(contents)
+                .map(|status| {
+                    status
+                        .lines
+                        .iter()
+                        .filter_map(|line| match line {
+                            StatusLine::Known { label, value }
+                                if STATUS_NUMBER_LABELS.contains(&label.name()) =>
+                            {
+                                match value {
+                                    StatusValue::Decimal(v) => Some(
+                                        i32::try_from(*v)
+                                            .ok()
+                                            .and_then(positive)
+                                            .into_iter()
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                    StatusValue::PidList(ids) => Some(
+                                        ids.iter()
+                                            .copied()
+                                            .filter_map(positive)
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -3326,55 +3382,82 @@ impl ProcfsFile {
             });
             return;
         }
+        let mut sanitize_refusal: Option<String> = None;
         self.contents = Some(match &self.kind {
-            ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => sanitize_status_held(
-                &contents,
-                Some((virtual_pid, virtual_pid, virtual_ppid)),
-                published_sigblk,
-                status_hides_ignored,
-                status_held_ignored,
-                cpus_allowed,
+            ProcfsKind::Stat => checked_or_refusal(
+                sanitize_stat_checked(&contents, Some((virtual_pid, virtual_ppid))),
+                &mut sanitize_refusal,
+            ),
+            ProcfsKind::Status => checked_or_refusal(
+                sanitize_status_held_checked(
+                    &contents,
+                    Some((virtual_pid, virtual_pid, virtual_ppid)),
+                    published_sigblk,
+                    status_hides_ignored,
+                    status_held_ignored,
+                    cpus_allowed,
+                ),
+                &mut sanitize_refusal,
             ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self stat was not bound when opened");
-                sanitize_stat(&contents, Some((tid, ppid)))
+                checked_or_refusal(
+                    sanitize_stat_checked(&contents, Some((tid, ppid))),
+                    &mut sanitize_refusal,
+                )
             }
             ProcfsKind::ThreadStatus => {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status_held(
-                    &contents,
-                    Some((tgid, tid, ppid)),
-                    published_sigblk,
-                    status_hides_ignored,
-                    status_held_ignored,
-                    cpus_allowed,
+                checked_or_refusal(
+                    sanitize_status_held_checked(
+                        &contents,
+                        Some((tgid, tid, ppid)),
+                        published_sigblk,
+                        status_hides_ignored,
+                        status_held_ignored,
+                        cpus_allowed,
+                    ),
+                    &mut sanitize_refusal,
                 )
             }
             ProcfsKind::ProcessStat => {
-                let sanitized = sanitize_stat(&contents, None);
-                match &self.guest_numbers {
-                    Some(numbers) => renumber_stat(&sanitized, numbers),
-                    None => sanitized,
+                let sanitized = checked_or_refusal(
+                    sanitize_stat_checked(&contents, None),
+                    &mut sanitize_refusal,
+                );
+                match (&self.guest_numbers, sanitize_refusal.is_none()) {
+                    (Some(numbers), true) => checked_or_refusal(
+                        renumber_stat_checked(&sanitized, numbers),
+                        &mut sanitize_refusal,
+                    ),
+                    _ => sanitized,
                 }
             }
-            ProcfsKind::Statm => sanitize_statm(&contents),
+            ProcfsKind::Statm => {
+                checked_or_refusal(sanitize_statm_checked(&contents), &mut sanitize_refusal)
+            }
             ProcfsKind::ProcessStatus => {
-                let sanitized = sanitize_status_held(
-                    &contents,
-                    None,
-                    published_sigblk,
-                    status_hides_ignored,
-                    status_held_ignored,
-                    cpus_allowed,
+                let sanitized = checked_or_refusal(
+                    sanitize_status_held_checked(
+                        &contents,
+                        None,
+                        published_sigblk,
+                        status_hides_ignored,
+                        status_held_ignored,
+                        cpus_allowed,
+                    ),
+                    &mut sanitize_refusal,
                 );
-                match &self.guest_numbers {
-                    Some(numbers) => renumber_status(&sanitized, numbers),
-                    None => sanitized,
+                match (&self.guest_numbers, sanitize_refusal.is_none()) {
+                    (Some(numbers), true) => checked_or_refusal(
+                        renumber_status_checked(&sanitized, numbers),
+                        &mut sanitize_refusal,
+                    ),
+                    _ => sanitized,
                 }
             }
             ProcfsKind::TimerSlack(_) => {
@@ -3395,7 +3478,10 @@ impl ProcfsFile {
                 virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents, machine.cpus))
             }
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
-            ProcfsKind::ProcessIo => sanitize_process_io(&contents),
+            ProcfsKind::ProcessIo => checked_or_refusal(
+                sanitize_process_io_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::NodeMeminfo => sanitize_node_meminfo(&contents),
@@ -3415,8 +3501,14 @@ impl ProcfsFile {
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
-            ProcfsKind::SelfSched => sanitize_self_sched(&contents),
-            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
+            ProcfsKind::SelfSched => checked_or_refusal(
+                sanitize_self_sched_checked(&contents),
+                &mut sanitize_refusal,
+            ),
+            ProcfsKind::Fdinfo => checked_or_refusal(
+                sanitize_fdinfo_checked(&contents, fdinfo_identity),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             // Rendered only where CPUID is virtualized and intercepted, from
@@ -3498,6 +3590,14 @@ impl ProcfsFile {
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
             ),
         });
+        self.sanitize_refusal = sanitize_refusal;
+        if self.sanitize_refusal.is_some() {
+            // Hold no snapshot while refused: the placeholder bytes
+            // must never be servable as an empty file, and
+            // `needs_snapshot` staying true keeps every later read on
+            // the refusal gate's path.
+            self.contents = None;
+        }
     }
 
     /// Returns the next bytes from the normalized snapshot, consuming them as
@@ -4409,130 +4509,337 @@ fn is_hwmon_input_file(path: &str) -> bool {
         })
 }
 
+/// Sanitizer refusals this process has recorded, by format. The
+/// grammar-backed sanitizers fail closed: kernel bytes they cannot
+/// parse are never republished to the guest. Each refusal is
+/// counted here, named at the read path, and surfaced by format in
+/// the run summary (`procfs_sanitize_refusals`), which is the
+/// counter's production reader. A refusal stops the run by name in
+/// strict mode (or fails every read of the file with `EIO` under
+/// `--allow-unsupported-syscalls`): the file was already opened
+/// through the kernel, and the alternatives are republishing host
+/// bytes or fabricating a partial file.
+static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Status labels dropped by name (the file still served), counted
+/// apart from whole-file refusals above.
+static SANITIZE_STATUS_UNKNOWN_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Labels dropped from sanitized status files in this Detcore
+/// process (see the run summary's `procfs_status_unknown_dropped`).
+pub(crate) fn sanitize_status_unknown_dropped() -> u64 {
+    SANITIZE_STATUS_UNKNOWN_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_status_unknown_dropped(count: usize) {
+    SANITIZE_STATUS_UNKNOWN_DROPPED.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The formats [`sanitize_refusal_counts`] reports, in counter order.
+const SANITIZE_FORMATS: [&str; 6] = ["stat", "status", "statm", "io", "sched", "fdinfo"];
+
+fn sanitize_refusal_index(format: &str) -> usize {
+    match format {
+        "stat" => 0,
+        "status" => 1,
+        "statm" => 2,
+        "io" => 3,
+        "sched" => 4,
+        "fdinfo" => 5,
+        _ => {
+            debug_assert!(false, "unknown sanitize format {format}");
+            0
+        }
+    }
+}
+
+/// Nonzero per-format refusal counts for this Detcore process, for
+/// the run summary. (One Hermit run is one Detcore process in the
+/// ptrace backend; the per-refusal `warn` lines remain the record
+/// where a backend splits the tool across processes.)
+pub(crate) fn sanitize_refusal_counts() -> BTreeMap<String, u64> {
+    SANITIZE_FORMATS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, format)| {
+            let count = SANITIZE_REFUSALS[i].load(std::sync::atomic::Ordering::Relaxed);
+            (count > 0).then(|| (format.to_string(), count))
+        })
+        .collect()
+}
+
+fn record_sanitize_refusal(format: &str) {
+    SANITIZE_REFUSALS[sanitize_refusal_index(format)]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one refusal and build its named reason. The checked
+/// sanitizers return this as their error; the snapshot read path
+/// turns it into the named policy refusal (or an `EIO` under
+/// `--allow-unsupported-syscalls`), so the guest never sees an
+/// empty file for it. The `Vec<u8>` wrappers below keep the
+/// historical empty-file shape for unit-level callers and tests.
+fn counted_refusal_reason(format: &str, reason: impl std::fmt::Display) -> String {
+    record_sanitize_refusal(format);
+    format!("procfs sanitize refused {format}: {reason}")
+}
+
+/// Take a checked sanitizer's bytes, or record its refusal on the
+/// file being initialized and yield no bytes: the caller holds no
+/// snapshot while refused, and every read path refuses by name
+/// before taking bytes.
+fn checked_or_refusal(result: Result<Vec<u8>, String>, refusal: &mut Option<String>) -> Vec<u8> {
+    match result {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            *refusal = Some(reason);
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+fn sanitize_refusal_count() -> u64 {
+    SANITIZE_REFUSALS
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// Zero one volatile `stat` field by its 1-based field number. The
+/// inventory is `do_task_stat`'s (`fs/proc/array.c`); the volatile
+/// set is Detcore's determinism policy (the same table the
+/// reverie-procfs consumer keeps).
+fn zero_stat_field(stat: &mut Stat, field: usize) {
+    match field {
+        10 => stat.minflt = 0,
+        11 => stat.cminflt = 0,
+        12 => stat.majflt = 0,
+        13 => stat.cmajflt = 0,
+        14 => stat.utime = 0,
+        15 => stat.stime = 0,
+        16 => stat.cutime = 0,
+        17 => stat.cstime = 0,
+        21 => stat.itrealvalue = 0,
+        22 => stat.starttime = 0,
+        23 => stat.vsize = 0,
+        24 => stat.rss = 0,
+        26 => stat.startcode = 0,
+        27 => stat.endcode = 0,
+        28 => stat.startstack = 0,
+        29 => stat.kstkesp = 0,
+        30 => stat.kstkeip = 0,
+        31 => stat.signal = 0,
+        32 => stat.blocked = 0,
+        33 => stat.sigignore = 0,
+        34 => stat.sigcatch = 0,
+        35 => stat.wchan = 0,
+        36 => stat.nswap = 0,
+        37 => stat.cnswap = 0,
+        39 => stat.processor = 0,
+        42 => stat.delayacct_blkio_ticks = 0,
+        43 => stat.guest_time = 0,
+        44 => stat.cguest_time = 0,
+        45 => stat.start_data = 0,
+        46 => stat.end_data = 0,
+        47 => stat.start_brk = 0,
+        48 => stat.arg_start = 0,
+        49 => stat.arg_end = 0,
+        50 => stat.env_start = 0,
+        51 => stat.env_end = 0,
+        _ => debug_assert!(false, "field {field} is not a volatile stat field"),
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
 // TODO-HUMAN-REVIEW(PR-843): Review process memory and runtime normalization.
+#[cfg(test)]
 fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u8> {
+    match sanitize_stat_checked(contents, virtual_identity) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
+fn sanitize_stat_checked(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32)>,
+) -> Result<Vec<u8>, String> {
     const VOLATILE_FIELDS: &[usize] = &[
         10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
         37, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
     ];
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+    // Grammar-backed parse; refused (counted, logged, empty) on any
+    // input the grammar cannot account for. The text surgery this
+    // replaces returned the host bytes verbatim for exactly the
+    // inputs that needed sanitizing (non-UTF-8 comm above all).
+    let mut stat = match parse_stat(contents) {
+        Ok(stat) => stat,
+        Err(error) => return Err(counted_refusal_reason("stat", error)),
     };
-    let Some(comm_start) = text.find(" (") else {
-        return contents.to_vec();
-    };
-    let Some(comm_end) = text.rfind(") ") else {
-        return contents.to_vec();
-    };
-    let comm = &text[comm_start..=comm_end];
-    let mut fields = text[comm_end + 2..]
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if fields.len() < 50 {
-        return contents.to_vec();
-    }
-
-    // `fields` starts with proc stat field 3 (state).
-    let pid = if let Some((virtual_pid, virtual_ppid)) = virtual_identity {
-        fields[4 - 3] = virtual_ppid.to_string();
-        fields[5 - 3] = "0".to_owned();
-        fields[6 - 3] = "0".to_owned();
-        virtual_pid.to_string()
+    if let Some((virtual_pid, virtual_ppid)) = virtual_identity {
+        stat.pid = virtual_pid;
+        stat.ppid = virtual_ppid;
+        stat.pgrp = 0;
+        stat.session = 0;
     } else {
-        fields[0] = "S".to_owned();
-        text[..comm_start].to_owned()
-    };
-    for field in VOLATILE_FIELDS {
-        fields[*field - 3] = "0".to_owned();
+        stat.state = b'S';
     }
-    format!("{pid}{comm} {}\n", fields.join(" ")).into_bytes()
+    for field in VOLATILE_FIELDS {
+        zero_stat_field(&mut stat, *field);
+    }
+    Ok(render_stat_snapshot(&stat))
 }
 
 /// The `status` lines whose values are process or thread numbers that
 /// [`renumber_status`] renumbers.
 const STATUS_NUMBER_LABELS: &[&str] = &["Tgid", "Pid", "PPid", "NStgid", "NSpid"];
 
-/// The guest's number for the kernel number `text`, where it is a positive
-/// number: from `numbers`, or 0 where it has none. Anything else (`-1`, `0`)
-/// is kept.
-fn renumbered(text: &str, numbers: &BTreeMap<i32, i32>) -> String {
-    match text.parse::<i32>() {
-        Ok(id) if id > 0 => numbers.get(&id).copied().unwrap_or(0).to_string(),
-        _ => text.to_owned(),
+/// The guest's number for the kernel number `id`, where it is a
+/// positive number: from `numbers`, or 0 where it has none. Anything
+/// else (`-1`, `0`) is kept.
+fn renumbered_id(id: i32, numbers: &BTreeMap<i32, i32>) -> i32 {
+    if id > 0 {
+        numbers.get(&id).copied().unwrap_or(0)
+    } else {
+        id
     }
 }
 
-/// A process's sanitized `stat` with its pid, parent, process group, session
-/// and terminal group renumbered from the kernel's numbers to the guest's.
+/// A process's sanitized `stat` with its pid, parent, process group,
+/// session and terminal group renumbered from the kernel's numbers
+/// to the guest's.
+#[cfg(test)]
 fn renumber_stat(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
-        return contents.to_vec();
-    };
-    let mut fields = text[comm_end + 2..]
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    // `fields` starts with proc stat field 3 (state): 4 is the parent, 5 the
-    // process group, 6 the session, 8 the terminal's process group.
-    for index in [1, 2, 3, 5] {
-        if let Some(field) = fields.get_mut(index) {
-            *field = renumbered(field, numbers);
+    match renumber_stat_checked(contents, numbers) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
         }
     }
-    format!(
-        "{}{} {}\n",
-        renumbered(&text[..comm_start], numbers),
-        &text[comm_start..=comm_end],
-        fields.join(" ")
-    )
-    .into_bytes()
+}
+
+fn renumber_stat_checked(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Result<Vec<u8>, String> {
+    // Empty is the upstream sanitize step's already-counted refusal.
+    if contents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stat = match parse_stat(contents) {
+        Ok(stat) => stat,
+        Err(error) => return Err(counted_refusal_reason("stat", error)),
+    };
+    stat.pid = renumbered_id(stat.pid, numbers);
+    stat.ppid = renumbered_id(stat.ppid, numbers);
+    stat.pgrp = renumbered_id(stat.pgrp, numbers);
+    stat.session = renumbered_id(stat.session, numbers);
+    stat.tpgid = renumbered_id(stat.tpgid, numbers);
+    Ok(render_stat_snapshot(&stat))
 }
 
 /// A process's sanitized `status` with the numbers in its
 /// [`STATUS_NUMBER_LABELS`] lines renumbered from the kernel's to the
 /// guest's.
+#[cfg(test)]
 fn renumber_status(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
-    let mut renumbered_lines = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let text = String::from_utf8_lossy(line);
-        let body = text.strip_suffix('\n').unwrap_or(&text);
-        match body.split_once(':') {
-            Some((label, value)) if STATUS_NUMBER_LABELS.contains(&label) => {
-                let values = value
-                    .split_whitespace()
-                    .map(|value| renumbered(value, numbers))
-                    .collect::<Vec<_>>()
-                    .join("\t");
-                renumbered_lines.extend_from_slice(format!("{label}:\t{values}").as_bytes());
-                if line.ends_with(b"\n") {
-                    renumbered_lines.push(b'\n');
-                }
-            }
-            _ => renumbered_lines.extend_from_slice(line),
+    match renumber_status_checked(contents, numbers) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
         }
     }
-    renumbered_lines
 }
 
-fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
-    let fields = contents
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    if fields.len() != 7
-        || fields
-            .iter()
-            .any(|field| !field.iter().all(u8::is_ascii_digit))
-    {
-        return contents.to_vec();
+fn renumber_status_checked(
+    contents: &[u8],
+    numbers: &BTreeMap<i32, i32>,
+) -> Result<Vec<u8>, String> {
+    // Empty is the upstream sanitize step's already-counted refusal.
+    if contents.is_empty() {
+        return Ok(Vec::new());
     }
-    b"0 0 0 0 0 0 0\n".to_vec()
+    let mut status = match parse_status_preserving_unknown(contents) {
+        Ok(status) => status,
+        Err(error) => return Err(counted_refusal_reason("status", error)),
+    };
+    // Never renumber a field we cannot type into the guest's file.
+    // Count and name whatever this site actually drops: after the
+    // sanitize step there is normally nothing left to drop, so each
+    // unknown label is counted exactly once, by whichever site
+    // drops it first.
+    let dropped_unknown = status.drop_unknown();
+    if !dropped_unknown.is_empty() {
+        record_status_unknown_dropped(dropped_unknown.len());
+        let labels: Vec<String> = dropped_unknown
+            .iter()
+            .map(|label| String::from_utf8_lossy(label).into_owned())
+            .collect();
+        tracing::warn!(
+            "renumber dropped unknown status labels by name: {}",
+            labels.join(", ")
+        );
+    }
+    for line in &mut status.lines {
+        let StatusLine::Known { label, value } = line else {
+            continue;
+        };
+        if !STATUS_NUMBER_LABELS.contains(&label.name()) {
+            continue;
+        }
+        match value {
+            StatusValue::Decimal(value) => {
+                if let Ok(id) = i32::try_from(*value) {
+                    *value = i64::from(renumbered_id(id, numbers));
+                }
+            }
+            StatusValue::PidList(ids) => {
+                for id in ids {
+                    *id = renumbered_id(*id, numbers);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(render_status_snapshot(&status))
+}
+
+#[cfg(test)]
+fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
+    match sanitize_statm_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
+fn sanitize_statm_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
+    if let Err(error) = parse_statm(contents) {
+        return Err(counted_refusal_reason("statm", error));
+    }
+    Ok(render_statm(&Statm {
+        size: 0,
+        resident: 0,
+        shared: 0,
+        text: 0,
+        lib: 0,
+        data: 0,
+        dirty: 0,
+    }))
 }
 
 /// [`sanitize_status_held`] with no held masks, as every status was rendered
@@ -4561,6 +4868,7 @@ fn sanitize_status(
 /// and the machine's CPU count, the `nr_cpu_ids` bits Linux prints
 /// `Cpus_allowed` with (`task_cpus_allowed`, fs/proc/array.c); `None` reports
 /// Hermit's historical single CPU in a 128-bit mask.
+#[cfg(test)]
 fn sanitize_status_held(
     contents: &[u8],
     virtual_identity: Option<(i32, i32, i32)>,
@@ -4569,51 +4877,53 @@ fn sanitize_status_held(
     held_ignored: (u64, u64),
     cpus_allowed: Option<(CpuSet, u32)>,
 ) -> Vec<u8> {
-    const STATE: &[u8] = b"State:";
-    const TGID: &[u8] = b"Tgid:";
-    const PID: &[u8] = b"Pid:";
-    const PPID: &[u8] = b"PPid:";
-    const TRACER_PID: &[u8] = b"TracerPid:";
-    const NS_TGID: &[u8] = b"NStgid:";
-    const NS_PID: &[u8] = b"NSpid:";
-    const NS_PGID: &[u8] = b"NSpgid:";
-    const NS_SID: &[u8] = b"NSsid:";
-    const SIGQ: &[u8] = b"SigQ:";
-    const SIGPND: &[u8] = b"SigPnd:";
-    const SHDPND: &[u8] = b"ShdPnd:";
-    const SIGBLK: &[u8] = b"SigBlk:";
-    const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
-    const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
-    // The nodes the task may allocate from: node 0 alone, the one node a
-    // kernel built without NUMA has. Its `MAX_NUMNODES` is 1, without
-    // `CONFIG_NODES_SHIFT` (include/linux/nodemask_types.h:7-13 and
-    // arch/x86/Kconfig:1555-1561 at v7.1), the width
-    // `cpuset_task_status_allowed` prints the mask with
-    // (kernel/cgroup/cpuset.c:4385-4391, include/linux/nodemask.h:104-109),
-    // so the mask is the one hexadecimal digit `1` (`bitmap_string`,
-    // lib/vsprintf.c:1232-1273) and the list `0`.
-    const MEMS_ALLOWED: &[u8] = b"Mems_allowed:";
-    const MEMS_ALLOWED_LIST: &[u8] = b"Mems_allowed_list:";
-    const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
-    const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
-    const MEMORY_FIELDS: &[&[u8]] = &[
-        b"VmPeak",
-        b"VmSize",
-        b"VmLck",
-        b"VmPin",
-        b"VmHWM",
-        b"VmRSS",
-        b"RssAnon",
-        b"RssFile",
-        b"RssShmem",
-        b"VmData",
-        b"VmStk",
-        b"VmExe",
-        b"VmLib",
-        b"VmPTE",
-        b"VmSwap",
-        b"HugetlbPages",
-    ];
+    match sanitize_status_held_checked(
+        contents,
+        virtual_identity,
+        published_sigblk,
+        hides_ignored,
+        held_ignored,
+        cpus_allowed,
+    ) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
+fn sanitize_status_held_checked(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+    hides_ignored: bool,
+    held_ignored: (u64, u64),
+    cpus_allowed: Option<(CpuSet, u32)>,
+) -> Result<Vec<u8>, String> {
+    // Grammar-backed parse; the rewrite policy below is unchanged.
+    // What changes is the failure mode: input the grammar cannot
+    // parse at all is refused counted, logged, and empty, where the
+    // line surgery republished such lines verbatim. A label merely
+    // missing from the grammar's inventory (a newer kernel field)
+    // is dropped by name below, counted and logged: the known lines
+    // still serve sanitized instead of the guest losing the file.
+    let mut status = match parse_status_preserving_unknown(contents) {
+        Ok(status) => status,
+        Err(error) => return Err(counted_refusal_reason("status", error)),
+    };
+    let dropped_unknown = status.drop_unknown();
+    if !dropped_unknown.is_empty() {
+        record_status_unknown_dropped(dropped_unknown.len());
+        let labels: Vec<String> = dropped_unknown
+            .iter()
+            .map(|label| String::from_utf8_lossy(label).into_owned())
+            .collect();
+        tracing::warn!(
+            "procfs sanitize status dropped unknown label(s) {}; serving known lines",
+            labels.join(", ")
+        );
+    }
 
     // Under the in-guest delivery gate (A5 step 3c.1d, design D37): the
     // ignored signals the guest's mask lets in, which Linux discarded when
@@ -4622,14 +4932,11 @@ fn sanitize_status_held(
     // thread's signal state (fs/proc/array.c:264-300 at v6.12). A status
     // missing one of them is left as it is.
     let hidden = if hides_ignored {
-        let field = |label: &[u8]| {
-            contents
-                .split(|byte| *byte == b'\n')
-                .find_map(|line| line.strip_prefix(label))
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-        };
-        match (field(b"SigIgn:"), field(b"SigCgt:"), field(SIGBLK)) {
+        match (
+            status.hex_mask(StatusLabel::SigIgn),
+            status.hex_mask(StatusLabel::SigCgt),
+            status.hex_mask(StatusLabel::SigBlk),
+        ) {
             (Some(ignored), Some(caught), Some(blocked)) => {
                 Some((ignored, caught, published_sigblk.unwrap_or(blocked)))
             }
@@ -4638,122 +4945,130 @@ fn sanitize_status_held(
     } else {
         None
     };
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let pending_label = hidden.and_then(|_| {
-            [SIGPND, SHDPND]
-                .into_iter()
-                .find(|label| body.starts_with(label))
-        });
-        if let (Some(label), Some((ignored, caught, mask))) = (pending_label, hidden)
-            && let Some(pending) = std::str::from_utf8(&body[label.len()..])
-                .ok()
-                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-        {
-            // A5 step 3c.1e A: each queue keeps its own held instances (D37's
-            // held masks), never the other queue's.
-            let held = if label == SIGPND {
-                held_ignored.0
-            } else {
-                held_ignored.1
-            };
-            let shown = pending
-                & !crate::ignored_signals::hidden_from_status(
-                    pending,
-                    ignored,
-                    caught,
-                    mask | held,
-                );
-            normalized.extend_from_slice(label);
-            normalized.extend_from_slice(format!("\t{shown:016x}").as_bytes());
-        } else if body.starts_with(STATE) {
-            normalized.extend_from_slice(b"State:\tS (sleeping)");
-        } else if let Some((virtual_tgid, _, _)) = virtual_identity
-            && (body.starts_with(TGID) || body.starts_with(NS_TGID))
-        {
-            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
-            normalized.extend_from_slice(label);
-            normalized.extend_from_slice(format!(":\t{virtual_tgid}").as_bytes());
-        } else if let Some((_, virtual_pid, _)) = virtual_identity
-            && (body.starts_with(PID) || body.starts_with(NS_PID))
-        {
-            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
-            normalized.extend_from_slice(label);
-            normalized.extend_from_slice(format!(":\t{virtual_pid}").as_bytes());
-        } else if let Some((_, _, virtual_ppid)) = virtual_identity
-            && body.starts_with(PPID)
-        {
-            normalized.extend_from_slice(PPID);
-            normalized.extend_from_slice(format!("\t{virtual_ppid}").as_bytes());
-        } else if body.starts_with(TRACER_PID) {
-            // No guest task has a tracer the guest could know of: Detcore
-            // refuses `ptrace` to every guest
-            // (`is_privileged_observation_refused_syscall`), and the backend's
-            // own tracer (under ptrace, Hermit's container init, pid 1 in the
-            // guest's pid namespace) is not the guest's debugger. Linux shows 0
-            // for a task with no tracer (`task_state`, fs/proc/array.c,
-            // lines 156, 163-165 and 188 at v6.16), which is what the program
-            // reads natively. Showing the tracer sent programs that look for a
-            // debugger down their debugger path: a death test's assertion then
-            // raised SIGTRAP to break into it instead of aborting.
-            normalized.extend_from_slice(TRACER_PID);
-            normalized.extend_from_slice(b"\t0");
-        } else if body.starts_with(NS_PGID) || body.starts_with(NS_SID) {
-            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
-            normalized.extend_from_slice(label);
-            normalized.extend_from_slice(b":\t0");
-        } else if body.starts_with(SIGQ) {
-            normalized.extend_from_slice(SIGQ);
-            normalized.extend_from_slice(b"\t0/0");
-        } else if let Some(mask) = published_sigblk
-            && body.starts_with(SIGBLK)
-        {
-            // The guest's own mask while Detcore holds the thread under a
-            // private one; the kernel's value is Detcore's.
-            normalized.extend_from_slice(format!("SigBlk:\t{mask:016x}").as_bytes());
-        } else if body.starts_with(CPUS_ALLOWED) {
-            normalized.extend_from_slice(CPUS_ALLOWED);
-            match cpus_allowed {
-                Some((cpus, bits)) => {
-                    normalized.extend_from_slice(format!("\t{}", cpus.mask(bits)).as_bytes())
-                }
-                None => normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001"),
+    if let Some((ignored, caught, mask)) = hidden {
+        // A5 step 3c.1e A: each queue keeps its own held instances
+        // (D37's held masks), never the other queue's.
+        for (label, held) in [
+            (StatusLabel::SigPnd, held_ignored.0),
+            (StatusLabel::ShdPnd, held_ignored.1),
+        ] {
+            if let Some(pending) = status.hex_mask(label) {
+                let shown = pending
+                    & !crate::ignored_signals::hidden_from_status(
+                        pending,
+                        ignored,
+                        caught,
+                        mask | held,
+                    );
+                status.set_hex_mask(label, shown);
             }
-        } else if body.starts_with(CPUS_ALLOWED_LIST) {
-            normalized.extend_from_slice(CPUS_ALLOWED_LIST);
-            match cpus_allowed {
-                Some((cpus, _)) => {
-                    normalized.extend_from_slice(format!("\t{}", cpus.list()).as_bytes())
-                }
-                None => normalized.extend_from_slice(b"\t0"),
-            }
-        } else if body.starts_with(MEMS_ALLOWED) {
-            normalized.extend_from_slice(MEMS_ALLOWED);
-            normalized.extend_from_slice(b"\t1");
-        } else if body.starts_with(MEMS_ALLOWED_LIST) {
-            normalized.extend_from_slice(MEMS_ALLOWED_LIST);
-            normalized.extend_from_slice(b"\t0");
-        } else if body.starts_with(VOLUNTARY) {
-            normalized.extend_from_slice(VOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else if body.starts_with(NONVOLUNTARY) {
-            normalized.extend_from_slice(NONVOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else if let Some(name_end) = body.iter().position(|byte| *byte == b':')
-            && MEMORY_FIELDS.contains(&&body[..name_end])
-        {
-            normalized.extend_from_slice(&body[..name_end]);
-            normalized.extend_from_slice(b":\t0 kB");
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
         }
     }
-    normalized
+
+    status.set(
+        StatusLabel::State,
+        StatusValue::State(b'S', b"sleeping".to_vec()),
+    );
+    if let Some((virtual_tgid, virtual_pid, virtual_ppid)) = virtual_identity {
+        status.set_decimal(StatusLabel::Tgid, i64::from(virtual_tgid));
+        status.set(
+            StatusLabel::NStgid,
+            StatusValue::PidList(vec![virtual_tgid]),
+        );
+        status.set_decimal(StatusLabel::Pid, i64::from(virtual_pid));
+        status.set(StatusLabel::NSpid, StatusValue::PidList(vec![virtual_pid]));
+        status.set_decimal(StatusLabel::PPid, i64::from(virtual_ppid));
+    }
+    // No guest task has a tracer the guest could know of: Detcore
+    // refuses `ptrace` to every guest
+    // (`is_privileged_observation_refused_syscall`), and the backend's
+    // own tracer (under ptrace, Hermit's container init, pid 1 in the
+    // guest's pid namespace) is not the guest's debugger. Linux shows 0
+    // for a task with no tracer (`task_state`, fs/proc/array.c,
+    // lines 156, 163-165 and 188 at v6.16), which is what the program
+    // reads natively. Showing the tracer sent programs that look for a
+    // debugger down their debugger path: a death test's assertion then
+    // raised SIGTRAP to break into it instead of aborting.
+    status.set_decimal(StatusLabel::TracerPid, 0);
+    status.set(StatusLabel::NSpgid, StatusValue::PidList(vec![0]));
+    status.set(StatusLabel::NSsid, StatusValue::PidList(vec![0]));
+    status.set(StatusLabel::SigQ, StatusValue::SigQ(0, 0));
+    if let Some(mask) = published_sigblk {
+        // The guest's own mask while Detcore holds the thread under a
+        // private one; the kernel's value is Detcore's.
+        status.set_hex_mask(StatusLabel::SigBlk, mask);
+    }
+    let (allowed_bitmap, allowed_list) = match cpus_allowed {
+        Some((cpus, bits)) => {
+            match (
+                parse_bitmap_token(cpus.mask(bits).as_bytes()),
+                parse_range_list_token(cpus.list().as_bytes()),
+            ) {
+                (Ok(bitmap), Ok(ranges)) => (bitmap, ranges),
+                _ => {
+                    return Err(counted_refusal_reason(
+                        "status",
+                        "CpuSet rendering did not parse as a kernel bitmap/list",
+                    ));
+                }
+            }
+        }
+        // Hermit's historical single CPU in a 128-bit mask.
+        None => (
+            Bitmap::new(8, vec![0, 0, 0, 1]).expect("historical 128-bit mask fits its width"),
+            vec![(0, 0)],
+        ),
+    };
+    status.set(
+        StatusLabel::CpusAllowed,
+        StatusValue::Bitmap(allowed_bitmap),
+    );
+    status.set(
+        StatusLabel::CpusAllowedList,
+        StatusValue::RangeList(allowed_list),
+    );
+    // The nodes the task may allocate from: node 0 alone, the one node a
+    // kernel built without NUMA has. Its `MAX_NUMNODES` is 1, without
+    // `CONFIG_NODES_SHIFT` (include/linux/nodemask_types.h:7-13 and
+    // arch/x86/Kconfig:1555-1561 at v7.1), the width
+    // `cpuset_task_status_allowed` prints the mask with
+    // (kernel/cgroup/cpuset.c:4385-4391, include/linux/nodemask.h:104-109),
+    // so the mask is the one hexadecimal digit `1` (`bitmap_string`,
+    // lib/vsprintf.c:1232-1273) and the list `0`.
+    status.set(
+        StatusLabel::MemsAllowed,
+        StatusValue::Bitmap(Bitmap::new(1, vec![1]).expect("node-0 mask fits its width")),
+    );
+    status.set(
+        StatusLabel::MemsAllowedList,
+        StatusValue::RangeList(vec![(0, 0)]),
+    );
+    status.set(StatusLabel::VoluntaryCtxtSwitches, StatusValue::Counter(0));
+    status.set(
+        StatusLabel::NonvoluntaryCtxtSwitches,
+        StatusValue::Counter(0),
+    );
+    for label in [
+        StatusLabel::VmPeak,
+        StatusLabel::VmSize,
+        StatusLabel::VmLck,
+        StatusLabel::VmPin,
+        StatusLabel::VmHWM,
+        StatusLabel::VmRSS,
+        StatusLabel::RssAnon,
+        StatusLabel::RssFile,
+        StatusLabel::RssShmem,
+        StatusLabel::VmData,
+        StatusLabel::VmStk,
+        StatusLabel::VmExe,
+        StatusLabel::VmLib,
+        StatusLabel::VmPTE,
+        StatusLabel::VmSwap,
+        StatusLabel::HugetlbPages,
+    ] {
+        status.set(label, StatusValue::Kb(0));
+    }
+    Ok(render_status_snapshot(&status))
 }
 
 /// Reports `/proc/cpuinfo` for the virtual CPUs, `cpus` of them, the ones
@@ -4935,34 +5250,34 @@ fn sanitize_node_numastat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+#[cfg(test)]
 fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
-    const COUNTERS: &[&[u8]] = &[
-        b"rchar",
-        b"wchar",
-        b"syscr",
-        b"syscw",
-        b"read_bytes",
-        b"write_bytes",
-        b"cancelled_write_bytes",
-    ];
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let name_end = body.iter().position(|byte| *byte == b':');
-        let name = name_end.map_or(body, |end| &body[..end]);
-        if COUNTERS.contains(&name) {
-            normalized.extend_from_slice(name);
-            normalized.extend_from_slice(b": 0");
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
+    match sanitize_process_io_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
         }
     }
-    normalized
+}
+
+fn sanitize_process_io_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
+    // Every counter becomes zero. Refused (counted, logged, empty)
+    // on unparseable input; previously unknown lines passed through
+    // verbatim, so a new kernel counter would have leaked host I/O
+    // accounting.
+    if let Err(error) = parse_process_io(contents) {
+        return Err(counted_refusal_reason("io", error));
+    }
+    Ok(render_process_io(&ProcessIo {
+        rchar: 0,
+        wchar: 0,
+        syscr: 0,
+        syscw: 0,
+        read_bytes: 0,
+        write_bytes: 0,
+        cancelled_write_bytes: 0,
+    }))
 }
 
 fn sanitize_node_meminfo(contents: &[u8]) -> Vec<u8> {
@@ -5728,39 +6043,50 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-928): Review the /proc/self/sched field policy.
+#[cfg(test)]
 fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
-    const FLOAT_FIELDS: &[&str] = &["se.exec_start", "se.vruntime", "se.sum_exec_runtime"];
-    const INTEGER_FIELDS: &[&str] = &[
-        "se.nr_migrations",
-        "nr_switches",
-        "nr_voluntary_switches",
-        "nr_involuntary_switches",
-        "se.avg.load_sum",
-        "se.avg.runnable_sum",
-        "se.avg.util_sum",
-        "se.avg.load_avg",
-        "se.avg.runnable_avg",
-        "se.avg.util_avg",
-        "se.avg.last_update_time",
-        "se.avg.util_est",
-        "clock-delta",
+    match sanitize_self_sched_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
+fn sanitize_self_sched_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
+    const FLOAT_FIELDS: &[&[u8]] = &[b"se.exec_start", b"se.vruntime", b"se.sum_exec_runtime"];
+    const INTEGER_FIELDS: &[&[u8]] = &[
+        b"se.nr_migrations",
+        b"nr_switches",
+        b"nr_voluntary_switches",
+        b"nr_involuntary_switches",
+        b"se.avg.load_sum",
+        b"se.avg.runnable_sum",
+        b"se.avg.util_sum",
+        b"se.avg.load_avg",
+        b"se.avg.runnable_avg",
+        b"se.avg.util_avg",
+        b"se.avg.last_update_time",
+        b"se.avg.util_est",
+        b"clock-delta",
     ];
-    const STABLE_INTEGER_FIELDS: &[&str] = &[
-        "se.load.weight",
-        "policy",
-        "prio",
-        "se.slice",
-        "ext.enabled",
-        "uclamp.min",
-        "uclamp.max",
-        "effective uclamp.min",
-        "effective uclamp.max",
+    const STABLE_INTEGER_FIELDS: &[&[u8]] = &[
+        b"se.load.weight",
+        b"policy",
+        b"prio",
+        b"se.slice",
+        b"ext.enabled",
+        b"uclamp.min",
+        b"uclamp.max",
+        b"effective uclamp.min",
+        b"effective uclamp.max",
     ];
-    const UCLAMP_FIELDS: &[(&str, &str)] = &[
-        ("uclamp.min", "0"),
-        ("uclamp.max", "1024"),
-        ("effective uclamp.min", "0"),
-        ("effective uclamp.max", "1024"),
+    const UCLAMP_FIELDS: &[(&[u8], i128)] = &[
+        (b"uclamp.min", 0),
+        (b"uclamp.max", 1024),
+        (b"effective uclamp.min", 0),
+        (b"effective uclamp.max", 1024),
     ];
     // NUMA balancing's lines, with its `current_node=` line and a
     // `numa_faults` line per node, which a kernel built without NUMA does
@@ -5768,225 +6094,170 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
     // under `CONFIG_NUMA_BALANCING`, which depends on `CONFIG_NUMA`): each is
     // checked as the others are and left out, as is how many nodes the host
     // has.
-    const NUMA_BALANCING_FIELDS: &[&str] = &[
-        "mm->numa_scan_seq",
-        "numa_pages_migrated",
-        "numa_preferred_nid",
-        "total_numa_faults",
+    const NUMA_BALANCING_FIELDS: &[&[u8]] = &[
+        b"mm->numa_scan_seq",
+        b"numa_pages_migrated",
+        b"numa_preferred_nid",
+        b"total_numa_faults",
     ];
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return Vec::new();
+    // Grammar-backed parse (comm as bytes, fixed-point values
+    // typed); the policy below — what is zeroed, kept, dropped, or
+    // refused — is unchanged from the text-surgery version it
+    // replaces. Refusals are counted and logged empty files.
+    let mut sched = match parse_sched(contents) {
+        Ok(sched) => sched,
+        Err(error) => return Err(counted_refusal_reason("sched", error)),
     };
-    let mut normalized = Vec::with_capacity(contents.len());
+    sched.pid = 0;
+    sched.threads = 1;
     let mut core_fields_seen = [false; 3];
-    let mut header_seen = false;
-
-    for (line_index, line) in text.split_inclusive('\n').enumerate() {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        if line_index == 0 {
-            let Some((name, details)) = body.rsplit_once(" (") else {
-                return Vec::new();
-            };
-            let Some(details) = details.strip_suffix(')') else {
-                return Vec::new();
-            };
-            let Some((pid, threads)) = details.split_once(", #threads: ") else {
-                return Vec::new();
-            };
-            if pid.parse::<i32>().is_err() || threads.parse::<u64>().is_err() {
-                return Vec::new();
-            }
-            normalized.extend_from_slice(format!("{name} (0, #threads: 1)").as_bytes());
-            if has_newline {
-                normalized.push(b'\n');
-            }
-            header_seen = true;
-            continue;
-        }
-        let Some((left, right)) = body.split_once(':') else {
-            if !body.is_empty() && body.bytes().all(|byte| byte == b'-') {
-                normalized.extend_from_slice(body.as_bytes());
-            } else if body.starts_with("current_node=") {
-                let fields = body
-                    .replace(',', "")
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                if fields.len() != 2
-                    || !fields.iter().all(|field| {
-                        field.split_once('=').is_some_and(|(name, value)| {
-                            matches!(name, "current_node" | "numa_group_id")
-                                && value.parse::<i64>().is_ok()
-                        })
-                    })
+    let mut kept = Vec::with_capacity(sched.entries.len());
+    enum Action {
+        Keep,
+        Drop,
+        Set(SchedValue),
+        Refuse,
+    }
+    for mut entry in std::mem::take(&mut sched.entries) {
+        let action = match &entry {
+            SchedEntry::Separator(_) => Action::Keep,
+            SchedEntry::CurrentNode { .. } | SchedEntry::NumaFaults { .. } => Action::Drop,
+            SchedEntry::Field { label, value, .. } => {
+                if NUMA_BALANCING_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(_) => Action::Drop,
+                        _ => Action::Refuse,
+                    }
+                } else if let Some(index) = FLOAT_FIELDS
+                    .iter()
+                    .position(|field| *field == label.as_slice())
                 {
-                    return Vec::new();
-                }
-                continue;
-            } else if body.starts_with("numa_faults ") {
-                let fields = body.split_whitespace().skip(1).collect::<Vec<_>>();
-                let expected = [
-                    "node",
-                    "task_private",
-                    "task_shared",
-                    "group_private",
-                    "group_shared",
-                ];
-                if fields.len() != expected.len()
-                    || !fields.iter().zip(expected).all(|(field, expected)| {
-                        field.split_once('=').is_some_and(|(name, value)| {
-                            name == expected && value.parse::<u64>().is_ok()
-                        })
-                    })
+                    match value {
+                        SchedValue::Fixed6(v) | SchedValue::Int(v) if *v >= 0 => {
+                            core_fields_seen[index] = true;
+                            Action::Set(SchedValue::Fixed6(0))
+                        }
+                        _ => Action::Refuse,
+                    }
+                } else if let Some((_, replacement)) = UCLAMP_FIELDS
+                    .iter()
+                    .find(|(field, _)| *field == label.as_slice())
                 {
-                    return Vec::new();
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(*replacement)),
+                        _ => Action::Refuse,
+                    }
+                } else if INTEGER_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(0)),
+                        _ => Action::Refuse,
+                    }
+                } else if STABLE_INTEGER_FIELDS.contains(&label.as_slice()) {
+                    match value {
+                        SchedValue::Int(_) => Action::Keep,
+                        _ => Action::Refuse,
+                    }
+                } else {
+                    // New kernels may append observational counters;
+                    // numeric telemetry is zeroed, anything else (a
+                    // negative unknown field) still fails closed. The
+                    // schedstats nanosecond fields print as fixed-point
+                    // milliseconds and land in the Fixed6 arm.
+                    match value {
+                        SchedValue::Int(v) if *v >= 0 => Action::Set(SchedValue::Int(0)),
+                        SchedValue::Fixed6(v) if *v >= 0 => Action::Set(SchedValue::Fixed6(0)),
+                        _ => Action::Refuse,
+                    }
                 }
-                continue;
-            } else {
-                return Vec::new();
             }
-            if has_newline {
-                normalized.push(b'\n');
-            }
-            continue;
+            _ => Action::Refuse,
         };
-        let label = left.trim();
-        if NUMA_BALANCING_FIELDS.contains(&label) {
-            if right.trim().parse::<i128>().is_err() {
-                return Vec::new();
+        match action {
+            Action::Keep => kept.push(entry),
+            Action::Drop => {}
+            Action::Set(new_value) => {
+                // Canonical column width for the new value, never the
+                // width the host value occupied.
+                entry.set_value(new_value);
+                kept.push(entry);
             }
-            continue;
-        }
-        let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
-        {
-            let Ok(value) = right.trim().parse::<f64>() else {
-                return Vec::new();
-            };
-            if !value.is_finite() || value.is_sign_negative() {
-                return Vec::new();
+            Action::Refuse => {
+                return Err(counted_refusal_reason(
+                    "sched",
+                    "scheduler accounting line refused by policy",
+                ));
             }
-            core_fields_seen[index] = true;
-            Some("0.000000")
-        } else if let Some((_, replacement)) =
-            UCLAMP_FIELDS.iter().find(|(field, _)| *field == label)
-        {
-            if right.trim().parse::<u128>().is_err() {
-                return Vec::new();
-            }
-            Some(*replacement)
-        } else if INTEGER_FIELDS.contains(&label) {
-            if right.trim().parse::<u128>().is_err() {
-                return Vec::new();
-            }
-            Some("0")
-        } else if STABLE_INTEGER_FIELDS.contains(&label) {
-            if right.trim().parse::<i128>().is_err() {
-                return Vec::new();
-            }
-            None
-        } else if right.trim().parse::<u128>().is_ok() {
-            // New kernels may append observational scheduler counters. Keep
-            // forward-compatible numeric telemetry deterministic without
-            // accepting malformed or negative unknown fields.
-            Some("0")
-        } else if right
-            .trim()
-            .parse::<f64>()
-            .is_ok_and(|value| value.is_finite() && !value.is_sign_negative())
-            && right.trim().contains('.')
-        {
-            // With kernel.sched_schedstats=1 the kernel adds nanosecond fields
-            // printed as milliseconds with six decimals (sum_sleep_runtime,
-            // wait_max, avg_atom, ...; kernel/sched/debug.c,
-            // proc_sched_show_task). They are host timing, so they become
-            // zero; refusing them emptied the whole file for the guest.
-            Some("0.000000")
-        } else {
-            return Vec::new();
-        };
-
-        if let Some(value) = replacement {
-            normalized.extend_from_slice(left.as_bytes());
-            normalized.extend_from_slice(b": ");
-            normalized.extend_from_slice(value.as_bytes());
-        } else {
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
         }
     }
-
-    if header_seen && core_fields_seen.iter().all(|seen| *seen) {
-        normalized
-    } else {
-        Vec::new()
+    if !core_fields_seen.iter().all(|seen| *seen) {
+        return Err(counted_refusal_reason(
+            "sched",
+            "missing core scheduler fields",
+        ));
     }
+    sched.entries = kept;
+    Ok(render_sched(&sched))
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
+#[cfg(test)]
 fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> Vec<u8> {
-    let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
-        return Vec::new();
-    };
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        if body.starts_with("mnt_id:") {
-            normalized.extend_from_slice(format!("mnt_id:\t{virtual_mount_id}").as_bytes());
-        } else if body.starts_with("ino:") {
-            normalized.extend_from_slice(format!("ino:\t{virtual_inode}").as_bytes());
-        } else if body.starts_with("flags:") {
-            normalized.extend_from_slice(format!("flags:\t{logical_flags:07o}").as_bytes());
-        } else if body.starts_with("eventfd-id:") {
-            normalized.extend_from_slice(format!("eventfd-id: {virtual_open_file}").as_bytes());
-        } else if body.starts_with("Pid:") {
-            normalized.extend_from_slice(b"Pid:\t1");
-        } else if body.starts_with("NSpid:") {
-            normalized.extend_from_slice(b"NSpid:\t1");
-        } else if body.starts_with("tfd:")
-            || body.starts_with("inotify ")
-            || body.starts_with("lock:")
-        {
-            return Vec::new();
-        } else {
-            let allowed = body.split_once(':').is_some_and(|(label, _)| {
-                matches!(
-                    label,
-                    "pos"
-                        | "eventfd-count"
-                        | "eventfd-semaphore"
-                        | "sigmask"
-                        | "clockid"
-                        | "ticks"
-                        | "settime flags"
-                        | "it_value"
-                        | "it_interval"
-                        | "seals"
-                        // Linux reports the number of descriptors currently
-                        // queued on this socket. It is socket state, not a
-                        // host-assigned identity, so preserve it verbatim.
-                        | "scm_fds"
-                )
-            });
-            if !allowed {
-                return Vec::new();
-            }
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
+    match sanitize_fdinfo_checked(contents, identity) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
         }
     }
-    normalized
+}
+
+fn sanitize_fdinfo_checked(
+    contents: &[u8],
+    identity: Option<(u64, i32, u64, u64)>,
+) -> Result<Vec<u8>, String> {
+    let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
+        // No virtual identity to substitute: a named, counted
+        // refusal like every other unserved shape, never an empty
+        // file.
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "no fd identity for the fdinfo snapshot",
+        ));
+    };
+    // Grammar-backed parse; identity substitution below is the same
+    // policy the line surgery applied. Kinds this policy does not
+    // serve (epoll, inotify, fuse), files carrying lock lines, and
+    // unparseable input are refused by name and counted.
+    let mut fdinfo = match parse_fdinfo(contents) {
+        Ok(fdinfo) => fdinfo,
+        Err(error) => return Err(counted_refusal_reason("fdinfo", error)),
+    };
+    if !fdinfo.locks.is_empty() {
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "lock lines are not served",
+        ));
+    }
+    fdinfo.mnt_id = virtual_mount_id;
+    fdinfo.ino = virtual_inode;
+    fdinfo.flags = logical_flags as u32;
+    match &mut fdinfo.kind {
+        FdinfoKind::Plain
+        | FdinfoKind::Signalfd { .. }
+        | FdinfoKind::Timerfd(_)
+        | FdinfoKind::UnixSocket { .. } => {}
+        FdinfoKind::Eventfd { id, .. } => {
+            *id = virtual_open_file;
+        }
+        FdinfoKind::Pidfd { pid, nspid } => {
+            *pid = 1;
+            *nspid = vec![1];
+        }
+        _ => return Err(counted_refusal_reason("fdinfo", "fd kind is not served")),
+    }
+    Ok(render_fdinfo(&fdinfo))
 }
 
 fn numa_page_accounting_value(field: &str) -> Option<&str> {
@@ -8599,11 +8870,11 @@ Rss:                   4 kB\n" as &[u8];
         );
 
         let file = ProcfsFile::from_path(Path::new("/proc/3/status")).unwrap();
-        let status = "Name:\tbash\nTgid:\t4\nPid:\t4\nPPid:\t1\nNSpid:\t4\nUid:\t0\t0\t0\t0\n";
+        let status = "Name:\tbash\nTgid:\t4\nPid:\t4\nPPid:\t1\nUid:\t0\t0\t0\t0\nNSpid:\t4\n";
         assert_eq!(file.kernel_numbers_held(status.as_bytes()), [4, 4, 1, 4]);
         assert_eq!(
             String::from_utf8(renumber_status(status.as_bytes(), &numbers)).unwrap(),
-            "Name:\tbash\nTgid:\t3\nPid:\t3\nPPid:\t1\nNSpid:\t3\nUid:\t0\t0\t0\t0\n"
+            "Name:\tbash\nTgid:\t3\nPid:\t3\nPPid:\t1\nUid:\t0\t0\t0\t0\nNSpid:\t3\n"
         );
         // Not a process's file: nothing held.
         let file = ProcfsFile::from_path(Path::new("/proc/self/stat")).unwrap();
@@ -8631,10 +8902,10 @@ Rss:                   4 kB\n" as &[u8];
     // TODO-HUMAN-REVIEW(#553)
     #[test]
     fn status_normalizes_affinity_and_context_switches() {
-        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nVmHWM:\t    1572 kB\nVmRSS:\t    1568 kB\nRssFile:\t    1452 kB\nSigQ:\t426/2042342\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, Some((3, 3, 1)), None, false),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nVmHWM:\t       0 kB\nVmRSS:\t       0 kB\nRssFile:\t       0 kB\nSigQ:\t0/0\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
@@ -8692,10 +8963,10 @@ Rss:                   4 kB\n" as &[u8];
             sanitize_statm(b"62203 7952 5707 4033 0 3255 0\n"),
             b"0 0 0 0 0 0 0\n"
         );
-        let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
+        let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t  249000 kB\nVmRSS:\t   30000 kB\n";
         assert_eq!(
             sanitize_status(status, None, None, false),
-            b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
+            b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t       0 kB\nVmRSS:\t       0 kB\n"
         );
     }
 
@@ -10215,21 +10486,32 @@ THPeligible:    0\n"
 
     #[test]
     fn fdinfo_hides_backing_identity_only() {
-        let contents = b"pos:\t1\n\
-flags:\t0100002\n\
-mnt_id:\t16368\n\
-ino:\t47761541\n\
-eventfd-count: 0000000000000007\n\
-scm_fds: 2\n";
+        // Kernel-real shapes: an eventfd's three lines (count is
+        // space-padded hex, `%16llx`) and, separately, a unix
+        // socket's scm_fds. (The previous fixture mixed both kinds in
+        // one file with a zero-padded count, which no kernel prints.)
+        let contents = format!(
+            "pos:\t1\nflags:\t0100002\nmnt_id:\t16368\nino:\t47761541\n\
+             eventfd-count: {:16x}\neventfd-id: 999\neventfd-semaphore: 0\n",
+            7
+        )
+        .into_bytes();
 
         assert_eq!(
-            sanitize_fdinfo(contents, Some((9007, 0o100002, 42, 7))),
-            b"pos:\t1\n\
-flags:\t0100002\n\
-mnt_id:\t7\n\
-ino:\t9007\n\
-eventfd-count: 0000000000000007\n\
-scm_fds: 2\n"
+            sanitize_fdinfo(&contents, Some((9007, 0o100002, 42, 7))),
+            format!(
+                "pos:\t1\nflags:\t0100002\nmnt_id:\t7\nino:\t9007\n\
+                 eventfd-count: {:16x}\neventfd-id: 42\neventfd-semaphore: 0\n",
+                7
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            sanitize_fdinfo(
+                b"pos:\t0\nflags:\t02000002\nmnt_id:\t12\nino:\t99\nscm_fds: 2\n",
+                Some((9007, 0o2000002, 42, 7))
+            ),
+            b"pos:\t0\nflags:\t02000002\nmnt_id:\t7\nino:\t9007\nscm_fds: 2\n".as_slice()
         );
         assert!(
             sanitize_fdinfo(
@@ -10302,40 +10584,55 @@ scm_fds: 2\n"
         assert_eq!(snapshot.canonical_mount_id(38), None);
     }
 
+    /// One canonical kernel sched integer line (`%-45s:%21Ld`).
+    fn sched_int_line(label: &str, value: i64) -> String {
+        format!("{label:<45}:{value:>21}\n")
+    }
+
+    /// One canonical kernel sched fixed-point line
+    /// (`%-45s:%14Ld.%06ld`).
+    fn sched_fixed_line(label: &str, whole: i64, frac: u32) -> String {
+        format!("{label:<45}:{whole:>14}.{frac:06}\n")
+    }
+
     #[test]
     fn self_sched_hides_host_scheduler_accounting() {
-        let contents = b"cat (3, #threads: 7)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n\
-nr_switches : 149\n\
-se.avg.load_avg : 749\n\
-uclamp.min : 128\n\
-uclamp.max : 768\n\
-effective uclamp.min : 256\n\
-effective uclamp.max : 512\n\
-policy : 0\n\
-uclamp.max : 1024\n\
-new.kernel.counter : 55\n\
-current_node=7, numa_group_id=91\n\
-numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
+        let contents = format!(
+            "cat (3, #threads: 7)\n{}{}{}{}{}{}{}{}{}{}{}{}current_node=7, numa_group_id=91\nnuma_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+            sched_int_line("nr_switches", 149),
+            sched_int_line("se.avg.load_avg", 749),
+            sched_int_line("uclamp.min", 128),
+            sched_int_line("uclamp.max", 768),
+            sched_int_line("effective uclamp.min", 256),
+            sched_int_line("effective uclamp.max", 512),
+            sched_int_line("policy", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("new.kernel.counter", 55),
+        )
+        .into_bytes();
 
-        assert_eq!(
-            sanitize_self_sched(contents),
-            b"cat (0, #threads: 1)\n\
-se.exec_start : 0.000000\n\
-se.vruntime : 0.000000\n\
-se.sum_exec_runtime : 0.000000\n\
-nr_switches : 0\n\
-se.avg.load_avg : 0\n\
-uclamp.min : 0\n\
-uclamp.max : 1024\n\
-effective uclamp.min : 0\n\
-effective uclamp.max : 1024\n\
-policy : 0\n\
-uclamp.max : 1024\n\
-new.kernel.counter : 0\n"
-        );
+        // Zeroed values render at the kernel's canonical column
+        // width, not at the width the host value occupied.
+        let expected = format!(
+            "cat (0, #threads: 1)\n{}{}{}{}{}{}{}{}{}{}{}{}",
+            sched_fixed_line("se.exec_start", 0, 0),
+            sched_fixed_line("se.vruntime", 0, 0),
+            sched_fixed_line("se.sum_exec_runtime", 0, 0),
+            sched_int_line("nr_switches", 0),
+            sched_int_line("se.avg.load_avg", 0),
+            sched_int_line("uclamp.min", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("effective uclamp.min", 0),
+            sched_int_line("effective uclamp.max", 1024),
+            sched_int_line("policy", 0),
+            sched_int_line("uclamp.max", 1024),
+            sched_int_line("new.kernel.counter", 0),
+        )
+        .into_bytes();
+        assert_eq!(sanitize_self_sched(&contents), expected);
     }
 
     /// A kernel built without NUMA prints none of NUMA balancing's lines
@@ -10344,10 +10641,12 @@ new.kernel.counter : 0\n"
     /// leaves the guest nothing, as any malformed line does.
     #[test]
     fn self_sched_leaves_out_numa_balancing() {
-        let core = "cat (3, #threads: 1)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n";
+        let core = format!(
+            "cat (3, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+        );
         let numa = "mm->numa_scan_seq                            :                    4\n\
 numa_pages_migrated                          :                    5\n\
 numa_preferred_nid                           :                   -1\n\
@@ -10379,17 +10678,20 @@ numa_faults node=1 task_private=7 task_shared=0 group_private=0 group_shared=0\n
     // becomes zero, and the file still reaches the guest.
     #[test]
     fn self_sched_hides_schedstats_fields() {
-        let core = "cat (3, #threads: 1)\n\
-se.exec_start : 377650149.445644\n\
-se.vruntime : 133948666.432951\n\
-se.sum_exec_runtime : 3.637972\n";
+        let core = format!(
+            "cat (3, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 377_650_149, 445_644),
+            sched_fixed_line("se.vruntime", 133_948_666, 432_951),
+            sched_fixed_line("se.sum_exec_runtime", 3, 637_972),
+        );
         let decimal = |label: &str, value: &str| format!("{label:<45}:{value:>21}\n");
-        let mut contents = core.to_owned();
-        let mut expected = "cat (0, #threads: 1)\n\
-se.exec_start : 0.000000\n\
-se.vruntime : 0.000000\n\
-se.sum_exec_runtime : 0.000000\n"
-            .to_owned();
+        let mut contents = core.clone();
+        let mut expected = format!(
+            "cat (0, #threads: 1)\n{}{}{}",
+            sched_fixed_line("se.exec_start", 0, 0),
+            sched_fixed_line("se.vruntime", 0, 0),
+            sched_fixed_line("se.sum_exec_runtime", 0, 0),
+        );
         for (label, value, zero) in [
             ("sum_sleep_runtime", "1234.567890", "0.000000"),
             ("wait_max", "2.500000", "0.000000"),
@@ -10397,7 +10699,8 @@ se.sum_exec_runtime : 0.000000\n"
             ("avg_atom", "0.000001", "0.000000"),
         ] {
             contents.push_str(&decimal(label, value));
-            expected.push_str(&format!("{label:<45}: {zero}\n"));
+            // The zero keeps the kernel's right-aligned column.
+            expected.push_str(&decimal(label, zero));
         }
         assert_eq!(
             String::from_utf8(sanitize_self_sched(contents.as_bytes())).unwrap(),
@@ -10429,6 +10732,77 @@ se.vruntime : 2.0\n\
 se.sum_exec_runtime : 3.0\n\
 nr_switches : -1\n";
         assert!(sanitize_self_sched(negative_counter).is_empty());
+    }
+
+    /// Every grammar-backed sanitizer refuses unparseable or
+    /// unserved input as a counted empty file, never the raw kernel
+    /// bytes (D5). The counter is process-global and monotonic, so
+    /// each path is checked by delta.
+    #[test]
+    fn sanitizers_fail_closed_and_count_refusals() {
+        /// `body` must serve empty and move the refusal counter.
+        fn assert_refused(body: impl FnOnce() -> Vec<u8>) {
+            let before = sanitize_refusal_count();
+            assert!(body().is_empty(), "refusal must serve an empty file");
+            assert!(sanitize_refusal_count() > before, "refusal must be counted");
+        }
+        assert_refused(|| sanitize_stat(b"42 (x) S 1 2 3\n", None));
+        assert_refused(|| sanitize_statm(b"1 2 3\n"));
+        assert_refused(|| sanitize_process_io(b"rchar: x\n"));
+        assert_refused(|| sanitize_status(b"Name:\tx\nSigBlk:\tZZZZ\n", None, None, false));
+        // An unknown status label is dropped by name (counted apart
+        // from whole-file refusals), not a whole-file refusal: known
+        // lines still serve sanitized.
+        let before = sanitize_status_unknown_dropped();
+        assert_eq!(
+            sanitize_status(
+                b"Name:\tx\nPid:\t7\nNewKernelField:\t1\n",
+                None,
+                None,
+                false
+            ),
+            b"Name:\tx\nPid:\t7\n"
+        );
+        assert!(
+            sanitize_status_unknown_dropped() > before,
+            "drop must be counted"
+        );
+        assert_refused(|| sanitize_self_sched(b"not a sched file\n"));
+        assert_refused(|| {
+            sanitize_fdinfo(
+                b"pos:\t0\nflags:\t02\nmnt_id:\t1\nino:\t2\nSqMask:\t0xff\n",
+                Some((1, 2, 3, 4)),
+            )
+        });
+        // An epoll fdinfo parses but is not a served kind.
+        assert_refused(|| {
+            sanitize_fdinfo(
+                b"pos:\t0\nflags:\t02000002\nmnt_id:\t18\nino:\t9225\n\
+                  tfd:        4 events:       19 data:                4  \
+                  pos:0 ino:2f sdev:f\n",
+                Some((1, 2, 3, 4)),
+            )
+        });
+        // A non-UTF-8 comm is not a refusal: it sanitizes.
+        let stat = b"42 (\xff\xfe) R 1 7 8 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 123 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
+        assert!(!sanitize_stat(stat, None).is_empty());
+        // Renumbering an already-refused empty snapshot is not a
+        // second refusal (no double counting in the dispatch chain).
+        assert!(renumber_stat(b"", &BTreeMap::new()).is_empty());
+        assert!(renumber_status(b"", &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn kernel_numbers_held_reads_a_non_utf8_comm() {
+        // The held-numbers read is grammar-based now: a non-UTF-8
+        // comm yields the real kernel numbers, so the guest-number
+        // map is populated and renumbering does not zero every pid
+        // (the DBT failure this guards).
+        let file = ProcfsFile::from_path(Path::new("/proc/4/stat")).unwrap();
+        let mut stat = b"4 (".to_vec();
+        stat.extend_from_slice(&[0xff, 0xfe]);
+        stat.extend_from_slice(format!(") S 1 4 4 0 -1{}\n", " 0".repeat(44)).as_bytes());
+        assert_eq!(file.kernel_numbers_held(&stat), [4, 1, 4, 4]);
     }
 
     #[test]
@@ -11552,6 +11926,18 @@ total_commit_ms 0\n"
         // its next read takes a new capture of the kernel's file.
         let mut kernel = ProcfsFile::from_path(Path::new("/proc/9/stat")).unwrap();
         kernel.initialize(b"9 (x) S 1\n".to_vec(), ProcfsSnapshotContext::default());
+        // A malformed snapshot is a named sanitize refusal the read
+        // path stops the run with, not an empty file to serve. No
+        // snapshot is held while refused, so a later read re-enters
+        // the refusal instead of serving placeholder bytes.
+        assert!(
+            kernel
+                .sanitize_refusal()
+                .is_some_and(|reason| reason.contains("stat")),
+            "{:?}",
+            kernel.sanitize_refusal()
+        );
+        assert!(kernel.needs_snapshot());
         assert!(kernel.drop_stale_task_snapshot(3));
         kernel.note_task_record_rendered(3, false);
         assert!(kernel.needs_snapshot());
@@ -11621,7 +12007,11 @@ total_commit_ms 0\n"
         let mut kernel = ProcfsFile::from_path(Path::new("/proc/7/io")).unwrap();
         assert!(kernel.follows_record_sequence());
         assert!(kernel.drop_stale_task_snapshot(0));
-        kernel.initialize(b"rchar: 0\n".to_vec(), ProcfsSnapshotContext::default());
+        kernel.initialize(
+            b"rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n"
+                .to_vec(),
+            ProcfsSnapshotContext::default(),
+        );
         kernel.note_task_record_rendered(0, true);
         kernel.commit_read(0, 9);
         assert!(!kernel.drop_stale_task_snapshot(9));
@@ -12002,7 +12392,7 @@ total_commit_ms 0\n"
         // The last argument byte is not NUL and the next page cannot be read:
         // a title, read as one string from arg_start (the sentinel is the one
         // byte at arg_end - 1, which a word-sized read would have missed).
-        let mut titled = b"title xyz".to_vec();
+        let mut titled = b"title\x00xyz".to_vec();
         let titled_area = CmdlineArea {
             arg_start: base,
             arg_end: base + titled.len() as u64,

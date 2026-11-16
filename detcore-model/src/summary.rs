@@ -342,6 +342,24 @@ pub struct RunSummary {
     /// human-readable summary, whose INFO view is compared by `--verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syscall_histogram: Option<SyscallHistogramSummary>,
+
+    /// Per-format counts of `/proc` sanitizer refusals during the
+    /// run (Detcore's grammar-backed sanitizers fail closed: a
+    /// refusal stops the run with the named policy refusal in
+    /// strict mode, or fails every read of the refused file with
+    /// `EIO` under `--allow-unsupported-syscalls`; see
+    /// `detcore::procfs`). Empty when nothing was refused. The
+    /// warning line is written by both the full report and the INFO
+    /// view `--verify` compares; the counts are a pure function of
+    /// the captured bytes, so compared runs agree.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub procfs_sanitize_refusals: BTreeMap<String, u64>,
+
+    /// Status labels dropped by name because the grammar does not
+    /// know them yet (the file still served), counted apart from
+    /// whole-file refusals above. Zero in ordinary runs.
+    #[serde(default, skip_serializing_if = "crate::summary::is_zero")]
+    pub procfs_status_unknown_dropped: u64,
     /// The host files the guest opened, with the identity each path's first
     /// open found and the set's digest (see [`crate::host_input`]). Two
     /// separate runs whose digests differ read different host files, which
@@ -897,6 +915,8 @@ impl RunSummary {
             property_snapshot,
             dispatch_stats: _,
             syscall_histogram: _,
+            procfs_sanitize_refusals,
+            procfs_status_unknown_dropped,
             host_inputs: _,
             host_inputs_changed: _,
             exclusive_pairs,
@@ -995,6 +1015,23 @@ impl RunSummary {
                  its programmed branch count, so this run is not reproducible from its seed \
                  (the overshoot moved a preemption point in this execution; another run of the \
                  same seed may not overshoot)"
+            )?;
+        }
+        // One warning line in the default output whenever a sanitize
+        // refusal or a named drop happened: a refused or partially
+        // served procfs file must never be silent.
+        if !procfs_sanitize_refusals.is_empty() || *procfs_status_unknown_dropped > 0 {
+            let parts: Vec<String> = procfs_sanitize_refusals
+                .iter()
+                .map(|(format, count)| format!("{format}={count}"))
+                .collect();
+            writeln!(
+                f,
+                "WARNING: procfs sanitize refusals: [{}] (named stop in strict mode, \
+                 EIO to guest reads under --allow-unsupported-syscalls); \
+                 unknown status labels dropped: {} (known lines served)",
+                parts.join(" "),
+                procfs_status_unknown_dropped
             )?;
         }
         if include_report_metadata && let Some(post_crash) = post_crash {

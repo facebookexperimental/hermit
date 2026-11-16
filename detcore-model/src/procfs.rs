@@ -10,6 +10,45 @@
 
 use std::collections::BTreeSet;
 
+/// The per-task file grammars (`stat`, `status`, `comm`, `fdinfo`,
+/// `io`, `sched`, `statm`) live in `reverie-proc-grammar`, a pure
+/// leaf crate with no backend knowledge; re-exported here so Detcore
+/// consumes them without declaring a `reverie-*` dependency of its
+/// own (the backend-abstraction commandment in `detcore/Cargo.toml`;
+/// a direct dependency plus a checker allowlist entry for this one
+/// pure crate is the named follow-up). Which fields are rewritten,
+/// and to what, is Detcore policy and stays in Detcore.
+pub use reverie_proc_grammar::Bitmap;
+pub use reverie_proc_grammar::Fdinfo;
+pub use reverie_proc_grammar::FdinfoKind;
+pub use reverie_proc_grammar::ProcParseError;
+pub use reverie_proc_grammar::ProcessIo;
+pub use reverie_proc_grammar::Sched;
+pub use reverie_proc_grammar::SchedEntry;
+pub use reverie_proc_grammar::SchedValue;
+pub use reverie_proc_grammar::Stat;
+pub use reverie_proc_grammar::Statm;
+pub use reverie_proc_grammar::Status;
+pub use reverie_proc_grammar::StatusLabel;
+pub use reverie_proc_grammar::StatusLine;
+pub use reverie_proc_grammar::StatusValue;
+pub use reverie_proc_grammar::parse_bitmap_token;
+pub use reverie_proc_grammar::parse_comm_file;
+pub use reverie_proc_grammar::parse_fdinfo;
+pub use reverie_proc_grammar::parse_process_io;
+pub use reverie_proc_grammar::parse_range_list_token;
+pub use reverie_proc_grammar::parse_sched;
+pub use reverie_proc_grammar::parse_stat;
+pub use reverie_proc_grammar::parse_statm;
+pub use reverie_proc_grammar::parse_status;
+pub use reverie_proc_grammar::parse_status_preserving_unknown;
+pub use reverie_proc_grammar::render_comm_file;
+pub use reverie_proc_grammar::render_fdinfo;
+pub use reverie_proc_grammar::render_process_io;
+pub use reverie_proc_grammar::render_sched;
+pub use reverie_proc_grammar::render_stat;
+pub use reverie_proc_grammar::render_statm;
+pub use reverie_proc_grammar::render_status;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 pub use reverie_proc_grammar::mountinfo::MOUNT_PEER_PREFIXES;

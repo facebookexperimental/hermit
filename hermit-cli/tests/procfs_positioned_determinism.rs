@@ -14,18 +14,37 @@
 //! `pread64` and `sendfile` read live kernel bytes. The probe asserts that a
 //! positioned read observes the sanitized snapshot and that a procfs `sendfile`
 //! input is refused, and Hermit's own `--verify` proves both are deterministic.
+//!
+//! The second test pins the guest-visible contract for a sanitize refusal
+//! at the read path, in both failure modes: strict mode stops the run
+//! with the named policy refusal (exit 122), and
+//! `--allow-unsupported-syscalls` fails every read of the refused file
+//! with EIO (first, repeat, pread, dup'd alias) instead of ever serving
+//! it as an empty file.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+
+fn runtime_path(name: &'static str) -> PathBuf {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{name} must be set at run time for this integration test"))
+}
+
+fn repository() -> PathBuf {
+    runtime_path("CARGO_MANIFEST_DIR")
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+        .to_path_buf()
+}
 
 #[test]
 fn procfs_positioned_reads_are_mediated_and_deterministic() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("hermit-cli should be inside the repository");
+    let repository = repository();
     let source = repository.join("tests/c/procfs_positioned_probe.c");
     let guest = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("procfs-positioned-probe-{}", std::process::id()));
@@ -111,4 +130,86 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
         vstdout.contains("Determinism verified") || vstderr.contains("Determinism verified"),
         "Hermit omitted its determinism marker\nstdout:\n{vstdout}\nstderr:\n{vstderr}"
     );
+}
+
+fn compile_refusal_probe() -> std::path::PathBuf {
+    let repository = repository();
+    let source = repository.join("tests/c/procfs_sanitize_refusal_probe.c");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "procfs-sanitize-refusal-probe-{}",
+        std::process::id()
+    ));
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile procfs sanitize refusal probe");
+    assert!(
+        compile.status.success(),
+        "probe compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    guest
+}
+
+fn run_refusal_probe(guest: &Path, mode_args: &[&str]) -> std::process::Output {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "5s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args(["--log=off", "--backend=ptrace", "run"])
+        .args(mode_args)
+        .args(["--base-env=minimal", "--"])
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
+}
+
+/// The probe's trigger is an epoll fdinfo file with a registered
+/// target, a kind Detcore's fdinfo policy does not serve.
+#[test]
+fn procfs_sanitize_refusal_stops_strict_and_fails_every_allow_mode_read() {
+    let guest = compile_refusal_probe();
+
+    // Strict: the first read stops the run with the named refusal.
+    let strict = run_refusal_probe(&guest, &["--strict", "--panic-on-unsupported-syscalls"]);
+    let strict_stdout = String::from_utf8_lossy(&strict.stdout);
+    let strict_stderr = String::from_utf8_lossy(&strict.stderr);
+    assert_eq!(
+        strict.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "strict run should stop with the policy-refusal exit\nstdout:\n{strict_stdout}\nstderr:\n{strict_stderr}"
+    );
+    assert!(
+        strict_stderr.contains("procfs sanitize refused fdinfo"),
+        "strict run should name the refusal\nstdout:\n{strict_stdout}\nstderr:\n{strict_stderr}"
+    );
+
+    // Allow: the probe itself asserts EIO on the first read, a
+    // repeat read, a pread and a dup'd alias; the markers confirm
+    // each check executed rather than being skipped.
+    let allow = run_refusal_probe(&guest, &["--allow-unsupported-syscalls"]);
+    let allow_stdout = String::from_utf8_lossy(&allow.stdout);
+    let allow_stderr = String::from_utf8_lossy(&allow.stderr);
+    assert!(
+        allow.status.success(),
+        "allow-mode run failed: {}\nstdout:\n{allow_stdout}\nstderr:\n{allow_stderr}",
+        allow.status
+    );
+    for marker in [
+        "procfs-refusal-read1-eio",
+        "procfs-refusal-read2-eio",
+        "procfs-refusal-pread-eio",
+        "procfs-refusal-dup-eio",
+        "procfs-refusal-splice-eio",
+        "procfs-refusal-status-splice-einval",
+        "procfs-refusal-uptime-splice-einval",
+    ] {
+        assert!(
+            allow_stdout.contains(marker),
+            "missing {marker}\nstdout:\n{allow_stdout}\nstderr:\n{allow_stderr}"
+        );
+    }
 }

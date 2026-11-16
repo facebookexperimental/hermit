@@ -7478,6 +7478,34 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             Err(Error::Errno(Errno::EINVAL))
                         }
                     } else {
+                        // A splice/tee FROM a procfs snapshot descriptor
+                        // would copy live kernel bytes, bypassing the
+                        // mediated read path — and, for a refused
+                        // snapshot, serve the very bytes the refusal
+                        // withholds. In this allow branch a refused
+                        // snapshot fails by name with EIO, like its
+                        // reads; under the fail-closed policy above
+                        // splice/tee themselves refuse EINVAL and the
+                        // named stop arrives at the fallback read. Any
+                        // other procfs input refuses with EINVAL so
+                        // callers fall back to read/write, exactly as
+                        // under that policy. (Tee's input must be a pipe on Linux,
+                        // so its check never fires for a real procfs
+                        // descriptor; it is spelled the same way.)
+                        let zero_copy_in = match call {
+                            Syscall::Splice(splice) => Some(splice.fd_in()),
+                            Syscall::Tee(tee) => Some(tee.fd_in()),
+                            _ => None,
+                        };
+                        if let Some(fd_in) = zero_copy_in {
+                            self.procfs_sanitize_refusal_gate(guest, fd_in).await?;
+                            let in_is_procfs = guest.thread_state().with_detfd(fd_in, |detfd| {
+                                detfd.record_sequence_unknown() || detfd.procfs_position().is_some()
+                            })?;
+                            if in_is_procfs {
+                                return Err(Error::Errno(Errno::EINVAL));
+                            }
+                        }
                         let result = self.passthrough(guest, call).await;
                         // A forwarded splice from a socket may take a message
                         // whose descriptors Linux releases unseen, and one into a

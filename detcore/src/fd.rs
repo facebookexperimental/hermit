@@ -2600,6 +2600,16 @@ impl DetFd {
         });
     }
 
+    /// Why this description's snapshot sanitize step refused, when
+    /// it did (`ProcfsFile::sanitize_refusal`).
+    pub(crate) fn procfs_sanitize_refusal(&self) -> Option<String> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(|file| file.sanitize_refusal().map(str::to_owned))
+        })
+    }
+
     /// Preview the snapshot bytes at its shared offset, with that offset,
     /// without consuming them.
     pub(crate) fn preview_procfs(&self, maximum: usize) -> Option<(usize, Vec<u8>)> {

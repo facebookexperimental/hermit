@@ -2234,6 +2234,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/procfs_sanitize_refusal_probe.c",
+      "runner": "hermit-cli/tests/procfs_positioned_determinism.rs",
+      "why": "tests/c/procfs_sanitize_refusal_probe.c is owned by hermit-cli/tests/procfs_positioned_determinism.rs: procfs_sanitize_refusal_stops_strict_and_fails_every_allow_mode_read compiles it and runs it under hermit --backend=ptrace, in strict mode where the first read of its epoll fdinfo must stop the run with the named policy refusal, and under --allow-unsupported-syscalls where the probe itself asserts EIO on the first, repeat, pread and dup'd reads; a generic manifest cannot vary the unsupported-syscalls policy or assert the strict exit status."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/procfs_system_directories.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/procfs_system_directories.c is owned by hermit-cli/tests/cli.rs: run_kvm_procfs_system_directories_answer_as_on_ptrace runs it under hermit run --strict on ptrace and on KVM at --proc=minimal and --proc=standard and requires KVM's output to equal ptrace's line for line: stat, lstat, opendir, fstat and the listing of every system-wide /proc directory of the level table, the listing's inode agreement with stat, rewind, fstatfs, O_TMPFILE, access(W_OK) and statfs, and the same through a symbolic link to /proc/sys, by redundant spellings, with .., for names the level or the kernel lacks, and at PATH_MAX; it stays a fixture because a generic manifest cannot compare one backend's run with another's."
