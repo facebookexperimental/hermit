@@ -97,7 +97,6 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_lock_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy \"$@\"; else \"$@\"; fi; }; hermit_run_lock_check ./ci/run-cargo-lock-check.sh --repo \"$PWD\"",
       "result_manifests": [],
       "deps": [
-        "gate.manifest",
         "pre.reverie_pin",
         "pre.submodules"
       ],

@@ -3179,6 +3179,11 @@ fn materialize_pressure_labels(cfg: &mut DagConfig) -> Result<(), String> {
 /// Keep direct preflight dependencies on host commands and tests so focused
 /// selection cannot drop their source/gate ordering. Pinned preparation retains
 /// its original pin/fetch prerequisites and can overlap the manifest audit.
+/// A preflight check (group `pre`) is not given the manifest gate either: it is
+/// preflight itself and consumes nothing the audit produces, so it keeps its
+/// authored dependencies plus the pin gate. Given the gate, pre.cargo_lock
+/// (a 900-second wall) ran after the whole portable preflight chain and moved
+/// its critical path from 3900 to 4800 seconds, past the preflight job's bound.
 fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
     for (labels, gate, pin, manifest_producer) in [
         (
@@ -3229,7 +3234,8 @@ fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
             }
             let pinned_preparation =
                 step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX) || tag == PINNED_ROOT_FETCH_TAG;
-            if !pinned_preparation && !gate_ancestors.contains(&tag) {
+            let preflight_check = step.group == "pre";
+            if !pinned_preparation && !preflight_check && !gate_ancestors.contains(&tag) {
                 step.deps.push(gate.into());
             }
             if !pin_ancestors.contains(&tag) && !gate_ancestors.contains(&tag) {

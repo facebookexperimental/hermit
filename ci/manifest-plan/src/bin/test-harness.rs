@@ -2373,6 +2373,8 @@ fn resolve_portable_selectors(portable: &dagrun::DagConfig, nodes: Vec<String>) 
 // build.rust_scripts' wall cap grew (900 to 1200) to keep 1.5 times its
 // largest observed wall. 3900 = 4200 minus setup.manifest_plan's 300 seconds,
 // which since 2026-10-16 runs beside build.rust_scripts instead of after it.
+// pre.cargo_lock (900 s) waits only on pre.submodules and pre.reverie_pin, so
+// its 2700-second chain runs beside build.rust_scripts and leaves 3900 as is.
 const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3900;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
@@ -2397,7 +2399,7 @@ fn audit_portable_preflight_budget(
     let preflight_nodes = resolve_portable_selectors(portable, preflight_nodes);
     // ci/run-node.sh passes --ignore-selected-deps: dependencies outside the
     // declared preflight population are supplied by the workflow, while edges
-    // among these five selected nodes remain load-bearing.
+    // among the selected preflight nodes remain load-bearing.
     let selected = dagrun::select_steps_by_tags(portable, &preflight_nodes, true)
         .map_err(|error| format!("cannot select portable preflight closure: {error}"))?;
     let critical_path = dag_critical_path(&selected)?;

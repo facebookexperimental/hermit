@@ -7835,10 +7835,13 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     let mut expected_tags = [child.clone(), parent.clone()]
         .into_iter()
         .collect::<BTreeSet<_>>();
+    // The same preflight build_plan forces into an --only selection,
+    // the Cargo.lock gate included.
     expected_tags.extend(
         [
             "pre.submodules",
             PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
             RUST_SCRIPT_PRODUCER_TAG,
             validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
             "gate.manifest",
@@ -7922,6 +7925,8 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
+    // Off record, build_plan still forces the minimal preflight: the
+    // submodules, the pin gate and the Cargo.lock gate.
     // The pinned-root command consumes its prepared script producer and locked
     // input fetch even off record. test.detcore_unit also requires the
     // prepared-nextest record, so its declared build chain is retained.
@@ -7930,6 +7935,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     let expected_off_record = [
         "pre.submodules".to_string(),
         PIN_GATE_TAG.to_string(),
+        CARGO_LOCK_GATE_TAG.to_string(),
         "test.detcore_unit".to_string(),
         "build.rust_scripts_in_pinned_root".to_string(),
         "setup.pinned_root_fetch".to_string(),
@@ -34705,6 +34711,7 @@ mod committed_selection_preservation_tests {
                 expected.extend([
                     "pre.submodules".into(),
                     PIN_GATE_TAG.into(),
+                    CARGO_LOCK_GATE_TAG.into(),
                     "compatprep.fixtures_on_host".into(),
                     validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
                     RUST_SCRIPT_PRODUCER_TAG.into(),
