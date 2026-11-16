@@ -1,4 +1,10 @@
 name: CI (DAG runner, manual)
+# NOTE (facebookexperimental): the self-hosted jobs in this file are
+# guarded to rrnewton/hermit and skip here; there are no self-hosted
+# runners on facebookexperimental. Kept because scripts/validate.rs and the test
+# harness still reference the DAG lanes; retire the privileged
+# lane together with those references. The portable lane is
+# unguarded.
 
 # Manual entrypoint for comparing or debugging the portable and privileged DAGs.
 # The integration-branch GitHub-managed portable signal uses the same portable

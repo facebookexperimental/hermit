@@ -1,4 +1,10 @@
 name: Linux boot (QEMU) — dedicated lane
+# NOTE (facebookexperimental): this workflow has no repository
+# guard; its only job needs a self-hosted PMU runner, which
+# facebookexperimental does not have, so a manual dispatch there
+# queues until GitHub cancels it after about 24 h. It does not
+# skip. Kept because it is the only Linux-boot demo runner;
+# deleting it needs an explicit later decision.
 
 # WHY THIS IS ITS OWN WORKFLOW.
 #

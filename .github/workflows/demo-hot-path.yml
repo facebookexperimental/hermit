@@ -1,4 +1,9 @@
 name: P0 Demo Gate (Hermit hot paths)
+# NOTE (facebookexperimental): the self-hosted jobs in this file are
+# guarded to rrnewton/hermit and skip here; there are no self-hosted
+# runners on facebookexperimental. Kept because merge-gate.yml queries and
+# re-runs this workflow and scripts/check-merge-gate-policy.sh
+# requires that re-run line.
 
 # The unified demos live in rrnewton/dev-hermit, but the parent repository has
 # no self-hosted runner. A manual dispatch runs the suite on Hermit's trusted PMU

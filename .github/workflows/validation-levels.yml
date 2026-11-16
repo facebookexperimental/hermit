@@ -1,4 +1,9 @@
 name: Validation Levels
+# NOTE (facebookexperimental): the self-hosted jobs in this file are
+# guarded to rrnewton/hermit and skip here; there are no self-hosted
+# runners on facebookexperimental. Kept because the trigger checker and
+# validation tooling still reference its levels; the quick job is
+# unguarded and runs on hosted runners.
 
 on:
   workflow_dispatch:

@@ -1,4 +1,9 @@
 name: CI (privileged)
+# NOTE (facebookexperimental): the self-hosted jobs in this file are
+# guarded to rrnewton/hermit and skip here; there are no self-hosted
+# runners on facebookexperimental. Kept because the validation DAG and
+# runner-health tooling still reference this lane; retire it
+# together with those references.
 
 on:
   workflow_dispatch:

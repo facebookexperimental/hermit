@@ -1,4 +1,10 @@
 name: Merge Gate
+# NOTE (facebookexperimental): the self-hosted jobs in this file are
+# guarded to rrnewton/hermit and skip here; there are no self-hosted
+# runners on facebookexperimental. Kept because its demo step,
+# scripts/check-merge-gate-policy.sh, the test-footprint data and
+# the validation DAG still reference it; retire it together with
+# those references.
 
 on:
   workflow_dispatch:

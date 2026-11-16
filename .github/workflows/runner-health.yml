@@ -26,7 +26,7 @@ jobs:
         run: >-
           echo "::warning title=Runner health monitoring disabled::Configure
           RUNNER_HEALTH_TOKEN with Actions (read) and Administration (read)
-          access to rrnewton/hermit"
+          access to this repository"
       - uses: actions/checkout@v4
         if: env.GH_TOKEN != ''
       - name: Restore offline-state observations
