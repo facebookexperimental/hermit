@@ -1,0 +1,36 @@
+---
+schema: syscall-pages/v2
+syscall: rt_sigreturn
+nr_x86_64: 15
+related:
+  - https://github.com/rrnewton/hermit/issues/408
+discussion:
+  kind: new
+  url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigreturn&body=Discussion+for+the+%60rt_sigreturn%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigreturn.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigreturn%60%2C+or+in+what+the+page+says%3F%0A
+# code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
+code_facts:
+  as_of: 54bd03547df04c519fedfb6c97ede1933bda4182
+  detcore_class: passthrough
+  dispatch: "sysno-guard"
+  refused: false
+  refused_only_when_fail_closed: false
+  subscribed_run: true
+  subscribed_record_replay: false
+---
+
+## Strategy
+
+Detcore classifies `rt_sigreturn` (15) as passthrough via sysno-guard dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: false.
+
+- Reviewed list: `detcore/src/syscall_classification.rs:2064`
+- Dispatch: `detcore/src/lib.rs:8487`
+
+This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
+
+## Discussion
+
+[Start a discussion about `rt_sigreturn`](https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+rt_sigreturn&body=Discussion+for+the+%60rt_sigreturn%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frt_sigreturn.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60rt_sigreturn%60%2C+or+in+what+the+page+says%3F%0A) (opens a prefilled issue form; nothing is filed until you submit it).
+
+## Status
+
+- 2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.

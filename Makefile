@@ -204,6 +204,7 @@ LINT_CHECK_TARGETS := \
     lint-check-docs-pages-contract \
     lint-check-pre-push-submodule-diagnosis \
     lint-check-doc-bare-urls \
+    lint-check-syscall-pages \
     lint-check-private-workspace-refs \
     lint-check-pre-push-doc-bare-urls \
     lint-check-required-check-outcomes \
@@ -279,6 +280,9 @@ lint-check-pre-push-submodule-diagnosis:
 
 lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
+
+lint-check-syscall-pages:
+	./scripts/syscall-pages.rs check --quick
 
 lint-check-private-workspace-refs:
 	./scripts/check-private-workspace-refs.sh
