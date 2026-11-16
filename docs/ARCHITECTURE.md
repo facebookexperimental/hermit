@@ -77,6 +77,7 @@ guest sees. Add an item only with the owner's approval and a written reason.
   and re-entry); building and popping the signal frame on the vCPU stack for
   `rt_sigreturn`, while Detcore decides which signal is delivered with which
   mask.
+- **ptrace (aarch64), restart codes a Tool returns:** when a Tool answers a guest syscall with `-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND` or `-ERESTART_RESTARTBLOCK`, the backend re-creates the syscall exit that the host kernel's restart processing needs, so the kernel resolves the code as x86-64's kernel does unaided. It does this through a skipped syscall's exit; with a held signal, through a tracer-queued real-time carrier signal that is identified by a secret cookie and never delivered; and with a temporary mask's restore pending, by putting back the syscall number, when the kernel's restart would run the call with the guest's own first argument. Where that route is closed or cannot run, or a restart would take an injected call's first argument, it reports what it read to the Tool and writes the Tool's answer; Detcore decides. It never chooses an outcome, and its own refusals are mechanism failures, named. Reason: without it, aarch64 guests receive errno 512-516 as syscall results. Tracked by https://github.com/facebookexperimental/hermit/issues/116.
 
 ## System overview
 
