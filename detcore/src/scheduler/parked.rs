@@ -263,6 +263,11 @@ pub enum ProtocolFailure {
     UnexpectedControl,
     Timer(TimerFailure),
     Observation(reverie::SignalObservationFailure),
+    /// A backend-forced frame-failure exit of a child that has (or had)
+    /// more than one thread: refused by name, because the
+    /// schedule-ordered mark for a synthesized death is proven only for
+    /// single-threaded children.
+    MultithreadedForcedChildExit,
 }
 impl From<TimerFailure> for ProtocolFailure {
     fn from(value: TimerFailure) -> Self {

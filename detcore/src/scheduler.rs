@@ -32,7 +32,7 @@ mod guest_send_admission_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
-mod parked_tests;
+pub(crate) mod parked_tests;
 pub(crate) mod pid_namespaces;
 mod pipe_wake;
 pub(crate) mod posix_timer_coalesce;

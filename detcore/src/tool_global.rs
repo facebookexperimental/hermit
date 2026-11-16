@@ -3500,8 +3500,40 @@ impl GlobalTool for GlobalState {
         // generation-bound publication under the scheduler mutex, then
         // self-wakes and returns Pending; its second poll consumes the typed
         // result and releases the stage-2 control barrier.
-        crate::scheduler::signal_control::ChildExitPublicationFuture::new(self.sched.clone(), event)
-            .await
+        //
+        // Poll once here so a death admission synthesized for a
+        // backend-forced exit releases its threads' descriptor tables
+        // between the polls, while the stage-2 barrier still holds every
+        // later turn and before the backend exposes waitability.
+        let mut publication = crate::scheduler::signal_control::ChildExitPublicationFuture::new(
+            self.sched.clone(),
+            event,
+        );
+        // Drive the helper's first poll here, release any synthesized
+        // death's tables, then suspend once ourselves: the backend
+        // exposes waitability only after this callback's first poll
+        // returns Pending, so completing the second poll inside the same
+        // outer poll would release the stage-2 barrier before that
+        // exposure and let the parent's wait turn observe a child the
+        // backend has not made waitable yet.
+        let mut first_poll_done = false;
+        std::future::poll_fn(|cx| {
+            if !first_poll_done {
+                first_poll_done = true;
+                match std::pin::Pin::new(&mut publication).poll(cx) {
+                    std::task::Poll::Ready(result) => return std::task::Poll::Ready(result),
+                    std::task::Poll::Pending => {
+                        if let Some(death) = publication.take_signal_death() {
+                            self.release_tables_at_death(death);
+                        }
+                        cx.waker().wake_by_ref();
+                        return std::task::Poll::Pending;
+                    }
+                }
+            }
+            std::pin::Pin::new(&mut publication).poll(cx)
+        })
+        .await
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
@@ -18586,6 +18618,65 @@ mod tests {
             .thread_tree
             .set_process_group(detpid, detpid);
         (config, state, dettid, detpid)
+    }
+
+    #[test]
+    fn backend_forced_child_death_is_admitted_between_publication_polls() {
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Poll;
+
+        use reverie::GlobalTool as _;
+
+        use crate::scheduler::parked_tests as parked;
+
+        // The callback drives the publication future's first poll itself:
+        // a backend-forced child exit is synthesized and published there,
+        // the callback then suspends once (so the backend exposes
+        // waitability only after that first poll), and its second poll
+        // completes the publication.
+        let (_config, mut state, _tid, _process) = cancellation_test_state();
+        let (mut scheduler, backend) = parked::fixture();
+        let _ = parked::add(&mut scheduler, 100, 100);
+        let (child, _child_mm, _) = parked::add_process_child(&mut scheduler, 100, 200);
+        state.sched = std::sync::Arc::new(Mutex::new(scheduler));
+        // The child holds a descriptor table, so the first poll's table
+        // release is observable: if the wrapper dropped the synthesized
+        // death (the old plain-.await shape), the held entry would stay.
+        assert!(
+            crate::syscalls::scm_rights::releases_tables_at_exits(&state.cfg),
+            "this test's config must enable table release at exits"
+        );
+        let table = std::sync::Arc::new(Mutex::new(crate::tool_local::FileMetadata::new(child)));
+        state
+            .held_tables
+            .lock()
+            .unwrap()
+            .insert(child, std::sync::Arc::downgrade(&table));
+        let mut event = parked::child_exit_event(
+            parked::task(100, 100).process,
+            parked::task(200, 200).process,
+            reverie::ExitStatus::signaled(libc::SIGSEGV, true),
+            true,
+        );
+        event.forced = true;
+        let mut callback = Box::pin(state.on_backend_child_wait_event(event));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(callback.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+        assert!(
+            !state.sched.lock().unwrap().next_turns.contains_key(&child),
+            "the synthesized death retired the child on the first poll"
+        );
+        assert!(
+            !state.held_tables.lock().unwrap().contains_key(&child),
+            "the wrapper released the death's held table between polls"
+        );
+        assert!(matches!(
+            callback.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     fn install_test_registration(state: &GlobalState, dettid: DetTid, request: Ivar<SchedRequest>) {

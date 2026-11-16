@@ -45,11 +45,11 @@ use crate::config::SchedHeuristic;
 use crate::tool_global::SigalrmControl;
 
 #[derive(Default)]
-struct Backend {
+pub(crate) struct Backend {
     child_effect: Mutex<Option<ChildExitPublicationEffect>>,
     child_failures: Mutex<Vec<ChildExitPublication>>,
     child_publication_probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    child_publications: Mutex<Vec<ChildExitCompletion>>,
+    pub(crate) child_publications: Mutex<Vec<ChildExitCompletion>>,
     fail_child_publication: std::sync::atomic::AtomicBool,
     fail_publication: std::sync::atomic::AtomicBool,
     /// Every alarm and timer publication reports its signal already pending.
@@ -401,7 +401,7 @@ fn committed_clock(s: &Scheduler) -> Arc<Mutex<GlobalTime>> {
     global.add_extra_time(std::time::Duration::from_nanos(s.committed_time.as_nanos()));
     Arc::new(Mutex::new(global))
 }
-fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
+pub(crate) fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
     SignalTaskIdentity {
         process: SignalProcessId {
             tgid: reverie::Pid::from_raw(pid),
@@ -411,7 +411,7 @@ fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
         task_generation: tid as u64,
     }
 }
-fn fixture() -> (Scheduler, Arc<Backend>) {
+pub(crate) fn fixture() -> (Scheduler, Arc<Backend>) {
     fixture_with_control(true)
 }
 /// A scheduler for a backend that reports the KVM capabilities. With
@@ -504,7 +504,7 @@ fn async_exit_completion_refuses_signal_control() {
     assert!(!s.signal_control_installed());
 }
 
-fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
+pub(crate) fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
     add_with_mm(s, pid, tid, MmId::initial(DetTid::from_raw(pid)))
 }
 fn add_with_mm(
@@ -547,7 +547,7 @@ fn add_with_mm(
     )
 }
 
-fn add_process_child(
+pub(crate) fn add_process_child(
     s: &mut Scheduler,
     parent: i32,
     child: i32,
@@ -582,7 +582,7 @@ fn add_process_child(
     )
 }
 
-fn child_exit_event(
+pub(crate) fn child_exit_event(
     parent: SignalProcessId,
     child: SignalProcessId,
     status: ExitStatus,
@@ -4051,6 +4051,360 @@ fn nonwaitable_child_auto_reaps_shadow_regardless_of_signal_effect() {
         backend.child_publications.lock().unwrap()[0],
         event.child_exit_completion().unwrap()
     );
+}
+
+#[test]
+fn backend_forced_signal_exit_without_reservation_publishes_as_task_local_death() {
+    // A backend-forced fatal signal (a refused rt_sigreturn frame in the
+    // guest that found this) ends a forked child inside the backend's
+    // signal machinery: no exit grant created a reservation and no
+    // terminal boundary receipt exists. Admission synthesizes the final
+    // transition, retires the child, and hands its death back between
+    // the two polls; publication then proceeds exactly as a controlled
+    // exit's does.
+    for waitable in [true, false] {
+        let (mut s, backend) = fixture();
+        let _ = add(&mut s, 100, 100);
+        let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+        let status = ExitStatus::signaled(libc::SIGSEGV, true);
+        let mut event = child_exit_event(
+            task(100, 100).process,
+            task(200, 200).process,
+            status,
+            waitable,
+        );
+        event.forced = true;
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+        assert_eq!(
+            publication.take_signal_death(),
+            Some(super::signal_control::SignalDeath {
+                process: DetPid::from_raw(200),
+                threads: vec![child],
+            })
+        );
+        assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+        {
+            let s = scheduler.lock().unwrap();
+            assert!(s.control_barrier(), "stage 2 survives admission");
+            assert!(!s.next_turns.contains_key(&child), "child retired");
+        }
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Ok(()))
+        ));
+        let s = scheduler.lock().unwrap();
+        assert!(!s.control_barrier());
+        let spec = crate::types::ChildWaitSpec {
+            selector: crate::types::ChildWaitSelector::Exact(DetPid::from_raw(200)),
+            owner: None,
+            exit_class: crate::types::ChildWaitExitClass::Sigchld,
+        };
+        assert_eq!(
+            s.ready_child_wait(DetPid::from_raw(100), spec),
+            waitable.then_some(DetPid::from_raw(200))
+        );
+    }
+}
+
+#[test]
+fn backend_forced_exit_without_a_signal_still_needs_a_reservation() {
+    // Synthesis is for the backend's own synchronous SIGSEGV only: an
+    // ordinary exited status the scheduler never granted, and signals
+    // some other actor owns (a guest-sent SIGKILL, a watchdog SIGTERM),
+    // remain protocol failures, so this path cannot bypass exit grants
+    // or launder a host-forced death into a schedule-committed one.
+    for status in [
+        ExitStatus::Exited(7),
+        ExitStatus::signaled(libc::SIGKILL, false),
+        ExitStatus::signaled(libc::SIGTERM, false),
+    ] {
+        let (mut s, backend) = fixture();
+        let _ = add(&mut s, 100, 100);
+        let _ = add_process_child(&mut s, 100, 200);
+        let mut event =
+            child_exit_event(task(100, 100).process, task(200, 200).process, status, true);
+        // Forced provenance present: these refusals pin the status gate
+        // itself, not the provenance gate.
+        event.forced = true;
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(publication.take_signal_death(), None);
+        assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn unforced_sigsegv_without_reservation_is_not_synthesized() {
+    // The same SIGSEGV status without typed backend-forced provenance
+    // (a guest fault death that reached publication through no
+    // controlled boundary) is never synthesized: provenance, not the
+    // signal number, opens this path. The refusal records nothing.
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    assert!(!event.forced);
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Err(_))
+    ));
+    assert_eq!(publication.take_signal_death(), None);
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    assert!(
+        scheduler.lock().unwrap().next_turns.contains_key(&child),
+        "refusal left the child unretired"
+    );
+}
+
+#[test]
+fn backend_forced_multithreaded_child_exit_is_refused_by_name() {
+    // Synthesis is scoped to single-threaded children: with workers
+    // live, another turn could run between the forced exit and
+    // publication, so the schedule-ordered mark is unproven and the
+    // exit is refused rather than relabeled. The refusal retires
+    // nobody and publishes nothing, and it is the named scope refusal
+    // (EOPNOTSUPP, not generic protocol EINVAL). The workers are added
+    // out of tid order (202 before 201).
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+    let (worker_b, _mm_b, _) = add(&mut s, 200, 202);
+    let (worker_a, _mm_a, _) = add(&mut s, 200, 201);
+    let mut event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    event.forced = true;
+    // Admission itself, not the future: the future ends the process
+    // with the policy-refusal exit for this variant (covered by
+    // a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status).
+    let (result, death) = s.begin_child_exit_publication(event);
+    assert_eq!(
+        result,
+        Err(ProtocolFailure::MultithreadedForcedChildExit),
+        "the named multithreaded scope refusal, not generic EINVAL"
+    );
+    assert_eq!(death, None);
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    for tid in [child, worker_a, worker_b] {
+        assert!(
+            s.next_turns.contains_key(&tid),
+            "refusal left thread {tid} unretired"
+        );
+    }
+    assert!(
+        !s.parked
+            .terminal_processes
+            .contains_key(&ProcessGeneration::from_backend(event.child)),
+        "refusal recorded no terminal transition"
+    );
+    assert!(
+        !s.parked
+            .child_exit_reservations
+            .contains_key(&ProcessGeneration::from_backend(event.child)),
+        "refusal installed no reservation"
+    );
+}
+
+#[test]
+fn backend_forced_child_with_an_exited_sibling_is_refused_by_name() {
+    // The scope is "never had a second thread": a sibling that already
+    // deregistered (however it exited) puts the child outside it, with
+    // the same named refusal as live siblings.
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+    let (worker, _worker_mm, _) = add(&mut s, 200, 201);
+    // The worker already exited: no next turn remains for it, while the
+    // thread tree still lists it among the process's threads.
+    s.next_turns.remove(&worker);
+    let mut event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    event.forced = true;
+    let (result, death) = s.begin_child_exit_publication(event);
+    assert_eq!(
+        result,
+        Err(ProtocolFailure::MultithreadedForcedChildExit),
+        "the named multithreaded scope refusal, not generic EINVAL"
+    );
+    assert_eq!(death, None);
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    assert!(s.next_turns.contains_key(&child));
+}
+
+/// Where the child of
+/// [`a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status`]
+/// learns to run its case.
+const MULTITHREADED_FORCED_CHILD: &str = "HERMIT_MULTITHREADED_FORCED_CHILD_CASE";
+
+/// The child side: a forced frame-failure exit of a multithreaded child
+/// reaches the publication future, which must end this process with
+/// the policy-refusal exit before the marker prints.
+fn run_multithreaded_forced_child_case() {
+    let (mut s, _backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add(&mut s, 200, 201);
+    let mut event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    event.forced = true;
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler,
+        event,
+    ));
+    let _ = poll_child_exit(&mut publication);
+    println!("MULTITHREADED_FORCED_CHILD survived");
+}
+
+/// The named multithreaded refusal is a policy refusal, not a Hermit
+/// failure: through the real publication future it ends the process
+/// with HERMIT_POLICY_REFUSAL_EXIT (122) and the named refusal on
+/// stderr. Run in a child of this test binary because the refusal
+/// ends the process.
+#[test]
+fn a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status() {
+    if std::env::var_os(MULTITHREADED_FORCED_CHILD).is_some() {
+        run_multithreaded_forced_child_case();
+        return;
+    }
+    const TEST: &str =
+        "scheduler::parked_tests::a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status";
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(MULTITHREADED_FORCED_CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "the run did not end within 60 s\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("forced exit of a multithreaded KVM child is unsupported"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("MULTITHREADED_FORCED_CHILD survived"));
+}
+
+#[test]
+fn backend_forced_child_with_an_outstanding_permit_is_refused() {
+    // A delivery permit for the child is still outstanding: its signal
+    // boundary owns the death, so synthesis refuses (generic protocol
+    // failure, not the named scope refusal) and records nothing.
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.parked.permits.insert(
+        child,
+        SignalDeliveryPermit {
+            task: task(200, 200),
+            sequence: 999,
+            site: None,
+        },
+    );
+    let mut event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    event.forced = true;
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    let Poll::Ready(Err(error)) = poll_child_exit(&mut publication) else {
+        panic!("forced exit with an outstanding permit must refuse");
+    };
+    match error.into_errno() {
+        Ok(errno) => assert_eq!(errno, reverie::Errno::EINVAL),
+        Err(other) => panic!("expected an errno refusal, got {other:?}"),
+    }
+    assert_eq!(publication.take_signal_death(), None);
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    assert!(scheduler.lock().unwrap().next_turns.contains_key(&child));
+}
+
+#[test]
+fn backend_forced_child_with_a_generation_mismatch_is_refused() {
+    // The completion names a different generation of the child's pid
+    // than the live process: not this child's death, never synthesized.
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _child_mm, _) = add_process_child(&mut s, 100, 200);
+    let mut stale_child = task(200, 200).process;
+    stale_child.generation += 1;
+    let mut event = child_exit_event(
+        task(100, 100).process,
+        stale_child,
+        ExitStatus::signaled(libc::SIGSEGV, true),
+        true,
+    );
+    event.forced = true;
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Err(_))
+    ));
+    assert_eq!(publication.take_signal_death(), None);
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 0);
+    assert!(scheduler.lock().unwrap().next_turns.contains_key(&child));
 }
 
 #[test]

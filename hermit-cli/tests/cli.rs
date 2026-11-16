@@ -206,6 +206,7 @@ static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_TARGET_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TWO_CHILD_AFTER_HANDLER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static MALFORMED_SIGRETURN_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TWO_CHILD_SLICE_BURNING_HANDLER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28494,6 +28495,75 @@ fn two_children_after_a_handler_return_choose_the_creator() {
     } else {
         eprintln!("skipping the KVM two-child case: /dev/kvm is unavailable");
     }
+    for backend in backends {
+        let _guard = hermit_run_guard();
+        let guest = guest_path.to_str().expect("guest path should be UTF-8");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args: Vec<&str> = backend.to_vec();
+        args.extend([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
+        assert_eq!(stdout(&output), native, "{backend:?}");
+    }
+}
+
+/// A forked child whose rt_sigreturn frame the backend refuses dies by
+/// SIGSEGV and its parent reaps it and runs on, as on Linux
+/// (https://github.com/facebookexperimental/hermit/issues/122). On KVM
+/// the backend forces that exit inside its signal machinery, before any
+/// exit reservation exists; at the parent of the fix this guest aborted
+/// the whole KVM run with exit 125 at child-exit publication admission.
+#[test]
+fn malformed_sigreturn_kills_only_the_child() {
+    malformed_sigreturn_case(&[&[][..]]);
+}
+
+/// The KVM half of the malformed-sigreturn case, in the KVM lane
+/// (run_kvm_* inventory, forbid-skips): at the parent of the fix this
+/// run aborted the whole Hermit run with exit 125 at child-exit
+/// publication admission, so assert_success is the red twin.
+#[test]
+fn run_kvm_malformed_sigreturn_kills_only_the_child() {
+    let test = "run_kvm_malformed_sigreturn_kills_only_the_child";
+    if kvm_unavailable(test) {
+        return;
+    }
+    malformed_sigreturn_case(&[&["--backend=kvm"][..]]);
+}
+
+fn malformed_sigreturn_case(backends: &[&[&str]]) {
+    let guest_path = MALFORMED_SIGRETURN_CHILD_GUEST
+        .get_or_init(|| compile_c_guest("malformed_sigreturn_child"));
+    let native = {
+        let output = Command::new(guest_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the malformed-sigreturn guest natively");
+        assert!(output.status.success(), "natively: {output:?}");
+        String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+    };
+    assert_eq!(
+        native, "child status signal=11 exit=0\nparent survived\n",
+        "natively"
+    );
     for backend in backends {
         let _guard = hermit_run_guard();
         let guest = guest_path.to_str().expect("guest path should be UTF-8");

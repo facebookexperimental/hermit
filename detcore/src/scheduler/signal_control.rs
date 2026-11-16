@@ -55,7 +55,7 @@ pub(crate) enum ExitReserveMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ChildExitBegin {
+pub(super) enum ChildExitBegin {
     Publish,
     ExactDuplicate,
 }
@@ -86,6 +86,11 @@ pub(crate) struct ChildExitPublicationFuture {
     sched: Arc<Mutex<Scheduler>>,
     event: reverie::BackendChildWaitEvent,
     state: ChildExitPollState,
+    /// A death admission synthesized for a backend-forced exit (see
+    /// `Scheduler::synthesize_backend_forced_child_exit`): the caller
+    /// releases its descriptor tables between the two polls, before the
+    /// backend exposes waitability.
+    signal_death: Option<SignalDeath>,
 }
 
 impl ChildExitPublicationFuture {
@@ -94,12 +99,25 @@ impl ChildExitPublicationFuture {
             sched,
             event,
             state: ChildExitPollState::Admission,
+            signal_death: None,
         }
+    }
+
+    /// The death admission synthesized on the first poll, if any. The
+    /// caller takes it between polls so descriptor tables are released
+    /// while the stage-2 barrier still holds every later turn.
+    pub(crate) fn take_signal_death(&mut self) -> Option<SignalDeath> {
+        self.signal_death.take()
     }
 
     fn protocol_error(failure: ProtocolFailure) -> reverie::Error {
         let errno = match failure {
             ProtocolFailure::Overflow => reverie::syscalls::Errno::EOVERFLOW,
+            // The named unsupported scope, distinct from the generic
+            // EINVAL protocol failures below (docs/ERROR_CATALOG.md).
+            ProtocolFailure::MultithreadedForcedChildExit => {
+                reverie::syscalls::Errno::EOPNOTSUPP
+            }
             ProtocolFailure::Unsupported | ProtocolFailure::UnexpectedControl => {
                 reverie::syscalls::Errno::ENOSYS
             }
@@ -146,14 +164,24 @@ impl Future for ChildExitPublicationFuture {
             ChildExitPollState::Admission => {
                 let event = self.event;
                 let (result, wakes) = {
-                    let mut sched = self.sched.lock().unwrap();
-                    let result = sched.begin_child_exit_publication(event);
-                    let wakes = result.as_ref().err().map_or_else(Vec::new, |_| {
-                        sched.mark_child_exit_publication_terminal(
-                            event,
-                            "KVM child-exit publication admission",
-                        )
-                    });
+                    let (result, death, wakes) = {
+                        let mut sched = self.sched.lock().unwrap();
+                        let (result, death) = sched.begin_child_exit_publication(event);
+                        let wakes = result.as_ref().err().map_or_else(Vec::new, |failure| {
+                            // The named scope refusal reports under its own
+                            // name, not the generic admission phase.
+                            let phase = if *failure
+                                == ProtocolFailure::MultithreadedForcedChildExit
+                            {
+                                "forced exit of a multithreaded KVM child is unsupported"
+                            } else {
+                                "KVM child-exit publication admission"
+                            };
+                            sched.mark_child_exit_publication_terminal(event, phase)
+                        });
+                        (result, death, wakes)
+                    };
+                    self.signal_death = death;
                     (result, wakes)
                 };
                 match result {
@@ -166,6 +194,21 @@ impl Future for ChildExitPublicationFuture {
                         self.state = ChildExitPollState::Done;
                         for wake in wakes {
                             let _ = wake.send(());
+                        }
+                        if failure == ProtocolFailure::MultithreadedForcedChildExit {
+                            // A deliberate scope limit, not a Hermit
+                            // failure: end the run with the policy-refusal
+                            // exit, naming the unsupported case.
+                            super::exit_on_scheduler_refusal(&format_args!(
+                                "hermit refused to continue the run: forced exit of a \
+                                 multithreaded KVM child is unsupported: a forked child that \
+                                 has (or once had) more than one thread died on a signal \
+                                 frame the KVM backend could not build or refused to \
+                                 restore, and the schedule ordering of synthesizing that \
+                                 death is proven only for single-threaded children. Run \
+                                 the program on ptrace, or keep the faulting child \
+                                 single-threaded."
+                            ));
                         }
                         Poll::Ready(Err(Self::protocol_error(failure)))
                     }
@@ -845,32 +888,213 @@ impl Scheduler {
         Ok(())
     }
 
-    fn begin_child_exit_publication(
+    /// Record a backend-forced fatal-signal exit that reached child-exit
+    /// publication without a controlled terminal boundary: a guest fault
+    /// the backend itself turned into a group exit inside its signal
+    /// machinery (a frame it could not build, an `rt_sigreturn` frame it
+    /// refused), where no exit grant or delivery permit ever existed.
+    /// Admission is keyed on the event's typed backend-forced provenance
+    /// (`BackendChildWaitEvent::forced`), never inferred from the status
+    /// alone, and is scoped to single-threaded children: marking the
+    /// death schedule-ordered is proven only when the faulting thread is
+    /// the child's only thread, so no other turn can have run between
+    /// the forced exit and this publication. A multithreaded forced
+    /// child exit is refused by name at that check until that ordering
+    /// is proven for it.
+    ///
+    /// This is the child-publication analogue of the synchronous-fault
+    /// bypass in `finish_process_retirement`: authenticate the exact
+    /// process generation and live parent, refuse anything that is not a
+    /// signalled status or that still holds a permit or exit fence, then
+    /// record the same final transition a terminal boundary receipt
+    /// would have, retire the process's threads, and hand the caller the
+    /// death whose descriptor tables it releases between the
+    /// publication future's two polls. The reservation the transition
+    /// installs is in `AwaitingPublication`, so the caller's ordinary
+    /// admission path proceeds unchanged in the same critical section:
+    /// no parent turn can observe the child before stage 2, exactly as
+    /// for a controlled exit. A non-signaled status without a
+    /// reservation stays a protocol failure: an ordinary exit the
+    /// scheduler never granted is a backend bug, not a fault to absorb.
+    fn synthesize_backend_forced_child_exit(
         &mut self,
         event: reverie::BackendChildWaitEvent,
-    ) -> Result<ChildExitBegin, ProtocolFailure> {
-        let completion = event
-            .child_exit_completion()
-            .ok_or(ProtocolFailure::Unsupported)?;
+        completion: reverie::ChildExitCompletion,
+    ) -> Result<SignalDeath, ProtocolFailure> {
+        // The event being admitted must name the same lifetimes as the
+        // completion being synthesized, checked before anything is
+        // recorded: admission compares both against the reservation
+        // afterwards, by which point synthesis has already mutated
+        // state. (Today the completion is derived from the event, so
+        // this is defense against a future caller that separates them.)
+        if event.parent != completion.parent || event.child != completion.child {
+            return Err(ProtocolFailure::Identity);
+        }
+        // Only the synchronous guest-fault class the backend forces
+        // without a boundary: a SIGSEGV it raised itself for a frame it
+        // refused or could not build. A SIGKILL or any other signal
+        // arriving unreserved names some other actor (a guest-sent kill
+        // whose receipts own the death, a watchdog, an OOM) and stays a
+        // protocol failure, never a schedule-committed death.
+        if completion.status.signal() != Some(libc::SIGSEGV) {
+            return Err(ProtocolFailure::Identity);
+        }
+        // Validate everything synthesis itself depends on before
+        // recording anything: it must not half-record a transition.
+        // Admission's later checks compare the event and completion
+        // against the reservation this transition installs, which is
+        // built from the same completion validated here.
+        if self.parked.control.is_none() {
+            return Err(ProtocolFailure::Identity);
+        }
+        let pid = DetPid::from_raw(completion.child.tgid.as_raw());
+        if self
+            .parked
+            .terminal_processes
+            .contains_key(&ProcessGeneration::from_backend(completion.child))
+        {
+            return Err(ProtocolFailure::Identity);
+        }
+        if self
+            .real_timers
+            .retained_process_identity(pid)
+            .map_err(|_| ProtocolFailure::Identity)?
+            != completion.child
+        {
+            return Err(ProtocolFailure::Identity);
+        }
+        let class = self.classify_final_process(pid)?;
+        let FinalProcessClass::LiveParent { parent } = class else {
+            return Err(ProtocolFailure::Identity);
+        };
+        if parent != completion.parent
+            || self
+                .parked
+                .permits
+                .values()
+                .any(|permit| permit.task.process == completion.child)
+            || self
+                .parked
+                .exit_fences
+                .values()
+                .any(|fence| fence.permit.task.process == completion.child)
+        {
+            return Err(ProtocolFailure::Phase);
+        }
+        // Scope limit, not an ordering claim: synthesis admits only a
+        // child that never had a second thread. A sibling that already
+        // deregistered - however it exited, including through an
+        // ordinary granted exit - puts the child outside that scope,
+        // so refuse here rather than widen the proven case.
+        let live: std::collections::BTreeSet<DetTid> = self.live_process_threads(pid).collect();
+        // Membership only: `process_threads` walks the thread tree, whose
+        // order is not tid order, so compare as sets. The named scope
+        // refusal applies only where the child ever had a second
+        // thread; a single-threaded child whose only thread is already
+        // gone is an ordinary protocol failure, not that refusal.
+        let ever: std::collections::BTreeSet<DetTid> =
+            self.process_threads(pid).into_iter().collect();
+        if live != ever {
+            return Err(if ever.len() > 1 {
+                ProtocolFailure::MultithreadedForcedChildExit
+            } else {
+                ProtocolFailure::Phase
+            });
+        }
+        // Validate the whole target set before retiring any of it, as a
+        // terminal boundary receipt does.
+        let mut retire = Vec::new();
+        for target in live {
+            let (mm, identity) = self
+                .real_timers
+                .task_identity(pid, target)
+                .ok_or(ProtocolFailure::Identity)?;
+            if identity.process != completion.child || !self.rpc_incarnation_matches(target, mm) {
+                return Err(ProtocolFailure::Identity);
+            }
+            retire.push((target, mm));
+        }
+        let Some(&(tid, _)) = retire.first() else {
+            return Err(ProtocolFailure::Identity);
+        };
+        // Refused by name: a multithreaded child's forced exit. The
+        // schedule-ordered mark below is proven only for a
+        // single-threaded child, where the faulting thread's own turn is
+        // the last turn before this publication (the controlled turn
+        // loop runs one guest thread at a time and the backend publishes
+        // the exit from that thread's completion path). With siblings,
+        // another turn could in principle run between the forced exit
+        // and publication; until that is disproven in code and covered
+        // by a repeated KVM verify guest, do not claim the schedule
+        // ordered this death.
+        if retire.len() != 1 {
+            return Err(ProtocolFailure::MultithreadedForcedChildExit);
+        }
+        self.record_exit_code(pid, completion.status.into_raw());
+        let recorded = self.record_final_process_transition(
+            tid,
+            pid,
+            true,
+            completion.child,
+            completion.status,
+        )?;
+        if recorded != Some(FinalProcessClass::LiveParent { parent }) {
+            return Err(ProtocolFailure::Phase);
+        }
+        let mut threads: Vec<DetTid> = retire.iter().map(|(target, _)| *target).collect();
+        threads.sort_unstable();
+        let death = SignalDeath {
+            process: pid,
+            threads,
+        };
+        self.signal_boundary_deaths.insert(pid);
+        for (target, mm) in retire {
+            self.logically_kill_thread(&target, &pid, mm);
+        }
+        self.signal_boundary_deaths.remove(&pid);
+        Ok(death)
+    }
+
+    pub(super) fn begin_child_exit_publication(
+        &mut self,
+        event: reverie::BackendChildWaitEvent,
+    ) -> (Result<ChildExitBegin, ProtocolFailure>, Option<SignalDeath>) {
+        let completion = match event.child_exit_completion() {
+            Some(completion) => completion,
+            None => return (Err(ProtocolFailure::Unsupported), None),
+        };
         let key = ProcessGeneration::from_backend(completion.child);
         if let Some(terminal) = self.parked.completed_child_exits.get(&key) {
             return if terminal.completion == completion {
-                Ok(ChildExitBegin::ExactDuplicate)
+                (Ok(ChildExitBegin::ExactDuplicate), None)
             } else {
-                Err(ProtocolFailure::Identity)
+                (Err(ProtocolFailure::Identity), None)
             };
         }
-        let reservation = self
-            .parked
-            .child_exit_reservations
-            .get(&key)
-            .copied()
-            .ok_or(ProtocolFailure::Identity)?;
+        // No reservation: a backend-forced fatal signal may have ended
+        // the child inside the backend's signal machinery, before any
+        // exit grant could create one. Synthesize its final transition
+        // here, in the same critical section as publication, keyed on
+        // the event's typed forced provenance: an exit the backend did
+        // not force is never synthesized, so an ordinary exit (or a
+        // guest-sent fault death) without a reservation keeps the
+        // Identity failure below exactly as before.
+        let mut death = None;
+        if event.forced && !self.parked.child_exit_reservations.contains_key(&key) {
+            match self.synthesize_backend_forced_child_exit(event, completion) {
+                Ok(synthesized) => death = Some(synthesized),
+                Err(failure) => return (Err(failure), None),
+            }
+        }
+        let reservation = match self.parked.child_exit_reservations.get(&key).copied() {
+            Some(reservation) => reservation,
+            None => return (Err(ProtocolFailure::Identity), None),
+        };
         let status = match reservation.phase {
             ChildExitReservationPhase::AwaitingPublication { status } => status,
             ChildExitReservationPhase::AwaitingTerminalStatus
             | ChildExitReservationPhase::Published { .. } => {
-                return Err(ProtocolFailure::Phase);
+                return (Err(ProtocolFailure::Phase), None);
             }
         };
         if reservation.child != completion.child
@@ -879,13 +1103,12 @@ impl Scheduler {
             || event.child != reservation.child
             || completion.status != status
         {
-            return Err(ProtocolFailure::Identity);
+            return (Err(ProtocolFailure::Identity), None);
         }
-        let control = self
-            .parked
-            .control
-            .clone()
-            .ok_or(ProtocolFailure::Identity)?;
+        let control = match self.parked.control.clone() {
+            Some(control) => control,
+            None => return (Err(ProtocolFailure::Identity), None),
+        };
         // The run-scoped facade is synchronous and forbidden from calling
         // GlobalTool. Holding the scheduler mutex here is the causal fence that
         // binds publication to the deterministic exit grant.
@@ -895,7 +1118,7 @@ impl Scheduler {
             .get_mut(&key)
             .expect("validated child-exit reservation")
             .phase = ChildExitReservationPhase::Published { completion, result };
-        Ok(ChildExitBegin::Publish)
+        (Ok(ChildExitBegin::Publish), death)
     }
 
     /// Make every callback error scheduler-terminal in the same critical

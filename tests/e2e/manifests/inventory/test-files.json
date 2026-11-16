@@ -1417,6 +1417,12 @@
       "why": "tests/c/main_stack_maps.c is owned by hermit-cli/tests/cli.rs: the_main_stack_is_read_from_maps_as_on_linux and run_kvm_the_main_stack_is_read_from_maps_as_on_linux run it natively and on ptrace and KVM at bitwise parity, and require at each step of its changes to its own stack the native run's stack-area lines of /proc/self/maps, pthread_getattr_np answers and descriptor size, and ESRCH for a descriptor whose task is reaped; on KVM but for where the lowest line starts, and for the two steps after which LinuxEmu loses track of the stack window, which must read its invented line, never an empty file (package K slice K9a of https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare a guest's output with its native run's."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/malformed_sigreturn_child.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/malformed_sigreturn_child.c is owned by hermit-cli/tests/cli.rs: malformed_sigreturn_kills_only_the_child compiles this guest, in which a forked child points its signal frame's FP state at unmapped memory so rt_sigreturn refuses the frame; it requires the parent to reap the child as signal 11 and survive, natively, on ptrace, and on KVM at bitwise parity, so a backend-forced child exit that aborts the whole run instead of publishing the death task-locally is caught (https://github.com/facebookexperimental/hermit/issues/122)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/map_shadow_stack_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
