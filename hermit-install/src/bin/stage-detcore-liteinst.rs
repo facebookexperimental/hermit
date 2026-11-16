@@ -1,7 +1,14 @@
 //! Finalize the ordinary packaged Detcore preload after the outer Cargo build.
 //! This executable must never be called by a Cargo build script.
+//!
+//! `--prebuilt <so>` stages an existing runtime file instead of the Cargo
+//! output, but only after the unchanged fixed build and qualification have
+//! run and the prebuilt bytes prove identical to the qualified artifact.
+//! Any other bytes are refused: this receipt attests the fixed
+//! `liteinst-runtime` build, and no second provenance can be recorded in it.
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -36,15 +43,38 @@ fn close<T>(result: proof::Result<T>, closing: proof::Result<()>) -> proof::Resu
     }
 }
 
-fn run() -> proof::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let authority = args.next().ok_or("expected --git or --source-copy")?;
+/// The arguments after the program name: the source authority, the target
+/// directory, and optionally a prebuilt runtime to stage in place of the
+/// Cargo output (admitted only if its bytes are the qualified ones).
+fn parse_args(args: &[String]) -> proof::Result<(String, String, Option<PathBuf>)> {
+    let mut args = args.iter();
+    let authority = args
+        .next()
+        .ok_or("expected --git or --source-copy")?
+        .clone();
     require(
         matches!(authority.as_str(), "--git" | "--source-copy"),
         "expected --git or --source-copy",
     )?;
-    let target = args.next().ok_or("expected existing target directory")?;
+    let target = args
+        .next()
+        .ok_or("expected existing target directory")?
+        .clone();
+    let prebuilt = match args.next().map(String::as_str) {
+        None => None,
+        Some("--prebuilt") => Some(PathBuf::from(
+            args.next()
+                .ok_or("expected prebuilt runtime path after --prebuilt")?,
+        )),
+        Some(_) => return Err("unexpected finalizer arguments".into()),
+    };
     require(args.next().is_none(), "unexpected finalizer arguments")?;
+    Ok((authority, target, prebuilt))
+}
+
+fn run() -> proof::Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (authority, target, prebuilt) = parse_args(&argv)?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("Hermit root missing")?;
@@ -193,13 +223,28 @@ fn run() -> proof::Result<()> {
         qualifier_source.verify()?;
         profile_inputs.verify()?;
         qualification.artifact.verify()?;
-        proof::write_new(
-            &pending,
-            &fs::read(&artifact.reported_path).map_err(|e| e.to_string())?,
-        )?;
+        // A prebuilt runtime is staged in place of the Cargo output only
+        // when its entire digest is the qualified one. The receipt below
+        // attests the fixed build that just ran, so different bytes — for
+        // example another builder's profile — are refused here by name
+        // rather than recorded under that build's provenance.
+        let staged_from = prebuilt.as_deref().unwrap_or(&artifact.reported_path);
+        let prebuilt_identity = match &prebuilt {
+            Some(path) => {
+                let identity = proof::FileIdentity::read(path)?;
+                require(
+                    identity.sha256 == qualification.artifact.sha256,
+                    "prebuilt runtime differs from the qualified fixed liteinst-runtime \
+                     build; only identical bytes can be staged under this receipt",
+                )?;
+                Some(identity)
+            }
+            None => None,
+        };
+        proof::write_new(&pending, &fs::read(staged_from).map_err(|e| e.to_string())?)?;
         fs::set_permissions(
             &pending,
-            fs::metadata(&artifact.reported_path)
+            fs::metadata(staged_from)
                 .map_err(|e| e.to_string())?
                 .permissions(),
         )
@@ -210,6 +255,9 @@ fn run() -> proof::Result<()> {
             "installed copy differs from qualified runtime",
         )?;
         qualification.artifact.verify()?;
+        if let Some(identity) = &prebuilt_identity {
+            identity.verify()?;
+        }
         Ok(
             json!({"schema":"hermit-packaged-detcore/v1", "reverie_pin":pin,
             "profile_name":"liteinst-runtime", "profile_inputs":profile_inputs,
@@ -285,6 +333,57 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn arguments_accept_an_optional_prebuilt_runtime() {
+        assert_eq!(
+            parse_args(&argv(&["--git", "target"])).unwrap(),
+            ("--git".to_string(), "target".to_string(), None)
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "--source-copy",
+                "target",
+                "--prebuilt",
+                "buck-out/lib.so"
+            ]))
+            .unwrap(),
+            (
+                "--source-copy".to_string(),
+                "target".to_string(),
+                Some(PathBuf::from("buck-out/lib.so"))
+            )
+        );
+    }
+
+    #[test]
+    fn arguments_refuse_every_other_shape() {
+        for (args, message) in [
+            (vec![], "expected --git or --source-copy"),
+            (vec!["--prebuilt", "x"], "expected --git or --source-copy"),
+            (vec!["--git"], "expected existing target directory"),
+            (
+                vec!["--git", "target", "extra"],
+                "unexpected finalizer arguments",
+            ),
+            (
+                vec!["--git", "target", "--prebuilt"],
+                "expected prebuilt runtime path",
+            ),
+            (
+                vec!["--git", "target", "--prebuilt", "x", "extra"],
+                "unexpected finalizer arguments",
+            ),
+        ] {
+            let error = parse_args(&argv(&args)).unwrap_err().to_string();
+            assert!(error.contains(message), "{args:?}: {error}");
+        }
+    }
+
     #[test]
     fn source_close_preserves_both_failures_and_never_publishes_success() {
         assert_eq!(
