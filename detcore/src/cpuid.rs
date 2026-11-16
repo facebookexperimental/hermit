@@ -19,9 +19,11 @@ use sha2::Sha256;
 #[derive(Debug, Clone, Copy)]
 pub struct InterceptedCpuid {
     profile: CpuProfile,
-    /// Under v3, the guest's leaf 0xD rows for subleaves 0-9, derived from the
-    /// host's: a guest's XGETBV and XSAVE run on the host, so leaf 0xD must
-    /// describe the host's XCR0 and layout.
+    /// Under v3, the guest's leaf 0xD rows for subleaves 0-9, derived from
+    /// the [`HostXstate`] facts: on a host-derived machine a guest's
+    /// XGETBV and XSAVE run on the host, so leaf 0xD describes the host's
+    /// XCR0 and layout; under `fixed_guest` facts it describes the fixed
+    /// KVM machine those facts define.
     xsave: [[u32; 4]; XSAVE_SUBLEAVES],
 }
 
@@ -1360,6 +1362,40 @@ mod tests {
         for leaf in [0, 2, 4, 0xb, 0x8000_0000, 0x8000_0002, 0x8000_0008] {
             assert_eq!(regs(&v3, leaf, 0), regs(&v2, leaf, 0), "leaf {leaf:#x}");
         }
+    }
+
+    #[test]
+    fn the_fixed_guest_v3_table_answers_only_the_fixed_leaf_0xd() {
+        // The KVM fixed machine (HostXstate::fixed_guest) through the same
+        // generic table construction: leaf 0xD is the architectural
+        // constants for XCR0 0x7 on every host, never host-derived rows.
+        let fixed = HostXstate::fixed_guest(41, true);
+        let v3 = InterceptedCpuid::v3(&fixed);
+        let rows: Vec<[u32; 4]> = (0..10)
+            .map(|subleaf| registers(v3.cpuid(0xd, subleaf).unwrap()))
+            .collect();
+        assert_eq!(rows[0], [0x7, 832, 832, 0]);
+        assert_eq!(rows[1], [0; 4]);
+        assert_eq!(rows[2], [256, 576, 0, 0]);
+        assert!(rows[3..].iter().all(|row| *row == [0; 4]));
+        for subleaf in [11, 63] {
+            assert_eq!(
+                registers(v3.cpuid(0xd, subleaf).unwrap()),
+                [0; 4],
+                "subleaf {subleaf}"
+            );
+        }
+        // The synthetic identity words are the fixed table's own leaf 0/1
+        // answers, not literals that can drift from them.
+        let leaf0 = registers(v3.cpuid(0, 0).unwrap());
+        assert_eq!([leaf0[1], leaf0[3], leaf0[2]], fixed.vendor);
+        assert_eq!(registers(v3.cpuid(1, 0).unwrap())[0], fixed.signature);
+        // The recording binding distinguishes the fixed machine from a
+        // host-derived one (here: the Zen 5 fixture host).
+        assert_ne!(
+            v3.digest(Some(&fixed)),
+            InterceptedCpuid::v3(&epyc_9d85()).digest(Some(&epyc_9d85()))
+        );
     }
 
     #[test]

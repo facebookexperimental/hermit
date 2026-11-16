@@ -107,13 +107,20 @@ impl std::fmt::Display for CpuProfile {
     }
 }
 
-/// The host facts a v3 guest's CPUID and xstate answers are built from,
-/// captured once at startup on a host that passed the qualification, and bound
-/// into a recording so that replay refuses a host where any of them differs.
+/// The facts a v3 guest's CPUID and xstate answers are built from. For a
+/// host-derived machine they are captured once at startup on a host that
+/// passed the qualification, and bound into a recording so that replay
+/// refuses a host where any of them differs. The synthetic
+/// [`HostXstate::fixed_guest`] instead describes the fixed KVM machine:
+/// its vendor and signature are the presented identity, not a captured
+/// host's, so a recording binding made from it does not by itself
+/// identify the real host class; bind that separately before such facts
+/// enter a recording or a qualification cache key.
 ///
 /// On the ptrace backend a guest's XGETBV and XSAVE run on the host, so leaf
 /// 0xD must describe the host's XCR0 and save layout; everything else in the v3
-/// table is fixed.
+/// table is fixed. Under `fixed_guest` leaf 0xD describes the fixed
+/// machine the KVM backend loads instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HostXstate {
     /// CPUID leaf 0 EBX, EDX, ECX: the vendor string.
@@ -140,7 +147,50 @@ pub struct HostXstate {
     pub probe_forced_exit: bool,
 }
 
+/// The fixed guest XCR0 the KVM backend loads: x87, SSE and YMM only.
+pub const FIXED_GUEST_XCR0: u64 = 0x7;
+/// The standard-format XSAVE area size for [`FIXED_GUEST_XCR0`].
+pub const FIXED_GUEST_XSAVE_SIZE: u32 = 832;
+/// Linux's `XFEATURE_MAX` on the 7.1.3 line: the first component index
+/// `ARCH_REQ_XCOMP_PERM` answers EINVAL for (the enum ends at
+/// XFEATURE_APX = 19 in `arch/x86/include/asm/fpu/types.h`; the boundary
+/// was also measured directly on AMD Zen 5 / Linux 7.1.3, where indices
+/// 0-19 answer EOPNOTSUPP and 20 answers EINVAL).
+pub const FIXED_GUEST_XFEATURE_MAX: u32 = 20;
+
 impl HostXstate {
+    /// The synthetic facts of the fixed KVM guest machine: not read from
+    /// any host, so a guest's leaf 0xD, XGETBV and arch_prctl answers are
+    /// the same on every qualified host. Vendor and signature mirror the
+    /// fixed table's leaf 0/1 identity words. `probe_cases` and
+    /// `probe_forced_exit` describe the in-guest VM-exit qualification
+    /// that admitted these facts; callers must pass the probe's real
+    /// counts — the constructor cannot itself enforce that a probe ran,
+    /// so admission code must not call it with invented counts.
+    pub fn fixed_guest(probe_cases: u32, probe_forced_exit: bool) -> Self {
+        Self {
+            vendor: [0x756e_6547, 0x4965_6e69, 0x6c65_746e],
+            signature: 0x0000_0663,
+            xcr0: FIXED_GUEST_XCR0,
+            xsave_leaves: vec![
+                [
+                    0,
+                    FIXED_GUEST_XCR0 as u32,
+                    FIXED_GUEST_XSAVE_SIZE,
+                    FIXED_GUEST_XSAVE_SIZE,
+                    0,
+                ],
+                [2, 256, 576, 0, 0],
+            ],
+            xcomp_supp: FIXED_GUEST_XCR0,
+            xcomp_perm: FIXED_GUEST_XCR0,
+            xcomp_guest_perm: FIXED_GUEST_XCR0,
+            xfeature_max: FIXED_GUEST_XFEATURE_MAX,
+            probe_cases,
+            probe_forced_exit,
+        }
+    }
+
     /// The host's leaf 0xD row for `subleaf`, if it was captured.
     pub fn xsave_leaf(&self, subleaf: u32) -> Option<[u32; 4]> {
         self.xsave_leaves
@@ -254,6 +304,25 @@ mod tests {
         }
         assert_eq!(CpuProfile::Auto.x86_64_level(), None);
         assert!(!CpuProfile::Auto.is_default());
+    }
+
+    #[test]
+    fn fixed_guest_facts_are_the_fixed_machine() {
+        let fixed = HostXstate::fixed_guest(41, true);
+        assert_eq!(fixed.xcr0, FIXED_GUEST_XCR0);
+        assert_eq!(fixed.xsave_leaf(0), Some([0x7, 832, 832, 0]));
+        assert_eq!(fixed.xsave_leaf(1), None);
+        assert_eq!(fixed.xsave_leaf(2), Some([256, 576, 0, 0]));
+        assert_eq!(fixed.xsave_leaf(3), None);
+        assert_eq!(fixed.xcomp_supp, 0x7);
+        assert_eq!(fixed.xcomp_perm, 0x7);
+        assert_eq!(fixed.xcomp_guest_perm, 0x7);
+        assert_eq!(fixed.xfeature_max, 20);
+        assert_eq!(fixed.probe_cases, 41);
+        assert!(fixed.probe_forced_exit);
+        // The identity words are the fixed table's, never a host's.
+        assert_eq!(fixed.vendor, [0x756e_6547, 0x4965_6e69, 0x6c65_746e]);
+        assert_eq!(fixed.signature, 0x663);
     }
 
     #[test]

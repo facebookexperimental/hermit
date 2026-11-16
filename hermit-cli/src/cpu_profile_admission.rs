@@ -1763,6 +1763,26 @@ fn non_x86_refusal() -> AdmissionRefusal {
 pub(crate) mod tests {
     use std::collections::BTreeMap;
 
+    #[test]
+    fn the_fixed_kvm_machine_agrees_across_crates() {
+        // The fixed guest machine is necessarily spelled in several
+        // crates (Detcore's presented facts, the KVM vCPU's installed
+        // XCR0, and the signal frames the backend builds). This is the
+        // one test that links all of them, so none can drift alone.
+        assert_eq!(
+            detcore_model::cpu_profile::FIXED_GUEST_XCR0,
+            reverie_kvm::FIXED_GUEST_XCR0
+        );
+        assert_eq!(
+            detcore_model::cpu_profile::FIXED_GUEST_XCR0,
+            reverie_kvm::FIXED_XFEATURES
+        );
+        assert_eq!(
+            detcore_model::cpu_profile::FIXED_GUEST_XSAVE_SIZE as usize,
+            reverie_kvm::XSAVE_SIZE
+        );
+    }
+
     /// A report the default probe could produce for `xcr0`.
     fn probe_report(xcr0: u64) -> xstate_probe::ProbeReport {
         let cases = xstate_probe::expected_case_count(xcr0);
