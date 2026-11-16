@@ -452,6 +452,48 @@ fn dt_flags_from_readelf(dump: &str) -> u64 {
     flags
 }
 
+/// `DT_NEEDED` sonames the loader contract never admits on this runtime:
+/// the cxx-driver and sysroot baggage the Rust closure does not
+/// reference (libstdc++, libatomic, libmvec) and, since the `-u`
+/// extraction from static libgcc, libgcc_s. `libm`/`libc`/`ld-linux`
+/// are genuinely referenced and stay.
+const FORBIDDEN_NEEDED: [&str; 4] = [
+    "libgcc_s.so.1",
+    "libstdc++.so.6",
+    "libatomic.so.1",
+    "libmvec.so.1",
+];
+
+/// The refusal for a `DT_NEEDED` list, if any: each forbidden soname
+/// names itself. Like `dt_flags_refusal`, this only ever refuses
+/// earlier and more specifically; the shared qualifier's loader
+/// contract still decides admission.
+fn needed_refusal(needed: &[String]) -> Option<String> {
+    let present: Vec<&str> = FORBIDDEN_NEEDED
+        .into_iter()
+        .filter(|soname| needed.iter().any(|entry| entry == soname))
+        .collect();
+    if present.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "canonical loader contract refuses DT_NEEDED {}: this runtime \
+             admits no libgcc_s/libstdc++/libatomic/libmvec dependency",
+            present.join(", ")
+        ))
+    }
+}
+
+/// The `DT_NEEDED` sonames in a `readelf -d` dump, in dump order: the
+/// `[soname]` of each `(NEEDED)` entry. An entry this cannot read
+/// yields no soname for that line, never a fabricated one.
+fn needed_from_readelf(dump: &str) -> Vec<String> {
+    dump.lines()
+        .filter(|line| line.contains("(NEEDED)"))
+        .filter_map(|line| line.split_once('[')?.1.split_once(']').map(|(s, _)| s.to_owned()))
+        .collect()
+}
+
 fn buck_profile_objects() -> serde_json::Value {
     json!({"liteinst-runtime": {"rustc_flags": BUCK_RUSTC_FLAGS}})
 }
@@ -715,6 +757,11 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
         &target,
     )?;
     if let Some(refusal) = dt_flags_refusal(dt_flags_from_readelf(&dynamic)) {
+        return Err(refusal);
+    }
+    // Same dump, same reasoning: name a forbidden DT_NEEDED before
+    // qualification's generic loader refusal.
+    if let Some(refusal) = needed_refusal(&needed_from_readelf(&dynamic)) {
         return Err(refusal);
     }
     let qualification =
@@ -1575,6 +1622,39 @@ mod tests {
         assert!(dt_flags_refusal(0x8).is_none());
         assert_eq!(dt_flags_from_readelf("(NEEDED) libc.so.6\n"), 0);
         assert!(dt_flags_refusal(0).is_none());
+    }
+
+    #[test]
+    fn needed_refusal_names_each_forbidden_soname() {
+        // The measured fbcode-built ELF's DT_NEEDED set (D1c-6): every
+        // forbidden soname is named; libm/libc/ld-linux are admitted.
+        let dump = "Dynamic section at offset 0x10 contains 8 entries:\n  \
+            Tag        Type                         Name/Value\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libmvec.so.1]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [ld-linux-x86-64.so.2]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libatomic.so.1]\n \
+            0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so.6]\n \
+            0x000000000000001e (FLAGS)              BIND_NOW\n";
+        let needed = needed_from_readelf(dump);
+        assert_eq!(needed.len(), 7);
+        assert_eq!(needed[0], "libgcc_s.so.1");
+        let refusal = needed_refusal(&needed).expect("forbidden NEEDEDs present");
+        for soname in FORBIDDEN_NEEDED {
+            assert!(refusal.contains(soname), "{soname} unnamed: {refusal}");
+        }
+        assert!(!refusal.contains("libm.so"), "{refusal}");
+        // -z text's post-fix FLAGS (BIND_NOW only) name nothing.
+        assert!(dt_flags_refusal(dt_flags_from_readelf(dump)).is_none());
+        // The admitted set alone refuses nothing; an unreadable line
+        // contributes no soname.
+        let clean = "0x1 (NEEDED) Shared library: [libm.so.6]\n\
+                     0x1 (NEEDED) Shared library: [libc.so.6]\n\
+                     0x1 (NEEDED) garbled-without-brackets\n";
+        assert!(needed_refusal(&needed_from_readelf(clean)).is_none());
+        assert!(needed_refusal(&[]).is_none());
     }
 
     #[test]
