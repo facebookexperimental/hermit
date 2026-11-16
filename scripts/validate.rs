@@ -927,6 +927,13 @@ const TOOL_HERMIT_SHA_ENV: &str = "DEV_HERMIT_TOOL_HERMIT_SHA";
 const TOOL_AGENT_UTILS_SHA_ENV: &str = "DEV_HERMIT_TOOL_AGENT_UTILS_SHA";
 const TOOL_BOOTSTRAP_SHA256_ENV: &str = "DEV_HERMIT_TOOL_BOOTSTRAP_SHA256";
 const TOOL_AUTHORITY_SCHEMA: &str = "dev-hermit-tool-authority-v1";
+/// The tool-cache directories an immutable tool root may live in: trees/ for
+/// bootstraps that predate roots carrying hermit/reverie, trees-r1/ for those
+/// whose roots carry them. Keep this list identical to the producer's
+/// TOOL_TREES_NAMES (ci-hub/validate/immutable_tool_authority.py in the
+/// parent workspace); a name missing here refuses every launch from that
+/// directory at admission.
+const TOOL_TREES_NAMES: &[&str] = &["trees", "trees-r1"];
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
 const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
@@ -11693,9 +11700,17 @@ fn read_immutable_tool_authority(
     if !authority.target_root.is_absolute()
         || resolved_target != authority.target_root
         || authority.target_root.file_name() != Some(OsStr::new(&authority.parent_sha))
-        || authority.target_root.parent().and_then(Path::file_name) != Some(OsStr::new("trees"))
+        || !authority
+            .target_root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| TOOL_TREES_NAMES.iter().any(|tree| name == OsStr::new(tree)))
     {
-        return Err("cached target authority does not name canonical trees/<parent-sha>".into());
+        return Err(
+            "cached target authority does not name canonical trees/<parent-sha> \
+             or trees-r1/<parent-sha>"
+                .into(),
+        );
     }
     let live_target_metadata = std::fs::symlink_metadata(&resolved_target)
         .map_err(|error| format!("cannot inspect canonical cached target: {error}"))?;
@@ -27391,6 +27406,47 @@ fn tool_root_split_bracket() -> Result<(), String> {
                 .into(),
         );
     }
+
+    // The operational bootstrap keeps tool roots under one of the cache's tree
+    // directories: trees/ for older bootstraps and trees-r1/ for roots that
+    // carry hermit/reverie. A root under trees-r1/ is as canonical as one under
+    // trees/; any other parent directory is refused.
+    for (parent, accepted) in [("trees-r1", true), ("trees-r2", false), ("cache", false)] {
+        let layout_target = root.join(format!(
+            "layout-{parent}/{parent}/1111111111111111111111111111111111111111"
+        ));
+        std::fs::create_dir_all(&layout_target)
+            .and_then(|_| {
+                std::fs::set_permissions(&layout_target, std::fs::Permissions::from_mode(0o555))
+            })
+            .map_err(|error| format!("tool-root split: cannot create {parent} target: {error}"))?;
+        let layout_authority = create_self_test_tool_authority(
+            &frozen_root,
+            &state_root,
+            &layout_target,
+            None,
+            false,
+            false,
+            None,
+        )?;
+        install_self_test_tool_authority(&layout_authority);
+        let outcome = configured_tool_root(Some(&state_root));
+        match (accepted, &outcome) {
+            (true, Ok(Some(retained))) if *retained == layout_authority.tool_root => {}
+            (false, Err(error)) if error.contains("does not name canonical") => {}
+            _ => {
+                let verdict = if accepted {
+                    "not accepted"
+                } else {
+                    "not refused"
+                };
+                return Err(format!(
+                    "tool-root split: a target under {parent}/ was {verdict} (got {outcome:?})"
+                ));
+            }
+        }
+    }
+    install_self_test_tool_authority(&valid_authority);
 
     // An ordinary directory with identical bytes is not the descriptor-backed
     // capability the producer authorized.
