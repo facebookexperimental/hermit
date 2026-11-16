@@ -1,0 +1,151 @@
+name: CI
+
+# The automatic GitHub check for this repository. It runs after a push to
+# `main` (the exported tip) or `integration`, and on pull requests that are
+# out of draft and not opened by the project bot (owner decisions 2026-10-27
+# and 2026-11-12). It is small on purpose. Owner decision, 2026-11-16: "I'd
+# rather it check LESS but be reliable. Our main source of actual testing is
+# fbsource plus local validates." It answers one question for anyone who
+# clones the repository: does this exact tree build from its GitHub sources,
+# against the Reverie commit its `reverie` submodule records, and do the unit
+# tests that need nothing from the host pass?
+#
+# WHAT IT RUNS (one job, one GitHub-hosted runner)
+#   1. A Reverie pin guard: every Cargo `path` dependency into reverie/ names a
+#      crate that exists at the recorded submodule commit, and finding no such
+#      dependency at all is a failure, not a pass. A Hermit change that
+#      starts using a new Reverie crate before the pin advances fails here, by
+#      name, instead of deep inside Cargo. A Hermit change that uses a new
+#      Reverie function, type or method is caught by the build below; a failed
+#      build then reports how far the pin is behind facebookexperimental/reverie.
+#   2. `cargo build --locked --workspace --all-targets`: every library, binary,
+#      test, benchmark and example compiles. Dev profile without debug info:
+#      a local run of this build plus the unit tests below filled 68 GB of
+#      target directory with debug info, more than a hosted runner's disk, and
+#      6.2 GB without it.
+#   3. `cargo test --locked --lib` for the five crates whose unit tests need no
+#      hardware performance counters, KVM, CPUID faulting, user or mount
+#      namespaces, setuid helpers or root: detcore-model, hermit-record-format,
+#      hermit-record, hermit-replay and hermit-resources (557 tests). They also
+#      pass with perf_event_open and namespace creation refused.
+#
+# WHAT MOVED, AND WHERE IT STILL RUNS (nothing was deleted)
+#   * The constructed portable DAG, ci-portable.yml (lint and repository-policy
+#     checkers, the Detcore and CLI suites, end-to-end manifest cells, strict
+#     compatibility), is now manual: run it from the Actions tab or with
+#     `gh workflow run ci-portable.yml`. A push to `integration` still starts
+#     it. It held this automatic role until 2026-11-16 and never completed
+#     green on facebookexperimental/hermit; `scripts/validate.rs portable-only`
+#     is its local mirror.
+#   * Formatting, Clippy and warnings-as-errors, the Detcore library unit tests
+#     (some need user namespaces, newuidmap or pid-limit behaviour a hosted
+#     runner does not promise), the CLI and end-to-end suites, and everything
+#     that needs PMU, KVM, CPUID faulting or root run in local validation
+#     (`scripts/validate.rs`), in the manual workflows (ci-portable.yml,
+#     ci-privileged.yml) and in Meta's internal CI.
+#   * This check gates nothing: it is not a required status check.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [integration, main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  # Debug info makes the dev-profile target directory too large for a hosted
+  # runner's disk; the build and the unit tests do not need it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # libunwind on the Ubuntu runner image is built with LZMA support.
+  RUSTFLAGS: -C link-arg=-llzma
+
+jobs:
+  build-and-test:
+    name: Build and unit tests
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # The build needs only Reverie; agent-utils and third-party/rr are
+      # used by the manual workflows and by local validation.
+      - name: Check out the recorded Reverie submodule
+        run: git submodule update --init reverie
+      - name: Reverie pin guard
+        run: |
+          set -euo pipefail
+          pin=$(git rev-parse HEAD:reverie)
+          echo "Recorded Reverie submodule commit: $pin"
+          if [[ ! -f reverie/Cargo.toml ]]; then
+            echo "::error::the reverie submodule is not checked out at $pin"
+            exit 1
+          fi
+          # Command substitutions, not process substitutions: under `set -e`
+          # a failing `git ls-files` or `sed` stops the step here instead of
+          # feeding an empty loop that would then pass.
+          manifests=$(git ls-files -- '*Cargo.toml')
+          checked=0
+          missing=0
+          while IFS= read -r manifest; do
+            dir=$(dirname "$manifest")
+            deps=$(sed -n 's/.*path = "\(\(\.\.\/\)*reverie\/[^"]*\)".*/\1/p' "$manifest")
+            while IFS= read -r rel; do
+              [[ -n "$rel" ]] || continue
+              checked=$((checked + 1))
+              if [[ ! -f "$dir/$rel/Cargo.toml" ]]; then
+                echo "::error file=$manifest::$manifest depends on $rel, which does not exist at the recorded Reverie commit $pin. These Hermit sources need a newer Reverie: advance the reverie submodule to a facebookexperimental/reverie commit that has that crate."
+                missing=1
+              fi
+            done <<< "$deps"
+          done <<< "$manifests"
+          # Hermit depends on Reverie only through such path dependencies, so
+          # finding none means this parser no longer matches the manifests.
+          # Fail rather than pass having checked nothing.
+          if [[ "$checked" -eq 0 ]]; then
+            echo "::error::found no Cargo path dependency into reverie/ in any tracked Cargo.toml, so this guard checked nothing. Update its pattern to match the manifests."
+            exit 1
+          fi
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "All $checked Cargo path dependencies into reverie/ exist at $pin."
+      - name: Install build dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libunwind-dev liblzma-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build-and-unit-tests
+      # Cargo installs the toolchain rust-toolchain.toml pins on first use;
+      # this step makes that a separate, visible step.
+      - name: Rust toolchain
+        run: |
+          cargo --version
+          rustc --version
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Build every target of the workspace
+        run: cargo build --locked --workspace --all-targets
+      - name: Unit tests
+        run: cargo test --locked --lib -p detcore-model -p hermit-record-format -p hermit-record -p hermit-replay -p hermit-resources
+      - name: Report how far the Reverie pin is behind
+        if: failure()
+        run: |
+          pin=$(git rev-parse HEAD:reverie)
+          if git -C reverie fetch --quiet origin main; then
+            behind=$(git -C reverie rev-list --count "$pin..FETCH_HEAD")
+            echo "::notice::The recorded Reverie commit $pin is $behind commit(s) behind facebookexperimental/reverie main ($(git -C reverie rev-parse FETCH_HEAD)). If a step above failed on a missing Reverie crate, module, type, function or method, these Hermit sources need a newer Reverie than the submodule records."
+          else
+            echo "::notice::Could not fetch facebookexperimental/reverie main to compare it with the recorded Reverie commit $pin."
+          fi

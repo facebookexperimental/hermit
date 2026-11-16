@@ -582,21 +582,24 @@ hand-run: no `pull_request` trigger on `merge-gate.yml` and no
 trigger, yields either a check that gates nothing or a requirement nothing can
 satisfy. Both layers or neither, and that pairing is an owner decision.
 
-The portable workflow is the one exception, by owner decision on 2026-10-27:
+The small CI workflow is the one exception, by owner decision on 2026-10-27:
 "invoke CI automatically only for external PRs not by our hermit-bot account".
-`ci-portable.yml` runs on `pull_request` (opened, synchronize, reopened,
+`ci.yml` runs on `pull_request` (opened, synchronize, reopened,
 ready_for_review) unless the author is `hermit-bot3` or the pull request is a
 draft, as well as after a push to `integration` or `main` and on manual
 dispatch (`main` since owner Slack 6324, 2026-11-12, for automated GitHub CI
-on the facebookexperimental/hermit mirror). It
-uses no secrets and a `contents: read` token (its `cleanup` job alone asks for
-`actions: write` to delete the run's own artifacts, and skips fork pull
-requests, whose token cannot have it), so it behaves the same for a branch of
-this repository and for a fork. Its result is supplemental evidence and gates
-nothing: it is not a required status check. The privileged (self-hosted, PMU)
-workflows remain dispatch-only. `scripts/check-github-actions-triggers.rs`
-enforces this shape: the bot/draft gate on every job that can start on its
-own, and GitHub-hosted runners only for every `ci-portable.yml` job.
+on the facebookexperimental/hermit mirror). Since 2026-11-16 it is a small
+build-and-unit-test check (owner: "I'd rather it check LESS but be
+reliable"); its header lists what it runs and where everything else runs.
+The constructed portable DAG, `ci-portable.yml`, held this role before and
+now runs only on manual dispatch and after a push to `integration`. `ci.yml`
+uses no secrets and a `contents: read` token, so it behaves the same for a
+branch of this repository and for a fork. Its result is supplemental evidence
+and gates nothing: it is not a required status check. The privileged
+(self-hosted, PMU) workflows remain dispatch-only.
+`scripts/check-github-actions-triggers.rs` enforces this shape: the bot/draft
+gate on every job that can start on its own, and GitHub-hosted runners only
+for every `ci.yml` job.
 
 ⚠️ **THE CHECKED-IN TRIGGERS DO NOT PROTECT THE SELF-HOSTED HOSTS.** For a
 `pull_request` event GitHub runs the workflow files from the pull request

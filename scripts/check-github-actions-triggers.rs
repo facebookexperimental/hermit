@@ -12,15 +12,20 @@
 //!
 //! Enforce the repository's GitHub Actions trigger policy.
 //!
-//! Local exact-head validation is the landing authority. The portable workflow
-//! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration` or `main`, and for pull requests not opened by the
-//! project bot (owner decision, 2026-10-27; `main` since owner Slack 6324,
-//! 2026-11-12, which asked for automated GitHub CI on the facebookexperimental
-//! mirror's main, the exported tip): its `pull_request` trigger must use exactly
-//! PORTABLE_PR_TYPES, and every job that can start without a predecessor or
-//! runs under `always()` must carry PORTABLE_PR_GATE, so a bot or draft pull
-//! request runs nothing. Two owner-approved maintenance workflows also run
+//! Local exact-head validation is the landing authority. One workflow,
+//! AUTOMATIC (`ci.yml`), is supplemental evidence that may run automatically:
+//! only after a commit is pushed to `integration` or `main`, and for pull
+//! requests not opened by the project bot (owner decision, 2026-10-27; `main`
+//! since owner Slack 6324, 2026-11-12, which asked for automated GitHub CI on
+//! the facebookexperimental mirror's main, the exported tip). Since 2026-11-16
+//! that workflow is the small build-and-unit-test check (owner: "I'd rather it
+//! check LESS but be reliable"); the constructed portable DAG,
+//! `ci-portable.yml`, held the role before and is now an ordinary workflow,
+//! manual and push-triggered only on `integration`. AUTOMATIC's `pull_request`
+//! trigger must use exactly PORTABLE_PR_TYPES, and every job of it that can
+//! start without a predecessor or runs under `always()` must carry
+//! PORTABLE_PR_GATE, so a bot or draft pull request runs nothing. Two
+//! owner-approved maintenance workflows also run
 //! at their exact reviewed schedules; every workflow may remain manually
 //! dispatchable. This checker deliberately accepts only the small YAML shape
 //! used here. An unfamiliar or ambiguous trigger block is an error, never a
@@ -40,18 +45,22 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const WORKFLOW_DIR: &str = ".github/workflows";
-const PORTABLE: &str = "ci-portable.yml";
+/// The one workflow that may run automatically on pushes to `main` and on pull
+/// requests: the small build-and-unit-test check since 2026-11-16. The
+/// constructed portable DAG, ci-portable.yml, held this role before and is now
+/// an ordinary manual workflow.
+const AUTOMATIC: &str = "ci.yml";
 const VALIDATION_LEVELS: &str = "validation-levels.yml";
 const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
-/// The only `pull_request` activity types ci-portable.yml may list.
+/// The only `pull_request` activity types AUTOMATIC may list.
 const PORTABLE_PR_TYPES: [&str; 4] = ["opened", "synchronize", "reopened", "ready_for_review"];
-/// The branches whose pushes start ci-portable.yml: `integration`, and `main`
+/// The branches whose pushes start AUTOMATIC: `integration`, and `main`
 /// since owner Slack 6324 (2026-11-12) asked for automated GitHub CI on the
 /// facebookexperimental/hermit mirror's main. Every other workflow may
 /// push-trigger only on `integration`.
 const PORTABLE_PUSH_BRANCHES: [&str; 2] = ["integration", "main"];
-/// The gate every ci-portable.yml entry job carries: a pull_request run whose
+/// The gate every AUTOMATIC entry job carries: a pull_request run whose
 /// author is hermit-bot3, or whose pull request is a draft, does nothing.
 const PORTABLE_PR_GATE: &str = "github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)";
 /// The cleanup job deletes artifacts (actions: write), which a fork's token lacks.
@@ -301,7 +310,7 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         "schedule".to_string(),
         "workflow_dispatch".to_string(),
     ]);
-    if name == PORTABLE {
+    if name == AUTOMATIC {
         recognized.insert("pull_request".to_string());
     }
     let mut errors = Vec::new();
@@ -312,7 +321,7 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("missing `workflow_dispatch` trigger".to_string());
     }
     if triggers.events.contains("push") {
-        if name != PORTABLE
+        if name != AUTOMATIC
             && triggers.push_branches.as_deref() != Some(&["integration".to_string()])
         {
             errors.push("`push.branches` must contain exactly `integration`".to_string());
@@ -344,17 +353,16 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("automatic `schedule` trigger is not permitted".to_string());
     }
 
-    if name == PORTABLE {
+    if name == AUTOMATIC {
         let allowed = BTreeSet::from([
             "pull_request".to_string(),
             "push".to_string(),
             "workflow_dispatch".to_string(),
         ]);
         if triggers.events != allowed {
-            errors.push(
-                "ci-portable.yml must have exactly `workflow_dispatch`, `push` and `pull_request` triggers"
-                    .to_string(),
-            );
+            errors.push(format!(
+                "{AUTOMATIC} must have exactly `workflow_dispatch`, `push` and `pull_request` triggers"
+            ));
         }
         if triggers.events.contains("pull_request")
             && !triggers
@@ -366,7 +374,7 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
                 .eq(PORTABLE_PR_TYPES.iter().copied())
         {
             errors.push(format!(
-                "ci-portable.yml `pull_request.types` must be exactly [{}]",
+                "{AUTOMATIC} `pull_request.types` must be exactly [{}]",
                 PORTABLE_PR_TYPES.join(", ")
             ));
         }
@@ -379,7 +387,7 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
             .eq(PORTABLE_PUSH_BRANCHES.iter().copied())
         {
             errors.push(format!(
-                "ci-portable.yml must push-trigger exactly on [{}]",
+                "{AUTOMATIC} must push-trigger exactly on [{}]",
                 PORTABLE_PUSH_BRANCHES.join(", ")
             ));
         }
@@ -387,7 +395,7 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
     errors
 }
 
-/// GitHub-hosted runner labels ci-portable.yml may use. It is the one workflow
+/// GitHub-hosted runner labels AUTOMATIC may use. It is the one workflow
 /// that runs a pull request's code automatically, so no job may run on a
 /// self-hosted runner.
 const PORTABLE_HOSTED_RUNNERS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
@@ -517,11 +525,11 @@ fn list_value(value: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The jobs of ci-portable.yml with their needs, job-level condition and runners.
+/// The jobs of AUTOMATIC with their needs, job-level condition and runners.
 /// Any line at job-key indentation that is not a plain `name:` key is an error.
 fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
     let Some(jobs_start) = source.find("\njobs:\n") else {
-        return Err("ci-portable.yml has no top-level `jobs:` mapping".to_string());
+        return Err(format!("{AUTOMATIC} has no top-level `jobs:` mapping"));
     };
     let mut jobs: Vec<PortableJob> = Vec::new();
     // The key whose block-scalar or block-list continuation is being read.
@@ -683,12 +691,12 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
         }
     }
     if jobs.is_empty() {
-        return Err("ci-portable.yml declares no jobs".to_string());
+        return Err(format!("{AUTOMATIC} declares no jobs"));
     }
     Ok(jobs)
 }
 
-/// ci-portable.yml must run nothing for a bot or draft pull request, and only
+/// AUTOMATIC must run nothing for a bot or draft pull request, and only
 /// on GitHub-hosted runners:
 /// - a job with no `needs:` must have exactly PORTABLE_PR_GATE as its `if:`;
 /// - `regular` must be exactly `always() && (gate)` and `cleanup` exactly
@@ -710,14 +718,14 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
     for job in &jobs {
         if job.runs_on.is_empty() {
             errors.push(format!(
-                "ci-portable.yml job `{}` has no `runs-on`",
+                "{AUTOMATIC} job `{}` has no `runs-on`",
                 job.name
             ));
         }
         for label in &job.runs_on {
             if !PORTABLE_HOSTED_RUNNERS.contains(&label.as_str()) {
                 errors.push(format!(
-                    "ci-portable.yml job `{}` must run on a GitHub-hosted runner ({}), not `{label}`",
+                    "{AUTOMATIC} job `{}` must run on a GitHub-hosted runner ({}), not `{label}`",
                     job.name,
                     PORTABLE_HOSTED_RUNNERS.join(", ")
                 ));
@@ -742,7 +750,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                     Ok(())
                 } else {
                     Err(format!(
-                        "ci-portable.yml job `{}` has no `needs:` and its `if:` must be exactly: {PORTABLE_PR_GATE}",
+                        "{AUTOMATIC} job `{}` has no `needs:` and its `if:` must be exactly: {PORTABLE_PR_GATE}",
                         job.name
                     ))
                 }
@@ -751,7 +759,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                     Ok(())
                 } else {
                     Err(format!(
-                        "ci-portable.yml job `regular` must have `if:` exactly: {regular}"
+                        "{AUTOMATIC} job `regular` must have `if:` exactly: {regular}"
                     ))
                 }
             } else if job.name == "cleanup" {
@@ -759,12 +767,12 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                     Ok(())
                 } else {
                     Err(format!(
-                        "ci-portable.yml job `cleanup` deletes artifacts and must have `if:` exactly: {cleanup}"
+                        "{AUTOMATIC} job `cleanup` deletes artifacts and must have `if:` exactly: {cleanup}"
                     ))
                 }
             } else if has_status_function(&condition) && has_top_level_or(&condition) {
                 Err(format!(
-                    "ci-portable.yml job `{}` combines a status function with a top-level `||`, which makes its success requirement optional",
+                    "{AUTOMATIC} job `{}` combines a status function with a top-level `||`, which makes its success requirement optional",
                     job.name
                 ))
             } else if has_status_function(&condition) {
@@ -779,7 +787,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                     Ok(())
                 } else {
                     Err(format!(
-                        "ci-portable.yml job `{}` uses a status function in `if:` and must also require a gated job it needs to succeed (`&& needs.<job>.result == 'success'`)",
+                        "{AUTOMATIC} job `{}` uses a status function in `if:` and must also require a gated job it needs to succeed (`&& needs.<job>.result == 'success'`)",
                         job.name
                     ))
                 }
@@ -787,7 +795,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                 Ok(())
             } else {
                 Err(format!(
-                    "ci-portable.yml job `{}` needs no gated job",
+                    "{AUTOMATIC} job `{}` needs no gated job",
                     job.name
                 ))
             };
@@ -1431,13 +1439,13 @@ fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 fn run(dir: &Path) -> Result<usize, Vec<String>> {
     let files = workflow_files(dir).map_err(|error| vec![error])?;
     let mut errors = Vec::new();
-    let mut saw_portable = false;
+    let mut saw_automatic = false;
     for path in &files {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        saw_portable |= name == PORTABLE;
+        saw_automatic |= name == AUTOMATIC;
         let source = match fs::read_to_string(path) {
             Ok(source) => source,
             Err(error) => {
@@ -1458,7 +1466,7 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
             }
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
-        if name == PORTABLE {
+        if name == AUTOMATIC {
             errors.extend(
                 validate_portable_pr_gate(&source)
                     .into_iter()
@@ -1480,8 +1488,8 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
             );
         }
     }
-    if !saw_portable {
-        errors.push(format!("{PORTABLE} is missing"));
+    if !saw_automatic {
+        errors.push(format!("{AUTOMATIC} is missing"));
     }
     if errors.is_empty() {
         Ok(files.len())
@@ -1494,7 +1502,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration (and main for ci-portable.yml), non-bot pull requests and exact approved schedules"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration (and main for {AUTOMATIC}), non-bot pull requests and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -1536,11 +1544,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(PORTABLE),
-            include_str!("../.github/workflows/ci-portable.yml"),
-        )
-        .unwrap();
+        fs::write(dir.join(AUTOMATIC), include_str!("../.github/workflows/ci.yml")).unwrap();
         fs::write(dir.join("broken.yml"), UNQUOTED_COLON_STEP).unwrap();
         let result = run(&dir);
         fs::remove_dir_all(&dir).unwrap();
@@ -1556,8 +1560,9 @@ mod tests {
     #[test]
     fn checked_in_workflows_parse_as_yaml() {
         for (name, source) in [
+            (AUTOMATIC, include_str!("../.github/workflows/ci.yml")),
             (
-                PORTABLE,
+                "ci-portable.yml",
                 include_str!("../.github/workflows/ci-portable.yml"),
             ),
             (
@@ -1577,7 +1582,7 @@ mod tests {
 
     #[test]
     fn portable_policy_accepts_integration_and_main_pushes_manual_and_gated_pull_requests() {
-        assert!(validate(PORTABLE, &parsed(PORTABLE_ON)).is_empty());
+        assert!(validate(AUTOMATIC, &parsed(PORTABLE_ON)).is_empty());
     }
 
     #[test]
@@ -1590,7 +1595,7 @@ mod tests {
         ] {
             let source = PORTABLE_ON.replace("[integration, main]", branches);
             assert!(
-                !validate(PORTABLE, &parsed(&source)).is_empty(),
+                !validate(AUTOMATIC, &parsed(&source)).is_empty(),
                 "{branches}"
             );
         }
@@ -1609,7 +1614,7 @@ mod tests {
         let triggers = parsed(
             "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\njobs:\n",
         );
-        assert!(!validate(PORTABLE, &triggers).is_empty());
+        assert!(!validate(AUTOMATIC, &triggers).is_empty());
     }
 
     #[test]
@@ -1621,13 +1626,13 @@ mod tests {
         ] {
             let source =
                 PORTABLE_ON.replace("[opened, synchronize, reopened, ready_for_review]", types);
-            assert!(!validate(PORTABLE, &parsed(&source)).is_empty(), "{types}");
+            assert!(!validate(AUTOMATIC, &parsed(&source)).is_empty(), "{types}");
         }
         let missing = PORTABLE_ON.replace(
             "    types: [opened, synchronize, reopened, ready_for_review]\n",
             "",
         );
-        assert!(!validate(PORTABLE, &parsed(&missing)).is_empty());
+        assert!(!validate(AUTOMATIC, &parsed(&missing)).is_empty());
     }
 
     #[test]
@@ -1643,18 +1648,35 @@ mod tests {
             );
             assert!(
                 parse_triggers(&source).is_err()
-                    || !validate(PORTABLE, &parsed(&source)).is_empty(),
+                    || !validate(AUTOMATIC, &parsed(&source)).is_empty(),
                 "{extra:?}"
             );
         }
     }
 
     #[test]
-    fn checked_in_portable_workflow_gates_every_entry_job() {
-        let source = include_str!("../.github/workflows/ci-portable.yml");
-        assert!(validate(PORTABLE, &parsed(source)).is_empty());
+    fn checked_in_automatic_workflow_gates_every_entry_job() {
+        let source = include_str!("../.github/workflows/ci.yml");
+        assert!(validate(AUTOMATIC, &parsed(source)).is_empty());
         let errors = validate_portable_pr_gate(source);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// The constructed portable DAG no longer runs for pull requests or for
+    /// pushes to main (owner, 2026-11-16): an ordinary workflow, it may only be
+    /// dispatched or start on a push to `integration`.
+    #[test]
+    fn checked_in_portable_dag_is_manual_and_integration_only() {
+        let triggers = parsed(include_str!("../.github/workflows/ci-portable.yml"));
+        assert!(validate("ci-portable.yml", &triggers).is_empty());
+        assert!(!triggers.events.contains("pull_request"));
+        assert_eq!(
+            triggers.push_branches.as_deref(),
+            Some(&["integration".to_string()][..])
+        );
+        // The old automatic shape is refused for it now.
+        let old = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+        assert!(!validate("ci-portable.yml", &parsed(old)).is_empty());
     }
 
     /// A miniature of ci-portable.yml's job graph: two gated roots, plain jobs that
@@ -2042,7 +2064,7 @@ mod tests {
     #[test]
     fn portable_requires_both_allowed_events() {
         let triggers = parsed("on:\n  workflow_dispatch:\njobs:\n");
-        assert!(!validate(PORTABLE, &triggers).is_empty());
+        assert!(!validate(AUTOMATIC, &triggers).is_empty());
     }
 
     #[test]
