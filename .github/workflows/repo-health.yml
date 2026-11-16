@@ -1,0 +1,125 @@
+name: repo-health
+# Detect-only repository health checks: PR tip reachability, a PR
+# census report, and Actions lane counts. Nothing here writes
+# labels or merges. Findings land in the run summary and artifacts.
+#
+# CUTOVER: land with workflow_dispatch only. Arming the schedule
+# also needs scripts/check-github-actions-triggers.rs updated (it
+# refuses schedules outside docs.yml and buck2-oss-nightly.yml)
+# and explicit owner approval of the exact cron.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "17 * * * *"
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+concurrency:
+  group: repo-health
+  cancel-in-progress: false
+jobs:
+  tip-reachability:
+    # An open PR whose head commit cannot be fetched by SHA or via
+    # its pull ref (with the fetched ref resolving to the head SHA)
+    # from an empty repository. Fails the job when any tip is
+    # unreachable, and when the PR enumeration itself fails or is
+    # truncated at the list limit (a partial sweep is not a pass).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Unreachable PR tips
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LIMIT: "200"
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --state open --limit "$LIMIT" \
+            --json number,headRefOid > prs.json
+          jq -e 'type=="array"' prs.json > /dev/null
+          count=$(jq length prs.json)
+          if [ "$count" -ge "$LIMIT" ]; then
+            echo "::error::PR enumeration truncated at limit $LIMIT; sweep would be partial"
+            exit 1
+          fi
+          mkdir scratch && git init -q scratch
+          : > unreachable.txt
+          jq -r '.[] | "\(.number) \(.headRefOid)"' prs.json | while read -r n sha; do
+            if git -C scratch fetch -q --force "https://github.com/$REPO.git" "$sha:refs/tmp/reach/$n" 2>/dev/null; then continue; fi
+            if git -C scratch fetch -q --force "https://github.com/$REPO.git" "refs/pull/$n/head:refs/tmp/pull/$n" 2>/dev/null \
+               && [ "$(git -C scratch rev-parse "refs/tmp/pull/$n")" = "$sha" ]; then continue; fi
+            echo "#$n $sha" >> unreachable.txt
+          done
+          { echo "## unreachable tips"; echo; cat unreachable.txt; } >> "$GITHUB_STEP_SUMMARY"
+          test ! -s unreachable.txt
+  pr-census-report:
+    # Report only (renamed from the host census gate, whose
+    # fail conditions read host-side verdict state that does not
+    # exist here): open/draft/review counts plus the census JSON
+    # as an artifact. Fails only when enumeration fails/truncates.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: PR census (report)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LIMIT: "200"
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --state open --limit "$LIMIT" \
+            --json number,isDraft,reviewDecision,statusCheckRollup,labels,createdAt > census.json
+          count=$(jq length census.json)
+          if [ "$count" -ge "$LIMIT" ]; then
+            echo "::error::PR enumeration truncated at limit $LIMIT; census would be partial"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import collections, json
+          prs = json.load(open("census.json"))
+          c = collections.Counter()
+          for p in prs:
+              c["open"] += 1
+              c["draft" if p["isDraft"] else "ready"] += 1
+              c[f"review:{p.get('reviewDecision') or 'none'}"] += 1
+          lines = ["## pr census (report)", ""] + [f"- {k}: {v}" for k, v in sorted(c.items())]
+          open("census.md", "w").write("\n".join(lines) + "\n")
+          PY
+          cat census.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-census
+          path: census.json
+          retention-days: 7
+  lane-saturation-counts:
+    # Report only: queued/in-progress run counts by workflow. The
+    # sustained-saturation verdict reads a durable host store and
+    # does not move; this job never pages.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Queued and in-progress runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for st in queued in_progress; do
+            gh api "repos/$REPO/actions/runs?status=$st&per_page=100" > "runs-$st.json"
+          done
+          python3 - <<'PY'
+          import collections, json
+          out = ["## lane saturation counts (report)", ""]
+          for st in ("queued", "in_progress"):
+              data = json.load(open(f"runs-{st}.json"))
+              runs = data["workflow_runs"]
+              if data.get("total_count", len(runs)) > len(runs):
+                  raise SystemExit(f"runs list truncated for {st}: "
+                                   f"{len(runs)} of {data['total_count']}")
+              by = collections.Counter(r["name"] for r in runs)
+              out.append(f"- {st}: {len(runs)} " +
+                         ", ".join(f"{k}={v}" for k, v in sorted(by.items())))
+          open("lanes.md", "w").write("\n".join(out) + "\n")
+          PY
+          cat lanes.md >> "$GITHUB_STEP_SUMMARY"

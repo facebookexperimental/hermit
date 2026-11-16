@@ -1,0 +1,62 @@
+name: repo-health-daily
+# Daily detect-only checks. CUTOVER: dispatch only until two
+# manual runs are reviewed; arming the schedule also needs
+# scripts/check-github-actions-triggers.rs updated and owner
+# approval of the exact cron.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "23 14 * * *"
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: repo-health-daily
+  cancel-in-progress: false
+jobs:
+  approvals-unverifiable:
+    # An APPROVED review is unverifiable against the current head
+    # when its commit_id is not the PR's current head AND no other
+    # APPROVED review names the current head. Lists them; never
+    # dismisses a review. Fails on any finding or on truncated
+    # enumeration.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Approvals not bound to current head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LIMIT: "100"
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --state open --limit "$LIMIT" \
+            --json number,headRefOid > prs.json
+          count=$(jq length prs.json)
+          if [ "$count" -ge "$LIMIT" ]; then
+            echo "::error::PR enumeration truncated at limit $LIMIT"
+            exit 1
+          fi
+          export REPO
+          python3 - <<'PY'
+          import json, os, subprocess
+          def api(path):
+              out = subprocess.run(["gh", "api", path],
+                                   capture_output=True, text=True, check=True).stdout
+              return json.loads(out)
+          found = []
+          for p in json.load(open("prs.json")):
+              reviews = api(f"repos/{os.environ['REPO']}/pulls/{p['number']}/reviews?per_page=100")
+              approved = [r for r in reviews if r.get("state") == "APPROVED"]
+              if any(r.get("commit_id") == p["headRefOid"] for r in approved):
+                  continue
+              for r in approved:
+                  found.append(f"#{p['number']} approved-at={str(r.get('commit_id'))[:12]} "
+                               f"head={p['headRefOid'][:12]}")
+          with open("approvals.md", "w") as f:
+              f.write("## approvals unverifiable against head\n\n")
+              f.write("\n".join(f"- {x}" for x in found) if found else "none\n")
+          raise SystemExit(1 if found else 0)
+          PY
+      - if: always()
+        run: cat approvals.md >> "$GITHUB_STEP_SUMMARY"

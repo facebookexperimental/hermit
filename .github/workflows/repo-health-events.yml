@@ -1,0 +1,72 @@
+name: repo-health-events
+# Event-driven halves. NOTE: runs dispatched with GITHUB_TOKEN do
+# not emit workflow_run events downstream, so the workflow_run path
+# below is a bonus - the scheduled sweep in repo-health.yml is the
+# reliable detector.
+on:
+  workflow_dispatch:
+  # CUTOVER: uncomment after the scheduled sweeps prove out AND
+  # scripts/check-github-actions-triggers.rs allows these triggers
+  # (owner-level policy change). On workflow_dispatch both jobs
+  # below skip by design.
+  # pull_request_review:
+  #   types: [submitted]
+  # pull_request:
+  #   types: [synchronize]
+  # workflow_run:
+  #   workflows: ["CI (GitHub-managed portable)", "CI (privileged)"]
+  #   types: [completed]
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: repo-health-events-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  approval-head-check:
+    # Single-PR form of approvals-unverifiable: on a new approval
+    # or a head move, report approvals whose reviewed commit is no
+    # longer the head, only when no approval names the head.
+    if: github.event_name == 'pull_request_review' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Approvals vs current head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" > reviews.json
+          python3 - <<'PY'
+          import json, os
+          approved = [r for r in json.load(open("reviews.json"))
+                      if r.get("state") == "APPROVED"]
+          head = os.environ["HEAD"]
+          stale = [] if any(r.get("commit_id") == head for r in approved) \
+              else approved
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## approvals unverifiable against head\n\n")
+              f.write("\n".join(f"- review {r['id']} at {str(r.get('commit_id'))[:12]}"
+                                for r in stale) if stale else "none\n")
+          raise SystemExit(1 if stale else 0)
+          PY
+  completed-run-sweep:
+    # Pointers only: the scheduled jobs in repo-health.yml do the
+    # checking. This job records that a watched workflow
+    # completed so a missing scheduled sweep is itself visible.
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record completion
+        env:
+          WF: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          { echo "## watched workflow completed"; echo;
+            echo "- $WF conclusion=$CONCLUSION head=$HEAD";
+            echo "- checks: repo-health.yml scheduled sweep"; } >> "$GITHUB_STEP_SUMMARY"
