@@ -823,23 +823,43 @@ mod tests {
 
     #[test]
     fn raw_numbers_count_beside_the_table_and_round_trip() {
-        // The first number past the pinned table (mseal on a newer kernel)
-        // has no name in it, and a negative number never can.
-        assert_eq!(syscall_name(462), "syscall_462");
-        assert_eq!(raw_syscall_number_key(462), 462);
+        // The first number past the pinned table has no name in it, and a
+        // negative number never can. Derive that number from the table
+        // itself: hard-coding it made this test break the day a table bump
+        // named the old example (462 became mseal in syscalls 0.8.1, which
+        // named every number through 469 plus 335 and 336). Production
+        // lookup is dynamic, so the recently named numbers must resolve.
+        for (nr, name) in [
+            (335, "uretprobe"),
+            (336, "uprobe"),
+            (462, "mseal"),
+            (463, "setxattrat"),
+            (464, "getxattrat"),
+            (465, "listxattrat"),
+            (466, "removexattrat"),
+            (467, "open_tree_attr"),
+            (468, "file_getattr"),
+            (469, "file_setattr"),
+        ] {
+            assert_eq!(syscall_name(nr), name, "nr {nr}");
+        }
+        let past = Sysno::last().id() + 1;
+        assert_eq!(Sysno::new(past as usize), None);
+        assert_eq!(syscall_name(past), format!("syscall_{past}"));
+        assert_eq!(raw_syscall_number_key(past as u64), past);
         assert_eq!(raw_syscall_number_key(u64::MAX), -1);
         assert_eq!(raw_syscall_number_key(0x1_0000_01c2), 450);
 
         let mut histogram = SyscallHistogram::default();
         histogram.enter(Sysno::read);
-        histogram.enter_raw(462);
-        histogram.finish_raw(462, SyscallOutcome::Refused);
+        histogram.enter_raw(past);
+        histogram.finish_raw(past, SyscallOutcome::Refused);
         histogram.enter_raw(999);
         histogram.enter_raw(-1);
         histogram.finish_raw(-1, SyscallOutcome::Refused);
         assert_eq!(histogram.total_calls(), 4);
         assert_eq!(
-            histogram.get_raw(462),
+            histogram.get_raw(past),
             Some(&SyscallOutcomes {
                 calls: 1,
                 detcore: 0,
@@ -852,15 +872,15 @@ mod tests {
         // The summary orders by the i32 number, negatives first.
         let summary = histogram.summary(SyscallObservationScope::Complete);
         let numbers: Vec<i32> = summary.syscalls.iter().map(|entry| entry.nr).collect();
-        assert_eq!(numbers, [-1, 0, 462, 999]);
-        assert_eq!(summary.get("syscall_462").unwrap().nr, 462);
+        assert_eq!(numbers, [-1, 0, past, 999]);
+        assert_eq!(summary.get(&format!("syscall_{past}")).unwrap().nr, past);
         assert_eq!(summary.total_calls(), 4);
 
         // The compact form encodes the 32-bit pattern, so -1 sorts last and
         // stays distinct from every non-negative number.
         let compact = summary.compact();
         let encoded: Vec<u64> = compact.counts.iter().map(|[nr, ..]| *nr).collect();
-        assert_eq!(encoded, [0, 462, 999, u64::from(u32::MAX)]);
+        assert_eq!(encoded, [0, past as u64, 999, u64::from(u32::MAX)]);
         assert_eq!(compact.malformation(), None);
 
         // The sparse per-thread form and both wire forms keep raw counts.
@@ -881,10 +901,10 @@ mod tests {
 
         // Merging adds overflow counts too.
         let mut other = SyscallHistogram::default();
-        other.enter_raw(462);
-        other.finish_raw(462, SyscallOutcome::Detcore);
+        other.enter_raw(past);
+        other.finish_raw(past, SyscallOutcome::Detcore);
         total.merge(&other);
-        let merged = total.get_raw(462).unwrap();
+        let merged = total.get_raw(past).unwrap();
         assert_eq!((merged.calls, merged.detcore, merged.refused), (2, 1, 1));
     }
 
