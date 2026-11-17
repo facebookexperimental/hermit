@@ -1862,7 +1862,6 @@ dependencies = [
  "libc",
  "reverie-core",
  "reverie-kvm-core",
- "reverie-proc-grammar",
  "reverie-procfs",
  "thiserror",
  "tracing",
