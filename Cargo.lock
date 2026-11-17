@@ -1834,6 +1834,7 @@ dependencies = [
  "reverie-core",
  "reverie-kvm-core",
  "reverie-linuxemu",
+ "serde",
  "thiserror",
 ]
 
@@ -1934,6 +1935,7 @@ dependencies = [
  "libc",
  "reverie-proc-grammar",
  "serde",
+ "tracing",
 ]
 
 [[package]]
