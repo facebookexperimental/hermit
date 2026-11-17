@@ -6289,6 +6289,12 @@ mod tests {
             findings.iter().any(|f| f.contains("write")),
             "entry for a prose-less page must fail the hard tier: {findings:?}"
         );
+        // Pin the cmd_check wiring itself: with the orphan entry in
+        // place, committed check over the written page must refuse.
+        fs::write(root.join("docs/syscalls/read.md"), emit_page(&page))
+            .expect("write fixture page");
+        assert_eq!(cmd_aggregate(&root, false), 0);
+        assert_eq!(cmd_check(&root, false, true), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
