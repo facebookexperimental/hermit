@@ -10,9 +10,13 @@
 //! Finding 4): prove every OSS Cargo root's committed lockfile is fresh
 //! versus its manifests, in seconds, before any build starts.
 //!
-//! The three OSS roots are the Hermit workspace root (`Cargo.toml`), the
+//! The four OSS roots are the Hermit workspace root (`Cargo.toml`), the
 //! Reverie workspace root (`reverie/Cargo.toml`, the pinned submodule),
-//! and the nested `liteinst-runtime-build/` workspace. For each root this
+//! the nested `liteinst-runtime-build/` workspace, and the standalone
+//! `reverie/reverie-liteinst/extract-harness/` workspace. The last was
+//! added after its lock went stale on master undetected (syscalls
+//! 0.6.18 locked against 0.8.1 manifests, found 2026-11-16): with no
+//! root here, no Tier 1 probe ever certified it. For each root this
 //! runs the FULL `cargo metadata --locked` probe. The flag choice is
 //! load-bearing: measured at the design head and re-verified on
 //! facebookexperimental/hermit `262fa517` (cargo 1.97.1), a planted stale
@@ -26,7 +30,7 @@
 //! checker covers only the nested `liteinst-runtime-build` root, as a
 //! fast-fail for the staged LiteInst build. Nothing checked the Hermit or
 //! Reverie root locks, which is how a stale Reverie `Cargo.lock` reached
-//! export on 2026-11-14/15 undetected. This checker covers all three
+//! export on 2026-11-14/15 undetected. This checker covers all four
 //! roots; the nested checker keeps its build-staging niche.
 //!
 //! `cargo metadata --locked` resolves git dependencies, so it needs
@@ -70,6 +74,10 @@ const CARGO_ROOTS: &[CargoRoot] = &[
     CargoRoot {
         dir: "liteinst-runtime-build",
         label: "liteinst-runtime-build",
+    },
+    CargoRoot {
+        dir: "reverie/reverie-liteinst/extract-harness",
+        label: "extract-harness",
     },
 ];
 
@@ -323,7 +331,12 @@ mod tests {
         let dirs: Vec<&str> = CARGO_ROOTS.iter().map(|root| root.dir).collect();
         assert_eq!(
             dirs,
-            [".", "reverie", "liteinst-runtime-build"],
+            [
+                ".",
+                "reverie",
+                "liteinst-runtime-build",
+                "reverie/reverie-liteinst/extract-harness"
+            ],
             "a root dropped here leaves the exported tree unchecked"
         );
     }
