@@ -5082,9 +5082,14 @@ from `{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- |
                 ),
                 (None, false) => ("not run".to_string(), "skipped (known gap)"),
             };
+            let gap = match row.gap.as_str() {
+                "D" => "D — threads with private file descriptor tables",
+                "E+F'" => "E+F' — interval-timer expiry during waits with temporary signal masks",
+                other => other,
+            };
             out.push_str(&format!(
-                "| `{test}` | {} | {} | {expected} | {status} |\n",
-                row.gap, row.issue
+                "| `{test}` | {gap} | {} | {expected} | {status} |\n",
+                row.issue
             ));
         }
     }
@@ -5120,7 +5125,7 @@ fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
 
 /// The archived execution paths ([`hermit_manifest_plan::archived::ARCHIVED`]),
 /// so the scorecard says why an archived backend has no cell selected by full.
-fn archived_paragraph() -> String {
+fn archived_paragraph(derived: &Derived) -> String {
     use hermit_manifest_plan::archived::ARCHIVED;
     use hermit_manifest_plan::archived::ArchivedKind;
     let entries: Vec<String> = ARCHIVED
@@ -5128,22 +5133,41 @@ fn archived_paragraph() -> String {
         .map(|entry| {
             let kind = match entry.kind {
                 ArchivedKind::Backend => "backend",
-                ArchivedKind::PreprocessingWithPtrace => "preprocessing with ptrace, not a backend",
+                ArchivedKind::PreprocessingWithPtrace => "binary preprocessing with ptrace",
             };
-            format!(
-                "`{}` ({kind}, archived {}, {})",
-                entry.name, entry.since, entry.schedule
-            )
+            format!("`{}` ({kind}, archived {})", entry.name, entry.since)
         })
         .collect();
     if entries.is_empty() {
         return String::new();
     }
-    format!(
-        "**Archived:** {}. These receive no feature development. Their compatibility tests run \
-separately from the full regression suite and therefore do not contribute to its selected counts.\n\n",
+    let mut out = format!(
+        "**Archived:** {}. These receive no feature development.",
         entries.join(" and ")
-    )
+    );
+    for entry in ARCHIVED
+        .iter()
+        .filter(|entry| entry.kind == ArchivedKind::Backend)
+    {
+        let applicable = derived
+            .applicable
+            .iter()
+            .filter(|id| id.backend == entry.name)
+            .count();
+        let selected = derived
+            .green
+            .iter()
+            .filter(|id| id.backend == entry.name)
+            .count();
+        let unselected = applicable - selected;
+        out.push_str(&format!(
+            " The catalogue retains **{applicable}** applicable cells for `{}`; \
+**{selected}** are selected by full and **{unselected}** are outside that suite.",
+            entry.name
+        ));
+    }
+    out.push_str("\n\n");
+    out
 }
 
 /// How many selected verify cells declare the stripped comparator, by
@@ -5628,24 +5652,28 @@ fn render_scorecard(derived: &Derived) -> String {
         .map(|(mode, count)| format!("**{count} {mode}**"))
         .collect::<Vec<_>>()
         .join(", ");
+    let ptrace_example = if ptrace_selected == 0 {
+        "No ptrace cells are selected by the full regression suite.".to_string()
+    } else {
+        format!("For ptrace, **{ptrace_selected}** selected cells comprise {ptrace_modes}.")
+    };
 
     let mut out = format!(
-        "# Compatibility scorecard\n\n\
+        "# Test selection scorecard\n\n\
 Hermit runs Linux programs reproducibly by controlling thread scheduling, clocks, and randomness. \
-This scorecard summarizes the coverage of its compatibility test suite; the \
-[compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded test results.\n\n\
-The suite is a matrix of **(program, mode, backend)** combinations, called cells. Modes test different \
-capabilities: `verify` compares repeated runs, `replay` checks record/replay, and `chaos` explores \
-thread schedules. The `naked` mode runs a program directly on Linux, shown as `native` in the \
-tables rather than a Hermit backend. One program can contribute several cells.\n\n\
-A backend is how Hermit observes and controls a running program. `ptrace` is the reference \
-implementation. KVM, LiteInst, and in-guest-trap are maturing alternatives with different trade-offs \
-in execution overhead, host requirements, and program support.\n\n\
-The headline counts add together **all modes** for each backend. For example, ptrace's \
-**{ptrace_selected}** selected cells comprise {ptrace_modes}. These are counts of tests included in \
-the full regression suite, not counts of unique programs or passing results. A test passes when it \
-completes as expected and meets its mode's checks; see [Methods](#methods).\n\n\
-## Coverage by backend\n\n\
+This scorecard shows which test combinations the full regression suite selects; the \
+[compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded results.\n\n\
+A **backend** is how Hermit observes and controls a running program. The default, best-tested \
+backend uses Linux's `ptrace` process-tracing interface and serves as the reference for comparisons. \
+Backends differ in execution overhead, host requirements, and program support.\n\n\
+The suite is a matrix of **(program, mode, backend)** combinations, called cells. `verify` compares \
+repeated runs; `replay` checks a recording against its replay; `chaos` checks repeatability for each \
+selected scheduling seed. `naked` runs a program directly on Linux, labelled `native` as the baseline. \
+One program can contribute several cells.\n\n\
+The headline counts sum **all modes** for each backend. {ptrace_example} They count selected test \
+combinations, not unique programs or passing results. A test passes when it completes as expected \
+and satisfies its mode's checks; see [Methods](#methods).\n\n\
+## Selection by backend\n\n\
 **Selected by full** means included in the full regression suite. **Not selected by full** means \
 an applicable combination outside that suite. **Not applicable** means the test configuration \
 does not enable that program, mode, and backend combination. Selection is not a test result: an \
@@ -5688,7 +5716,25 @@ Of **{}** total cells, **{selected_by_full_total}** are selected by full, \
         "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
         total - selected_total - na_total
     ));
-    out.push_str(&archived_paragraph());
+    if ordered.contains(&"dbt") {
+        let applicable = derived
+            .applicable
+            .iter()
+            .filter(|id| id.backend == "dbt")
+            .count();
+        let selected = derived
+            .green
+            .iter()
+            .filter(|id| id.backend == "dbt")
+            .count();
+        out.push_str(&format!(
+            "`dbt` (dynamic binary translation) retains the test catalogue for the \
+[separately developed DynamoRIO implementation](https://github.com/rrnewton/hermit-dynamorio): \
+**{applicable}** applicable cells, **{selected}** selected by full. This is not a current Hermit \
+command-line backend choice.\n\n"
+        ));
+    }
+    out.push_str(&archived_paragraph(derived));
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
     //
@@ -5715,12 +5761,18 @@ Of **{}** total cells, **{selected_by_full_total}** are selected by full, \
         .iter()
         .map(|id| id.mode.as_str())
         .collect();
+    let baseline = if ordered.contains(&"native") {
+        "- Baseline: `native`\n"
+    } else {
+        ""
+    };
     let methods = format!(
         "\n## Methods\n\n\
 ### What the counts cover\n\n\
-The matrix includes these execution paths and modes:\n\n\
-- Execution paths: {}\n\
-- Modes: {}\n\n\
+The matrix retains these backend names and modes; catalogue membership does not imply \
+support in the current Hermit command:\n\n\
+- Backend catalogue: {}\n\
+{baseline}- Modes: {}\n\n\
 The full regression suite selects **{selected_total} / {total}** cells (**{percent:.2}%**). \
 Of the total, **{na}** are not applicable. Excluding those gives **{selected_total} / {applicable}** \
 applicable cells (**{applicable_percent:.2}%**). These describe the same selection with different \
@@ -5732,12 +5784,13 @@ standard error, and nonempty INFO event logs. Log comparison removes host wall-c
 and consistently renames host addresses while preserving their identity and order; virtual time, \
 branch counts, syscall values, and other event details must match. {stripped_sentence}\n\n\
 `replay` checks a recording against its replay. `chaos` checks repeatability for each selected \
-scheduling seed and tests for the expected race behavior. Repeated runs on one backend do not \
+scheduling seed. Repeated runs on one backend do not \
 establish agreement with another backend; the tracker reports \
 [cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.\n\n\
 See the [test-suite documentation](ci/compat-envelope/README.md) for the detailed rules.\n",
         ordered
             .iter()
+            .filter(|backend| **backend != "native")
             .map(|b| format!("`{b}`"))
             .collect::<Vec<_>>()
             .join(", "),
@@ -5755,7 +5808,7 @@ See the [test-suite documentation](ci/compat-envelope/README.md) for the detaile
         },
     );
     out.push_str(
-        "## Coverage by mode\n\n\
+        "## Selection by mode\n\n\
 Each backend entry is `selected by full / total cells`, including not-applicable combinations \
 in the total. An em dash means that mode is not defined for that execution path.\n\n| Mode",
     );
@@ -5879,6 +5932,111 @@ suite but are outside the matrix and its counts.\n\n\
     out.push_str(&render_known_gaps(&derived.known_gaps));
     out.push_str(&methods);
     out
+}
+
+#[cfg(test)]
+mod scorecard_prose_tests {
+    use super::*;
+
+    fn cell(backend: &str, test: &str) -> CellId {
+        CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: test.into(),
+            mode: if backend == "native" {
+                "naked"
+            } else {
+                "verify"
+            }
+            .into(),
+            backend: backend.into(),
+        }
+    }
+
+    fn fixture(population: &[CellId], applicable: &[CellId], selected: &[CellId]) -> Derived {
+        Derived {
+            population: population.iter().cloned().collect(),
+            applicable: applicable.iter().cloned().collect(),
+            ci_disabled_reasons: BTreeMap::new(),
+            not_applicable_reasons: BTreeMap::new(),
+            selected: selected.iter().cloned().collect(),
+            green: selected.iter().cloned().collect(),
+            selected_custom: BTreeSet::new(),
+            stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_ptrace_selection_is_explained_even_without_ptrace_rows() {
+        for population in [vec![cell("ptrace", "fixture/a")], Vec::new()] {
+            let rendered = render_scorecard(&fixture(&population, &population, &[]));
+            let introduction = rendered.split("\n## ").next().unwrap();
+            assert!(
+                introduction.contains("No ptrace cells are selected by the full regression suite."),
+                "{introduction}"
+            );
+            assert!(
+                !introduction.contains("comprise"),
+                "an empty selection must not produce an empty mode breakdown: {introduction}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_catalogue_prose_tracks_new_names_and_separates_native() {
+        let population = [
+            cell("ptrace", "fixture/a"),
+            cell("future-tracer", "fixture/b"),
+            cell("native", "fixture/c"),
+        ];
+        let rendered = render_scorecard(&fixture(&population, &population, &[]));
+        // Inspect the explanatory list, not the table, which already had dynamic columns.
+        let catalogue = rendered
+            .lines()
+            .find(|line| line.starts_with("- Backend catalogue:"))
+            .expect("backend catalogue list is missing");
+        assert!(catalogue.contains("`future-tracer`"), "{catalogue}");
+        assert!(catalogue.contains("`ptrace`"), "{catalogue}");
+        assert!(!catalogue.contains("`native`"), "{catalogue}");
+        assert!(rendered.lines().any(|line| line == "- Baseline: `native`"));
+
+        let without_native = &population[..2];
+        let rendered = render_scorecard(&fixture(without_native, without_native, &[]));
+        assert!(!rendered.lines().any(|line| line.starts_with("- Baseline:")));
+    }
+
+    #[test]
+    fn archived_counts_exclude_other_backends_and_inapplicable_cells() {
+        let population = [
+            cell("sabre", "fixture/a"),
+            cell("sabre", "fixture/b"),
+            cell("sabre", "fixture/c"),
+            cell("ptrace", "fixture/a"),
+        ];
+        let applicable = [
+            population[0].clone(),
+            population[1].clone(),
+            population[3].clone(),
+        ];
+        let selected = [population[0].clone(), population[3].clone()];
+        let mut derived = fixture(&population, &applicable, &selected);
+        let archived = archived_paragraph(&derived);
+        assert!(
+            archived.contains("**2** applicable cells for `sabre`; **1** are selected by full and **1** are outside"),
+            "{archived}"
+        );
+        assert!(archived.contains("`e9patch` (binary preprocessing with ptrace,"));
+        assert!(!archived.contains("applicable cells for `e9patch`"));
+        assert!(!archived.contains("nightly"));
+
+        derived.applicable.insert(population[2].clone());
+        let archived = archived_paragraph(&derived);
+        assert!(
+            archived.contains("**3** applicable cells for `sabre`; **1** are selected by full and **2** are outside"),
+            "{archived}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -23508,7 +23666,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     };
     let rendered = render_scorecard(&selected_fixture);
     let status_prose = rendered
-        .split("## Coverage by mode")
+        .split("## Selection by mode")
         .next()
         .ok_or("scorecard omitted its status explanation")?;
     for required in [

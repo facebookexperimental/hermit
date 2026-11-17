@@ -12,7 +12,7 @@ exported and published.
 See also: [website](https://hermetic-infra.org/) ·
 [introductory blog post](https://developers.facebook.com/blog/post/2022/11/22/hermit-deterministic-linux-testing/) ·
 [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) ·
-[backend maturity scorecard](SCORECARD.md).
+[test selection scorecard](SCORECARD.md).
 
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
@@ -258,14 +258,14 @@ Hermit configuration are unchanged.
 
 ## Compatibility
 
-The [latest compatibility scorecard](https://rrnewton.github.io/hermit/compatibility/latest/)
+The [compatibility tracker](https://hermetic-infra.org/compatibility/latest/)
 records results for specific workloads, execution backends, and modes. A
 passing version probe does not establish support for an application's other
 workflows. Check the recorded command and configuration, then test the workload
 you depend on. Run and record/replay have different compatibility limits.
 
-[SCORECARD.md](SCORECARD.md) lists which tests apply to each backend; it is a
-selection catalogue, not a pass/fail report. For a larger example, the
+The [test selection scorecard](SCORECARD.md) lists applicable combinations and
+which ones the full regression suite selects. For a larger example, the
 [QEMU boot guide](docs/QEMU_BOOT.md) describes deterministic and relaxed Linux
 boot configurations and their limits.
 
@@ -450,9 +450,10 @@ and licensing guidelines.
 
 ## More Documentation
 
-- [Compatibility results](https://rrnewton.github.io/hermit/compatibility/latest/):
+- [Compatibility results](https://hermetic-infra.org/compatibility/latest/):
   measured outcomes by workload, backend, and mode.
-- [Test selection catalogue](SCORECARD.md): which tests apply to each backend.
+- [Test selection scorecard](SCORECARD.md): applicable combinations and selection
+  for the full regression suite.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Debugging](DEBUGGING.md): GDB, the `hermit-dap` Debug Adapter Protocol
   adapter, reverse execution on recordings, and editor support.

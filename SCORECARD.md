@@ -1,14 +1,14 @@
-# Compatibility scorecard
+# Test selection scorecard
 
-Hermit runs Linux programs reproducibly by controlling thread scheduling, clocks, and randomness. This scorecard summarizes the coverage of its compatibility test suite; the [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded test results.
+Hermit runs Linux programs reproducibly by controlling thread scheduling, clocks, and randomness. This scorecard shows which test combinations the full regression suite selects; the [compatibility tracker](https://hermetic-infra.org/compatibility/latest/) shows recorded results.
 
-The suite is a matrix of **(program, mode, backend)** combinations, called cells. Modes test different capabilities: `verify` compares repeated runs, `replay` checks record/replay, and `chaos` explores thread schedules. The `naked` mode runs a program directly on Linux, shown as `native` in the tables rather than a Hermit backend. One program can contribute several cells.
+A **backend** is how Hermit observes and controls a running program. The default, best-tested backend uses Linux's `ptrace` process-tracing interface and serves as the reference for comparisons. Backends differ in execution overhead, host requirements, and program support.
 
-A backend is how Hermit observes and controls a running program. `ptrace` is the reference implementation. KVM, LiteInst, and in-guest-trap are maturing alternatives with different trade-offs in execution overhead, host requirements, and program support.
+The suite is a matrix of **(program, mode, backend)** combinations, called cells. `verify` compares repeated runs; `replay` checks a recording against its replay; `chaos` checks repeatability for each selected scheduling seed. `naked` runs a program directly on Linux, labelled `native` as the baseline. One program can contribute several cells.
 
-The headline counts add together **all modes** for each backend. For example, ptrace's **1195** selected cells comprise **615 verify**, **573 replay**, **7 chaos**. These are counts of tests included in the full regression suite, not counts of unique programs or passing results. A test passes when it completes as expected and meets its mode's checks; see [Methods](#methods).
+The headline counts sum **all modes** for each backend. For ptrace, **1195** selected cells comprise **615 verify**, **573 replay**, **7 chaos**. They count selected test combinations, not unique programs or passing results. A test passes when it completes as expected and satisfies its mode's checks; see [Methods](#methods).
 
-## Coverage by backend
+## Selection by backend
 
 **Selected by full** means included in the full regression suite. **Not selected by full** means an applicable combination outside that suite. **Not applicable** means the test configuration does not enable that program, mode, and backend combination. Selection is not a test result: an unselected cell may have passed, failed, or never run.
 
@@ -25,9 +25,11 @@ Of **17822** total cells, **2437** are selected by full, **1845** are not select
 | `native` | 0 | 33 | 905 | 938 |
 | **Total** | **2437** | **1845** | **13540** | **17822** |
 
-**Archived:** `sabre` (backend, archived 2026-10-25, nightly only) and `e9patch` (preprocessing with ptrace, not a backend, archived 2026-10-25, nightly only). These receive no feature development. Their compatibility tests run separately from the full regression suite and therefore do not contribute to its selected counts.
+`dbt` (dynamic binary translation) retains the test catalogue for the [separately developed DynamoRIO implementation](https://github.com/rrnewton/hermit-dynamorio): **561** applicable cells, **0** selected by full. This is not a current Hermit command-line backend choice.
 
-## Coverage by mode
+**Archived:** `sabre` (backend, archived 2026-10-25) and `e9patch` (binary preprocessing with ptrace, archived 2026-10-25). These receive no feature development. The catalogue retains **480** applicable cells for `sabre`; **0** are selected by full and **480** are outside that suite.
+
+## Selection by mode
 
 Each backend entry is `selected by full / total cells`, including not-applicable combinations in the total. An em dash means that mode is not defined for that execution path.
 
@@ -85,16 +87,17 @@ These **2** tests document unresolved backend limitations in additional test sui
 
 | Test | Gap | Tracking issue | Must fail with | Status |
 | --- | --- | --- | --- | --- |
-| `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4485 | not run | skipped (known gap) |
-| `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4995 | not run | skipped (known gap) |
+| `itimer_a_private_descriptor_table_consumer_re_arms` | D — threads with private file descriptor tables | https://github.com/rrnewton/hermit/issues/4485 | not run | skipped (known gap) |
+| `itimer_generation_discard_follows_the_wait_mask` | E+F' — interval-timer expiry during waits with temporary signal masks | https://github.com/rrnewton/hermit/issues/4995 | not run | skipped (known gap) |
 
 ## Methods
 
 ### What the counts cover
 
-The matrix includes these execution paths and modes:
+The matrix retains these backend names and modes; catalogue membership does not imply support in the current Hermit command:
 
-- Execution paths: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
+- Backend catalogue: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`
+- Baseline: `native`
 - Modes: `chaos`, `naked`, `replay`, `verify`
 
 The full regression suite selects **2437 / 17822** cells (**13.67%**). Of the total, **13540** are not applicable. Excluding those gives **2437 / 4282** applicable cells (**56.91%**). These describe the same selection with different denominators; neither is a pass rate. Adding programs, backends, or modes changes the denominator, so comparisons over time must use the same population.
@@ -103,7 +106,7 @@ The full regression suite selects **2437 / 17822** cells (**13.67%**). Of the to
 
 Full `verify` comparisons run the same backend twice and compare exit status, standard output, standard error, and nonempty INFO event logs. Log comparison removes host wall-clock prefixes and consistently renames host addresses while preserving their identity and order; virtual time, branch counts, syscall values, and other event details must match. All **1857** selected `verify` cells require this full comparison.
 
-`replay` checks a recording against its replay. `chaos` checks repeatability for each selected scheduling seed and tests for the expected race behavior. Repeated runs on one backend do not establish agreement with another backend; the tracker reports [cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.
+`replay` checks a recording against its replay. `chaos` checks repeatability for each selected scheduling seed. Repeated runs on one backend do not establish agreement with another backend; the tracker reports [cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.
 
 See the [test-suite documentation](ci/compat-envelope/README.md) for the detailed rules.
 
