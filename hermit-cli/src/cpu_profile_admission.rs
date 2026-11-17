@@ -1824,6 +1824,9 @@ fn qualify_host_with(
     probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
 ) -> Result<Qualification, AdmissionRefusal> {
     let xcr0 = fixed_host_checks()?;
+    // The refuse-only XCR0 test seam, before any cached probe report can
+    // stand in for measuring (see `xstate_probe::XCR0_EXTRA_TEST_ENV`).
+    xstate_probe::check_forced_extra_bits(xcr0)?;
     let probe = probe(xcr0)?;
     let host = capture(&probe)?;
     Ok((probe, host))

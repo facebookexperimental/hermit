@@ -242,6 +242,9 @@ macro_rules! v3_residual {
          samples a fixed set of cases and forces only CPUID exits, so a CPU or hypervisor \
          that behaves differently only on other instruction paths, or on VM exits the guest \
          cannot see, is not excluded. Firmware (SMM) entries cannot be checked at all. \
+         On a host with MPX state the check covers it only with bounds checks disabled, \
+         as a guest that never enables MPX runs; a guest that enables MPX itself takes \
+         paths the check does not sample. \
          x86-64-v2 runs, including an auto run that chose x86-64-v2, are not affected."
     };
 }
