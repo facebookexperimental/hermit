@@ -1698,6 +1698,24 @@ fn kvm_fixed_qualification_matches(
         && report.unstable == 0
 }
 
+/// Turns a completed fixed-guest xstate measurement into the admission
+/// verdict its consumer sees: a stable report passes through, and any
+/// other report is a named refusal, never a pass.
+#[cfg(target_arch = "x86_64")]
+fn ensure_kvm_fixed_qualification(
+    report: reverie_kvm::guest_probe::FixedXstateQualification,
+) -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal> {
+    if kvm_fixed_qualification_matches(&report) {
+        Ok(report)
+    } else {
+        Err(format!(
+            "the guest's XSAVE answers changed across a VM exit \
+             ({} of {} comparisons unstable, guest XCR0 {:#x})",
+            report.unstable, report.comparisons, report.guest_xcr0,
+        ))
+    }
+}
+
 /// Qualify the fixed KVM guest machine's xstate behavior on this host,
 /// through the per-host cache: Reverie-KVM's in-guest probe records
 /// XGETBV/XSAVE before and after forced VM exits (one trial reinstalling
@@ -1720,15 +1738,7 @@ pub fn qualify_kvm_fixed_guest()
         || {
             let report = reverie_kvm::guest_probe::qualify_fixed_guest_xstate()
                 .map_err(|error| format!("the KVM fixed-guest xstate probe failed: {error}"))?;
-            if kvm_fixed_qualification_matches(&report) {
-                Ok(report)
-            } else {
-                Err(format!(
-                    "the guest's XSAVE answers changed across a VM exit \
-                     ({} of {} comparisons unstable, guest XCR0 {:#x})",
-                    report.unstable, report.comparisons, report.guest_xcr0,
-                ))
-            }
+            ensure_kvm_fixed_qualification(report)
         },
     )
 }
@@ -2097,6 +2107,28 @@ pub(crate) mod tests {
         let mut empty = kvm_fixed_report();
         empty.comparisons = 0;
         assert!(!kvm_fixed_qualification_matches(&empty));
+    }
+
+    /// The product path refuses an unstable measurement by name instead
+    /// of letting it qualify: a stable report passes through, and an
+    /// unstable one is an AdmissionRefusal naming the changed XSAVE
+    /// answers, on every host.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_unstable_fixed_guest_measurement_is_a_named_admission_refusal() {
+        assert_eq!(
+            ensure_kvm_fixed_qualification(kvm_fixed_report()).unwrap(),
+            kvm_fixed_report()
+        );
+        let mut unstable = kvm_fixed_report();
+        unstable.unstable = 2;
+        unstable.first_image_difference = Some(512);
+        let refusal = ensure_kvm_fixed_qualification(unstable).unwrap_err();
+        assert!(
+            refusal.contains("2 of 6 comparisons unstable"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("XSAVE answers changed"), "{refusal}");
     }
 
     /// The KVM qualification's cache inputs bind the fixed guest layout, so
