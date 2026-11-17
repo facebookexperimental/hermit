@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>nanosleep</code> (35)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+nanosleep&amp;body=Discussion+for+the+%60nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fnanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60nanosleep%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, wake timing and interruption depend on the host clock and scheduler. In the deterministic configuration Hermit parks the caller in its own scheduler until a logical-time deadline. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> A native sleep ends when the host's monotonic clock and scheduler say so: the actual delay overshoots by host load, and whether a signal interrupts it — and how much time then remains — depends on host-timed signal delivery.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> In the sequentialized deterministic configuration, Detcore determinizes the sleep: the caller parks in Detcore's own scheduler until a logical-time deadline, so the wake point is a schedule event, not a host wait, and other guest threads run meanwhile in deterministic order.<sup>[c1]</sup><sup>[c2]</sup><sup>[c6]</sup> A configuration that does not sequentialize threads instead runs the sleep in the host kernel, keeping the kernel's own restart block; that path observes host time and is a relaxation, not the deterministic mode.<sup>[c6]</sup></p>
+<p><strong>Interface fidelity.</strong> The request is validated before any sleep: a null request pointer fails with <code>EFAULT</code>, and a malformed interval (negative seconds, or nanoseconds outside the legal range) fails with <code>EINVAL</code> rather than wrapping into an effectively endless sleep.<sup>[c4]</sup> A signal that ends the sleep returns <code>EINTR</code> and, for a relative sleep, writes the unslept remainder to <code>rem</code> measured from when the interrupting signal was due.<sup>[c5]</sup> One restart subtlety matches Linux: when a <code>SIGCHLD</code> that Detcore holds for delivery at the thread's resumption (its claimed-signal case) ends a relative sleep and no handler runs, the original deadline is kept for the kernel's <code>restart_syscall</code> resumption instead of starting the interval over.<sup>[c5]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> The virtualized sleep is regenerated from its logical deadline at the same schedule point, including which signal interruption ends it and the remainder that follows.<sup>[c5]</sup><sup>[c6]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the slept interval is logical time, so the overshoot profile is the virtual clock's granularity rather than a host high-resolution timer's.<sup>[c6]</sup></li>
+<li>G2 (by design): without thread sequentialization the sleep runs in the host kernel and observes host time; deterministic runs use the sequentialized path above.<sup>[c6]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+nanosleep&amp;body=Discussion+for+the+%60nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fnanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60nanosleep%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `nanosleep`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>nanosleep</code> (35) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1805</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8156</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+nanosleep&amp;body=Discussion+for+the+%60nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fnanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60nanosleep%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `nanosleep`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>Interruption remainder and zero-length sleeps: <code>detcore/src/syscalls/time.rs</code> (<code>interrupted_sleep_remaining_time_floors_at_zero</code>, <code>only_a_relative_sleep_of_zero_is_a_zero_length_sleep</code>) — interface fidelity, and what Hermit does.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>nanosleep(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/hrtimer.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1805 sha256:bdb80887873e8a3d <sup>[c2]</sup>: detcore/src/lib.rs:8156 sha256:ed87abad08b828c8 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:1020-1040 sha256:780522b8b85931be <sup>[c5]</sup>: detcore/src/syscalls/time.rs:926-972 sha256:ccfb2f3a9f96e469 <sup>[c6]</sup>: detcore/src/syscalls/time.rs:1105-1125 sha256:da2305f33c564d21 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L1105-L1125</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

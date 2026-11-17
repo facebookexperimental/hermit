@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>io_uring_enter</code> (426)</h1>
 <p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_uring_enter&amp;body=Discussion+for+the+%60io_uring_enter%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_uring_enter.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_uring_enter%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, io_uring completes work asynchronously in shared ring memory, outside syscall order. Hermit refuses it with ENOSYS, so nothing is ever submitted or waited on. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>io_uring_enter</code> submits queued operations and can wait for completions: the kernel completes ring work asynchronously, so which completions are visible, in which order, and after how long a wait are not functions of the guest's syscall sequence alone.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> Detcore refuses the whole <code>io_uring</code> family — <code>io_uring_setup</code>, <code>io_uring_enter</code>, and <code>io_uring_register</code> — with <code>ENOSYS</code> at dispatch, unconditionally: these numbers are in the deterministic-refusal set (not in the smaller strict-only subset), and the dispatch arm returns the error before any handler or guest injection can run.<sup>[c1]</sup><sup>[c2]</sup><sup>[c3]</sup><sup>[c4]</sup> The reason is structural: completions would land in shared ring memory outside the serialized syscall order Detcore schedules, and Detcore has no scheduler model for them.<sup>[c4]</sup></p>
+<p><strong>Interface fidelity.</strong> No submission is accepted and no completion is waited for: the refusal is by syscall number regardless of the fd or flags passed, so an inherited or received ring fd gains nothing.<sup>[c4]</sup> The refusal is tested to happen before the syscall can be injected into the guest on backend paths that inject syscalls.<sup>[c5]</sup><sup>[c6]</sup></p>
+<p><strong>Record &amp; replay.</strong> All three numbers are subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c4]</sup> The result is a constant (<code>ENOSYS</code>), so replay reproduces it exactly and there is no ring state to record.<sup>[c4]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (unimplemented): there is no deterministic ring model, so no submission or completion path exists to fall back to within io_uring.<sup>[c4]</sup> Guests that require io_uring cannot run; guests with an <code>epoll</code>, POSIX AIO, or synchronous fallback never reach this call on that path. Supporting rings would mean Detcore owns completion scheduling — a design change, not a handler addition.</li>
+<li>G2 (by design): a guest that obtained a ring fd outside Hermit's control (passed across exec or received from another process) still gets <code>ENOSYS</code> here, where a native kernel would submit to the ring.<sup>[c4]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_uring_enter&amp;body=Discussion+for+the+%60io_uring_enter%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_uring_enter.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_uring_enter%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_uring_enter`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>io_uring_enter</code> (426) as determinized-refused via typed dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1746</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8090</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_uring_enter&amp;body=Discussion+for+the+%60io_uring_enter%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_uring_enter.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_uring_enter%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `io_uring_enter`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>Refusal precedes guest injection: <code>detcore/src/io_buffers.rs</code> (<code>io_uring_refusal_never_reaches_guest_injection</code>) — what Hermit does, and interface fidelity. Guest-level fallback is tracked by manifest custom cell <code>c-programs/io-uring-fallback</code> — known gaps.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>io_uring_enter(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/io_uring/io_uring.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1746 sha256:1c1981b8b744f325 <sup>[c2]</sup>: detcore/src/syscall_classification.rs:1555-1564 sha256:d6fb9993d44cbe48 <sup>[c3]</sup>: detcore/src/lib.rs:464-465 sha256:dfe85e842e0e8a89 <sup>[c4]</sup>: detcore/src/lib.rs:8089-8092 sha256:5508f1a66cc8ff30 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8089-L8092 <sup>[c5]</sup>: detcore/src/io_buffers.rs:1626-1631 sha256:bbd8dc0663f6afd6 <sup>[c6]</sup>: detcore/src/io_buffers.rs:1817-1835 sha256:89e8c68d0a1a09e2</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

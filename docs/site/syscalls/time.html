@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>time</code> (201)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+time&amp;body=Discussion+for+the+%60time%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60time%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, this returns the host wall clock in whole seconds. By default (time virtualization on), Hermit returns the virtual clock's whole seconds instead. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>time</code> returns the host wall clock in whole seconds, so its result — and anything the guest seeds or orders by it — differs between runs and between hosts.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> With time virtualization on (the deterministic configuration; <code>--no-virtualize-time</code> turns it off), Detcore determinizes the result: the handler reads the guest clock (the scheduler's logical time, observed as a global request and clamped per thread so it never goes backwards) and returns its whole seconds.<sup>[c1]</sup><sup>[c2]</sup><sup>[c3]</sup><sup>[c4]</sup> Without time virtualization the call passes through to the host clock.<sup>[c5]</sup></p>
+<p><strong>Interface fidelity.</strong> The seconds value is both the return value and, when <code>tloc</code> is non-null, stored through it; a null <code>tloc</code> stores nothing and is not an error.<sup>[c3]</sup> A bad <code>tloc</code> pointer surfaces as the memory-write error rather than a fabricated result.<sup>[c3]</sup> Sub-second information is truncated exactly as the interface specifies, so two reads within the same virtual second agree.<sup>[c3]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> Virtualized readings regenerate from logical time at the same schedule point; without virtualization, a recording captures the host value the guest observed and replay returns it without reading the host clock.<sup>[c5]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the value is epoch-plus-logical-elapsed seconds, so it is comparable across Hermit runs with the same epoch and schedule, never to a native run's reading of the same instant.<sup>[c3]</sup><sup>[c4]</sup></li>
+<li>G2 (unmeasured): no dedicated test runs this handler; the nearest tests exercise <code>time</code> only as the <code>gettimeofday</code> repair's store probe, not this call's own contract.<sup>[c3]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+time&amp;body=Discussion+for+the+%60time%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60time%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `time`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>time</code> (201) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1949</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:7989</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+time&amp;body=Discussion+for+the+%60time%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60time%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `time`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>No dedicated test for this handler exists at this revision; that absence is G2. The handler itself is the evidence for the claims above pending one.<sup>[c3]</sup></p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>time(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/time.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1949 sha256:bab02b747529bee6 <sup>[c2]</sup>: detcore/src/lib.rs:7988-7995 sha256:f319953eedd3775f <sup>[c3]</sup>: detcore/src/syscalls/time.rs:724-740 sha256:efe5c93a6f9cbe34 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L724-L740 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:185-192 sha256:2bfaae47fe5e3eed <sup>[c5]</sup>: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

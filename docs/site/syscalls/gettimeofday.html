@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>gettimeofday</code> (96)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, this returns the host wall clock. By default (time virtualization on), Hermit overwrites the time value with virtual time after running the call, while the timezone buffer still receives host state in run and record modes. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>gettimeofday</code> returns the host wall clock at microsecond precision, so every result — and anything the guest derives from it, including ordering decisions and seeds — differs between runs.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> With time virtualization on (the deterministic configuration; <code>--no-virtualize-time</code> turns it off), Detcore determinizes the result: the handler reads the guest clock (the scheduler's logical time, observed as a global request and clamped per thread so it never goes backwards) and stores that virtual time, at microsecond truncation, over whatever the forwarded call produced.<sup>[c1]</sup><sup>[c2]</sup><sup>[c4]</sup><sup>[c5]</sup> The handler deliberately still runs the call through the record/replay path first, then overwrites <code>tv</code>, so error behaviour and memory effects match the forwarded call while the value the guest reads is virtual.<sup>[c4]</sup> Without time virtualization the call passes through to the host clock.<sup>[c6]</sup></p>
+<p><strong>Interface fidelity.</strong> A null <code>tv</code> stores nothing and is not an error, matching the forwarded call's result.<sup>[c4]</sup> Fault behaviour is preserved word by word: when the forwarded call fails with <code>EFAULT</code>, a store probe establishes which words of <code>tv</code> the kernel actually reached, and only those are overwritten with virtual time; if that repair cannot be completed, the run fails closed rather than let host wall-clock words survive in guest memory.<sup>[c4]</sup><sup>[c11]</sup> Any other error leaves <code>tv</code> untouched, because only <code>EFAULT</code> says anything about what reached it.<sup>[c4]</sup> The handler itself never writes the obsolete timezone argument — but the forwarded call it runs first does, so in run and record modes the guest's timezone buffer receives the host's timezone state unmodified.<sup>[c4]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> Virtualized, the stored <code>tv</code> value is regenerated from logical time at the same schedule point; the overwrite-after-forward shape exists precisely so a recording captures the call as executed while the guest only ever reads virtual time from <code>tv</code>.<sup>[c4]</sup><sup>[c6]</sup> The timezone buffer gets no such treatment in any mode: the handler writes nothing there, so whatever the forwarded call wrote (host state in run and record modes) simply stands.<sup>[c4]</sup> A replayed log's own <code>EFAULT</code> keeps the same repair discipline for <code>tv</code>.<sup>[c4]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (unimplemented): the timezone out-parameter is not virtualized. The forwarded call writes the host's timezone state into it in run and record modes, so host timezone configuration reaches the guest through this call even though the time value itself is virtual.<sup>[c4]</sup></li>
+<li>G2 (unmeasured): the repair path for a faulting <code>tv</code> depends on backend store probes; where a backend cannot prove which words were stored, the run fails closed instead of completing with a partially virtual value — safe, but stricter than Linux.<sup>[c4]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `gettimeofday`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>gettimeofday</code> (96) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1730</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:7981</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&amp;body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `gettimeofday`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>Fault-repair proof obligations: <code>detcore/src/syscalls/time.rs</code> (<code>without_a_store_probe_the_repair_refuses</code>, <code>successful_time_store_probe_requires_an_overwrite</code>, <code>any_control_probe_error_means_the_efault_was_not_a_store_fault</code>) — interface fidelity, and record and replay.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>gettimeofday(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/time.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1730 sha256:310a3124777d80e5 <sup>[c2]</sup>: detcore/src/lib.rs:7981-7987 sha256:c164fb54a01b22d1 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:685-722 sha256:a10e250f8324a803 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L685-L722 <sup>[c5]</sup>: detcore/src/syscalls/time.rs:185-192 sha256:2bfaae47fe5e3eed <sup>[c6]</sup>: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258 <sup>[c11]</sup>: detcore/src/syscalls/time.rs:292-345 sha256:bc3909d75a332b56</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

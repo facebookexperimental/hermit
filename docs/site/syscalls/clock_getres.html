@@ -4,18 +4,36 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>clock_getres</code> (229)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_getres&amp;body=Discussion+for+the+%60clock_getres%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_getres.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_getres%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, the reported resolution is a property of the host clocksource. By default (time virtualization on), Hermit reports one fixed resolution for ordinary clocks, so a guest that sizes its timing loops from this answer sizes them for the virtual clock. Known gaps: 1.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> The resolution a host reports depends on the host's clocksource and kernel configuration, and guests use it to decide how finely they can measure — so the *value itself* is a small host fingerprint, and behaviour derived from it can differ between hosts.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> With time virtualization on (the deterministic configuration; <code>--no-virtualize-time</code> turns it off), Detcore determinizes the answer: every non-CPU clock reports one fixed resolution, a constant ten microseconds, whatever the host clocksource could do.<sup>[c1]</sup><sup>[c2]</sup><sup>[c4]</sup> A CPU clock reports its kind's resolution from Detcore's logical CPU accounting, after the named task is validated the way Linux validates it.<sup>[c4]</sup> Without time virtualization the call passes through to the host, with determinism resting on record/replay capturing the observed value.<sup>[c5]</sup></p>
+<p><strong>Interface fidelity.</strong> Clock ids are accepted or rejected as Linux decides from the id alone: the fixed clocks and <code>CLOCK_TAI</code> are known, the removed SGI cycle clock and ids from twelve up fail with <code>EINVAL</code>, and a negative id is decoded as a CPU-clock name validated against the task it names — except descriptor-encoded ids, which classify as ordinary clocks and so report the same fixed resolution.<sup>[c3]</sup><sup>[c4]</sup><sup>[c6]</sup> A null <code>res</code> pointer is valid, as on Linux: the id is validated, zero is returned, and nothing is stored.<sup>[c4]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> The virtualized answer is a constant (or a CPU-kind constant), so replay regenerates it; the non-virtualized answer is captured by the recording like the other clock reads.<sup>[c5]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the fixed ten-microsecond resolution replaces the per-clock resolutions a modern host kernel reports (often a single nanosecond), so a guest that sizes its timing loops from this answer sizes them for the virtual clock, not the host.<sup>[c4]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_getres&amp;body=Discussion+for+the+%60clock_getres%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_getres.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_getres%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_getres`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>clock_getres</code> (229) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1629</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8003</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_getres&amp;body=Discussion+for+the+%60clock_getres%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_getres.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_getres%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_getres`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>CPU-clock task validation through this call: <code>detcore/src/cpu_clock/handler_tests.rs</code> (<code>clock_getres_validates_the_task_a_cpu_clock_names</code>) — interface fidelity. The shared clock-id table: <code>detcore/src/syscalls/time.rs</code> (<code>timer_create_clock_refusal_matches_linuxs_clock_table</code>) — interface fidelity.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>clock_getres(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1629 sha256:00b8308a0ee86a95 <sup>[c2]</sup>: detcore/src/lib.rs:8003-8009 sha256:47575a8e7cdfd456 <sup>[c3]</sup>: detcore/src/syscalls/time.rs:55-66 sha256:ea09775213d38639 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:775-815 sha256:f229250e93cd7931 <sup>[c5]</sup>: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258 <sup>[c6]</sup>: detcore/src/cpu_clock.rs:106-150 sha256:72ee848aa6b82421</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

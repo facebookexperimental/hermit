@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>clock_gettime</code> (228)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_gettime&amp;body=Discussion+for+the+%60clock_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_gettime%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, every clock reads host time or host CPU accounting. By default (time virtualization on), Hermit answers from the guest's logical clock and logical CPU accounting, so readings repeat with the schedule. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>clock_gettime</code> reads a host clock — wall time, a monotonic clock, or a process/thread CPU clock — so the returned timespec advances with real elapsed time and with how the host scheduler ran the process.<sup>[linux]</sup> Two runs of the same program therefore observe different values everywhere a clock is read.</p>
+<p><strong>What Hermit does.</strong> With time virtualization on (the deterministic configuration; <code>--no-virtualize-time</code> turns it off), Detcore determinizes the call: typed dispatch reaches a handler that answers from the guest clock, the scheduler's logical time, observed as a global request so the read has a defined place in the schedule, and clamped per thread so no thread sees its own clock go backwards.<sup>[c1]</sup><sup>[c2]</sup><sup>[c5]</sup><sup>[c6]</sup> CPU clocks instead read Detcore's logical CPU accounting for the named process or thread, after the same guest-clock observation, so even a CPU-clock read keeps its schedule position.<sup>[c4]</sup> Without time virtualization the call passes through to the host clock, and determinism then depends on record/replay capturing the observed value (next part).<sup>[c7]</sup></p>
+<p><strong>Interface fidelity.</strong> Clock ids are accepted or rejected as Linux decides from the id alone: the fixed clocks and <code>CLOCK_TAI</code> are known, the removed SGI cycle clock and ids from twelve up fail with <code>EINVAL</code>, and a negative id is decoded as a CPU-clock name whose validity depends on the task it names — except descriptor-encoded ids, which the classifier puts with the ordinary clocks.<sup>[c3]</sup><sup>[c8]</sup> A CPU-clock id naming no live task fails with <code>EINVAL</code>; an unknown fixed id fails before any clock observation is made.<sup>[c4]</sup> A null output pointer fails with <code>EFAULT</code>, after the observation.<sup>[c4]</sup> All non-CPU clocks are *coalesced*: realtime, monotonic, boottime, and the coarse variants all read the one guest clock.<sup>[c4]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> Virtualized readings are regenerated when replay reaches the same call in the same schedule, because the value is a function of logical time there.<sup>[c5]</sup> Without virtualization, a recording captures the host value the guest observed and replay returns it without reading the host clock — which is why every clock read of this family carries a record/replay handler rather than a plain passthrough in that configuration.<sup>[c7]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the offsets between the non-CPU clocks are not modelled — <code>CLOCK_TAI</code> has no leap-second offset from realtime here, and boottime includes nothing extra — because all of them read the one guest clock.<sup>[c4]</sup></li>
+<li>G2 (by design): a dynamic clock descriptor does not read the clock it names: the classifier treats descriptor ids as ordinary clocks, so the call succeeds with the guest clock's virtual time instead of the descriptor clock's reading.<sup>[c8]</sup><sup>[c4]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_gettime&amp;body=Discussion+for+the+%60clock_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_gettime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_gettime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>clock_gettime</code> (228) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1632</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:7996</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_gettime&amp;body=Discussion+for+the+%60clock_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_gettime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_gettime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>CPU-clock readings and dead-task ids: <code>detcore/src/cpu_clock/handler_tests.rs</code> (<code>cpu_clocks_read_the_logical_cpu_accounting</code>, <code>cpu_clock_ids_naming_no_task_answer_as_linux_does</code>) — what Hermit does, and interface fidelity. The shared clock-id table: <code>detcore/src/syscalls/time.rs</code> (<code>timer_create_clock_refusal_matches_linuxs_clock_table</code>) — interface fidelity.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>clock_gettime(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1632 sha256:8ab0a9216ecb32b8 <sup>[c2]</sup>: detcore/src/lib.rs:7996-8002 sha256:6a297e311e55e02e https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L7996-L8002 <sup>[c3]</sup>: detcore/src/syscalls/time.rs:55-66 sha256:ea09775213d38639 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:742-773 sha256:0af0a455c8cc2b74 <sup>[c5]</sup>: detcore/src/syscalls/time.rs:185-192 sha256:2bfaae47fe5e3eed <sup>[c6]</sup>: detcore/src/tool_local.rs:5845-5850 sha256:fec2796a0addaa95 <sup>[c7]</sup>: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258 <sup>[c8]</sup>: detcore/src/cpu_clock.rs:106-150 sha256:72ee848aa6b82421</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

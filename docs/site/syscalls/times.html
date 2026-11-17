@@ -4,18 +4,37 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>times</code> (100)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+times&amp;body=Discussion+for+the+%60times%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimes.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60times%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, both the elapsed-tick return and the CPU times come from the host. Hermit derives both from its logical clock and logical CPU accounting. Known gaps: 2.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>times</code> reports two host quantities at once: elapsed wall-clock ticks since some host-boot-related instant (the return value), and the calling process's user/system CPU times as the host scheduler accounted them, including reaped children's.<sup>[linux]</sup> Both vary between runs and between hosts.</p>
+<p><strong>What Hermit does.</strong> Detcore determinizes both halves. The return value is elapsed ticks on the global logical clock, counted from the virtual boot instant plus the configured uptime offset, at the same <code>USER_HZ</code> tick rate Linux exposes, with the same wrapping conversion to <code>clock_t</code>.<sup>[c1]</sup><sup>[c2]</sup><sup>[c4]</sup><sup>[c5]</sup> The <code>tms</code> fields come from Detcore's per-process logical CPU accounting — user and syscall-system time aggregated across the process's threads — converted to ticks with Linux's truncation, never from host scheduler counters.<sup>[c3]</sup><sup>[c4]</sup><sup>[c6]</sup></p>
+<p><strong>Interface fidelity.</strong> A null <code>buf</code> stores nothing and still returns the elapsed ticks, as on Linux.<sup>[c3]</sup> Child counters aggregate a child's totals into the parent when the child is reaped, and a forked process starts with fresh counters.<sup>[c3]</sup><sup>[c7]</sup> Tick conversion truncates rather than rounds, matching the kernel's conversion.<sup>[c4]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> Every reported quantity is regenerated from logical time and logical CPU accounting at the same schedule point, so replay reproduces the same ticks without host input.<sup>[c3]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the elapsed-tick return value counts from the virtual boot instant (plus configured offset), so it is comparable between Hermit runs, never to a native run's host-boot-relative value.<sup>[c5]</sup></li>
+<li>G2 (by design): CPU times are logical accounting, not host scheduler time, so their ratio to elapsed time reflects executed work, not host wall-clock occupancy; a guest calibrating against a native ratio measures a different machine.<sup>[c3]</sup><sup>[c6]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+times&amp;body=Discussion+for+the+%60times%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimes.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60times%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `times`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>times</code> (100) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1966</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8436</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+times&amp;body=Discussion+for+the+%60times%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimes.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60times%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `times`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>Tick projection: <code>detcore/src/syscalls/sysinfo.rs</code> (<code>logical_clock_ticks_include_boot_offset_and_fractional_seconds</code>, <code>logical_clock_ticks_wrap_configured_offset_like_linux_clock_t</code>) — what Hermit does, and interface fidelity.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>times(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/sys.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1966 sha256:d27b643c185ed892 <sup>[c2]</sup>: detcore/src/lib.rs:8435-8436 sha256:e0b415f6635d038d <sup>[c3]</sup>: detcore/src/syscalls/sysinfo.rs:463-493 sha256:5dfe35d3a967053d https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/sysinfo.rs#L463-L493 <sup>[c4]</sup>: detcore/src/syscalls/sysinfo.rs:22-31 sha256:806ff51e57634dc0 <sup>[c5]</sup>: detcore/src/syscalls/sysinfo.rs:55-64 sha256:60859f7af97540ec <sup>[c6]</sup>: detcore/src/tool_local.rs:7738-7748 sha256:61f13661ddf079b7 <sup>[c7]</sup>: detcore/src/tool_local.rs:5716-5731 sha256:465998d86a303e3f</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

@@ -4,18 +4,36 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>clock_settime</code> (227)</h1>
 <p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_settime&amp;body=Discussion+for+the+%60clock_settime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_settime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_settime%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, this sets the host wall clock for everyone. Hermit refuses it outright; the virtual epoch is run configuration, not guest-writable. Known gaps: 1.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>clock_settime</code> does not read nondeterminism, it creates it: setting the host wall clock changes what every later clock read on the machine returns, for this process and all others.<sup>[linux]</sup></p>
+<p><strong>What Hermit does.</strong> Detcore refuses the call with <code>EPERM</code> at dispatch, unconditionally: the number is in the deterministic-refusal set, and the arm discards its arguments and returns the error without touching any clock.<sup>[c1]</sup><sup>[c2]</sup><sup>[c3]</sup><sup>[c4]</sup> The virtual clock's epoch is run configuration, chosen by whoever launched the run; a guest cannot move it from inside, which is what makes later clock reads reproducible.</p>
+<p><strong>Interface fidelity.</strong> The refusal precedes all other validation: an unknown clock id and a null timespec pointer get the same <code>EPERM</code>, with no earlier argument-specific answer, because the arm never reads its arguments.<sup>[c3]</sup> A privileged guest is refused identically; there is no capability the guest can hold that changes the answer.<sup>[c3]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c3]</sup> The result is a constant (<code>EPERM</code>), so replay reproduces it exactly and no clock state is recorded.<sup>[c3]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): there is no in-guest way to move the virtual clock through this call; guests that test clock-setting behaviour (time daemons, installers) see a permanently unprivileged answer, and the only way to run at a different epoch is to relaunch with one.<sup>[c3]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_settime&amp;body=Discussion+for+the+%60clock_settime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_settime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_settime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_settime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>clock_settime</code> (227) as determinized-refused via typed dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1638</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8012</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_settime&amp;body=Discussion+for+the+%60clock_settime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_settime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_settime%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `clock_settime`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>The fixed-error refusal aggregate this call belongs to: <code>detcore/src/syscall_classification.rs</code> (<code>deterministic_refusal_aggregate_includes_fixed_error_families</code>) — what Hermit does.</p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>clock_settime(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1638 sha256:43b78c7486dd3208 <sup>[c2]</sup>: detcore/src/syscall_classification.rs:1555-1564 sha256:d6fb9993d44cbe48 <sup>[c3]</sup>: detcore/src/lib.rs:8012-8014 sha256:ce80d6b93fe56ba9 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8012-L8014 <sup>[c4]</sup>: detcore/src/lib.rs:464-465 sha256:dfe85e842e0e8a89</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
+<li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
 </ul>
 </body></html>

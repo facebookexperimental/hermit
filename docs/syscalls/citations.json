@@ -1,0 +1,1050 @@
+{
+  "generated_by": "scripts/syscall-pages.rs anchor",
+  "pages": {
+    "access": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 2000,
+          "hash": "338d98bf9b74cc53",
+          "id": "c1",
+          "last": 2000,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8539,
+          "hash": "46fdc2c10422fe4b",
+          "id": "c2",
+          "last": 8539,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 5142,
+          "hash": "b70894cae0b286e2",
+          "id": "c3",
+          "last": 5149,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 8372,
+          "hash": "0623ae321077732f",
+          "id": "c4",
+          "last": 8406,
+          "path": "detcore/src/syscalls/files/rendered_procfs.rs"
+        },
+        {
+          "first": 290,
+          "hash": "501d2754f4fd2903",
+          "id": "c5",
+          "last": 306,
+          "path": "detcore/src/syscalls/files/prefilter_tests.rs"
+        },
+        {
+          "first": 7765,
+          "hash": "3b4d70911051ee26",
+          "id": "c6",
+          "last": 7780,
+          "path": "detcore/src/syscalls/files/rendered_procfs.rs"
+        },
+        {
+          "first": 8077,
+          "hash": "adb87316238537e6",
+          "id": "c7",
+          "last": 8093,
+          "path": "detcore/src/syscalls/files/rendered_procfs.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EACCESS"
+      ],
+      "tests": [
+        {
+          "names": [
+            "passthru_opt_subscribes_every_determinized_syscall"
+          ],
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "names": [
+            "a_representative_call_of_each_check_still_reaches_it"
+          ],
+          "path": "detcore/src/syscalls/files/prefilter_tests.rs"
+        }
+      ]
+    },
+    "adjtimex": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1614,
+          "hash": "83559dce6281bf2d",
+          "id": "c1",
+          "last": 1614,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8021,
+          "hash": "92c9c3b78daa6c6d",
+          "id": "c2",
+          "last": 8032,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 162,
+          "hash": "9d53c5f9c9cd0cdf",
+          "id": "c3",
+          "last": 181,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 817,
+          "hash": "fbcdb3caabb0543b",
+          "id": "c4",
+          "last": 858,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1898,
+          "hash": "72acd2655164229d",
+          "id": "c5",
+          "last": 1907,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EOPNOTSUPP",
+        "EPERM",
+        "ERROR"
+      ],
+      "tests": [
+        {
+          "names": [
+            "timex_policy_distinguishes_queries_from_mutations",
+            "timex_snapshot_is_unsynchronized_and_uses_virtual_time"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "clock_getres": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1629,
+          "hash": "00b8308a0ee86a95",
+          "id": "c1",
+          "last": 1629,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8003,
+          "hash": "47575a8e7cdfd456",
+          "id": "c2",
+          "last": 8009,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 55,
+          "hash": "ea09775213d38639",
+          "id": "c3",
+          "last": 66,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 775,
+          "hash": "f229250e93cd7931",
+          "id": "c4",
+          "last": 815,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 7978,
+          "hash": "2018927e6bf82258",
+          "id": "c5",
+          "last": 7980,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 106,
+          "hash": "72ee848aa6b82421",
+          "id": "c6",
+          "last": 150,
+          "path": "detcore/src/cpu_clock.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINVAL"
+      ],
+      "tests": [
+        {
+          "names": [
+            "clock_getres_validates_the_task_a_cpu_clock_names"
+          ],
+          "path": "detcore/src/cpu_clock/handler_tests.rs"
+        },
+        {
+          "names": [
+            "timer_create_clock_refusal_matches_linuxs_clock_table"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "clock_gettime": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1632,
+          "hash": "8ab0a9216ecb32b8",
+          "id": "c1",
+          "last": 1632,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 7996,
+          "hash": "6a297e311e55e02e",
+          "id": "c2",
+          "last": 8002,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 55,
+          "hash": "ea09775213d38639",
+          "id": "c3",
+          "last": 66,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 742,
+          "hash": "0af0a455c8cc2b74",
+          "id": "c4",
+          "last": 773,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 185,
+          "hash": "2bfaae47fe5e3eed",
+          "id": "c5",
+          "last": 192,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 5845,
+          "hash": "fec2796a0addaa95",
+          "id": "c6",
+          "last": 5850,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 7978,
+          "hash": "2018927e6bf82258",
+          "id": "c7",
+          "last": 7980,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 106,
+          "hash": "72ee848aa6b82421",
+          "id": "c8",
+          "last": 150,
+          "path": "detcore/src/cpu_clock.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINVAL"
+      ],
+      "tests": [
+        {
+          "names": [
+            "cpu_clocks_read_the_logical_cpu_accounting",
+            "cpu_clock_ids_naming_no_task_answer_as_linux_does"
+          ],
+          "path": "detcore/src/cpu_clock/handler_tests.rs"
+        },
+        {
+          "names": [
+            "timer_create_clock_refusal_matches_linuxs_clock_table"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "clock_nanosleep": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1635,
+          "hash": "4a4c9cd61f298909",
+          "id": "c1",
+          "last": 1635,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 926,
+          "hash": "ccfb2f3a9f96e469",
+          "id": "c10",
+          "last": 972,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 641,
+          "hash": "9f7ee2f871c456b8",
+          "id": "c11",
+          "last": 645,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1149,
+          "hash": "97e3cab71e4960c1",
+          "id": "c12",
+          "last": 1192,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 8157,
+          "hash": "a8cc88fc6dd9178b",
+          "id": "c2",
+          "last": 8159,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 988,
+          "hash": "e136235491938171",
+          "id": "c3",
+          "last": 1003,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1020,
+          "hash": "780522b8b85931be",
+          "id": "c4",
+          "last": 1040,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1005,
+          "hash": "a227c07e2df918b8",
+          "id": "c5",
+          "last": 1018,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1182,
+          "hash": "e48dfcc7f1dd0ef2",
+          "id": "c6",
+          "last": 1192,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1057,
+          "hash": "d54f7113d8299803",
+          "id": "c7",
+          "last": 1102,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 419,
+          "hash": "8aa80945903cb0be",
+          "id": "c8",
+          "last": 434,
+          "path": "detcore/src/cpu_clock.rs"
+        },
+        {
+          "first": 1194,
+          "hash": "64b20d04fefb079b",
+          "id": "c9",
+          "last": 1222,
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "ENOSYS",
+        "EOPNOTSUPP",
+        "ERESTART",
+        "ERESTARTNOHAND"
+      ],
+      "tests": [
+        {
+          "names": [
+            "an_absolute_cpu_deadline_waits_for_the_rest"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "names": [
+            "a_cpu_clock_sleep_that_would_wait_is_refused"
+          ],
+          "path": "detcore/src/cpu_clock/handler_tests.rs"
+        },
+        {
+          "names": [
+            "interrupted_sleep_remaining_time_floors_at_zero"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "clock_settime": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1638,
+          "hash": "43b78c7486dd3208",
+          "id": "c1",
+          "last": 1638,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1555,
+          "hash": "d6fb9993d44cbe48",
+          "id": "c2",
+          "last": 1564,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8012,
+          "hash": "ce80d6b93fe56ba9",
+          "id": "c3",
+          "last": 8014,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 464,
+          "hash": "dfe85e842e0e8a89",
+          "id": "c4",
+          "last": 465,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EPERM"
+      ],
+      "tests": [
+        {
+          "names": [
+            "deterministic_refusal_aggregate_includes_fixed_error_families"
+          ],
+          "path": "detcore/src/syscall_classification.rs"
+        }
+      ]
+    },
+    "getrandom": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1721,
+          "hash": "c54a525905843c1d",
+          "id": "c1",
+          "last": 1721,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 422,
+          "hash": "f70450ad8a392d48",
+          "id": "c10",
+          "last": 465,
+          "path": "detcore/src/random.rs"
+        },
+        {
+          "first": 8076,
+          "hash": "93780f6568a9ccb6",
+          "id": "c2",
+          "last": 8076,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 995,
+          "hash": "da781258bb76f39c",
+          "id": "c3",
+          "last": 1006,
+          "path": "detcore/src/syscalls/misc.rs"
+        },
+        {
+          "first": 85,
+          "hash": "80070102c8955726",
+          "id": "c4",
+          "last": 89,
+          "path": "detcore/src/random.rs"
+        },
+        {
+          "first": 8064,
+          "hash": "77f5b8fa2750c93f",
+          "id": "c4",
+          "last": 8064,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 353,
+          "hash": "457f6f1d8c825499",
+          "id": "c5",
+          "last": 367,
+          "path": "detcore/src/random.rs"
+        },
+        {
+          "first": 369,
+          "hash": "1214b3548eb1bffa",
+          "id": "c6",
+          "last": 372,
+          "path": "detcore/src/random.rs"
+        },
+        {
+          "first": 33,
+          "hash": "f905def3a3370b21",
+          "id": "c7",
+          "last": 36,
+          "path": "detcore/src/page.rs"
+        },
+        {
+          "first": 498,
+          "hash": "04119e41e82c2eb6",
+          "id": "c8",
+          "last": 531,
+          "path": "detcore/src/random.rs"
+        },
+        {
+          "first": 531,
+          "hash": "ecba227f019bd3b1",
+          "id": "c9",
+          "last": 545,
+          "path": "detcore/src/random.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINVAL"
+      ],
+      "tests": [
+        {
+          "names": [
+            "getrandom_accepts_linux_flags",
+            "getrandom_rejects_invalid_flags",
+            "getrandom_caps_requests_at_linux_max_rw_count"
+          ],
+          "path": "detcore/src/syscalls/misc.rs"
+        },
+        {
+          "names": [
+            "shared_random_preserves_auxv_and_fault_semantics",
+            "eight_byte_random_copy_distinguishes_faults_from_backend_errors"
+          ],
+          "path": "detcore/src/random.rs"
+        }
+      ]
+    },
+    "gettimeofday": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1730,
+          "hash": "310a3124777d80e5",
+          "id": "c1",
+          "last": 1730,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 292,
+          "hash": "bc3909d75a332b56",
+          "id": "c11",
+          "last": 345,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 7981,
+          "hash": "c164fb54a01b22d1",
+          "id": "c2",
+          "last": 7987,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 685,
+          "hash": "a10e250f8324a803",
+          "id": "c4",
+          "last": 722,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 185,
+          "hash": "2bfaae47fe5e3eed",
+          "id": "c5",
+          "last": 192,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 7978,
+          "hash": "2018927e6bf82258",
+          "id": "c6",
+          "last": 7980,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "without_a_store_probe_the_repair_refuses",
+            "successful_time_store_probe_requires_an_overwrite",
+            "any_control_probe_error_means_the_efault_was_not_a_store_fault"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "io_uring_enter": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1746,
+          "hash": "1c1981b8b744f325",
+          "id": "c1",
+          "last": 1746,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1555,
+          "hash": "d6fb9993d44cbe48",
+          "id": "c2",
+          "last": 1564,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 464,
+          "hash": "dfe85e842e0e8a89",
+          "id": "c3",
+          "last": 465,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 8089,
+          "hash": "5508f1a66cc8ff30",
+          "id": "c4",
+          "last": 8092,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1626,
+          "hash": "bbd8dc0663f6afd6",
+          "id": "c5",
+          "last": 1631,
+          "path": "detcore/src/io_buffers.rs"
+        },
+        {
+          "first": 1817,
+          "hash": "89e8c68d0a1a09e2",
+          "id": "c6",
+          "last": 1835,
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "ENOSYS"
+      ],
+      "tests": [
+        {
+          "names": [
+            "io_uring_refusal_never_reaches_guest_injection"
+          ],
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ]
+    },
+    "io_uring_register": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1747,
+          "hash": "2cf1d4de8ca1559d",
+          "id": "c1",
+          "last": 1747,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1555,
+          "hash": "d6fb9993d44cbe48",
+          "id": "c2",
+          "last": 1564,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 464,
+          "hash": "dfe85e842e0e8a89",
+          "id": "c3",
+          "last": 465,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 8089,
+          "hash": "5508f1a66cc8ff30",
+          "id": "c4",
+          "last": 8092,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1626,
+          "hash": "bbd8dc0663f6afd6",
+          "id": "c5",
+          "last": 1631,
+          "path": "detcore/src/io_buffers.rs"
+        },
+        {
+          "first": 1817,
+          "hash": "89e8c68d0a1a09e2",
+          "id": "c6",
+          "last": 1835,
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "ENOSYS"
+      ],
+      "tests": [
+        {
+          "names": [
+            "io_uring_refusal_never_reaches_guest_injection"
+          ],
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ]
+    },
+    "io_uring_setup": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1748,
+          "hash": "2049c5abbcf5fbf5",
+          "id": "c1",
+          "last": 1748,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1555,
+          "hash": "d6fb9993d44cbe48",
+          "id": "c2",
+          "last": 1564,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 464,
+          "hash": "dfe85e842e0e8a89",
+          "id": "c3",
+          "last": 465,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 8089,
+          "hash": "5508f1a66cc8ff30",
+          "id": "c4",
+          "last": 8092,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1626,
+          "hash": "bbd8dc0663f6afd6",
+          "id": "c5",
+          "last": 1631,
+          "path": "detcore/src/io_buffers.rs"
+        },
+        {
+          "first": 1817,
+          "hash": "89e8c68d0a1a09e2",
+          "id": "c6",
+          "last": 1835,
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "ENOSYS"
+      ],
+      "tests": [
+        {
+          "names": [
+            "io_uring_refusal_never_reaches_guest_injection"
+          ],
+          "path": "detcore/src/io_buffers.rs"
+        }
+      ]
+    },
+    "mprotect": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 2048,
+          "hash": "7467309d5c39fe53",
+          "id": "c1",
+          "last": 2048,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8539,
+          "hash": "46fdc2c10422fe4b",
+          "id": "c2",
+          "last": 8539,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [],
+      "tests": [
+        {
+          "names": [
+            "random_read_before_an_unmapped_page",
+            "page_before_a_hole"
+          ],
+          "path": "detcore/tests/misc/mod.rs"
+        }
+      ]
+    },
+    "nanosleep": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1805,
+          "hash": "bdb80887873e8a3d",
+          "id": "c1",
+          "last": 1805,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8156,
+          "hash": "ed87abad08b828c8",
+          "id": "c2",
+          "last": 8156,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1020,
+          "hash": "780522b8b85931be",
+          "id": "c4",
+          "last": 1040,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 926,
+          "hash": "ccfb2f3a9f96e469",
+          "id": "c5",
+          "last": 972,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1105,
+          "hash": "da2305f33c564d21",
+          "id": "c6",
+          "last": 1125,
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "ERESTART",
+        "ERESTARTNOHAND"
+      ],
+      "tests": [
+        {
+          "names": [
+            "interrupted_sleep_remaining_time_floors_at_zero",
+            "only_a_relative_sleep_of_zero_is_a_zero_length_sleep"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ]
+    },
+    "restart_syscall": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 2094,
+          "hash": "141bc2be34332b90",
+          "id": "c1",
+          "last": 2094,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 2260,
+          "hash": "c25880d1866152ac",
+          "id": "c10",
+          "last": 2290,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 8540,
+          "hash": "60fa791b3b39c5f3",
+          "id": "c2",
+          "last": 8553,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1970,
+          "hash": "a52a49e793018d72",
+          "id": "c4",
+          "last": 1987,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1909,
+          "hash": "9019875916d9fecc",
+          "id": "c5",
+          "last": 1916,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1992,
+          "hash": "11ce7bfdd0a59cb2",
+          "id": "c6",
+          "last": 2029,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1880,
+          "hash": "a956e173f03ed24f",
+          "id": "c7",
+          "last": 1906,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 3016,
+          "hash": "4f7604dfddef1d52",
+          "id": "c8",
+          "last": 3045,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 6955,
+          "hash": "9ae2050e058435fa",
+          "id": "c9",
+          "last": 6963,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EINTR",
+        "ERESTART",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "signal_interruption_errno_matches_linux_restart_policy",
+            "kernel_restart_errno_matches_linux_restart_policy",
+            "a_woken_poll_restarts_through_erestartsys_where_linux_restarts_it"
+          ],
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ]
+    },
+    "time": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1949,
+          "hash": "bab02b747529bee6",
+          "id": "c1",
+          "last": 1949,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 7988,
+          "hash": "f319953eedd3775f",
+          "id": "c2",
+          "last": 7995,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 724,
+          "hash": "efe5c93a6f9cbe34",
+          "id": "c3",
+          "last": 740,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 185,
+          "hash": "2bfaae47fe5e3eed",
+          "id": "c4",
+          "last": 192,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 7978,
+          "hash": "2018927e6bf82258",
+          "id": "c5",
+          "last": 7980,
+          "path": "detcore/src/lib.rs"
+        }
+      ],
+      "cited_errnos": [],
+      "tests": []
+    },
+    "times": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1966,
+          "hash": "d27b643c185ed892",
+          "id": "c1",
+          "last": 1966,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8435,
+          "hash": "e0b415f6635d038d",
+          "id": "c2",
+          "last": 8436,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 463,
+          "hash": "5dfe35d3a967053d",
+          "id": "c3",
+          "last": 493,
+          "path": "detcore/src/syscalls/sysinfo.rs"
+        },
+        {
+          "first": 22,
+          "hash": "806ff51e57634dc0",
+          "id": "c4",
+          "last": 31,
+          "path": "detcore/src/syscalls/sysinfo.rs"
+        },
+        {
+          "first": 55,
+          "hash": "60859f7af97540ec",
+          "id": "c5",
+          "last": 64,
+          "path": "detcore/src/syscalls/sysinfo.rs"
+        },
+        {
+          "first": 7738,
+          "hash": "61f13661ddf079b7",
+          "id": "c6",
+          "last": 7748,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 5716,
+          "hash": "465998d86a303e3f",
+          "id": "c7",
+          "last": 5731,
+          "path": "detcore/src/tool_local.rs"
+        }
+      ],
+      "cited_errnos": [],
+      "tests": [
+        {
+          "names": [
+            "logical_clock_ticks_include_boot_offset_and_fractional_seconds",
+            "logical_clock_ticks_wrap_configured_offset_like_linux_clock_t"
+          ],
+          "path": "detcore/src/syscalls/sysinfo.rs"
+        }
+      ]
+    }
+  },
+  "schema": "citations.json/v1"
+}
