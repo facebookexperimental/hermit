@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Scenario tests for ci/buck-e2e/ingest.py, run against a stand-in testx.
 
 Each test lays out a Buck test run the way testx lists it (every cell execution
@@ -200,7 +206,7 @@ class IngestTest(unittest.TestCase):
         self.testx.chmod(0o755)
         (self.root / "plan.json").write_text(json.dumps(PLAN))
 
-    def ingest(self, runs, local=(), extra=(), **environment):
+    def ingest(self, runs, local=(), extra=(), local_listing=False, **environment):
         """Run ingest.py on RUNS ({test run id: [execution, ...]}), with each
         execution in LOCAL copied into its own buck-out artifacts directory and
         EXTRA added to its arguments. Its --withheld-on-re list goes to
@@ -228,23 +234,29 @@ class IngestTest(unittest.TestCase):
                 target = buck_out / "root" / f"target{index}" / "config" / "default"
                 write_artifacts(target / "artifacts_directory", uploaded)
             command += ["--local-artifacts", str(buck_out)]
+        if local_listing:
+            command += ["--local-listing"]
         environment = dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake), **environment)
+        if local_listing:
+            # Listing locally must never reach for TestX at all.
+            environment["TESTX"] = "/nonexistent/testx"
         process = subprocess.run(
-            command + list(extra) + list(runs), capture_output=True, text=True, env=environment
+            command + list(extra) + ([] if local_listing else list(runs)),
+            capture_output=True, text=True, env=environment
         )
         return work, process
 
-    def refused(self, runs, reason, local=()):
-        _, process = self.ingest(runs, local)
+    def refused(self, runs, reason, local=(), local_listing=False):
+        _, process = self.ingest(runs, local, local_listing=local_listing)
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         self.assertIn(reason, process.stderr)
 
-    def accepted(self, runs, local=(), withheld_on_re=(), withheld_retries=()):
+    def accepted(self, runs, local=(), withheld_on_re=(), withheld_retries=(), local_listing=False):
         """Return ingest.py's printed summary, the bucket's rows as (cell,
         attempt, outcome, run id), and the bucket's summary.json. The cells it
         lists as withheld on RE by every execution must be WITHHELD_ON_RE, and
         those whose retry after an attempt was withheld WITHHELD_RETRIES."""
-        work, process = self.ingest(runs, local)
+        work, process = self.ingest(runs, local, local_listing=local_listing)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual((work / "withheld-on-re").read_text(), "".join(f"{slug}\n" for slug in withheld_on_re))
         self.assertEqual((work / "withheld-retries").read_text(), "".join(f"{slug}\n" for slug in withheld_retries))
@@ -691,6 +703,62 @@ class IngestTest(unittest.TestCase):
         )
         self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
         self.assertEqual(printed["sources"], {"local": 1, "testx": 2})
+
+    def test_local_listing_ingests_without_testx(self):
+        # The stock runner has no TestX run to list: the artifacts
+        # directories themselves (run marker + result.json) are the listing.
+        printed, rows, _ = self.accepted(
+            {},
+            local=[execution(X, 300, "PASS", "rx1"), Y_PASSES],
+            local_listing=True,
+        )
+        self.assertEqual(rows, [(X, 1, "PASS", "rx1"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["sources"], {"local": 2})
+
+    def test_local_listing_refuses_two_markers_in_one_directory(self):
+        self.refused(
+            {},
+            "holds 2 run markers",
+            local=[execution(X, 300, "PASS", "rx1", markers=["rx1", "rx2"])],
+            local_listing=True,
+        )
+
+    def test_local_listing_refuses_a_marked_directory_without_result_json(self):
+        self.refused(
+            {},
+            "has no readable result.json",
+            local=[execution(X, 300, "PASS", "rx1", result=None)],
+            local_listing=True,
+        )
+
+    def test_local_listing_refuses_a_bad_cell_name(self):
+        bad = {"cell": "bogus", "run_id": "rx1", "evidence_complete": True,
+               "producer_completion": VALID}
+        self.refused(
+            {},
+            "names a bad cell",
+            local=[execution(X, 300, "PASS", "rx1", result=bad)],
+            local_listing=True,
+        )
+
+    def test_local_listing_refuses_when_nothing_is_marked(self):
+        self.refused(
+            {},
+            "no local artifacts directories with run markers",
+            local=[execution(X, 300, "PASS", "rx1", markers=[])],
+            local_listing=True,
+        )
+
+    def test_local_listing_refuses_a_leftover_cell_outside_the_plan(self):
+        # A leftover execution from another run is never silently imported:
+        # its cell is outside this ingest's plan, so the ingest refuses.
+        leftover = execution("t/z/verify@ptrace", 100, "PASS", "rz0")
+        self.refused(
+            {},
+            "unexpected cells",
+            local=[execution(X, 300, "PASS", "rx1"), Y_PASSES, leftover],
+            local_listing=True,
+        )
 
     def test_a_marker_that_does_not_name_one_local_directory_is_fetched(self):
         cases = [

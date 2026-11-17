@@ -449,6 +449,62 @@ tree cache, and a Buck-runner row never answers a cargo request: the cache reads
 `HERMIT_GIT_DEP_MIRRORS` must be set in the validation's environment when the
 proxy refuses GitHub to Reindeer.
 
+#### The stock public runner
+
+The cell targets above speak the artifact protocol of Meta's internal test
+runner: each expects per-test artifact directories and reports its outcome as
+one JSON `test_done` record, exiting 0 for every harness outcome. The stock
+`buck2 test` runner in a public Buck2 release provides none of that protocol,
+so running the cell targets directly under it is never evidence: every cell
+reports `test_done status="failed"` ("Tpx artifact dirs are not set"), exits
+0, and Buck records a pass. Passing `-c hermit_e2e.stock_runner=true`
+generates a shell-test twin of every cell, `:<slug>-stock` (and a
+`:stock-local` suite), which runs `ci/buck-e2e/cell-stock.py` around the
+unchanged `cell.sh`: the wrapper supplies a unique `artifacts_directory`,
+maps the cell's JSON claim onto its exit code (0 pass, 1 fail, 3
+host-inapplicable, 2 protocol error; the stock runner has no skip status, so a
+host-inapplicable cell fails closed rather than passing), and refuses a pass
+whose published `result.json` evidence is incomplete. Test-execution caching
+is disabled for the twins; they execute on the local host of whatever
+execution platform the public configuration selects (the public build has no
+remote executor configured by default). Give each run a fresh artifact root,
+so an ingest lists only that run's executions. Stage a bundle first
+(`ci/buck-e2e/stage --from-cargo`), then:
+
+```sh
+RUN=$(mktemp -d)
+buck2 test //ci/buck-e2e:c-programs-getcpu-verify-kvm-stock \
+    -c hermit_e2e.stock_runner=true -c hermit_e2e.hermit=staged \
+    -c "hermit_e2e.stock_artifact_root=$RUN/execution" --no-remote-cache
+python3 - "$RUN/plan.json" <<'PY'
+import json, sys
+plan = json.load(open("ci/expected-e2e-plan.json"))
+plan["cells"] = [
+    c for c in plan["cells"]
+    if (c["test"], c["mode"], c["backend"]) == ("c-programs/getcpu", "verify", "kvm")
+]
+json.dump(plan, open(sys.argv[1], "w"))
+PY
+python3 ci/buck-e2e/ingest.py --plan "$RUN/plan.json" --out "$RUN/import" \
+    --local-artifacts "$RUN/execution" --local-listing
+```
+
+The plan passed to ingest must list exactly the cells that were run: ingest
+refuses a plan cell with no execution and an execution outside the plan, so
+the committed full plan only fits a run of every cell. The snippet above
+narrows it to the one cell this example runs; widen the filter to match
+whatever set of twins a larger run executes.
+
+`--local-listing` lists executions from those artifact directories (run marker
+plus `result.json`) instead of asking the internal result service, which a
+public run does not have; the import directory then feeds
+`test-harness run --import` exactly as an internal ingest does. On a host
+without KVM, CPUID faulting or an exact branch counter, the cells needing
+those capabilities fail closed with exit 3: select the twins for your host
+(by backend or label) and read the exit-3 lines as capability gaps, not
+product failures. The default target graph is unchanged without the `-c`
+flag.
+
 ## Host prerequisites for Buck validation
 
 The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then

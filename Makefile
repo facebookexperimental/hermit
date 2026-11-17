@@ -249,6 +249,7 @@ LINT_CHECK_TARGETS := \
     lint-check-core-review-protocol \
     lint-check-audit-test-binary-registration-test \
     lint-check-buck-e2e-ingest \
+    lint-check-buck-e2e-stock \
     lint-check-buck-e2e-verdict \
     lint-check-buck-e2e-cell \
     lint-check-buck-e2e-stage \
@@ -441,6 +442,9 @@ lint-check-audit-test-binary-registration-test:
 
 lint-check-buck-e2e-ingest:
 	python3 ./ci/test_buck_e2e_ingest.py
+
+lint-check-buck-e2e-stock:
+	python3 ./ci/test_buck_e2e_stock.py
 
 lint-check-buck-e2e-verdict:
 	python3 ./ci/test_buck_e2e_verdict.py

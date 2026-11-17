@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Rebuild the e2e result files of a Buck test run from its Tpx results.
 
 usage: ingest.py --plan ci/expected-e2e-plan.json --out IMPORT_DIR [--work DIR]
-                 [--local-artifacts BUCK_OUT_TEST_DIR] [--failed-verify-logs DIR]
+                 [--local-artifacts DIR [--local-listing]] [--failed-verify-logs DIR]
                  [--withheld-on-re FILE] TEST_RUN_ID...
 
 TEST_RUN_ID is what `buck2 test --write-test-id FILE` wrote (one per invocation; the
-hybrid run makes two, one for RE cells and one for local cells). Every cell execution
+hybrid run makes two, one for RE cells and one for local cells). With --local-listing
+(and no test run ids), executions are instead listed from --local-artifacts itself,
+one per artifacts directory's run marker and result.json, and testx is never called:
+the stock public runner (cell-stock.py) has no TestX run to list. Every cell execution
 uploads the rows test-harness wrote as its results.jsonl Tpx artifact; this fetches
 them with testx (TESTX env, default `testx`) and writes one bucket per (lane, category):
 
@@ -526,6 +535,51 @@ def restore(out, run_id, result, logs, log_dir, fetch_error):
         entries[recorded] = (target, None) if reason is None else (None, reason)
     return entries
 
+def listed_local(local_root):
+    """Executions listed from local artifacts instead of TestX.
+
+    Each execution is one artifacts directory holding exactly one run
+    marker, as cell-stock.py leaves them. The result.json names the
+    cell, so a marked directory without a readable one cannot be
+    listed honestly and refuses here rather than vanishing from the
+    count. Tuples match the TestX listing shape fetch() consumes,
+    with the synthetic run id "stock-local".
+    """
+    executions = []
+    for dirpath, dirnames, filenames in os.walk(local_root):
+        if os.path.basename(dirpath) != "artifacts_directory":
+            continue
+        dirnames[:] = []
+        found = markers(filenames)
+        if not found:
+            continue
+        if len(found) > 1:
+            sys.exit(
+                f"ingest: local artifacts directory {dirpath} holds {len(found)} run markers")
+        marker = found[0]
+        result_path = os.path.join(dirpath, "result.json")
+        try:
+            with open(result_path) as f:
+                result = json.load(f)
+        except (OSError, ValueError) as error:
+            sys.exit(
+                f"ingest: local artifacts directory {dirpath} has no readable result.json: {error}")
+        cell = result.get("cell")
+        head, at, backend = cell.rpartition("@") if isinstance(cell, str) else ("", "", "")
+        test, slash, mode = head.rpartition("/")
+        if not at or not slash or not test or not mode or not backend:
+            sys.exit(f"ingest: local result.json in {dirpath} names a bad cell: {cell!r}")
+        end = int(os.stat(result_path).st_mtime)
+        executions.append((cell, end, marker, "stock-local", marker, {
+            "test_details": {"name": f"stock - {cell}", "id": marker},
+            "end_time": end,
+            "artifacts": [],
+        }))
+    if not executions:
+        sys.exit("ingest: no local artifacts directories with run markers to list")
+    return executions
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", required=True)
@@ -533,14 +587,22 @@ def main():
     ap.add_argument("--work", help="where fetched artifacts go (default: a temporary directory)")
     ap.add_argument("-j", type=int, default=32)
     ap.add_argument("--local-artifacts", help="buck-out/v2/test/execution: read an execution from here when one directory holds its marker")
+    ap.add_argument("--local-listing", action="store_true", help="list executions from --local-artifacts instead of TestX (takes no test run ids)")
     ap.add_argument("--failed-verify-logs", metavar="DIR", help="keep the verify logs of every execution that did not pass here")
     ap.add_argument("--failed-log-max-bytes", type=int, default=FAILED_LOG_MAX_BYTES, help=argparse.SUPPRESS)  # tests only
     ap.add_argument("--withheld-on-re", help="write the target name of each cell withheld on RE by every execution here")
     ap.add_argument("--withheld-retries", help="write the target name of each cell whose retry after an attempt was withheld on RE here")
     ap.add_argument("--event-log", action="append", default=[], help="an invocation's Buck event log, read to name why an execution wrote no row")
     ap.add_argument("--buck2", default=os.environ.get("BUCK2", "buck2"), help="the buck2 that reads --event-log")
-    ap.add_argument("run_ids", nargs="+")
+    ap.add_argument("run_ids", nargs="*")
     a = ap.parse_args()
+    if a.local_listing:
+        if not a.local_artifacts:
+            ap.error("--local-listing needs --local-artifacts")
+        if a.run_ids:
+            ap.error("--local-listing takes no test run ids")
+    elif not a.run_ids:
+        ap.error("test run ids are required without --local-listing")
     failed_root, failed_logs_error = a.failed_verify_logs, None
     if failed_root is not None and os.path.lexists(failed_root):
         def holds_index():
@@ -586,7 +648,17 @@ def main():
         print(f"ingest: testx listed {len(results)} results of test run {rid} in "
               f"{time.monotonic() - started:.1f} s", file=sys.stderr)
         return results
-    with cf.ThreadPoolExecutor(len(a.run_ids)) as ex:
+    local = collections.defaultdict(list)  # run id -> local artifact directories holding its marker
+    if a.local_artifacts:
+        for dirpath, dirnames, filenames in os.walk(a.local_artifacts):
+            if os.path.basename(dirpath) == "artifacts_directory":
+                dirnames[:] = []
+                found = markers(filenames)
+                if len(found) == 1:
+                    local[found[0]].append(dirpath)
+    if a.local_listing:
+        executions.extend(listed_local(a.local_artifacts))
+    with cf.ThreadPoolExecutor(max(1, len(a.run_ids))) as ex:
         listings = list(ex.map(listed, a.run_ids))
     for rid, results in zip(a.run_ids, listings):
         for t in results:
@@ -603,15 +675,6 @@ def main():
     if ties:
         sys.exit(f"ingest: executions of one cell ended in the same second, so their order is unknown "
                  f"and testx (RUN.TEST.END) cannot tell their artifacts apart: {ties[:20]} ({len(ties)})")
-
-    local = collections.defaultdict(list)  # run id -> local artifact directories holding its marker
-    if a.local_artifacts:
-        for dirpath, dirnames, filenames in os.walk(a.local_artifacts):
-            if os.path.basename(dirpath) == "artifacts_directory":
-                dirnames[:] = []
-                found = markers(filenames)
-                if len(found) == 1:
-                    local[found[0]].append(dirpath)
 
     def fetch(item):
         cell, end, tid, rid, marker, t = item
