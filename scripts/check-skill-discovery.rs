@@ -9,6 +9,8 @@
 
 //! Verify the cross-client skill layout without duplicating instruction bodies.
 
+#[path = "lib/agent_utils_skills.rs"]
+mod agent_utils_skills;
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
@@ -37,6 +39,10 @@ const PACKAGED_SKILLS: &[&str] = &[
     "progress-rubric",
     "repo-cleanliness",
     "test-shrink-optimization",
+    "testing-principles",
+    "testing-principles-hermit",
+    "testing-with-buck",
+    "testing-with-dagrun",
     "ux-tester",
     "validation-evidence",
 ];
@@ -607,6 +613,7 @@ fn main() {
     if let Err(error) = parser_regression_tests()
         .and_then(|_| containment_regression_test())
         .and_then(|_| package_resource_regression_test())
+        .and_then(|_| agent_utils_skills::regression_test())
     {
         eprintln!("check-skill-discovery: ERROR: {error}");
         std::process::exit(1);
@@ -624,6 +631,20 @@ fn main() {
     if let Err(error) = check(&root) {
         eprintln!("check-skill-discovery: ERROR: {error}");
         std::process::exit(1);
+    }
+    if let Some(name) = agent_utils_skills::IMPORTED
+        .iter()
+        .find(|name| !PACKAGED_SKILLS.contains(name))
+    {
+        eprintln!("check-skill-discovery: ERROR: imported skill {name} is not a packaged skill");
+        std::process::exit(1);
+    }
+    match agent_utils_skills::check(&root, None) {
+        Ok(summary) => println!("check-skill-discovery: {summary}"),
+        Err(error) => {
+            eprintln!("check-skill-discovery: ERROR: {error}");
+            std::process::exit(1);
+        }
     }
     println!(
         "check-skill-discovery: PASS ({} canonical packages; Claude root and Codex package links verified)",

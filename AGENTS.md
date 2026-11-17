@@ -44,6 +44,10 @@ nightly formatter) and `cargo clippy --workspace --all-targets -- -D warnings`.
 matrix: more than 700 internal Buck integration tests are not fully ported.
 Include the host environment when a failure depends on PMU, CPUID or CPU
 features, and never mark or delete a hardware-sensitive test to green a VM.
+Testing rules: `testing-principles`, `testing-with-dagrun` and
+`testing-with-buck`, imported from agent-utils by
+`scripts/import-agent-utils-skills.rs` and never edited here, plus the Hermit
+addendum `testing-principles-hermit`.
 
 ## Backend Definition
 
