@@ -88,7 +88,7 @@ These **2** tests document unresolved backend limitations in additional test sui
 | Test | Gap | Tracking issue | Must fail with | Status |
 | --- | --- | --- | --- | --- |
 | `itimer_a_private_descriptor_table_consumer_re_arms` | D — threads with private file descriptor tables | https://github.com/rrnewton/hermit/issues/4485 | not run | skipped (known gap) |
-| `itimer_generation_discard_follows_the_wait_mask` | E+F' — interval-timer expiry during waits with temporary signal masks | https://github.com/rrnewton/hermit/issues/4995 | not run | skipped (known gap) |
+| `itimer_generation_discard_follows_the_wait_mask` | E&#43;F&#39; — interval&#45;timer expiry during waits with temporary signal masks | https://github.com/rrnewton/hermit/issues/4995 | not run | skipped (known gap) |
 
 ## Methods
 

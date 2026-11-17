@@ -4969,6 +4969,7 @@ struct KnownGapNode {
     ledger: String,
     required_tests: u64,
     rows: Vec<hermit_manifest_plan::known_gaps::Row>,
+    descriptions: BTreeMap<String, String>,
 }
 
 /// Every declared known-gap ledger, read from `root`.
@@ -4980,6 +4981,8 @@ fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
             let text = fs::read_to_string(root.join(declaration.ledger))
                 .map_err(|e| format!("cannot read known-gap ledger {}: {e}", declaration.ledger))?;
             let rows = known_gaps::parse(&text)
+                .map_err(|e| format!("known-gap ledger {}: {e}", declaration.ledger))?;
+            let descriptions = known_gaps::parse_descriptions(&text, &rows)
                 .map_err(|e| format!("known-gap ledger {}: {e}", declaration.ledger))?;
             // Required tests are derived, never pinned: the suite's listed
             // population (from its source) less its ledger rows, exactly as
@@ -4996,6 +4999,7 @@ fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
                 ledger: declaration.ledger.to_string(),
                 required_tests,
                 rows,
+                descriptions,
             })
         })
         .collect()
@@ -5030,6 +5034,75 @@ mod known_gap_nodes_tests {
         // Non-ignored suite tests {required_one, gap_one} less the ledger
         // row {gap_one}: one required test, derived with no pinned count.
         assert_eq!(nodes[0].required_tests, 1);
+
+        let ledger = tests_dir.join("deadline_slice_cap.kvm-gaps.tsv");
+        let text = fs::read_to_string(&ledger).unwrap();
+        fs::write(
+            &ledger,
+            format!("{text}# description\thermit-run::deadline_slice_cap$absent\tx\n"),
+        )
+        .unwrap();
+        let error = known_gap_nodes(root).unwrap_err();
+        assert!(error.contains("deadline_slice_cap.kvm-gaps.tsv"));
+        assert!(error.contains("not a row in this ledger"));
+    }
+
+    fn node(name: &str, description: &str) -> KnownGapNode {
+        use hermit_manifest_plan::known_gaps;
+        let text = format!(
+            "{}\n\
+             pkg::suite$a\tD\thttps://github.com/rrnewton/hermit/issues/1\tskipped\t-\tbaseline\n\
+             pkg::suite$b\tD\thttps://github.com/rrnewton/hermit/issues/1\tskipped\t-\tbaseline\n\
+             # description\tpkg::suite$a\t{description}\n",
+            known_gaps::HEADER
+        );
+        let rows = known_gaps::parse(&text).unwrap();
+        KnownGapNode {
+            node: name.into(),
+            backend: "kvm".into(),
+            ledger: format!("{name}.tsv"),
+            required_tests: 0,
+            descriptions: known_gaps::parse_descriptions(&text, &rows).unwrap(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn gap_descriptions_belong_to_one_ledger_and_full_row_id() {
+        let mut nodes = [
+            node("first", "first meaning"),
+            node("second", "second meaning"),
+        ];
+        let before = render_known_gaps(&nodes);
+        assert!(before.contains("| `a` | D — first meaning |"));
+        assert!(before.contains("| `a` | D — second meaning |"));
+        assert_eq!(before.matches("| `b` | D |").count(), 2);
+        let encoded = encoded_known_gaps(&nodes).unwrap();
+        nodes[0]
+            .descriptions
+            .insert("pkg::suite$a".into(), "revised meaning".into());
+        assert_eq!(
+            render_known_gaps(&nodes),
+            before.replace("first meaning", "revised meaning")
+        );
+        assert_eq!(encoded_known_gaps(&nodes).unwrap(), encoded);
+    }
+
+    #[test]
+    fn gap_descriptions_render_as_plain_text_in_one_table_cell() {
+        let nodes = [node(
+            "example",
+            "a|b `code` <tag> &amp; [link](https://example.org) *x* _y_ ~z~ \\path",
+        )];
+        let text = render_known_gaps(&nodes);
+        let row = text
+            .lines()
+            .find(|line| line.starts_with("| `a` |"))
+            .unwrap();
+        assert_eq!(row.matches('|').count(), 6);
+        assert!(row.contains("a&#124;b &#96;code&#96; &#60;tag&#62; &#38;amp&#59;"));
+        assert!(row.contains("&#91;link&#93;&#40;https&#58;&#47;&#47;example&#46;org&#41;"));
+        assert!(row.contains("&#42;x&#42; &#95;y&#95; &#126;z&#126; &#92;path"));
     }
 }
 
@@ -5082,11 +5155,11 @@ from `{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- |
                 ),
                 (None, false) => ("not run".to_string(), "skipped (known gap)"),
             };
-            let gap = match row.gap.as_str() {
-                "D" => "D — threads with private file descriptor tables",
-                "E+F'" => "E+F' — interval-timer expiry during waits with temporary signal masks",
-                other => other,
+            let gap = match node.descriptions.get(&row.id) {
+                Some(description) => format!("{} — {description}", row.gap),
+                None => row.gap.clone(),
             };
+            let gap = markdown_plain_text(&gap);
             out.push_str(&format!(
                 "| `{test}` | {gap} | {} | {expected} | {status} |\n",
                 row.issue
@@ -5094,6 +5167,18 @@ from `{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- |
         }
     }
     out
+}
+
+fn markdown_plain_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_punctuation() {
+                format!("&#{};", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// `ci/compat-envelope/known-gaps.json`: the machine-readable form of [`render_known_gaps`].

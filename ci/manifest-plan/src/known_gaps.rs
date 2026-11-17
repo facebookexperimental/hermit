@@ -39,6 +39,11 @@
 //! | `signature` | For `failed`, text the test's output must show ([`signature_matches`]) when the node runs it with `RUST_BACKTRACE=0`, so a panic prints std's `note: run with` line rather than a backtrace; it may hold spaces, not TABs, and writes a newline as `\n`, a backslash as `\\` and any run of digits as `<N>`. For `cpu_timeout` and `skipped`, `-`. |
 //! | `approval` | `baseline` for a row present, unchanged, since the ledger's introduction; otherwise the full URL of a specific approving comment, review or commit. |
 //!
+//! Optional `# description<TAB>id<TAB>text` comments provide plain-text explanations for the
+//! scorecard. Each names a full row id in the same ledger, at most once; its text is nonempty,
+//! unpadded and contains no control characters. [`parse_descriptions`] reads these separately
+//! from the execution rows, so descriptions do not change their scope or approval history.
+//!
 //! # What may change, checked against history
 //!
 //! A row excuses one test failing one way: its id, outcome and signature ([`Row::scope`]). The
@@ -496,6 +501,49 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
         });
     }
     Ok(rows)
+}
+
+/// Read scorecard descriptions for the rows returned by [`parse`] for this ledger.
+pub fn parse_descriptions(
+    text: &str,
+    rows: &[Row],
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let ids = rows
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut descriptions = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.first() != Some(&"# description") {
+            continue;
+        }
+        let number = index + 1;
+        let [_, id, description] = fields.as_slice() else {
+            return Err(format!("line {number}: expected # description<TAB>id<TAB>text").into());
+        };
+        if !ids.contains(id) {
+            return Err(format!(
+                "line {number}: description id {id:?} is not a row in this ledger"
+            )
+            .into());
+        }
+        if description.is_empty()
+            || description.trim() != *description
+            || description.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "line {number}: description must be nonempty text without padding or control characters"
+            ).into());
+        }
+        if descriptions
+            .insert(id.to_string(), description.to_string())
+            .is_some()
+        {
+            return Err(format!("line {number}: description for {id} is listed twice").into());
+        }
+    }
+    Ok(descriptions)
 }
 
 /// The placeholder in a signature that matches one or more ASCII digits.
@@ -1228,6 +1276,70 @@ mod tests {
         assert_eq!(rows[1].signature, None);
         assert_eq!(rows[1].approval, Approval::Url(APPROVAL.into()));
         assert_eq!(rows[1].test(DECLARATION.id_prefix), Some("b"));
+    }
+
+    #[test]
+    fn descriptions_do_not_change_execution_rows_or_history() {
+        let text = ledger(&[&failed("a", "baseline"), &skipped("b", APPROVAL)]);
+        let rows = parse(&text).unwrap();
+        let annotated = format!(
+            "# description\tpkg::suite$a\tfirst explanation\n{text}\
+             # ordinary comment\n# description of this ledger stays a comment\n\
+             # description\tpkg::suite$b\tsecond explanation\n"
+        );
+        assert_eq!(parse(&annotated).unwrap(), rows);
+        assert_eq!(
+            parse_descriptions(&annotated, &rows).unwrap(),
+            BTreeMap::from([
+                ("pkg::suite$a".into(), "first explanation".into()),
+                ("pkg::suite$b".into(), "second explanation".into()),
+            ])
+        );
+        for exempt in SQUASHED_APPROVALS {
+            let original = format!("{HEADER}\n{}\n", exempt.row);
+            let rows = parse(&original).unwrap();
+            let annotated = format!("{original}# description\t{}\texplanation\n", rows[0].id);
+            let versions = [Version {
+                position: 0,
+                commit: exempt.entered.into(),
+                rows: parse(&annotated).unwrap(),
+                tests: BTreeMap::new(),
+            }];
+            assert_eq!(versions[0].rows, rows);
+            assert!(squashed_approval(exempt.ledger, &rows[0], &versions));
+        }
+    }
+
+    #[test]
+    fn invalid_description_metadata_is_refused() {
+        let text = ledger(&[&failed("a", "baseline")]);
+        let rows = parse(&text).unwrap();
+        for (comment, expected) in [
+            ("# description", "expected # description"),
+            ("# description\tpkg::suite$a", "expected # description"),
+            (
+                "# description\tpkg::suite$a\tx\ty",
+                "expected # description",
+            ),
+            ("# description\tpkg::suite$unknown\tx", "not a row"),
+            ("# description\t pkg::suite$a\tx", "not a row"),
+            ("# description\tpkg::suite$a\t", "nonempty text"),
+            ("# description\tpkg::suite$a\t padded", "without padding"),
+            ("# description\tpkg::suite$a\tpadded ", "without padding"),
+            ("# description\tpkg::suite$a\tx\0y", "control characters"),
+            (
+                "# description\tpkg::suite$a\tx\n# description\tpkg::suite$a\ty",
+                "listed twice",
+            ),
+        ] {
+            let annotated = format!("{text}{comment}\n");
+            assert_eq!(parse(&annotated).unwrap(), rows);
+            let error = parse_descriptions(&annotated, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{comment:?}: {error}");
+            assert!(error.starts_with("line "), "{error}");
+        }
     }
 
     #[test]
