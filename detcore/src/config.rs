@@ -449,6 +449,11 @@ mod tests {
         // 60 on its own base, renumbered to 61 at its rebase onto main's
         // 60. Digest measured at this head.
         (61, "fb8c186c3fd4a2d2", "878bf500cb907b38"),
+        // Adds `ReportAdmittedRestartCode`: an admitted restart code's entry
+        // in the unsupported-use summary, sent from a backend hook with no
+        // access to the guest. 60 on its own base, then 61, then 62 at its
+        // rebase onto main's 61. Digests measured at this head.
+        (62, "faab2e5b78560755", "878bf500cb907b38"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

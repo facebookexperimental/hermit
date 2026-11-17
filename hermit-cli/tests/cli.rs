@@ -263,6 +263,7 @@ static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGSUSPEND_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static BACKEND_SIGNAL_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_EXIT_SIGCHLD_WAKE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1779,6 +1780,32 @@ fn realtime_signals_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "realtime-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn sigsuspend_signal_guest() -> &'static Path {
+    SIGSUSPEND_SIGNAL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigsuspend-signal");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create sigsuspend-signal guest directory");
+        let guest = build_root.join("sigsuspend_signal");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/sigsuspend_signal.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile sigsuspend-signal guest");
+        assert!(
+            output.status.success(),
+            "sigsuspend-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -52073,6 +52100,77 @@ fn a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_n
         log.contains("process-directed signal 10 to process")
             && log.contains("the sending thread does not block the signal"),
         "the refusal must name the call and the reason:\nstderr:\n{log}"
+    );
+}
+
+/// Hermit runs under a seccomp filter of the host's (one that denies only
+/// `acct`), so its tracer threads may be filtered, and a guest thread waits in
+/// `sigsuspend` for a signal another thread sends. Detcore answers the
+/// interrupted wait with the kernel's `-ERESTARTNOHAND`. x86-64's kernel
+/// resolves it: the handler runs and the wait returns EINTR. On aarch64 the
+/// ptrace backend cannot hand the code to the kernel from a tracer a filter
+/// may refuse, and asks Detcore (`Tool::handle_unresolved_restart`,
+/// `TracerMayBeFiltered`): a fail-closed run stops with the policy-refusal
+/// status and the refusal's name, and `--allow-unsupported-syscalls` gives
+/// the guest EINTR, the handler runs, and the end-of-run list names the call.
+/// The opt-in run also verifies under `--verify --verify-strict`:
+/// the answer and its report, made at a backend stop through an RPC handle
+/// with no access to the guest, leave the two runs alike.
+#[test]
+fn a_restart_code_under_a_filtered_tracer_is_resolved_or_refused_by_name() {
+    let guest = sigsuspend_signal_guest().to_str().unwrap().to_owned();
+    let expected = "sigsuspend: -1 (Interrupted system call), handled: 1\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = |log: &'static str, extra: &[&str]| {
+        let mut args = vec![log, "run", "--timeout", "60"];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest.as_str()]);
+        let mut command = hermit_command_under_host_filter(&args);
+        deny_syscall(&mut command, libc::SYS_acct);
+        let output = command
+            .current_dir(directory.path())
+            .output()
+            .expect("run hermit");
+        (output.status.code(), stdout(&output), stderr(&output))
+    };
+    let (status, out, log) = run("--log=warn", &[]);
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!((status, out.as_str()), (Some(0), expected), "stderr:\n{log}");
+        return;
+    }
+    assert_eq!(
+        status,
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{out}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("unresolved restart code refused (TracerMayBeFiltered): Detcore answered rt_sigsuspend")
+            && log.contains("--unsafe-ignore-host-seccomp"),
+        "the refusal must name the reason, the call and the override that admitted the filter:\n{log}"
+    );
+    let (status, out, log) = run("--log=warn", &["--allow-unsupported-syscalls"]);
+    assert_eq!(
+        (status, out.as_str()),
+        (Some(0), expected),
+        "the opt-in gives the guest EINTR:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("unresolved restart code refused (TracerMayBeFiltered)")
+            && log.contains("rt_sigsuspend (restart code refused: TracerMayBeFiltered)"),
+        "the opt-in warns with the refusal and lists the call:\n{log}"
+    );
+    let (status, out, log) = run(
+        "--log=info",
+        &["--allow-unsupported-syscalls", "--verify", "--verify-strict"],
+    );
+    assert_eq!(
+        (status, out.as_str()),
+        (Some(0), expected),
+        "the opt-in run verifies:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "the opt-in run's comparison was not canonical:\n{log}"
     );
 }
 

@@ -245,6 +245,220 @@ pub fn untrap_passthrough_admission(config: &Config) -> Result<(), UntrapPassthr
     }
     Ok(())
 }
+/// Detcore's refusal of a restart code (`ERESTARTSYS`, `ERESTARTNOINTR`,
+/// `ERESTARTNOHAND` or `ERESTART_RESTARTBLOCK`) that it answered a guest
+/// syscall with and that the backend could not hand to the kernel
+/// (`Tool::handle_unresolved_restart`, [`unresolved_restart_answer`]). Linux
+/// never returns these codes to user space, so the run stops rather than give
+/// the guest one, unless `Config::allow_unresolved_restart_codes`
+/// (`--allow-unsupported-syscalls`) admits it, and the guest gets `EINTR`.
+///
+/// Whether a run meets it depends on the host as well as the guest: the
+/// ptrace backend on aarch64 cannot hand the code to the kernel when a tracer
+/// thread may be under a seccomp filter, as inside some containers
+/// (`UnresolvedRestart::TracerMayBeFiltered`), or when the guest installed a
+/// filter of its own (`GuestSeccompFilter`). x86-64's kernel resolves every
+/// code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnresolvedRestartRefusal {
+    /// The syscall Detcore answered.
+    pub syscall: reverie::syscalls::Sysno,
+    /// The restart code it answered it with.
+    pub code: Errno,
+    /// Why the backend could not let the kernel resolve it.
+    pub reason: reverie::UnresolvedRestart,
+}
+
+impl std::fmt::Display for UnresolvedRestartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unresolved restart code refused ({:?}): Detcore answered {} with {}, which the \
+             backend could not hand to the kernel to resolve, and Linux never returns to a \
+             program. Whether a run meets this depends on the host: on aarch64 the backend \
+             cannot hand the code over when a tracer thread may be under a seccomp filter \
+             (TracerMayBeFiltered) or the guest installed one (GuestSeccompFilter). \
+             --allow-unsupported-syscalls gives the guest EINTR instead",
+            self.reason, self.syscall, self.code
+        )?;
+        if matches!(self.reason, reverie::UnresolvedRestart::TracerMayBeFiltered) {
+            write!(
+                f,
+                ". Hermit's threads are under a seccomp filter when Hermit inherited one, \
+                 as a run that --unsafe-ignore-host-seccomp admits does: run Hermit where it \
+                 inherits no filter to let the kernel resolve the code"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnresolvedRestartRefusal {}
+
+/// Detcore's answer to a restart code its backend could not hand to the kernel
+/// (`Tool::handle_unresolved_restart`): an [`UnresolvedRestartRefusal`] that
+/// ends the run, unless `Config::allow_unresolved_restart_codes` admits it;
+/// then `EINTR`, Linux's result for an interrupted call that does not
+/// restart, never the code itself, after the same refusal is logged as a
+/// warning.
+pub fn unresolved_restart_answer(
+    config: &Config,
+    syscall: reverie::syscalls::Sysno,
+    code: Errno,
+    reason: reverie::UnresolvedRestart,
+) -> Result<i64, Error> {
+    let refusal = UnresolvedRestartRefusal {
+        syscall,
+        code,
+        reason,
+    };
+    if !config.allow_unresolved_restart_codes {
+        error!("[detcore] {refusal}");
+        return Err(Error::Tool(anyhow::Error::new(refusal)));
+    }
+    warn!("[detcore] {refusal}; admitted, the guest gets EINTR");
+    Err(Errno::EINTR.into())
+}
+
+/// The cases Detcore cannot decide the outcome of a restart code in under
+/// a pending temporary mask's restore ([`linux_mask_restore_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UndecidableRestart {
+    /// `ERESTARTSYS` for a signal with a handler: the outcome hangs on the
+    /// handler's `SA_RESTART`, which procfs does not show. Linux never
+    /// returns the code with a restore pending.
+    ErestartsysWithHandlerUnderPendingRestore,
+    /// A signal to deliver that the mask in effect blocks: the kernel would
+    /// queue it again rather than deliver it. A held signal was let through
+    /// by the mask in effect when it was taken; a later mask-swapping
+    /// injection that blocks it and is interrupted leaves a new restore
+    /// pending under its own mask.
+    DeliveredSignalBlockedUnderPendingRestore,
+}
+
+impl UndecidableRestart {
+    fn explanation(self) -> &'static str {
+        match self {
+            UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore => {
+                "-ERESTARTSYS with a handler, whose outcome hangs on SA_RESTART, which the \
+                 backend cannot read"
+            }
+            UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore => {
+                "the mask in effect blocks the signal to deliver, which the kernel would \
+                 queue again"
+            }
+        }
+    }
+}
+
+/// Detcore's refusal of a restart code it answered a syscall with while a
+/// temporary signal mask's restore is pending and a signal is held for the
+/// resume, in a case whose outcome it cannot decide ([`UndecidableRestart`]).
+/// It ends the run unless `Config::allow_unresolved_restart_codes`
+/// (`--allow-unsupported-syscalls`) admits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartOutcomeRefusal {
+    /// The syscall Detcore answered.
+    pub syscall: reverie::syscalls::Sysno,
+    /// The restart code it answered it with.
+    pub code: Errno,
+    /// Why its outcome cannot be decided.
+    pub reason: UndecidableRestart,
+}
+
+impl std::fmt::Display for RestartOutcomeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "restart code refused ({:?}): Detcore answered {} with {} while a temporary signal \
+             mask's restore is pending and a signal is held: {}. --allow-unsupported-syscalls \
+             gives the guest EINTR instead",
+            self.reason,
+            self.syscall,
+            self.code,
+            self.reason.explanation()
+        )
+    }
+}
+
+impl std::error::Error for RestartOutcomeRefusal {}
+
+fn signal_bit(signal: i32) -> u64 {
+    1u64 << (signal - 1)
+}
+
+/// Whether a handler runs at the resume the facts describe: `get_signal`
+/// takes the delivered signal unless the mask in effect blocks it (then the
+/// kernel queues it again, `ptrace_signal`, kernel/signal.c:2591-2632 at
+/// v6.12.9), then, while none has a handler, the pending signals the mask in
+/// effect lets through. SIGKILL and SIGSTOP never run one.
+pub fn mask_restore_handler_runs(facts: &reverie::PendingMaskRestore) -> bool {
+    let unrunnable = signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP);
+    let runs = |signals: u64| signals & facts.caught & !facts.mask_in_effect & !unrunnable != 0;
+    facts.delivered.is_some_and(|signal| runs(signal_bit(signal))) || runs(facts.pending)
+}
+
+/// The outcome Linux's `do_signal` takes for the restart code the facts
+/// name (arch/arm64/kernel/signal.c:1395-1464 at v6.12.9): with a handler,
+/// `-EINTR` for `ERESTARTNOHAND` and `ERESTART_RESTARTBLOCK` and a restart for
+/// `ERESTARTNOINTR`; with none, a restart for every code. Refuses the two
+/// cases it cannot decide ([`UndecidableRestart`]).
+pub fn linux_mask_restore_outcome(
+    facts: &reverie::PendingMaskRestore,
+) -> Result<reverie::MaskRestoreOutcome, UndecidableRestart> {
+    if let Some(signal) = facts.delivered
+        && facts.mask_in_effect & signal_bit(signal) != 0
+    {
+        return Err(UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore);
+    }
+    let handler_runs = mask_restore_handler_runs(facts);
+    match facts.code {
+        Errno::ERESTARTNOHAND | Errno::ERESTART_RESTARTBLOCK if handler_runs => {
+            Ok(reverie::MaskRestoreOutcome::Interrupted { handler_runs })
+        }
+        Errno::ERESTARTSYS if handler_runs => {
+            Err(UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore)
+        }
+        _ => Ok(reverie::MaskRestoreOutcome::Restart { handler_runs }),
+    }
+}
+
+/// Detcore's outcome for a restart code under a pending temporary mask's
+/// restore, with a signal held for the resume
+/// (`Tool::resolve_restart_under_pending_mask_restore`): Linux's
+/// ([`linux_mask_restore_outcome`]). A case that cannot decide is refused by
+/// name ([`RestartOutcomeRefusal`]), which ends the run, unless
+/// `Config::allow_unresolved_restart_codes` admits it; then `EINTR`, after
+/// the same refusal is logged as a warning.
+pub fn pending_mask_restore_outcome(
+    config: &Config,
+    facts: &reverie::PendingMaskRestore,
+) -> Result<reverie::MaskRestoreOutcome, Error> {
+    let reason = match linux_mask_restore_outcome(facts) {
+        Ok(outcome) => return Ok(outcome),
+        Err(reason) => reason,
+    };
+    let refusal = RestartOutcomeRefusal {
+        syscall: facts.syscall,
+        code: facts.code,
+        reason,
+    };
+    if !config.allow_unresolved_restart_codes {
+        error!("[detcore] {refusal}");
+        return Err(Error::Tool(anyhow::Error::new(refusal)));
+    }
+    warn!("[detcore] {refusal}; admitted, the guest gets EINTR");
+    Ok(reverie::MaskRestoreOutcome::Interrupted {
+        handler_runs: mask_restore_handler_runs(facts),
+    })
+}
+
+/// The name an admitted restart code is listed under in the end-of-run
+/// unsupported-syscall report (`tool_global::report_unsupported_name`).
+fn admitted_restart_name(syscall: reverie::syscalls::Sysno, refusal: &str) -> String {
+    format!("{syscall} (restart code refused: {refusal})")
+}
+
 pub use finalization::combine_finalization;
 pub use pidfd_self::PidfdSelfQualificationRefusal;
 #[cfg(test)]
@@ -4950,6 +5164,44 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.returned_from_sigreturn = true;
     }
 
+    /// A restart code the backend could not hand to the kernel is refused by
+    /// name, or answered `EINTR` and listed as unsupported under
+    /// `--allow-unsupported-syscalls` ([`unresolved_restart_answer`]).
+    async fn handle_unresolved_restart<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        tid: reverie::Tid,
+        syscall: reverie::syscalls::Sysno,
+        code: Errno,
+        reason: reverie::UnresolvedRestart,
+    ) -> Result<i64, Error> {
+        let answer = unresolved_restart_answer(&self.cfg, syscall, code, reason);
+        if self.cfg.allow_unresolved_restart_codes {
+            let name = admitted_restart_name(syscall, &format!("{reason:?}"));
+            tool_global::report_admitted_restart_code(rpc, tid, name).await;
+        }
+        answer
+    }
+
+    /// Linux's outcome for a restart code under a pending temporary mask's
+    /// restore; a case that cannot decide is refused by name, or answered
+    /// `EINTR` and listed as unsupported under `--allow-unsupported-syscalls`
+    /// ([`pending_mask_restore_outcome`]).
+    async fn resolve_restart_under_pending_mask_restore<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        facts: reverie::PendingMaskRestore,
+    ) -> Result<reverie::MaskRestoreOutcome, Error> {
+        let outcome = pending_mask_restore_outcome(&self.cfg, &facts);
+        if self.cfg.allow_unresolved_restart_codes
+            && let Err(reason) = linux_mask_restore_outcome(&facts)
+        {
+            let name = admitted_restart_name(facts.syscall, &format!("{reason:?}"));
+            tool_global::report_admitted_restart_code(rpc, facts.tid, name).await;
+        }
+        outcome
+    }
+
     /// Counts each signal the backend passes on without reporting it, which
     /// could reach a guest handler, so the delivery counters show what no
     /// delivery check saw (A5 step 3.2b).
@@ -9411,6 +9663,230 @@ mod subscription_tests {
                 "passthru_opt allowed {syscall} to bypass Detcore's thread-exit state"
             );
         }
+    }
+
+    /// A restart code the backend could not hand to the kernel ends the run
+    /// with Detcore's named refusal under the default configuration, which
+    /// an embedder gets unless it opts in, and the opt-in
+    /// (`allow_unresolved_restart_codes`, `--allow-unsupported-syscalls`)
+    /// gives the guest `EINTR`, never the code.
+    #[test]
+    fn an_unresolved_restart_code_is_refused_by_name_unless_admitted() {
+        use reverie::UnresolvedRestart;
+        use reverie::syscalls::Sysno;
+        assert!(!Config::default().allow_unresolved_restart_codes, "strict by default");
+        let admitted = Config {
+            allow_unresolved_restart_codes: true,
+            ..Config::default()
+        };
+        for reason in [
+            UnresolvedRestart::TracerMayBeFiltered,
+            UnresolvedRestart::GuestSeccompFilter,
+        ] {
+            match unresolved_restart_answer(
+                &Config::default(),
+                Sysno::ppoll,
+                Errno::ERESTARTNOHAND,
+                reason,
+            ) {
+                Err(reverie::Error::Tool(error)) => {
+                    let refusal = error
+                        .downcast_ref::<UnresolvedRestartRefusal>()
+                        .unwrap_or_else(|| panic!("{error:?}"));
+                    assert_eq!(
+                        *refusal,
+                        UnresolvedRestartRefusal {
+                            syscall: Sysno::ppoll,
+                            code: Errno::ERESTARTNOHAND,
+                            reason,
+                        }
+                    );
+                    let text = refusal.to_string();
+                    assert!(text.contains("depends on the host"), "{text}");
+                    assert!(text.contains("--allow-unsupported-syscalls"), "{text}");
+                    assert_eq!(
+                        text.contains("--unsafe-ignore-host-seccomp"),
+                        reason == UnresolvedRestart::TracerMayBeFiltered,
+                        "only a filtered tracer names the override that admits one: {text}"
+                    );
+                }
+                other => panic!("{reason:?}: {other:?}"),
+            }
+            for code in [
+                Errno::ERESTARTSYS,
+                Errno::ERESTARTNOINTR,
+                Errno::ERESTARTNOHAND,
+                Errno::ERESTART_RESTARTBLOCK,
+            ] {
+                match unresolved_restart_answer(&admitted, Sysno::rt_sigsuspend, code, reason) {
+                    Err(reverie::Error::Errno(errno)) => assert_eq!(errno, Errno::EINTR),
+                    other => panic!("{reason:?} {code}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Facts for a `ppoll` answered with `code` under a pending temporary
+    /// mask's restore.
+    fn mask_restore_facts(
+        code: Errno,
+        delivered: Option<i32>,
+        in_effect: u64,
+        caught: u64,
+        pending: u64,
+    ) -> reverie::PendingMaskRestore {
+        reverie::PendingMaskRestore::new(
+            reverie::Tid::from_raw(7),
+            reverie::syscalls::Sysno::ppoll,
+            code,
+            delivered,
+            in_effect,
+            caught,
+            pending,
+        )
+    }
+
+    /// Linux's outcome for each restart code under a pending temporary
+    /// mask's restore, by whether a handler runs at the resume, and the two
+    /// cases that cannot decide (arch/arm64/kernel/signal.c:1395-1464 at
+    /// v6.12.9).
+    #[test]
+    fn linux_mask_restore_outcomes_follow_do_signal() {
+        use reverie::MaskRestoreOutcome;
+        let (usr1, usr2) = (libc::SIGUSR1, libc::SIGUSR2);
+        let (bit1, bit2) = (signal_bit(usr1), signal_bit(usr2));
+        let interrupted = |handler_runs| Ok(MaskRestoreOutcome::Interrupted { handler_runs });
+        let restart = |handler_runs| Ok(MaskRestoreOutcome::Restart { handler_runs });
+        let outcome = |code, delivered, in_effect, caught, pending| {
+            linux_mask_restore_outcome(&mask_restore_facts(
+                code, delivered, in_effect, caught, pending,
+            ))
+        };
+        // A delivered signal with a handler.
+        assert_eq!(outcome(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0), interrupted(true));
+        assert_eq!(
+            outcome(Errno::ERESTART_RESTARTBLOCK, Some(usr1), 0, bit1, 0),
+            interrupted(true)
+        );
+        assert_eq!(outcome(Errno::ERESTARTNOINTR, Some(usr1), 0, bit1, 0), restart(true));
+        // None runs a handler: every code restarts.
+        for code in [
+            Errno::ERESTARTNOHAND,
+            Errno::ERESTARTSYS,
+            Errno::ERESTARTNOINTR,
+            Errno::ERESTART_RESTARTBLOCK,
+        ] {
+            assert_eq!(outcome(code, Some(usr1), 0, 0, 0), restart(false), "{code}");
+            assert_eq!(outcome(code, None, 0, 0, 0), restart(false), "{code}");
+        }
+        // A dropped held signal, and a pending one the mask lets through
+        // with a handler: it runs.
+        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, 0, bit2, bit2), interrupted(true));
+        // A pending one the mask in effect blocks runs none.
+        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, bit2, bit2, bit2), restart(false));
+        // SIGKILL and SIGSTOP never run a handler.
+        let kill = signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP);
+        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, 0, kill, kill), restart(false));
+        // The two cases that cannot decide.
+        assert_eq!(
+            outcome(Errno::ERESTARTSYS, Some(usr1), 0, bit1, 0),
+            Err(UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore)
+        );
+        assert_eq!(
+            outcome(Errno::ERESTARTSYS, None, 0, bit2, bit2),
+            Err(UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore)
+        );
+        for code in [Errno::ERESTARTNOHAND, Errno::ERESTARTNOINTR] {
+            assert_eq!(
+                outcome(code, Some(usr1), bit1, bit1, 0),
+                Err(UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore),
+                "{code}"
+            );
+        }
+    }
+
+    /// A delivered signal the mask in effect blocks is queued again rather
+    /// than delivered, so it runs no handler even when it has one; only a
+    /// pending signal the mask lets through can.
+    #[test]
+    fn a_caught_signal_the_mask_in_effect_blocks_runs_no_handler() {
+        let (usr1, usr2) = (libc::SIGUSR1, libc::SIGUSR2);
+        let (bit1, bit2) = (signal_bit(usr1), signal_bit(usr2));
+        let blocked = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), bit1, bit1, 0);
+        assert!(!mask_restore_handler_runs(&blocked));
+        let blocked_with_another =
+            mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), bit1, bit1 | bit2, bit2);
+        assert!(mask_restore_handler_runs(&blocked_with_another));
+        let delivered = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0);
+        assert!(mask_restore_handler_runs(&delivered));
+    }
+
+    /// Under a pending temporary mask's restore Detcore takes Linux's outcome,
+    /// refuses a case that cannot decide by name by default, and answers it
+    /// `EINTR` under the opt-in, restoring the saved mask unless a handler
+    /// runs.
+    #[test]
+    fn a_pending_mask_restore_outcome_is_linuxs_and_refuses_what_cannot_decide() {
+        use reverie::MaskRestoreOutcome;
+        use reverie::syscalls::Sysno;
+        let usr1 = libc::SIGUSR1;
+        let bit1 = signal_bit(usr1);
+        let handled = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0);
+        assert_eq!(
+            pending_mask_restore_outcome(&Config::default(), &handled).unwrap(),
+            MaskRestoreOutcome::Interrupted { handler_runs: true }
+        );
+        let erestartsys = mask_restore_facts(Errno::ERESTARTSYS, Some(usr1), 0, bit1, 0);
+        let blocked = mask_restore_facts(Errno::ERESTARTNOHAND, Some(usr1), bit1, bit1, 0);
+        for (facts, reason) in [
+            (
+                erestartsys,
+                UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore,
+            ),
+            (
+                blocked,
+                UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore,
+            ),
+        ] {
+            match pending_mask_restore_outcome(&Config::default(), &facts) {
+                Err(reverie::Error::Tool(error)) => {
+                    let refusal = error
+                        .downcast_ref::<RestartOutcomeRefusal>()
+                        .unwrap_or_else(|| panic!("{error:?}"));
+                    assert_eq!(
+                        *refusal,
+                        RestartOutcomeRefusal {
+                            syscall: Sysno::ppoll,
+                            code: facts.code,
+                            reason,
+                        }
+                    );
+                    let text = refusal.to_string();
+                    assert!(
+                        text.starts_with(&format!("restart code refused ({reason:?})")),
+                        "{text}"
+                    );
+                    assert!(text.contains("--allow-unsupported-syscalls"), "{text}");
+                }
+                other => panic!("{reason:?}: {other:?}"),
+            }
+        }
+        let admitted = Config {
+            allow_unresolved_restart_codes: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            pending_mask_restore_outcome(&admitted, &erestartsys).unwrap(),
+            MaskRestoreOutcome::Interrupted { handler_runs: true }
+        );
+        assert_eq!(
+            pending_mask_restore_outcome(&admitted, &blocked).unwrap(),
+            MaskRestoreOutcome::Interrupted {
+                handler_runs: false
+            },
+            "the delivered signal is caught but blocked by the mask in effect, so no \
+             handler runs and the saved mask is restored"
+        );
     }
 
     /// The mode's configuration prerequisites are checked where every launch

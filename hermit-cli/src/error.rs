@@ -214,10 +214,41 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::UntrapPassthroughRefusal>()
             || cause.is::<detcore::ReplayDepartureError>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
+            || is_restart_policy_refusal(cause)
             || is_chosen_root_id_taken(cause)
             || is_kvm_host_resources_refusal(cause)
             || is_kvm_named_refusal(cause)
             || is_kvm_vfork_child_refusal(cause)
+    }
+    // The refusals of a restart code (ERESTARTSYS and the like) Hermit
+    // answered a syscall with and could not hand to the kernel. Each is a
+    // decision not to give the guest a result Linux never gives:
+    // - `detcore::UnresolvedRestartRefusal`: the backend could not hand the
+    //   code to the kernel (a filtered tracer or a guest filter), and the
+    //   fail-closed policy refuses to answer EINTR in the kernel's stead;
+    // - `detcore::RestartOutcomeRefusal`: the outcome under a pending
+    //   temporary mask's restore hangs on what procfs does not show
+    //   (SA_RESTART) or on a signal the mask in effect blocks, so Detcore
+    //   guesses no outcome;
+    // - `reverie_ptrace::RestartRefusal` for `NoFreeCarrierSignal`: the
+    //   guest keeps every realtime signal pending, which leaves the backend
+    //   no signal to carry the resume, a state of the guest's making.
+    // `CarrierInstanceNotTheTracers` is not one: a guest instance queued in
+    // the window between the backend's check and its send is a timing race
+    // of the backend's own, so it is reported as Hermit's failure. Nor is
+    // `OutcomeNotWritable`: Detcore decided an outcome the backend cannot
+    // write.
+    fn is_restart_policy_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause.is::<detcore::UnresolvedRestartRefusal>()
+            || cause.is::<detcore::RestartOutcomeRefusal>()
+            || cause
+                .downcast_ref::<reverie_ptrace::RestartRefusal>()
+                .is_some_and(|refusal| {
+                    matches!(
+                        refusal.reason,
+                        reverie_ptrace::RestartRefusalReason::NoFreeCarrierSignal
+                    )
+                })
     }
     // The KVM backend's end of a run whose exec it could not finish past the
     // exec's point of no return, because a host resource of Hermit's own
@@ -878,6 +909,93 @@ mod tests {
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(
             serialized.error.contains("0x71000002"),
+            "{}",
+            serialized.error
+        );
+    }
+
+    /// The refusals of a restart code Hermit could not hand to the kernel
+    /// are policy refusals (exit 122), as the backend's primary cause and
+    /// wrapped, and keep their names across the container boundary: Detcore's
+    /// (`UnresolvedRestartRefusal`) and its refusal of an outcome it cannot
+    /// decide (`RestartOutcomeRefusal`), and the backend's `NoFreeCarrierSignal`.
+    /// The backend's `CarrierInstanceNotTheTracers`, a timing race of its
+    /// own, and `OutcomeNotWritable` are Hermit's failures.
+    #[test]
+    fn restart_code_refusals_are_policy_refusals_but_a_carrier_race_is_not() {
+        let backend = |reason| reverie_ptrace::RestartRefusal {
+            tid: 7,
+            syscall: reverie::syscalls::Sysno::rt_sigsuspend,
+            code: reverie::Errno::ERESTARTNOHAND,
+            reason,
+        };
+        let undecidable = |reason| detcore::RestartOutcomeRefusal {
+            syscall: reverie::syscalls::Sysno::ppoll,
+            code: reverie::Errno::ERESTARTSYS,
+            reason,
+        };
+        let detcore = || detcore::UnresolvedRestartRefusal {
+            syscall: reverie::syscalls::Sysno::ppoll,
+            code: reverie::Errno::ERESTARTNOHAND,
+            reason: reverie::UnresolvedRestart::GuestSeccompFilter,
+        };
+        for (error, name, kind) in [
+            (
+                Error::new(undecidable(
+                    detcore::UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore,
+                )),
+                "restart code refused (ErestartsysWithHandlerUnderPendingRestore)",
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                Error::new(undecidable(
+                    detcore::UndecidableRestart::DeliveredSignalBlockedUnderPendingRestore,
+                )),
+                "restart code refused (DeliveredSignalBlockedUnderPendingRestore)",
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                Error::new(detcore()),
+                "unresolved restart code refused (GuestSeccompFilter)",
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                Error::new(backend(
+                    reverie_ptrace::RestartRefusalReason::NoFreeCarrierSignal,
+                )),
+                "restart code refused (NoFreeCarrierSignal)",
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                Error::new(backend(
+                    reverie_ptrace::RestartRefusalReason::CarrierInstanceNotTheTracers,
+                )),
+                "restart code refused (CarrierInstanceNotTheTracers)",
+                FailureKind::Error,
+            ),
+            (
+                Error::new(backend(
+                    reverie_ptrace::RestartRefusalReason::OutcomeNotWritable,
+                )),
+                "restart code refused (OutcomeNotWritable)",
+                FailureKind::Error,
+            ),
+        ] {
+            let message = format!("{error}");
+            assert!(message.contains(name), "{message}");
+            let primary = reverie::Error::Tool(error);
+            assert_eq!(classify_ptrace_primary(&primary), kind, "{name}");
+            let wrapped = Error::new(primary).context("the ptrace backend failed");
+            assert_eq!(classify_unwrapped(&wrapped), kind, "{name}");
+        }
+        let serialized = SerializableError::from(Error::new(undecidable(
+            detcore::UndecidableRestart::ErestartsysWithHandlerUnderPendingRestore,
+        )));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized
+                .error
+                .contains("restart code refused (ErestartsysWithHandlerUnderPendingRestore)"),
             "{}",
             serialized.error
         );

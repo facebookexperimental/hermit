@@ -2058,6 +2058,10 @@ pub struct RunOpts {
 
     /// Permit unsupported syscalls to reach the host kernel. This weakens determinism and exists
     /// only as an explicit compatibility escape hatch; ordinary runs fail closed by default.
+    /// It also admits a restart code (ERESTARTSYS and the like) that Hermit answered a syscall
+    /// with and that the backend could not hand to the kernel: the guest gets EINTR, where
+    /// Linux would have restarted the call or given EINTR, and the call is listed as
+    /// unsupported at the end of the run.
     #[clap(
         long,
         conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"]
@@ -15259,6 +15263,7 @@ impl RunOpts {
         // Ordinary execution therefore fails closed; compatibility passthrough
         // is available only through the explicit, noisy opt-out.
         config.panic_on_unsupported_syscalls = !self.allow_unsupported_syscalls;
+        config.allow_unresolved_restart_codes = self.allow_unsupported_syscalls;
         if config.passthru_opt && config.panic_on_unsupported_syscalls {
             anyhow::bail!(
                 "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
@@ -20664,6 +20669,7 @@ impl RunOpts {
         {
             config.panic_on_unsupported_syscalls = true;
         }
+        config.allow_unresolved_restart_codes = self.allow_unsupported_syscalls;
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
         // Hand the scheduler the resolved happens-before program (already resolved
         // against the guest binary in `main()`). `#[serde(skip)]` on the field means

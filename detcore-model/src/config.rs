@@ -1273,6 +1273,19 @@ pub struct Config {
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 
+    /// Admit a restart code (`ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND`
+    /// or `ERESTART_RESTARTBLOCK`) that Detcore answered a guest syscall with
+    /// and that the backend could neither hand to the kernel nor resolve as
+    /// the kernel would: the guest gets `EINTR`, Linux's result for an
+    /// interrupted call that does not restart, after the refusal is logged.
+    /// Off by default, so an embedder that does not set it gets the refusal,
+    /// which ends the run; `hermit run --allow-unsupported-syscalls` sets it.
+    /// It has no legacy key: [`to_legacy_backend_json`] leaves it out and
+    /// [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub allow_unresolved_restart_codes: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-644): Review backend-safe fail-closed termination.
     /// Return a typed Tool error instead of unwinding through a backend callback.
@@ -4437,7 +4450,10 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 66] = [
+    /// `allow_unresolved_restart_codes` came after it too: only the ptrace
+    /// backend on aarch64 asks Detcore about restart codes, so it is never
+    /// written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 67] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4504,6 +4520,7 @@ mod legacy_backend_json {
         "watch_from",
         "chaos_instruction_offset",
         "untrap_passthrough_syscalls",
+        "allow_unresolved_restart_codes",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4660,7 +4677,8 @@ mod legacy_backend_json {
                     | "rewrite_exclusives_overlay_requested"
                     | "count_store_exclusives"
                     | "stacktrace_at_schedule_positions"
-                    | "untrap_passthrough_syscalls",
+                    | "untrap_passthrough_syscalls"
+                    | "allow_unresolved_restart_codes",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some(
@@ -5053,7 +5071,8 @@ mod legacy_backend_json {
                 | "watch"
                 | "watch_from"
                 | "chaos_instruction_offset"
-                | "untrap_passthrough_syscalls" => Ok(()),
+                | "untrap_passthrough_syscalls"
+                | "allow_unresolved_restart_codes" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -6136,7 +6155,8 @@ mod tests {
                 | "watch"
                 | "watch_from"
                 | "chaos_instruction_offset"
-                | "untrap_passthrough_syscalls" => {}
+                | "untrap_passthrough_syscalls"
+                | "allow_unresolved_restart_codes" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -6178,15 +6198,15 @@ mod tests {
         // `stacktrace_at_schedule_positions`, `count_store_exclusives`,
         // `property_snapshot`, `watch`, `watch_from`, `rewrite_exclusives_overlay`,
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
-        // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty-five fewer (lenient_replay joined them in dh-mvz7y,
-        // chaos_timed_wait_spread later, `autofs_roots` and
+        // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`,
+        // `allow_unresolved_restart_codes` and `strict_schedule_boundaries`
+        // none: fourteen more keys and sixty-six fewer (lenient_replay joined
+        // them in dh-mvz7y, chaos_timed_wait_spread later, `autofs_roots` and
         // `notice_autofs_eloop` later still, then
-        // `ephemeral_port_range_override`), so fifty-one keys fewer
+        // `ephemeral_port_range_override`), so fifty-two keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 51);
+        assert_eq!(fields.len(), keys.len() + 52);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7035,6 +7055,39 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .untrap_passthrough_syscalls
+        );
+    }
+
+    /// `allow_unresolved_restart_codes` never enters the legacy form,
+    /// whatever its value: the legacy string keeps its bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn allow_unresolved_restart_codes_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            allow_unresolved_restart_codes: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("allow_unresolved_restart_codes"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .allow_unresolved_restart_codes
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .allow_unresolved_restart_codes
         );
     }
 

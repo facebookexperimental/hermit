@@ -492,6 +492,12 @@ impl Scheduler {
         }
     }
 
+    /// The CPU time of `tid`'s latest arrival, for tests.
+    #[cfg(test)]
+    pub(crate) fn work_span_cpu_now(&self, tid: DetTid) -> Option<u64> {
+        self.work_span.cpu_now.get(&tid).copied()
+    }
+
     /// Every other thread whose request waits (blocked, polling, or parked
     /// outside the run queue: a futex waiter, a parked child wait) follows
     /// `by`, which has reached `at` in the upper span.

@@ -1842,6 +1842,22 @@ impl GlobalState {
         (None, GlobalResponse::StoreExclusive(()))
     }
 
+    /// Adds `name` to the run-wide unsupported-use summary, and to its report
+    /// file the first time.
+    fn note_unsupported_name(&self, name: String) {
+        let inserted = self
+            .unsupported_syscalls
+            .lock()
+            .unwrap()
+            .insert(name.clone());
+        if inserted
+            && let Some(report) = &self.unsupported_syscall_report_fd
+            && let Err(error) = writeln!(report.lock().unwrap(), "{name}")
+        {
+            warn!("failed to append unsupported-syscall report: {error}");
+        }
+    }
+
     /// Ordinary RPC mutation must linearize before terminal publication under
     /// the same mutex as scheduler grants. A losing callback stays pending for
     /// the backend's failure subscription to drop; no normal reply is invented.
@@ -4124,6 +4140,17 @@ impl GlobalState {
             }
             request => request,
         };
+        // An admitted restart code's entry in the unsupported-use summary
+        // (`report_admitted_restart_code`). It comes from a backend hook with
+        // no access to the guest, so its clock is zero and carries no time:
+        // it is answered before the work-span accounting below, which would
+        // take that zero as the sender's CPU time, and its answer carries no
+        // time back. It is sent in the sender's own turn, at a backend stop,
+        // so the summary gains entries in the same order every run.
+        if let GlobalRequest::ReportAdmittedRestartCode(name) = request {
+            self.note_unsupported_name(name);
+            return (None, R::ReportUnsupportedSyscall(()));
+        }
         let time_from_guest = guest_time.as_nanos();
         // The thread's own computation and syscalls, excluding clock advances
         // (`DetTime::advance_to`), for `--work-span-report`.
@@ -4738,6 +4765,9 @@ impl GlobalState {
             GlobalRequest::DiscardedSignal(_) => {
                 unreachable!("discarded-at-send control answered before clock accounting")
             }
+            GlobalRequest::ReportAdmittedRestartCode(_) => {
+                unreachable!("an admitted restart code's report answered before clock accounting")
+            }
             GlobalRequest::PostCrash(_) => {
                 unreachable!("post-crash step answered before clock accounting")
             }
@@ -4889,17 +4919,7 @@ impl GlobalState {
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let inserted = self
-                    .unsupported_syscalls
-                    .lock()
-                    .unwrap()
-                    .insert(name.clone());
-                if inserted
-                    && let Some(report) = &self.unsupported_syscall_report_fd
-                    && let Err(error) = writeln!(report.lock().unwrap(), "{name}")
-                {
-                    warn!("failed to append unsupported-syscall report: {error}");
-                }
+                self.note_unsupported_name(name);
                 R::ReportUnsupportedSyscall(())
             }
             GlobalRequest::AnnounceSignalHandlerNotInstalled(signum) => {
@@ -8729,8 +8749,10 @@ pub enum SignalScope {
 /// `poll_deadline` is suppressed (record/replay); the same change's
 /// open-file model also gained `send_timeout` and `socket_family`
 /// under this revision (60 on its own base, renumbered to 61 at its
-/// rebase onto main's 60). It is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 61;
+/// rebase onto main's 60). 62 adds `ReportAdmittedRestartCode`, an admitted
+/// restart code's entry in the unsupported-use summary, sent from a backend
+/// hook with no access to the guest; it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 62;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8849,6 +8871,12 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC request.
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
+
+    /// Add a restart code Detcore admitted to the run-wide unsupported-use
+    /// summary, from a backend hook that has no access to the guest
+    /// (`report_admitted_restart_code`). Like `DiscardedSignal`, it carries
+    /// no logical time and its answer carries none back.
+    ReportAdmittedRestartCode(String),
 
     /// A guest asked for a disposition of this signal that Detcore answered
     /// with success but did not install. The coordinator announces it once per
@@ -10648,6 +10676,26 @@ where
         GlobalRequest::ReportUnsupportedSyscall(sysno.to_string()),
     )
     .await;
+    assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
+}
+
+/// `report_unsupported_syscall` for a restart code Detcore admitted
+/// (`Config::allow_unresolved_restart_codes`), listed as `name`, from a
+/// backend hook that can send RPCs for thread `tid` and has no access to the
+/// guest (`Tool::handle_unresolved_restart`).
+pub async fn report_admitted_restart_code<R: GlobalRPC<GlobalState>>(
+    rpc: &R,
+    tid: reverie::Tid,
+    name: String,
+) {
+    let tid = DetTid::from_raw(tid.as_raw());
+    let (_, response) = rpc
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(tid),
+            GlobalRequest::ReportAdmittedRestartCode(name),
+        ))
+        .await;
     assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
 }
 
@@ -25997,6 +26045,49 @@ mod tests {
         state.complete_physical_process_exit(detpid.as_raw());
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    /// An admitted restart code's report comes from a backend hook with no
+    /// access to the guest, so it carries a zero clock
+    /// (`report_admitted_restart_code`). Under `--work-span-report` that zero
+    /// does not become the sender's CPU time: the summary lists the entry and
+    /// the sender's work-span accounting is unchanged.
+    #[tokio::test]
+    async fn an_admitted_restart_codes_report_leaves_work_span_accounting_alone() {
+        let config = Config {
+            work_span_report: Some(std::env::temp_dir().join(format!(
+                "admitted-restart-work-span-{}.json",
+                std::process::id()
+            ))),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let tid = DetTid::from_raw(17);
+        install_test_registration(&state, tid, Ivar::new());
+        state.sched.lock().unwrap().work_span_note_arrival(
+            tid,
+            500,
+            crate::scheduler::work_span::Arrival::Other,
+        );
+        assert_eq!(state.sched.lock().unwrap().work_span_cpu_now(tid), Some(500));
+        let name = "rt_sigsuspend (restart code refused: TracerMayBeFiltered)";
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::default(),
+                    MmId::initial(tid),
+                    GlobalRequest::ReportAdmittedRestartCode(name.to_owned()),
+                ),
+            )
+            .await;
+        assert_eq!(response, (None, GlobalResponse::ReportUnsupportedSyscall(())));
+        assert!(state.unsupported_syscalls.lock().unwrap().contains(name));
+        assert_eq!(
+            state.sched.lock().unwrap().work_span_cpu_now(tid),
+            Some(500),
+            "the report's zero clock is not the sender's CPU time"
+        );
     }
 
     #[test]

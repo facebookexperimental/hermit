@@ -1411,6 +1411,9 @@ fn record_or_replay_config_with_timer_support(
         // backend callback. The tracer owns process-tree cleanup on that error.
         exit_on_unsupported_syscall: true,
         shutdown_on_unsupported_syscall: false,
+        // A restart code the backend cannot hand to the kernel is refused, as
+        // an unsupported syscall is.
+        allow_unresolved_restart_codes: false,
         unsupported_syscall_report_fd: None,
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
