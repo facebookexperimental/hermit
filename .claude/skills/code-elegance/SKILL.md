@@ -44,7 +44,7 @@ from a fresh one. **Re-run a recipe before trusting its number.**
 
    The same trap exists *without touching any comparator code*: bare `--verify`
    uses the lossy `Stripped` comparator and **cannot establish L2**
-   (`AGENTS.md:232`). Only `--verify-strict` compares under `BitwiseInfoV1`.
+   (`AGENTS.md`, "Determinism and assurance levels"). Only `--verify-strict` compares under `BitwiseInfoV1`.
    Quoting a `--verify`-only pass as an L2 result is a fake green by reporting
    rather than by code.
 
@@ -71,7 +71,8 @@ from a fresh one. **Re-run a recipe before trusting its number.**
    So **always pass `--verify-json` and read `bitwise_parity`**; never rest an
    L2 claim on the success line. Use the canonical form in workflow step 5.
 3. **Respect backend modularity — no private escape hatches.** Per
-   [`AGENTS.md` § Backend Definition](../../../AGENTS.md) (`AGENTS.md:160`),
+   [`AGENTS.md` § Backend Definition](../../../AGENTS.md) and the
+   [`validation-evidence`](../validation-evidence/SKILL.md) skill,
    every real backend runs through the same `Detcore<XxxGuest>` path and the
    same shared Detcore code. A backend must not grow a special code path that
    only it takes to dodge the shared contract.
@@ -83,7 +84,7 @@ from a fresh one. **Re-run a recipe before trusting its number.**
    | --- | --- |
    | Differs in **mechanism** — how this backend traps a nondeterministic instruction | Differs in **guarantee** — this backend skips a check the others perform |
    | Still reaches the shared `Detcore<XxxGuest>` path | Bypasses Detcore, or reimplements a determinization locally |
-   | The limitation is **declared and reported** in the result (AGENTS.md's KVM `--verify` output-only fallback reports `bitwise_parity: false`) | The limitation is silent, and the weaker path still reports the same verdict as the strong one |
+   | The limitation is **declared and reported** in the result (a KVM `--verify` output-only fallback reports `bitwise_parity: false`) | The limitation is silent, and the weaker path still reports the same verdict as the strong one |
 
    A `match backend { ... }` that dispatches to backend-specific
    *implementations* of the *same* contract is fine. A branch that gives one
@@ -96,7 +97,7 @@ from a fresh one. **Re-run a recipe before trusting its number.**
    originate work by reading code (see "Finding candidates" below), or by
    picking up a flagged item from `mb`/`tg` backlog notes. Either way, land it
    as one focused PR.
-5. **Add a regression test at the lowest useful layer.** `AGENTS.md:274` says
+5. **Add a regression test at the lowest useful layer.** The [`development`](../development/SKILL.md) skill says
    "Add a regression test at the lowest useful layer"; the sibling
    [`repo-cleanliness`](../repo-cleanliness/SKILL.md) skill (line 29) says "at
    the narrowest useful layer". Both are binding, and they agree: put Detcore
@@ -119,7 +120,7 @@ from a fresh one. **Re-run a recipe before trusting its number.**
    [`test-shrink-optimization`](../test-shrink-optimization/SKILL.md).
 
    **Deletion is a separate, higher gate that no sibling skill covers** — see
-   "Deleting a test" below. `AGENTS.md:481` lists tests "`#[ignore]`d, masked,
+   "Deleting a test" below. The [`contributing`](../contributing/SKILL.md) skill lists tests "`#[ignore]`d, masked,
    or deleted to make a checkout look green" under **Not done**.
 7. **Improve modularity and generality.** Fix functions with too many
    arguments (bundle related parameters into a struct, or split the function).
@@ -385,7 +386,7 @@ description:
    ```
 
 Without both, shrink or re-tier it. Deleting or `#[ignore]`-ing a test to make
-a checkout look green is explicitly **Not done** (`AGENTS.md:481`).
+a checkout look green is explicitly **Not done** (`contributing` skill, "Records").
 
 ## NOT a smell
 
@@ -423,9 +424,9 @@ regression, not an elegance improvement:
 - **Hardware-sensitive tests that fail on *your* host.** PMU/RCB-dependent
   preemption tests, CPUID-interception tests, and the Detcore `tests_misc`
   RDRAND/RDSEED cases can fail in a restricted container or VM
-  (`AGENTS.md:41-48`, `:94-96`). Under principle 6 they are the perfect false
-  positive: slow *and* red on a restricted host. `AGENTS.md` is explicit — "Do
-  not mark or delete a hardware-sensitive test merely to make a local VM
+  (`development` skill, "Supported environment" and "Test"). Under principle 6 they are the perfect false
+  positive: slow *and* red on a restricted host. The `development` skill is explicit — "Never
+  mark or delete a hardware-sensitive test merely to make a local VM
   green." Report the host limitation instead.
 - **`--unsafe-strip-lines` and similar diagnostic-only normalizations**, used
   to *localize* a divergence in `hermit log-diff`. These are fine as debugging
@@ -471,7 +472,7 @@ regression, not an elegance improvement:
    Then `cargo fmt --all -- --check` and
    `cargo clippy --workspace --all-targets -- -D warnings`.
 6. Write the PR with **Summary**, **Determinism**, **Linux Semantics**, and
-   **Validation** sections (per `AGENTS.md`); if the change touches
+   **Validation** sections (per the `contributing` skill); if the change touches
    backend-shared code, name which backends you validated it against, and
    state the assurance level with its backend rather than an unqualified
    "passes".

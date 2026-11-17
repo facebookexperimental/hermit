@@ -6,6 +6,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+
 //! Verify the cross-client skill layout without duplicating instruction bodies.
 
 #[path = "lib/rust_script_prelude.rs"]
@@ -24,8 +25,10 @@ const PACKAGED_SKILLS: &[&str] = &[
     "ci-debugging",
     "code-elegance",
     "continuous-virtual-time-is-sacred",
+    "contributing",
     "deadlock-debugging",
     "determinism-regression-debugging",
+    "development",
     "fabler",
     "hermit-debugging",
     "how-to-build-a-cli",
@@ -35,6 +38,7 @@ const PACKAGED_SKILLS: &[&str] = &[
     "repo-cleanliness",
     "test-shrink-optimization",
     "ux-tester",
+    "validation-evidence",
 ];
 
 const PARENT_ONLY_ROLES: &[&str] = &[

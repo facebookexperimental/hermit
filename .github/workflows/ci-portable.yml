@@ -6,8 +6,8 @@ name: CI (GitHub-managed portable)
 # ci.yml. Before that it also ran for pull requests opened by anyone other than
 # the project bot (owner decision, 2026-10-27: "invoke CI automatically only
 # for external PRs not by our hermit-bot account") and for pushes to main.
-# Follow AGENTS.md for landing: local or GitHub evidence is acceptable, and
-# reported failures require investigation.
+# Its results are supplemental evidence (AGENTS.md); reported failures require
+# investigation.
 #
 # EXTERNAL PULL REQUESTS. A pull_request run whose author is hermit-bot3, or
 # whose pull request is a draft, skips every job: the gate sits on the jobs

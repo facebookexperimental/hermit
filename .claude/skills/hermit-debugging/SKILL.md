@@ -27,6 +27,38 @@ invoke every Hermit binary through the `dev-hermit` parent workspace's
 The wrapper caps the child process's stderr. It does not cap files written by
 `--log-file` or retained verify logs; those have separate guards.
 
+## Tools and documents to start from
+
+- `hermit --log info run -- <program>` (or `debug`/`trace`) shows the event
+  stream and Detcore's decisions; `DETLOG` lines record syscalls, scheduling
+  and virtualized time.
+- `hermit run --strict --verify --verify-strict` runs the guest twice under the
+  L2 comparison policy and reports the first divergence. **Before triaging what
+  it reports, read [docs/DIVERGENCE_CLASSES.md](../../../docs/DIVERGENCE_CLASSES.md).**
+  There are three classes needing different fixes, and identical DETLOG counts
+  do not mean the difference is a clock: classify on what differs at the
+  divergent record (a time field, a control-flow difference visible in the
+  counts, or payload bytes with everything else identical).
+- `hermit record start --verify --verify-strict -- <program>` records, replays
+  and diffs the two logs; a divergence names the thread and syscall event where
+  the runs parted.
+- `hermit-verify` runs stress, trace, schedule and replay checks; the
+  `log-diff` and `analyze` subcommands compare two runs' logs.
+- Prefer the smallest guest that reproduces the issue; `tests` and
+  `flaky-tests` already hold minimal time, futex, pipe, signal and scheduling
+  programs.
+- Several nested mechanisms can stop a run and they bound different
+  quantities; [docs/TIMEOUT_LADDER.md](../../../docs/TIMEOUT_LADDER.md)
+  describes each rung, why an exit code cannot say which fired, and how the
+  stderr class line distinguishes them.
+- A rare flake in Hermit's own host-timed handling can be forced with race
+  probes (`HERMIT_RACE_PROBE`, off by default);
+  [docs/RACE_PROBES.md](../../../docs/RACE_PROBES.md) lists the points and
+  why an outcome under a probe is one that host timing alone could produce.
+- When a symptom depends on PMU access, CPUID interception or specific CPU
+  features, capture the host environment in the report; those are host
+  limitations, not necessarily product bugs.
+
 ## Establish what actually failed
 
 Start from the exact failing observation. For a manifest cell, record its lane,
