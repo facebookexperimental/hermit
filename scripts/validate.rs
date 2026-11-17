@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "6e80ecfbc8d1a4e5f93478d8121ed377e70b6d0e" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "096a8d745d063ae798470d48ef24f14abf789557" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -4624,6 +4624,7 @@ fn self_test() -> Result<(), String> {
             cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
+            no_result: false,
         };
         let outcomes = vec![
             row("first_fails", false),
@@ -7657,6 +7658,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
+        no_result: false,
     };
     let coverage = typed_test_node_coverage(&population, &[outcome]);
     let absent = coverage["absent_nodes"]
@@ -17720,6 +17722,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
+        no_result: false,
     };
     let none: BTreeSet<String> = BTreeSet::new();
 
@@ -25860,6 +25863,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
             "test failure".into()
         },
         aborted,
+        no_result: false,
     };
 
     let planned = BTreeSet::from([
@@ -25919,6 +25923,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
             "test failure".into()
         },
         aborted: false,
+        no_result: false,
     };
     let full = vec![
         outcome("test.a", true, Some(398), Some(0)),
@@ -26403,6 +26408,7 @@ fn ledger_gate_compaction_bracket() -> Result<(), String> {
         cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
+        no_result: false,
     };
     let mut passed = failed.clone();
     passed.ok = true;
@@ -26736,6 +26742,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
+        no_result: false,
     };
     let row = ledger_gate(&failed);
     if row["failure_origin"] != "outer_gate"
@@ -27865,6 +27872,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
+        no_result: false,
     };
     let outcomes = vec![
         row("fixture.missing", false, Some(127), 1.0),
@@ -27908,6 +27916,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         cpu_timed_out: false,
         reason: String::new(),
         aborted,
+        no_result: false,
     };
 
     let pass = outcome("pass", 0, false);
@@ -33583,6 +33592,7 @@ fn stop_test_seam(
             "stop-test synthetic failure".into()
         },
         aborted: false,
+        no_result: false,
     };
     let outcomes = vec![
         synth("stop-test completed gate 1", !prior_failure),

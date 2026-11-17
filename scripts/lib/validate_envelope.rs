@@ -458,6 +458,7 @@ pub fn self_test() -> Result<String, String> {
         cpu_timed_out: false,
         reason: String::new(),
         aborted,
+        no_result: false,
     };
     let mut all: Vec<StepOutcome> = Vec::new();
     for p in PROBES {

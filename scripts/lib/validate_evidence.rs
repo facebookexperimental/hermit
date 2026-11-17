@@ -346,6 +346,7 @@ mod tests {
             cpu_timed_out: false,
             reason: "fixture failed".into(),
             aborted: false,
+            no_result: false,
         };
         let attempt = super::super::reported_attempt(&outcome, 1);
         let (nodes, compatibility) = test_inputs(
