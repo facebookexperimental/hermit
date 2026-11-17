@@ -56,8 +56,10 @@ pub mod rewrite;
 /// 11: literal and base readers in executable segment bytes no
 /// executable section covers protect the bytes they read, under
 /// their own refusal name, and direct branches out of those bytes
-/// count as branch targets.
-pub const REWRITE_FORMAT_VERSION: u32 = 11;
+/// count as branch targets. 12: a file whose executable section ends past
+/// the top of the address space is refused whole, and a relocation's
+/// covered range saturates at the top instead of wrapping.
+pub const REWRITE_FORMAT_VERSION: u32 = 12;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

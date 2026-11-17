@@ -291,7 +291,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             .chain(elf.dynrelas.iter().map(|reloc| reloc.r_offset))
             .chain(elf.dynrels.iter().map(|reloc| reloc.r_offset))
             .chain(elf.pltrelocs.iter().map(|reloc| reloc.r_offset))
-            .map(|offset| (offset, offset + 8))
+            .map(|offset| (offset, offset.saturating_add(8)))
             .collect();
         // SHT_RELR = 19: packed relative relocations, which the ELF reader
         // does not report, so they are decoded here and ADDED to that list.
@@ -326,6 +326,16 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         };
         if elf.section_headers.is_empty() {
             return skip_file("the file has no section headers, so code cannot be told from data");
+        }
+        // Every address in an executable section is its start plus an
+        // offset into it, so one that ends past the top of the address
+        // space has addresses nothing can compute.
+        if elf.section_headers.iter().any(|sh| {
+            sh.sh_type == section_header::SHT_PROGBITS
+                && sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0
+                && sh.sh_addr.checked_add(sh.sh_size).is_none()
+        }) {
+            return skip_file("an executable section ends past the top of the address space");
         }
         let evidence = file_code_evidence(bytes, &elf);
         let sections = elf
@@ -367,9 +377,10 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 // reach from the functions' entries: a table a function
                 // branches over, or keeps after its return, is not.
                 let (code, unknown) = match (&words, held.evidence) {
-                    _ if unproven.is_some() => {
-                        (Vec::new(), vec![(sh.sh_addr, sh.sh_addr + sh.sh_size)])
-                    }
+                    _ if unproven.is_some() => (
+                        Vec::new(),
+                        vec![(sh.sh_addr, sh.sh_addr.saturating_add(sh.sh_size))],
+                    ),
                     _ => (held.code, held.unknown),
                 };
                 Section {
@@ -2906,6 +2917,109 @@ pub(crate) mod tests {
         let image = with_program_header(image, 0x300, 0x400000, 0);
         let plan = plan_bytes(&image).unwrap().unwrap();
         assert_eq!(plan.patches.len(), 1, "{plan:?}");
+    }
+
+    /// An executable section whose end is past the top of the address
+    /// space is refused by name, with the whole file, instead of
+    /// overflowing an address computed in it.
+    #[test]
+    fn an_executable_section_past_the_top_of_the_address_space_is_refused() {
+        let mut image = elf_image(&LOOP, None);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let addr = shoff + 64 + 16;
+        image[addr..addr + 8].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.patches.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.report.skipped_segments,
+            vec!["an executable section ends past the top of the address space".to_string()],
+            "{plan:?}"
+        );
+    }
+
+    /// The refusal above takes only an end PAST the top: a section ending
+    /// exactly at the top of the address space (`u64::MAX`, which is
+    /// representable) is planned as it would be anywhere else.
+    #[test]
+    fn an_executable_section_ending_exactly_at_the_top_of_the_address_space_is_planned() {
+        fn field(image: &[u8], at: usize) -> usize {
+            u64::from_le_bytes(image[at..at + 8].try_into().unwrap()) as usize
+        }
+        let control = plan_bytes(&elf_image(&LOOP, Some(&[(1, 0, true)])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.patches.len(), 1, "{control:?}");
+        // `.text` grows to 27 bytes (its six words and three more), so at an
+        // address that is a multiple of four it ends at `u64::MAX`; its `$x`
+        // mark moves with it.
+        let mut image = elf_image(&LOOP, Some(&[(1, 0, true)]));
+        let addr = u64::MAX - 27;
+        let text = field(&image, 40) + 64;
+        image[text + 16..text + 24].copy_from_slice(&addr.to_le_bytes());
+        image[text + 32..text + 40].copy_from_slice(&27u64.to_le_bytes());
+        let mark = field(&image, field(&image, 40) + 64 * 3 + 24) + 24;
+        image[mark + 8..mark + 16].copy_from_slice(&addr.to_le_bytes());
+        let plan = plan_bytes(&image).unwrap().unwrap();
+        assert!(plan.report.skipped_segments.is_empty(), "{plan:?}");
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        assert_eq!(
+            plan.patches[0].offset, control.patches[0].offset,
+            "{plan:?}"
+        );
+    }
+
+    /// A relocation covers its offset and the widest relocation's eight
+    /// bytes after it, saturated at the top of the address space: an offset
+    /// in the last eight addresses neither overflows nor refuses code it does
+    /// not touch.
+    #[test]
+    fn a_relocation_at_the_top_of_the_address_space_saturates() {
+        // `image` with one more section, SHT_RELA, holding one entry at
+        // `offset`, and the section header table moved to the file's end.
+        fn with_relocation(image: &[u8], offset: u64) -> Vec<u8> {
+            let mut image = image.to_vec();
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            let shnum = u16::from_le_bytes(image[60..62].try_into().unwrap());
+            let headers = image[shoff..shoff + 64 * usize::from(shnum)].to_vec();
+            let rela_at = image.len().next_multiple_of(8);
+            image.resize(rela_at, 0);
+            // r_offset, then r_info and r_addend, both zero.
+            image.extend_from_slice(&offset.to_le_bytes());
+            image.extend_from_slice(&[0; 16]);
+            let new_shoff = image.len().next_multiple_of(8);
+            image.resize(new_shoff, 0);
+            image.extend_from_slice(&headers);
+            let mut rela = [0u8; 64];
+            rela[4..8].copy_from_slice(&4u32.to_le_bytes()); // SHT_RELA
+            rela[24..32].copy_from_slice(&(rela_at as u64).to_le_bytes());
+            rela[32..40].copy_from_slice(&24u64.to_le_bytes());
+            rela[40..44].copy_from_slice(&3u32.to_le_bytes()); // .symtab
+            rela[44..48].copy_from_slice(&1u32.to_le_bytes()); // .text
+            rela[48..56].copy_from_slice(&8u64.to_le_bytes());
+            rela[56..64].copy_from_slice(&24u64.to_le_bytes());
+            image.extend_from_slice(&rela);
+            image[40..48].copy_from_slice(&(new_shoff as u64).to_le_bytes());
+            image[60..62].copy_from_slice(&(shnum + 1).to_le_bytes());
+            image
+        }
+        let image = elf_image(&LOOP, Some(&[(1, 0, true)]));
+        let (_, report) = rewritten(&image);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        // The fixture's relocation is read: one inside the loop refuses it.
+        let inside = with_relocation(&image, 0x108);
+        let (bytes, report) = rewritten(&inside);
+        assert_eq!(bytes, inside, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("relocation-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+        // One in the last eight addresses touches no code: the loop is
+        // rewritten as without it.
+        let (_, report) = rewritten(&with_relocation(&image, u64::MAX - 3));
+        assert!(report.skipped_segments.is_empty(), "{report:?}");
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_eq!(report.refused_total(), 0, "{report:?}");
     }
 
     /// What an `ADRP` lets the code read is protected like a literal load's
