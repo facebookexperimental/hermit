@@ -86,6 +86,12 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         populations: &[],
     },
     ExtensionNode {
+        tag: "check.linuxemu_unsafe",
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &["build.rust_scripts"],
+        populations: &[],
+    },
+    ExtensionNode {
         tag: "e2e.manifest_rr",
         labels: &["full", "portable"],
         deps: &[

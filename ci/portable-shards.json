@@ -42,7 +42,8 @@
     "selftest.manifest_cli",
     "selftest.core_build",
     "check.gvisor_vendoring",
-    "check.linuxemu_graph"
+    "check.linuxemu_graph",
+    "check.linuxemu_unsafe"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",

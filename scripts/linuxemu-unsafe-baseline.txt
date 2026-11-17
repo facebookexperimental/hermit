@@ -1,0 +1,47 @@
+# LinuxEmu unsafe census baseline. Regenerated only by
+# scripts/check-linuxemu-unsafe.rs --write-baseline in the same diff
+# that moves unsafe; see that file for the counting method.
+total 612
+capture_identity.rs 7
+core_dump.rs 3
+credentials.rs 6
+elf.rs 13
+executor/abi.rs 2
+executor/event_fds.rs 13
+executor/fd_table.rs 19
+executor/file.rs 52
+executor/futex.rs 1
+executor/host_mount.rs 4
+executor/host_probe.rs 9
+executor/identity.rs 4
+executor/inotify.rs 7
+executor/ioctl.rs 2
+executor/mapping_list.rs 9
+executor/mm.rs 5
+executor/pidfd.rs 16
+executor/pipe_owner.rs 2
+executor/poll.rs 15
+executor/proc.rs 11
+executor/random.rs 1
+executor/read_write.rs 47
+executor/shared_file.rs 3
+executor/socket.rs 46
+executor/stat.rs 14
+executor/syncfs.rs 1
+executor/sys_signal.rs 3
+executor/task.rs 4
+executor/time.rs 5
+executor/uaccess.rs 3
+executor/vfs_file.rs 2
+executor/vm_flags.rs 15
+executor/xattr.rs 8
+native_exit_broker.rs 16
+native_exit_broker/bootstrap.rs 23
+native_exit_broker/daemon.rs 88
+native_exit_broker/exec_client.rs 9
+native_exit_broker/raw.rs 95
+pidfd_shadow.rs 6
+proc_mechanics.rs 2
+signal.rs 5
+terminal_cleanup.rs 1
+terminal_read.rs 15

@@ -413,6 +413,43 @@
     },
     {
       "group": "check",
+      "job": "linuxemu_unsafe",
+      "desc": "LinuxEmu unsafe census ratchet",
+      "description": "Keeps the LinuxEmu unsafe surface from drifting silently while policy moves into safe Rust over a contracted unsafe layer (lead plan U-gate). scripts/check-linuxemu-unsafe.rs counts unsafe syntax sites in reverie-linuxemu/src outside test scopes with the syn parser (blocks, fns, impls, traits, extern blocks, plus unsafe tokens in macro bodies; tests/ directories, *_tests.rs files and test-only cfg (cfg(test)/cfg(all(test, ...))) items excluded; cfg(any(test, ...)) and cfg(not(test)) counted, as are all other cfg branches) and requires an exact per-file match with scripts/linuxemu-unsafe-baseline.txt in both directions (a decrease refuses until --write-baseline locks it in; regenerating with an increase requires a per-file --justify reason persisted in the baseline for the diff seat to judge, a stale justification refuses, creating a baseline requires --init, and in git scope a count raised over the committed HEAD baseline without a matching justification refuses — which catches only uncommitted hand edits (every run prints BASE: compared or BASE: skipped with its reason), so a committed raise is enforced by the seat's review of its justify lines until the explicit-base follow-up lands). Before trusting a pass it runs negative controls (nested blocks, cfg(test) exclusion, macro tokens, comment/string non-counts). The step also runs scripts/check-linuxemu-unsafe-test.sh (11 twins: real-tree pass, planted site refuses, unlocked decrease refuses then locks in, test-scope plant passes, missing tree and unknown args fail closed, raise without --justify refuses to write, justified raise writes and stale justification refuses, cfg(not(test))/cfg(any(test, ...)) sites counted, missing-baseline write needs --init, git-scope hand-raised baseline over HEAD refuses without justification). The baseline is 612 sites, identical per-file at fbsource b9092dc0a180 and 8c5befcd with this method; the 2026-11-16 formal-verification census reported 613 at b9092dc0a180, the one differing site being executor/read_write.rs:1845 (mprotect in #[cfg(test)] fn protect_after_data, an impl-item fn its scanner's test ranges missed), so this checker's series starts at 612. A syntax count is a mechanical record, not a safety proof.",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/check-linuxemu-unsafe.rs --repo-root . && ./scripts/check-linuxemu-unsafe-test.sh",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "priority": 100,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 268435456,
+        "hard_mem_max_bytes": 1073741824,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "check.linuxemu_unsafe"
+    },
+    {
+      "group": "check",
       "job": "backend_parity_mutation",
       "desc": "Identity fixtures in tests/c are non-vacuous (native mutation harness)",
       "description": "Proves every identity fixture in tests/c that includes parity_probe.h would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. The harness refuses to run unless its registry equals the set of tests/c sources that include parity_probe.h, and prints every fixture it examined. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. The fixtures and this harness moved from tests/backend-parity when the backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the job id is kept so shard maps and history keep naming the same node. Real cross-backend parity for those fixtures is carried by their c-programs verify cells, which e2e.manifest_c_programs and its _on_host twin select: c-programs/ioctl-fionread on ptrace and LiteInst, and c-programs/rlimit-identity and c-programs/sched-getaffinity-identity on ptrace, KVM and LiteInst. None of the three has a CI-selected DBT cell: ioctl-fionread disables DBT, and rlimit-identity and sched-getaffinity-identity enable a DBT verify cell with ci.dbt=false (infrastructure-error, RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9: DBT cannot isolate the required /test workdir). The retired test.dbt_parity matrix never compiled them either; its 28 cases now run as DBT verify cells in the c-programs and system-utils manifests (https://github.com/rrnewton/hermit/issues/3301, slice S13).",

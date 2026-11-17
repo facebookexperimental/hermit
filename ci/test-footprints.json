@@ -768,6 +768,17 @@
     {
       "_why": "Standalone checks map to their own portable DAG node.",
       "nodes": [
+        "check.linuxemu_unsafe"
+      ],
+      "paths": [
+        "scripts/check-linuxemu-unsafe.rs",
+        "scripts/check-linuxemu-unsafe-test.sh",
+        "scripts/linuxemu-unsafe-baseline.txt"
+      ]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
+      "nodes": [
         "check.portability_paths"
       ],
       "paths": [
