@@ -49,7 +49,7 @@ type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 /// process). Without it a host qualification cache miss runs the XINUSE probe
 /// inside the replay, whose log then holds the probe's lines and whose guest
 /// thread ids move by the probe's threads
-/// (https://github.com/facebookexperimental/hermit/issues/118).
+/// (<https://github.com/facebookexperimental/hermit/issues/118>).
 pub fn qualify_host_for_replay(dir: &Path, gdbserver: bool) -> Result<(), Error> {
     qualified_host_facts(&Metadata::load(dir)?, gdbserver).map(drop)
 }

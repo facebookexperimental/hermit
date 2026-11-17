@@ -53,6 +53,19 @@ RUST_SCRIPT_BIN=$(command -v rust-script || true)
 [[ -f $CHECKER ]] || { echo "missing $CHECKER" >&2; exit 2; }
 [[ -n $RUST_SCRIPT_BIN ]] || { echo "rust-script not on PATH" >&2; exit 2; }
 command -v cargo >/dev/null 2>&1 || { echo "cargo not on PATH" >&2; exit 2; }
+# Twins 9 and 11 run the checker under a PATH narrowed to a few tools. That
+# PATH must narrow what the CHECKER finds, not what runs it: the validation
+# graph's rust-script is ci/rust-script-bin/rust-script, a bash shim over a
+# prepared binary that itself needs bash, realpath, dirname and awk, and under
+# the narrowed PATH it died with "/usr/bin/env: 'bash': No such file or
+# directory". Resolve the prepared binary once; a plain rust-script install
+# has no --resolve-optional, keeps compiling the source (the narrowed PATH
+# carries cargo and rustc for it), and is run as before.
+CHECKER_CMD=("$RUST_SCRIPT_BIN" "$CHECKER")
+if prepared=$("$RUST_SCRIPT_BIN" --resolve-optional "$CHECKER" 2>/dev/null) \
+    && [[ -x $prepared ]]; then
+    CHECKER_CMD=("$prepared")
+fi
 
 echo "twin 1: today's graph passes; reverie-procfs flagged, not hidden"
 OUT=$(rust-script "$CHECKER" --repo-root "$REPO_ROOT" 2>&1); RC=$?
@@ -196,7 +209,7 @@ done
 if [[ -x $fakebin/sl ]]; then
     fail "git-only PATH fixture unexpectedly contains sl"
 else
-    OUT=$(env PATH="$fakebin" "$RUST_SCRIPT_BIN" "$CHECKER" --repo-root "$scratch/repo" \
+    OUT=$(env PATH="$fakebin" "${CHECKER_CMD[@]}" --repo-root "$scratch/repo" \
         --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" 2>&1); RC=$?
     if ((RC == 1)) && grep -q "REFUSE" <<<"$OUT" \
         && grep -q "SKIP SUMMARY (counted): 2 Sapling negative control(s)" <<<"$OUT"; then
@@ -305,7 +318,7 @@ if command -v sl >/dev/null 2>&1; then
     fakebin="$scratch/fakebin"
     OUT=$(BUCK_FIXTURE_KIND="$scratch/kind-roots.txt" \
         BUCK_FIXTURE_LABELS="$scratch/labels-clean.txt" \
-        env PATH="$fakebin" "$RUST_SCRIPT_BIN" "$CHECKER" \
+        env PATH="$fakebin" "${CHECKER_CMD[@]}" \
         --repo-root "$buckaudit" \
         --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" \
         --skip-negative-control 2>&1); RC=$?

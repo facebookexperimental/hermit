@@ -10,3 +10,23 @@
 scripts/validate.rs | const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/issues/549"; | Functional: validate writes this URL into the evidence of every frozen-run skip record in the ledger, and the private parent's ci-hub tests compare that evidence string exactly. Changing it changes recorded output.
 scripts/validate.rs | parent.join("worktrees/slots/validate-fresh-lookalike") | Functional: a self-test fixture for validate's checkout admission, which must tell a disposable validation checkout from a path in the parent workspace's slot layout that only looks like one.
 ci/compat-envelope/testdata/parity-ledger/provenance.json | $HOME/work/dev-hermit/bin/safehermit | Byte-authenticated evidence: the wrapper text sits beside its recorded size and sha256 (d6e90b66...), which every row's hermit_bin_sha256 repeats; editing the text breaks that check.
+
+# scripts/syscall-pages.rs: its P30 public-text lint refuses these same classes in
+# generated syscall pages, so its needle lists and its red twins must contain them.
+# One entry per line, so that any other such line in that file is still refused.
+scripts/syscall-pages.rs | "from the checkout at", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "from our checkout", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "from my checkout", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in our slot", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in my slot", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in our worktree", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in my worktree", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in our lane", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "in my lane", | Functional: a P30 needle (workplace phrasing) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | lc.contains("dev-hermit/") | Functional: a P30 needle (workspace path) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | lc.contains("work/dev-hermit") | Functional: a P30 needle (workspace path) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | lc.contains("worktrees/slots/") | Functional: a P30 needle (workspace path) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | lc.contains("github.com/rrnewton/dev-hermit") | Functional: a P30 needle (private-repository link) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | lc.contains("githubusercontent.com/rrnewton/dev-hermit") | Functional: a P30 needle (private-repository link) that the lint refuses in generated pages.
+scripts/syscall-pages.rs | "dev-hermit/experiments/x", | Functional: the red twin that proves P30 refuses a workspace path; it must contain one.
+scripts/syscall-pages.rs | "worktrees/slots/lane", | Functional: the red twin that proves P30 refuses a slot path; it must contain one.

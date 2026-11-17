@@ -280,10 +280,10 @@ fn emit_pin_watches(repository: &Path) {
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
-    if submodule.join(".git").exists() {
-        if let Some(reference) = git_at(&["symbolic-ref", "-q", "HEAD"]) {
-            names.push(reference);
-        }
+    if submodule.join(".git").exists()
+        && let Some(reference) = git_at(&["symbolic-ref", "-q", "HEAD"])
+    {
+        names.push(reference);
     }
     let mut paths: Vec<PathBuf> = if submodule.join(".git").exists() {
         names

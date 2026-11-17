@@ -6815,7 +6815,7 @@ fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
 }
 
 /// The CPU profile the ptrace verify run of a parity-compared test names
-/// ([`names_parity_golden_profile`]), right after `run`.
+/// (`names_parity_golden_profile`), right after `run`.
 ///
 /// The ptrace verify log is the parity golden
 /// ([`crate::parity::PARITY_REFERENCE_BACKEND`]), and no candidate backend can
@@ -10287,16 +10287,16 @@ pub struct InterpreterRefusalEvidence {
 ///
 /// - `cell` declares no image, so the interpreter is this host's;
 /// - every attempt is a FAIL with runs, and no run ran inside an image
-///   ([`runs_inside_an_image`]): no v2 retry ran, because the cell was not
+///   (`runs_inside_an_image`): no v2 retry ran, because the cell was not
 ///   eligible for it or the run had no rootfs. A v2 retry refused before
 ///   launch ([`is_v2_retry_refusal`]) is an ERROR row with no runs, so it
 ///   keeps the cell's result too;
 /// - every run of every attempt is a loader rejection whose evidence names
 ///   the level its interpreter needs and the CPU profile Hermit presented
-///   and why ([`attempt_interpreter_refusal`]), and every run names the same
+///   and why (`attempt_interpreter_refusal`), and every run names the same
 ///   level, profile and reason;
 /// - that refusal is one another host could avoid
-///   ([`host_dependent_refusal_error`]): the level is above the presented
+///   (`host_dependent_refusal_error`): the level is above the presented
 ///   profile's and no higher than x86-64-v3, and the host chose the profile.
 ///
 /// A level that is not above the presented one (glibc naming x86-64-v2 under
@@ -10358,7 +10358,7 @@ pub fn interpreter_refusal_evidence(
 /// Why an imported claim of a host-image interpreter refusal for `cell` is
 /// not one this run would record, if it is not: its typed evidence must name
 /// at least one attempt and run, and a refusal another host could avoid
-/// ([`host_dependent_refusal_error`]), and `cell`, as this checkout declares
+/// (`host_dependent_refusal_error`), and `cell`, as this checkout declares
 /// it, must have no image. The runs' own evidence stays with the producer;
 /// this re-checks every typed field it decided from.
 pub fn check_interpreter_refusal_claim(

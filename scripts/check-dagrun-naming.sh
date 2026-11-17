@@ -85,7 +85,10 @@ fi
 
 # ---------------------------------------------------------------- check 2
 readonly MODEL_PY='agent-utils/py/dagrun/model.py'
-readonly MODEL_RS='agent-utils/rs/dagrun/src/model.rs'
+# The Rust runner's model moved into its own crate (agent-utils 9eeed771,
+# "extract the model and JSON IO into dagrun-model"); rs/dagrun/src/model.rs
+# now only re-exports it, so the constant is read where it is defined.
+readonly MODEL_RS='agent-utils/rs/dagrun-model/src/model.rs'
 readonly EXPORTER='ci/configure-build-jobs.sh'
 
 if [[ ! -f $MODEL_PY || ! -f $MODEL_RS ]]; then

@@ -96,6 +96,16 @@ const ALLOWLIST: &[(&str, &str)] = &[
          product failure in a lint node. Waived rather than scheduled for that \
          reason, not because nothing should run it.",
     ),
+    (
+        "scripts/check-no-v3.rs",
+        "Runs NIGHTLY ONLY by owner ruling, never land-blocking, and its one \
+         scheduler is Meta's internal Buck nightly, which scans the Buck-built \
+         hermit against a counted baseline; that scheduler is not exported, so \
+         nothing in this tree names it. The Cargo-built scan has NO validate-DAG \
+         node yet: the script's own header records that node as a follow-up. \
+         Open defect in the scan itself: https://github.com/facebookexperimental/hermit/issues/335. \
+         Delete this entry when that node lands.",
+    ),
 ];
 
 /// Is this tracked path a checker entrypoint?

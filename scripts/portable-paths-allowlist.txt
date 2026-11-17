@@ -1,0 +1,12 @@
+# Lines that scripts/check-portable-paths.sh must not refuse.
+#
+# Format: PATH | SUBSTRING | REASON
+# A hit is allowed when its file is exactly PATH and its line contains
+# SUBSTRING. Every entry needs a reason, and an entry that matches no hit fails
+# the check. This list is ONLY for a detector's own needle: text a checker must
+# contain so that it can refuse it. A host that ran or measured anything is
+# never listed here; record it in docs/TESTING_ENVIRONMENTS.md under "Named
+# measurement hosts" instead.
+
+scripts/syscall-pages.rs | const INTERNAL_DEV_HOST_PREFIX: &str = "devbig"; | Functional: the needle with which the P30 public-text lint refuses a generated syscall page that names an internal development host. It is spelled once; the lint and its red twin derive from it.
+hermit-cli/tests/cli.rs | b"devbig", | Functional: one of the needles with which the_checked_in_pre_psabi_recording_carries_no_host_environment refuses a re-recorded public fixture that carries the recording host's name.

@@ -1982,9 +1982,14 @@ fn lint_tests_evidence(page: &Page, root: &Path, tests: &str, rep: &mut Report) 
 // extend here, not a quiet leak.
 // ---------------------------------------------------------------------------
 
-fn is_devbig_host(s: &str) -> bool {
+/// The name prefix of an internal development host. A needle, not a host:
+/// it is what lets P30 refuse a page that names such a host, so it is
+/// spelled once, here, with its reason in scripts/portable-paths-allowlist.txt.
+const INTERNAL_DEV_HOST_PREFIX: &str = "devbig";
+
+fn is_internal_dev_host(s: &str) -> bool {
     let s = s.strip_suffix("'s").unwrap_or(s);
-    if let Some(rest) = s.strip_prefix("devbig") {
+    if let Some(rest) = s.strip_prefix(INTERNAL_DEV_HOST_PREFIX) {
         return rest.chars().take_while(|c| c.is_ascii_digit()).count() >= 3
             && rest[rest.chars().take_while(|c| c.is_ascii_digit()).count()..]
                 .chars()
@@ -1997,7 +2002,7 @@ fn scrub_findings(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Hostname substrings anywhere, including inside quoted payloads.
     let mut at = 0;
-    while let Some(i) = text[at..].find("devbig") {
+    while let Some(i) = text[at..].find(INTERNAL_DEV_HOST_PREFIX) {
         let start = at + i;
         let run: String = text[start..]
             .chars()
@@ -2040,7 +2045,7 @@ fn scrub_findings(text: &str) -> Vec<String> {
                     .unwrap_or(false)
             })
         });
-        if is_devbig_host(core)
+        if is_internal_dev_host(core)
             || core.starts_with("/home/")
             || core.starts_with("/data/users/")
             || core.starts_with("/var/tmp")
@@ -4933,17 +4938,14 @@ fn site_page_html(page: &Page) -> String {
         html_escape(&page.discussion_kind),
     );
     let short = |rev: &str| html_escape(&rev[..12.min(rev.len())]);
-    match &page.prose {
-        Some(p) => {
-            let _ = writeln!(
-                s,
-                "<p>Facts as of <code>{}</code> &middot; prose checked {} at <code>{}</code></p>",
-                short(&page.code_facts.as_of),
-                html_escape(&p.reviewed_at),
-                short(&p.based_on),
-            );
-        }
-        None => {}
+    if let Some(p) = &page.prose {
+        let _ = writeln!(
+            s,
+            "<p>Facts as of <code>{}</code> &middot; prose checked {} at <code>{}</code></p>",
+            short(&page.code_facts.as_of),
+            html_escape(&p.reviewed_at),
+            short(&p.based_on),
+        );
     }
     for (h, body) in display_sections(page) {
         let _ = writeln!(s, "<h2>{}</h2>", html_escape(h));
@@ -5377,9 +5379,11 @@ mod tests {
 
     #[test]
     fn lint_rejects_internal_hostname_unknown_and_duplicate_keys() {
+        // A host-shaped name built from the needle, so that no real host is
+        // spelled in this public file.
         let bad = sample_page().replace(
             "facts-only page generated",
-            "Measured on devbig030 today; facts-only page generated",
+            &format!("Measured on {INTERNAL_DEV_HOST_PREFIX}000 today; facts-only page generated"),
         );
         let (rep, _) = lint_page("read", &bad, Path::new("."));
         assert!(
@@ -5427,7 +5431,7 @@ mod tests {
             "ignored/syscall-tracking/x.md",
             "dev-hermit/experiments/x",
             "worktrees/slots/lane",
-            "/home/someone/file",
+            "/home/user/file",
             "Author: Someone",
         ] {
             assert!(

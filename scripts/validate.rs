@@ -21241,7 +21241,12 @@ mod nextest_timeout_tests {
                 // 2998 with c-programs/pidfd-waitid-child verify/KVM (KVM opens
                 // a pidfd for another guest process since Reverie 1410, and
                 // Detcore answers waitid(P_PIDFD) from its pidfd model).
-                assert_eq!(all.len(), 2998, "the original all-owner population is retained");
+                // 3001 with c-programs/preempt-spin-flag (verify and replay on
+                // ptrace, verify on KVM), a pure-userspace spin that needs
+                // preemption, added as bin-c/preempt-spin-flag and moved to
+                // c-programs the same day. Recounted by enumerating this
+                // selection at both trees: those three cells added, none removed.
+                assert_eq!(all.len(), 3001, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
