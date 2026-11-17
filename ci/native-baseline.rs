@@ -632,6 +632,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         isolated_workdir: None,
         shares_ld_so_cache: false,
+        v2_retry_oci_dir: None,
     };
     let pin_cpu = match options.pin_cpu.or_else(first_allowed_cpu) {
         Some(cpu) => cpu,

@@ -92,6 +92,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -1164,7 +1165,7 @@ fn fingerprint_mismatch(
 
 /// Candidate on-disk paths for a normalized tree path, in either
 /// tree shape (export checkout root, or fbsource root).
-fn tree_candidates(repo: &PathBuf, normalized: &str) -> Vec<PathBuf> {
+fn tree_candidates(repo: &Path, normalized: &str) -> Vec<PathBuf> {
     let fbsource = if normalized.starts_with("reverie/") || normalized == "reverie/Cargo.toml" {
         repo.join("fbcode/hermetic_infra").join(normalized)
     } else {
@@ -1174,7 +1175,7 @@ fn tree_candidates(repo: &PathBuf, normalized: &str) -> Vec<PathBuf> {
 }
 
 /// Read a normalized tree path from the checkout, if present.
-fn read_tree_file(repo: &PathBuf, normalized: &str) -> Option<String> {
+fn read_tree_file(repo: &Path, normalized: &str) -> Option<String> {
     tree_candidates(repo, normalized)
         .iter()
         .find_map(|candidate| std::fs::read_to_string(candidate).ok())
@@ -1184,7 +1185,7 @@ fn read_tree_file(repo: &PathBuf, normalized: &str) -> Option<String> {
 /// missing or unreadable lockfile is a checker error, never an
 /// empty resolution: judging co-ownership without the resolution it
 /// is derived from would silently restore the hole this rule closes.
-fn load_lock(repo: &PathBuf, lock: &str) -> Result<Lockfile, String> {
+fn load_lock(repo: &Path, lock: &str) -> Result<Lockfile, String> {
     let candidates = tree_candidates(repo, lock);
     for candidate in &candidates {
         match std::fs::read_to_string(candidate) {
@@ -1453,7 +1454,7 @@ fn tree_manifests(
 /// match their manifests, with the same fingerprint the co-change
 /// rule uses. This is the fbsource contract gate's mode: Buck
 /// supplies a declared snapshot instead of a changed set.
-fn check_tree(repo: &PathBuf) -> Result<i32, String> {
+fn check_tree(repo: &Path) -> Result<i32, String> {
     let read = |path: &str| read_tree_file(repo, path);
     let locks: Vec<(&str, Lockfile)> = NESTED_LOCKS
         .iter()

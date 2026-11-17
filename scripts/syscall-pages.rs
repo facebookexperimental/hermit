@@ -1594,13 +1594,13 @@ fn parse_census(src: &str) -> Result<Census, String> {
                     break;
                 };
                 let name = &line[begin..begin + end_rel];
-                if is_syscall_name(name) && !skip_next {
-                    if classes
+                if is_syscall_name(name)
+                    && !skip_next
+                    && classes
                         .insert(name.to_string(), (class.to_string(), off + 1))
                         .is_some()
-                    {
-                        return Err(format!("census: {name} listed twice"));
-                    }
+                {
+                    return Err(format!("census: {name} listed twice"));
                 }
                 at = begin + end_rel + 1;
             }
