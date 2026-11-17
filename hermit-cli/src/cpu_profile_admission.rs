@@ -1662,6 +1662,109 @@ fn cached_report_matches(report: &xstate_probe::ProbeReport, xcr0: u64) -> bool 
         && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
 }
 
+/// The name of the KVM fixed-guest qualification's file in the host
+/// qualification cache.
+#[cfg(target_arch = "x86_64")]
+const KVM_FIXED_CACHE_NAME: &str = "cpu-profile-x86-64-v3-kvm-fixed-xstate";
+
+#[cfg(target_arch = "x86_64")]
+fn kvm_fixed_cache_path() -> Option<std::path::PathBuf> {
+    crate::host_qualification::default_path(KVM_FIXED_CACHE_NAME)
+}
+
+/// The KVM fixed-guest qualification's cache inputs besides the host key
+/// (which binds kernel, boot, CPU, microcode and the Hermit binary): the
+/// fixed guest layout the probe certifies. The IA32_XSS outcome is part of
+/// the cached report itself and is host-derived, so the host key binds it.
+#[cfg(target_arch = "x86_64")]
+fn kvm_fixed_cache_inputs() -> String {
+    format!(
+        "fixed-guest xcr0={:#x} xsave_size={} xfeature_max={}",
+        detcore_model::cpu_profile::FIXED_GUEST_XCR0,
+        detcore_model::cpu_profile::FIXED_GUEST_XSAVE_SIZE,
+        detcore_model::cpu_profile::FIXED_GUEST_XFEATURE_MAX,
+    )
+}
+
+/// Whether a fixed-guest xstate measurement qualifies: the guest ran with
+/// exactly the fixed XCR0 and every before/after comparison across the
+/// probe's VM exits agreed. Anything else is a miss, never a pass.
+#[cfg(target_arch = "x86_64")]
+fn kvm_fixed_qualification_matches(
+    report: &reverie_kvm::guest_probe::FixedXstateQualification,
+) -> bool {
+    report.guest_xcr0 == detcore_model::cpu_profile::FIXED_GUEST_XCR0
+        && report.comparisons > 0
+        && report.unstable == 0
+}
+
+/// Qualify the fixed KVM guest machine's xstate behavior on this host,
+/// through the per-host cache: Reverie-KVM's in-guest probe records
+/// XGETBV/XSAVE before and after forced VM exits (one trial reinstalling
+/// the image through the signal-frame codec at the exit) and this returns
+/// its measurement when every comparison is stable. This is evidence for
+/// admission to consume; it admits nothing by itself, and
+/// [`check_request`] still refuses x86-64-v3 on the KVM backend until the
+/// admission slice lands.
+#[cfg(target_arch = "x86_64")]
+pub fn qualify_kvm_fixed_guest()
+-> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal> {
+    let path = if under_hypervisor() {
+        None
+    } else {
+        kvm_fixed_cache_path()
+    };
+    kvm_fixed_probe_at(
+        path.as_deref(),
+        &crate::host_qualification::HostKey::current(),
+        || {
+            let report = reverie_kvm::guest_probe::qualify_fixed_guest_xstate()
+                .map_err(|error| format!("the KVM fixed-guest xstate probe failed: {error}"))?;
+            if kvm_fixed_qualification_matches(&report) {
+                Ok(report)
+            } else {
+                Err(format!(
+                    "the guest's XSAVE answers changed across a VM exit \
+                     ({} of {} comparisons unstable, guest XCR0 {:#x})",
+                    report.unstable, report.comparisons, report.guest_xcr0,
+                ))
+            }
+        },
+    )
+}
+
+/// [`qualify_kvm_fixed_guest`] with its cache path, host key and probe as
+/// parameters, for the tests. Only a stable report is stored.
+#[cfg(target_arch = "x86_64")]
+fn kvm_fixed_probe_at(
+    path: Option<&std::path::Path>,
+    host: &crate::host_qualification::HostKey,
+    probe: impl FnOnce()
+    -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal>,
+) -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal> {
+    let Some(path) = path else {
+        return probe();
+    };
+    let inputs = kvm_fixed_cache_inputs();
+    let cached = || {
+        crate::host_qualification::load::<reverie_kvm::guest_probe::FixedXstateQualification>(
+            path, host, &inputs,
+        )
+        .filter(kvm_fixed_qualification_matches)
+    };
+    if let Some(report) = cached() {
+        return Ok(report);
+    }
+    crate::host_qualification::locked(path, || {
+        if let Some(report) = cached() {
+            return Ok(report);
+        }
+        let report = probe()?;
+        crate::host_qualification::store(path, host, &inputs, &report);
+        Ok(report)
+    })
+}
+
 /// [`cached_probe`] with its cache path (`None`: no cache), host key, warning
 /// writer and probe as parameters, for the tests.
 #[cfg(target_arch = "x86_64")]
@@ -1956,6 +2059,51 @@ pub(crate) mod tests {
     fn nothing_is_cached_under_a_hypervisor() {
         assert_eq!(cache_path_for(true), None);
         assert_eq!(cache_path_for(false), probe_cache_path());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn kvm_fixed_report() -> reverie_kvm::guest_probe::FixedXstateQualification {
+        reverie_kvm::guest_probe::FixedXstateQualification {
+            guest_xcr0: detcore_model::cpu_profile::FIXED_GUEST_XCR0,
+            xss: reverie_kvm::guest_probe::XssOutcome {
+                kind: reverie_kvm::guest_probe::XssOutcomeKind::Kept(
+                    reverie_kvm::guest_probe::XssKeepReason::NoHostComponents,
+                ),
+                read_back: 0,
+            },
+            host_cpuid_d_1_eax: 0,
+            comparisons: 6,
+            unstable: 0,
+            first_image_difference: None,
+        }
+    }
+
+    /// Only a stable measurement of the fixed machine is a KVM fixed-guest
+    /// qualification: any unstable comparison, a guest XCR0 other than the
+    /// fixed one, or no comparisons at all is a miss, never a pass.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn only_a_stable_fixed_guest_measurement_qualifies_kvm() {
+        assert!(kvm_fixed_qualification_matches(&kvm_fixed_report()));
+        let mut unstable = kvm_fixed_report();
+        unstable.unstable = 1;
+        assert!(!kvm_fixed_qualification_matches(&unstable));
+        let mut wrong_xcr0 = kvm_fixed_report();
+        wrong_xcr0.guest_xcr0 = 0x2e7;
+        assert!(!kvm_fixed_qualification_matches(&wrong_xcr0));
+        let mut empty = kvm_fixed_report();
+        empty.comparisons = 0;
+        assert!(!kvm_fixed_qualification_matches(&empty));
+    }
+
+    /// The KVM qualification's cache inputs bind the fixed guest layout, so
+    /// a layout change measures again instead of reusing a stale verdict.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_kvm_fixed_cache_inputs_bind_the_fixed_layout() {
+        let inputs = kvm_fixed_cache_inputs();
+        assert!(inputs.contains("xcr0=0x7"), "{inputs}");
+        assert!(inputs.contains("xsave_size=832"), "{inputs}");
     }
 
     /// When the cache cannot be written the warning says it is measured again,
