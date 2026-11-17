@@ -181,7 +181,11 @@ fn write_blob(root: &Path, bytes: &[u8]) -> String {
 /// A one-layer OCI layout directory holding `rootfs_tar`.
 fn write_oci_dir(root: &Path, rootfs_tar: &[u8]) {
     std::fs::create_dir_all(root).unwrap();
-    std::fs::write(root.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    std::fs::write(
+        root.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
     let config = serde_json::to_vec(&serde_json::json!({
         "architecture": "amd64",
         "os": "linux",
@@ -368,7 +372,9 @@ fn build_fixture(test: &str, build: &Path) -> Option<PathBuf> {
     let Some(input) = fixture_input() else {
         skip(
             test,
-            &format!("{FIXTURE_ENV} does not name a directory holding lib64/ld-linux-x86-64.so.2 and lib64/libc.so.6"),
+            &format!(
+                "{FIXTURE_ENV} does not name a directory holding lib64/ld-linux-x86-64.so.2 and lib64/libc.so.6"
+            ),
         );
         return None;
     };
@@ -388,7 +394,11 @@ fn build_fixture(test: &str, build: &Path) -> Option<PathBuf> {
         dir_entry("proc"),
         dir_entry("dev"),
         dir_entry("tmp"),
-        file_entry("lib64/ld-linux-x86-64.so.2", 0o755, read("lib64/ld-linux-x86-64.so.2")),
+        file_entry(
+            "lib64/ld-linux-x86-64.so.2",
+            0o755,
+            read("lib64/ld-linux-x86-64.so.2"),
+        ),
         file_entry("lib64/libc.so.6", 0o755, read("lib64/libc.so.6")),
         file_entry("lib64/libneeds-v3.so", 0o755, lib),
         file_entry("usr/bin/cpuid-v2-probe", 0o755, probe),

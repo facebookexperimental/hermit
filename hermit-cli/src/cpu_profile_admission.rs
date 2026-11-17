@@ -1749,8 +1749,7 @@ pub fn qualify_kvm_fixed_guest()
 fn kvm_fixed_probe_at(
     path: Option<&std::path::Path>,
     host: &crate::host_qualification::HostKey,
-    probe: impl FnOnce()
-    -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal>,
+    probe: impl FnOnce() -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal>,
 ) -> Result<reverie_kvm::guest_probe::FixedXstateQualification, AdmissionRefusal> {
     let Some(path) = path else {
         return probe();
@@ -2124,10 +2123,7 @@ pub(crate) mod tests {
         unstable.unstable = 2;
         unstable.first_image_difference = Some(512);
         let refusal = ensure_kvm_fixed_qualification(unstable).unwrap_err();
-        assert!(
-            refusal.contains("2 of 6 comparisons unstable"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("2 of 6 comparisons unstable"), "{refusal}");
         assert!(refusal.contains("XSAVE answers changed"), "{refusal}");
     }
 
@@ -2747,15 +2743,9 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&config));
-        assert_eq!(
-            check_recorded_table_digest(profile, Some(&digest)),
-            Ok(())
-        );
+        assert_eq!(check_recorded_table_digest(profile, Some(&digest)), Ok(()));
         let wrong = check_recorded_table_digest(profile, Some("00")).unwrap_err();
-        assert!(
-            wrong.reason.contains("CPUID table digest"),
-            "{wrong}"
-        );
+        assert!(wrong.reason.contains("CPUID table digest"), "{wrong}");
         let absent = check_recorded_table_digest(profile, None).unwrap_err();
         assert!(
             absent.reason.contains("carries no CPUID table digest"),

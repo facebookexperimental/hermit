@@ -332,12 +332,9 @@ pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result
     // x86-64-v2-legacy directly needs no mapping, and noting the
     // era is then a no-op.
     if manifest.schema != crate::app::manifest::SCHEMA_V3
-        || manifest
-            .cpu_profile
-            .as_ref()
-            .is_some_and(|choice| {
-                choice.profile == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
-            })
+        || manifest.cpu_profile.as_ref().is_some_and(|choice| {
+            choice.profile == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
+        })
     {
         note_pre_psabi_era();
     }

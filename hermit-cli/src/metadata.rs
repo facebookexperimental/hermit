@@ -54,8 +54,7 @@ impl RecordVersion {
         // replay on the legacy CPUID table (migrated at load). An
         // older replayer still refuses this version by the same
         // equality, by name.
-        self == other
-            || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
+        self == other || (*self == RecordVersion(0x1a1) && *other == LAST_PRE_PSABI_RECORD_VERSION)
     }
 }
 
@@ -1319,8 +1318,7 @@ impl Metadata {
         if metadata.version <= LAST_PRE_PSABI_RECORD_VERSION
             && metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V2
         {
-            metadata.cpu_profile =
-                detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell;
+            metadata.cpu_profile = detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell;
         }
         Ok(metadata)
     }

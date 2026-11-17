@@ -13618,8 +13618,7 @@ impl RunOpts {
             if era_profile != profile {
                 self.cpu_profile_migrated = true;
                 self.auto_log.push(
-                    "pre-psABI document: x86-64-v2 reruns on the legacy table it saved"
-                        .to_owned(),
+                    "pre-psABI document: x86-64-v2 reruns on the legacy table it saved".to_owned(),
                 );
             }
             let profile = era_profile;

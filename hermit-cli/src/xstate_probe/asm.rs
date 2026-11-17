@@ -75,31 +75,31 @@ pub enum Kind {
 #[repr(C)]
 #[derive(Debug)]
 pub struct ArmCtx {
-    pub kind: u32,          // 0
-    pub component: u32,     // 4
-    pub mxcsr: u32,         // 8
-    pub mode: u32,          // 12
-    pub xcr0: u64,          // 16
-    pub save_area: *mut u8, // 24: XSAVE destination, 64-byte aligned
-    pub image: *const u8,   // 32: XRSTOR/FXRSTOR source, 64-byte aligned
-    pub fd_to_peer: i32,    // 40
-    pub fd_from_peer: i32,  // 44
-    pub tgid: i32,          // 48
-    pub tid: i32,           // 52
-    pub ones: *const u8,    // 56: 64 nonzero bytes, 64-byte aligned
-    pub pkru_out: u32,      // 64
-    pub avx512: u32,        // 68: whether ZMM16-31 and k0-7 exist
-    pub cpuid_cycles: u64,  // 72: the forced exit's CPUID round trip
-    pub seq: u8,            // 80: handshake byte sent
-    pub reply: u8,          // 81: handshake byte received
-    pub pkru: u8,           // 82: nonzero when RDPKRU and WRPKRU may run
-    pub _pad: u8,           // 83
-    pub status: u32,        // 84: an `ArmStatus`
-    pub saved_pkru: u32,    // 88: scratch
-    pub saved_mxcsr: u32,   // 92: scratch
+    pub kind: u32,            // 0
+    pub component: u32,       // 4
+    pub mxcsr: u32,           // 8
+    pub mode: u32,            // 12
+    pub xcr0: u64,            // 16
+    pub save_area: *mut u8,   // 24: XSAVE destination, 64-byte aligned
+    pub image: *const u8,     // 32: XRSTOR/FXRSTOR source, 64-byte aligned
+    pub fd_to_peer: i32,      // 40
+    pub fd_from_peer: i32,    // 44
+    pub tgid: i32,            // 48
+    pub tid: i32,             // 52
+    pub ones: *const u8,      // 56: 64 nonzero bytes, 64-byte aligned
+    pub pkru_out: u32,        // 64
+    pub avx512: u32,          // 68: whether ZMM16-31 and k0-7 exist
+    pub cpuid_cycles: u64,    // 72: the forced exit's CPUID round trip
+    pub seq: u8,              // 80: handshake byte sent
+    pub reply: u8,            // 81: handshake byte received
+    pub pkru: u8,             // 82: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,             // 83
+    pub status: u32,          // 84: an `ArmStatus`
+    pub saved_pkru: u32,      // 88: scratch
+    pub saved_mxcsr: u32,     // 92: scratch
     pub mpx_image: *const u8, // 96: dirty-MPX XRSTOR source, 64-byte aligned
-    pub mpx: u8,            // 104: nonzero when the MPX dirty XRSTOR may run
-    pub _pad_tail: [u8; 7], // 105
+    pub mpx: u8,              // 104: nonzero when the MPX dirty XRSTOR may run
+    pub _pad_tail: [u8; 7],   // 105
 }
 
 /// How an arm call ended. Anything but `Ok` voids the trial.
@@ -148,29 +148,29 @@ pub enum PeerState {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PeerCtx {
-    pub state: u32,        // 0: a `PeerState`, set before each handshake
-    pub fd_in: i32,        // 4
-    pub fd_out: i32,       // 8
-    pub avx512: u32,       // 12
-    pub image: *const u8,  // 16: the XRSTOR source for states 2, 3 and 5
-    pub xcr0: u64,         // 24
-    pub ones: *const u8,   // 32
-    pub tgid: i32,         // 40
-    pub tid: i32,          // 44
-    pub expected_cpu: u32, // 48
-    pub wrong_cpu: u32,    // 52: rounds the peer ran on another CPU
-    pub status: u32,       // 56: why the loop ended early, as `ArmStatus`
-    pub rounds: u32,       // 60
-    pub byte: u8,          // 64: received
-    pub reply: u8,         // 65: sent
-    pub pkru: u8,          // 66: nonzero when RDPKRU and WRPKRU may run
-    pub _pad: u8,          // 67
-    pub cpu_out: u32,      // 68: getcpu result
-    pub saved_pkru: u32,   // 72
-    pub saved_mxcsr: u32,  // 76
+    pub state: u32,           // 0: a `PeerState`, set before each handshake
+    pub fd_in: i32,           // 4
+    pub fd_out: i32,          // 8
+    pub avx512: u32,          // 12
+    pub image: *const u8,     // 16: the XRSTOR source for states 2, 3 and 5
+    pub xcr0: u64,            // 24
+    pub ones: *const u8,      // 32
+    pub tgid: i32,            // 40
+    pub tid: i32,             // 44
+    pub expected_cpu: u32,    // 48
+    pub wrong_cpu: u32,       // 52: rounds the peer ran on another CPU
+    pub status: u32,          // 56: why the loop ended early, as `ArmStatus`
+    pub rounds: u32,          // 60
+    pub byte: u8,             // 64: received
+    pub reply: u8,            // 65: sent
+    pub pkru: u8,             // 66: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,             // 67
+    pub cpu_out: u32,         // 68: getcpu result
+    pub saved_pkru: u32,      // 72
+    pub saved_mxcsr: u32,     // 76
     pub mpx_image: *const u8, // 80: dirty-MPX XRSTOR source, 64-byte aligned
-    pub mpx: u8,           // 88: nonzero when the MPX dirty XRSTOR may run
-    pub _pad_tail: [u8; 7], // 89
+    pub mpx: u8,              // 88: nonzero when the MPX dirty XRSTOR may run
+    pub _pad_tail: [u8; 7],   // 89
 }
 
 /// The handshake byte that ends the peer loop.

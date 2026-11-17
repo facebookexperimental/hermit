@@ -523,10 +523,8 @@ fn ppoll_lone_timed_wait_expires_under_record() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "ppoll-lone-timed-wait-{}",
-        std::process::id()
-    ));
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-lone-timed-wait-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
     let mut compile = Command::new("cc");

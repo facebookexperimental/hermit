@@ -143,9 +143,7 @@ fn extra_bits_from(value: Option<&std::ffi::OsStr>) -> Result<u64, ProbeRefusal>
         return Ok(0);
     };
     let malformed = || {
-        format!(
-            "{XCR0_EXTRA_TEST_ENV}={value:?} is not a bit mask (decimal, or 0x-prefixed hex)"
-        )
+        format!("{XCR0_EXTRA_TEST_ENV}={value:?} is not a bit mask (decimal, or 0x-prefixed hex)")
     };
     let text = value.to_str().ok_or_else(malformed)?;
     let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
@@ -403,10 +401,7 @@ fn mpx_offsets(layout: &Layout) -> Option<(usize, usize)> {
             .map(|(_, offset, _)| *offset)
             .filter(|offset| offset + need <= layout.size)
     };
-    Some((
-        find(BNDREGS_COMPONENT, 64)?,
-        find(BNDCSR_COMPONENT, 16)?,
-    ))
+    Some((find(BNDREGS_COMPONENT, 64)?, find(BNDCSR_COMPONENT, 16)?))
 }
 
 /// Fills `area` as an XRSTOR image (RFBM is the caller's MPX mask) holding
@@ -2282,39 +2277,204 @@ mod tests {
     #[test]
     fn the_2e7_case_list_is_unchanged_by_mpx_widening() {
         let golden = vec![
-            Case { kind: Kind::XrstorInit, component: 0, targets: 1, live: 742 },
-            Case { kind: Kind::XrstorHeaderSet, component: 0, targets: 1, live: 742 },
-            Case { kind: Kind::CompactedXrstorInit, component: 0, targets: 1, live: 742 },
-            Case { kind: Kind::XrstorInit, component: 1, targets: 2, live: 741 },
-            Case { kind: Kind::XrstorHeaderSet, component: 1, targets: 2, live: 741 },
-            Case { kind: Kind::CompactedXrstorInit, component: 1, targets: 2, live: 741 },
-            Case { kind: Kind::XrstorInit, component: 2, targets: 4, live: 739 },
-            Case { kind: Kind::XrstorHeaderSet, component: 2, targets: 4, live: 739 },
-            Case { kind: Kind::CompactedXrstorInit, component: 2, targets: 4, live: 739 },
-            Case { kind: Kind::XrstorInit, component: 5, targets: 32, live: 711 },
-            Case { kind: Kind::XrstorHeaderSet, component: 5, targets: 32, live: 711 },
-            Case { kind: Kind::CompactedXrstorInit, component: 5, targets: 32, live: 711 },
-            Case { kind: Kind::XrstorInit, component: 6, targets: 64, live: 679 },
-            Case { kind: Kind::XrstorHeaderSet, component: 6, targets: 64, live: 679 },
-            Case { kind: Kind::CompactedXrstorInit, component: 6, targets: 64, live: 679 },
-            Case { kind: Kind::XrstorInit, component: 7, targets: 128, live: 615 },
-            Case { kind: Kind::XrstorHeaderSet, component: 7, targets: 128, live: 615 },
-            Case { kind: Kind::CompactedXrstorInit, component: 7, targets: 128, live: 615 },
-            Case { kind: Kind::XrstorInit, component: 9, targets: 512, live: 231 },
-            Case { kind: Kind::XrstorHeaderSet, component: 9, targets: 512, live: 231 },
-            Case { kind: Kind::CompactedXrstorInit, component: 9, targets: 512, live: 231 },
-            Case { kind: Kind::WrpkruZero, component: 0, targets: 512, live: 231 },
-            Case { kind: Kind::Sigreturn, component: 0, targets: 512, live: 231 },
-            Case { kind: Kind::Vzeroupper, component: 0, targets: 68, live: 675 },
-            Case { kind: Kind::LegacyPxor, component: 0, targets: 2, live: 741 },
-            Case { kind: Kind::Vex128Zero, component: 0, targets: 70, live: 673 },
-            Case { kind: Kind::Hi16Zero, component: 0, targets: 128, live: 615 },
-            Case { kind: Kind::PxorVzeroupperHi16, component: 0, targets: 198, live: 545 },
-            Case { kind: Kind::OpmaskZero, component: 0, targets: 32, live: 711 },
-            Case { kind: Kind::X87FullInit, component: 0, targets: 1, live: 742 },
-            Case { kind: Kind::X87DirtyFullInit, component: 0, targets: 1, live: 742 },
-            Case { kind: Kind::FxrstorInit, component: 0, targets: 3, live: 740 },
-            Case { kind: Kind::VzeroallAll, component: 0, targets: 198, live: 545 },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::WrpkruZero,
+                component: 0,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::Sigreturn,
+                component: 0,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::Vzeroupper,
+                component: 0,
+                targets: 68,
+                live: 675,
+            },
+            Case {
+                kind: Kind::LegacyPxor,
+                component: 0,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::Vex128Zero,
+                component: 0,
+                targets: 70,
+                live: 673,
+            },
+            Case {
+                kind: Kind::Hi16Zero,
+                component: 0,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::PxorVzeroupperHi16,
+                component: 0,
+                targets: 198,
+                live: 545,
+            },
+            Case {
+                kind: Kind::OpmaskZero,
+                component: 0,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::X87FullInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::X87DirtyFullInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::FxrstorInit,
+                component: 0,
+                targets: 3,
+                live: 740,
+            },
+            Case {
+                kind: Kind::VzeroallAll,
+                component: 0,
+                targets: 198,
+                live: 545,
+            },
         ];
         assert_eq!(case_list(0x2e7).unwrap(), golden);
     }
@@ -2343,9 +2503,8 @@ mod tests {
             components: vec![(2, 576, 256), (3, 960, 64), (4, 1024, 64)],
         };
         assert_eq!(mpx_offsets(&layout), Some((960, 1024)));
-        let word = |area: &Area, at: usize| {
-            u64::from_le_bytes(area.0[at..at + 8].try_into().unwrap())
-        };
+        let word =
+            |area: &Area, at: usize| u64::from_le_bytes(area.0[at..at + 8].try_into().unwrap());
         let (mut arm, mut peer) = (Area::boxed(), Area::boxed());
         fill_mpx_dirty_image(&mut arm, &layout, false);
         fill_mpx_dirty_image(&mut peer, &layout, true);

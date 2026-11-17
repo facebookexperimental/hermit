@@ -11234,12 +11234,7 @@ fn run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first() {
 /// [`exited_receiver_loopback`]) so a neighbour port is uncontended on
 /// the host, and `::1` for IPv6. Each prints the same line natively and
 /// under Hermit, so the native run is the comparison.
-fn bind_allocator_guest(
-    backend: &str,
-    guest: &str,
-    native_prefix: &str,
-    hermit_expected: &str,
-) {
+fn bind_allocator_guest(backend: &str, guest: &str, native_prefix: &str, hermit_expected: &str) {
     for address in [exited_receiver_loopback(), "::1".to_owned()] {
         let native = Command::new(guest)
             .arg(&address)
@@ -11286,7 +11281,12 @@ fn bind_ephemeral_after_loopback_close(backend: &str) {
     )
     .to_str()
     .expect("guest path is UTF-8");
-    bind_allocator_guest(backend, guest, "rebind ok=1", "rebind ok=1 port_differs=1\n");
+    bind_allocator_guest(
+        backend,
+        guest,
+        "rebind ok=1",
+        "rebind ok=1 port_differs=1\n",
+    );
 }
 
 /// `tests/c/bind_ephemeral_retry.c` holds the allocator's first port P,
@@ -52135,7 +52135,11 @@ fn a_restart_code_under_a_filtered_tracer_is_resolved_or_refused_by_name() {
     };
     let (status, out, log) = run("--log=warn", &[]);
     if cfg!(target_arch = "x86_64") {
-        assert_eq!((status, out.as_str()), (Some(0), expected), "stderr:\n{log}");
+        assert_eq!(
+            (status, out.as_str()),
+            (Some(0), expected),
+            "stderr:\n{log}"
+        );
         return;
     }
     assert_eq!(
@@ -52144,8 +52148,9 @@ fn a_restart_code_under_a_filtered_tracer_is_resolved_or_refused_by_name() {
         "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{out}\nstderr:\n{log}"
     );
     assert!(
-        log.contains("unresolved restart code refused (TracerMayBeFiltered): Detcore answered rt_sigsuspend")
-            && log.contains("--unsafe-ignore-host-seccomp"),
+        log.contains(
+            "unresolved restart code refused (TracerMayBeFiltered): Detcore answered rt_sigsuspend"
+        ) && log.contains("--unsafe-ignore-host-seccomp"),
         "the refusal must name the reason, the call and the override that admitted the filter:\n{log}"
     );
     let (status, out, log) = run("--log=warn", &["--allow-unsupported-syscalls"]);
@@ -52161,7 +52166,11 @@ fn a_restart_code_under_a_filtered_tracer_is_resolved_or_refused_by_name() {
     );
     let (status, out, log) = run(
         "--log=info",
-        &["--allow-unsupported-syscalls", "--verify", "--verify-strict"],
+        &[
+            "--allow-unsupported-syscalls",
+            "--verify",
+            "--verify-strict",
+        ],
     );
     assert_eq!(
         (status, out.as_str()),
@@ -65273,7 +65282,11 @@ fn a_v1_run_config_reruns_on_the_legacy_table_and_records_the_migration() {
         &[],
     );
     assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
-    assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+    assert_eq!(
+        logged_profile(&stderr),
+        Some("x86-64-v2-legacy"),
+        "{stderr}"
+    );
     let manifests = run.manifests();
     assert_eq!(manifests.len(), 1, "{stderr}");
     let (_, manifest) = &manifests[0];
@@ -65317,7 +65330,10 @@ fn an_explicit_cpu_profile_wins_over_a_pre_psabi_document() {
     let manifests = run.manifests();
     assert_eq!(manifests.len(), 1, "{stderr}");
     let (_, manifest) = &manifests[0];
-    assert_eq!(manifest["cpu_profile"]["profile"], "x86-64-v2", "{manifest:#}");
+    assert_eq!(
+        manifest["cpu_profile"]["profile"], "x86-64-v2",
+        "{manifest:#}"
+    );
     assert!(
         manifest.get("cpu_profile_migration").is_none(),
         "no migration applied, so none is recorded: {manifest:#}"
@@ -65367,7 +65383,11 @@ fn a_rerun_of_an_era_migrated_manifest_stays_on_the_legacy_table() {
             &[],
         );
         assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
-        assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+        assert_eq!(
+            logged_profile(&stderr),
+            Some("x86-64-v2-legacy"),
+            "{stderr}"
+        );
         let mut written: Vec<(PathBuf, serde_json::Value)> = run
             .manifests()
             .into_iter()
@@ -65467,14 +65487,10 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     metadata["version"] = 0x1a1.into();
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let (status, stdout, stderr) =
-        edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    let (status, stdout, stderr) = edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
     assert_ne!(status, Some(0), "{stderr}");
     assert_ne!(stdout, expected, "{stderr}");
-    assert!(
-        stderr.contains("carries no CPUID table digest"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("carries no CPUID table digest"), "{stderr}");
 
     // The output-discriminating control: the same recording claiming
     // the psABI era WITH that table's digest passes the digest gate
@@ -65500,8 +65516,7 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
         .collect::<String>()
         .into();
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-    let (status, stdout, stderr) =
-        forced.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    let (status, stdout, stderr) = forced.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
     assert!(
         !stderr.contains("CPUID table digest"),
         "the forced copy must pass the digest gate:\n{stderr}"
@@ -65583,7 +65598,11 @@ fn hermit_cpu_profile_in_the_environment_does_not_lift_a_documents_migration() {
         &[("HERMIT_CPU_PROFILE", "x86-64-v2")],
     );
     assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
-    assert_eq!(logged_profile(&stderr), Some("x86-64-v2-legacy"), "{stderr}");
+    assert_eq!(
+        logged_profile(&stderr),
+        Some("x86-64-v2-legacy"),
+        "{stderr}"
+    );
     let manifests = run.manifests();
     assert_eq!(manifests.len(), 1, "{stderr}");
     let (_, manifest) = &manifests[0];

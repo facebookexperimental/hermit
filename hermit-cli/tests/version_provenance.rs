@@ -178,8 +178,11 @@ fn pin_watch_paths_cover_the_gitlink_sources_the_reader_reads() {
     );
     let submodule_head = submodule.join(".git/HEAD");
     let marker = repo.path().join("reverie.submodule.txt");
-    fs::write(&marker, "Subproject commit 1111111111111111111111111111111111111111\n")
-        .expect("failed to write marker");
+    fs::write(
+        &marker,
+        "Subproject commit 1111111111111111111111111111111111111111\n",
+    )
+    .expect("failed to write marker");
 
     let paths = build_support::reverie_pin_watch_paths_in(repo.path());
     assert!(!paths.contains(&git_dir.join("index")));
@@ -675,7 +678,14 @@ fn main() {
     let stage = |sha: &str, message: &str| {
         git(
             repo.path(),
-            &["update-index", "--add", "--cacheinfo", "160000", sha, "reverie"],
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                sha,
+                "reverie",
+            ],
         );
         git(
             repo.path(),
