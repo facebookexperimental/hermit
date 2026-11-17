@@ -311,6 +311,13 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
         // Form 5 (NEW): a banner-less git FS denial. Requires BOTH a git-fatal
         // shape and a denial on the same line, so a guest test that merely prints
         // "permission denied" cannot trip it.
+        //
+        // The denial is a separate conjunct because `.git/` is in both lists:
+        // without it, ANY line naming a path under a `.git/` directory matched.
+        // Measured 2026-11-17: every failing hermit-cli build prints
+        // `cargo:rerun-if-changed=<gitdir>/modules/reverie/HEAD`, so genuine
+        // build failures were recorded as environmental and left the blocking
+        // count.
         if (line.starts_with("fatal:") || line.contains(" fatal: ") || line.contains(".git/"))
             && has_any(
                 line,
@@ -326,6 +333,7 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
                     ".git/",
                 ],
             )
+            && has_denial(line)
         {
             vcs_hit = true;
         }

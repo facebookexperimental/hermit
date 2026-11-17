@@ -2040,6 +2040,23 @@ pub fn self_test() -> Result<String, String> {
         // Generic tool-like prose and a denial on different lines in one
         // indented product block must not qualify for the Cargo-only widening.
         "test failed: could not open expected output\n  guest errno: Permission denied",
+        // A line that only NAMES a path under `.git/` is not a git denial.
+        // Measured 2026-11-17 (paths shortened): every failing hermit-cli build
+        // prints its Reverie pin inputs, and this genuine build failure was
+        // recorded as vcs-fs-denial and dropped from the blocking count.
+        "error: failed to run custom build command for `hermit-run v0.5.7 (/src/hermit-cli)`\n\n\
+         Caused by:\n  \
+         process didn't exit successfully: `/src/target/b/build-script-build` (exit status: 101)\n  \
+         --- stdout\n  \
+         cargo:rerun-if-changed=/w/.git/worktrees/v/modules/reverie/HEAD\n  \
+         cargo:rerun-if-changed=/w/.git/worktrees/v/modules/reverie/packed-refs\n\n  \
+         --- stderr\n  \
+         thread 'main' panicked at artifact.rs:1121:29:\n  \
+         native compiled-source qualification refused: content Detcore dependency differs \
+         from independent full pin: reverie-core",
+        // A git-shaped line with a filesystem phrase but no denial is not a
+        // denial either: a held lock is contention, not the sandbox.
+        "error: could not lock config file /w/.git/config: File exists",
     ];
     let mut refused = 0usize;
     for text in refuse {
