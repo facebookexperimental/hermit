@@ -25,10 +25,8 @@ before landing more work.
   `./ci-hub/bin/who-am-i --tag --role ROLE` and paste it as the first line of
   the commit body and of the PR description. Never put it in a subject or
   title; keep titles concise, descriptive prose.
-- Internal commit and diff bodies carry the exact tag. Exported or public text
-  (anything on, or mirrored to, a public repository) carries it without the
-  host field, for example `[hermit2, claude-skills, opus, role=impl]`
-  (maintainers' ruling, 2026-11-16).
+- Paste the exact tag, verbatim; never reconstruct or edit it. Short host
+  names are fine; fully qualified host names never (owner, 2026-10-09).
 - The first section after the disclosure is exactly **Plain Language Summary
   and Project Impact**: what capability, correctness property, evidence quality
   or developer workflow moves forward, its connection to the product vision or

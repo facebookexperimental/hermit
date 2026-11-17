@@ -135,13 +135,13 @@ a labeled PR you must run `scripts/core-review-protocol-lint.sh` by hand
 - Main is gated: changes reach it only through the project's validated landing
   path. Keep main green; repair a regression before landing more work.
 - Where the maintainers' `who-am-i` tool is available, its disclosure is the
-  first line of a commit body and of a PR description, never in a title:
-  internal commit and diff bodies carry the exact tag; exported or public text
-  carries the tag without its host field. The first section after it is **Plain
-  Language Summary and Project Impact**; PR descriptions also need
-  **Determinism**, **Linux Semantics** (citing the kernel source it matches) and
-  **Validation**, plus **Relationship to gVisor** for KVM and **Human Review
-  Required** for a labeled PR.
+  first line of a commit body and of a PR description, never in a title: the
+  exact tag, verbatim; short host names are fine, fully qualified host names
+  never (owner, 2026-10-09). The first section after it is **Plain Language
+  Summary and Project Impact**; PR descriptions also need **Determinism**,
+  **Linux Semantics** (citing the kernel source it matches) and **Validation**,
+  plus **Relationship to gVisor** for KVM and **Human Review Required** for a
+  labeled PR.
 - Implemented means a pushed change under review (a PR, or the primary
   repository's code review) carrying the exact tested head and its validation;
   landed means on `main` by freshly fetched ancestry. Never report a weaker
