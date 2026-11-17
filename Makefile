@@ -282,7 +282,7 @@ lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
 
 lint-check-syscall-pages:
-	./scripts/syscall-pages.rs check --quick
+	./scripts/syscall-pages.rs check --committed
 
 lint-check-private-workspace-refs:
 	./scripts/check-private-workspace-refs.sh

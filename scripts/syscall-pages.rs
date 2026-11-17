@@ -11,40 +11,55 @@
 //! ```
 //!
 //! Per-syscall Detcore pages: lint, generate, facts, aggregate, render,
-//! and check.
+//! check, report, and wave.
 //!
-//! The facts-only pages in `docs/syscalls/<name>.md` record the
-//! code-derived Detcore strategy for each syscall in this tree's
-//! Detcore census. Checked analysis prose is not in them yet; it returns
-//! in batches. Which backends can run a syscall is not tracked here.
-//! Test coverage is likewise separate: generated indexes link the
-//! coverage audit and never merge its numbers into the strategy table.
-//! The normative page format is `docs/syscalls/SCHEMA.md`.
+//! The pages in `docs/syscalls/<name>.md` record the code-derived
+//! Detcore strategy for each syscall in this tree's Detcore census.
+//! A page may also carry checked determinism-strategy prose whose
+//! claims are pinned to Detcore code by hash-anchored citations
+//! (schema v3; v2 facts-only pages remain valid). Which backends can
+//! run a syscall is not tracked here. Test coverage is likewise
+//! separate: generated indexes link the coverage audit and never merge
+//! its numbers into the strategy table. The normative page format is
+//! `docs/syscalls/SCHEMA.md`.
 //!
 //! Subcommands:
-//! - `lint` — schema, sections, Status format, public-text rules, and
-//!   discussion-link shape. No build, runs in seconds.
-//! - `generate` — (re)generate every facts-only page from this tree's
+//! - `lint` — schema, sections, checked-prose rules, Status format,
+//!   public-text rules, and discussion-link shape. No build, runs in
+//!   seconds.
+//! - `generate` — (re)generate every page's code facts from this tree's
 //!   Detcore sources, optionally overlaying an exporter TSV for exact
-//!   numbers and refused/subscription facts.
+//!   numbers and refused/subscription facts; checked prose, discussion
+//!   links, and Status logs are preserved.
 //! - `facts [--apply]` — export per-syscall policy from Detcore itself
 //!   (public API only, through `scripts/syscall-pages-facts.rs`) plus the
 //!   dispatch parse. Needs a git checkout with the `reverie/` submodule.
 //! - `aggregate [--check]`, `render [--check]` — regenerate or verify
 //!   the JSON table, index, and static site, byte for byte.
-//! - `check [--quick]` — lint + derived census + classes + dispatch +
-//!   citations + generated-output freshness and public-text scan, all
-//!   from this tree's sources; full `check` also compares exporter facts
-//!   (the git-only part, named as such in SCHEMA.md).
+//! - `check [--quick|--committed]` — lint + derived census + classes +
+//!   dispatch + citations (including prose citation hashes) +
+//!   generated-output freshness and public-text scan, all from this
+//!   tree's sources; full `check` also compares exporter facts (the
+//!   git-only part, named as such in SCHEMA.md). `--committed` is the
+//!   hard CI tier: lint and freshness only, deriving nothing from
+//!   live Detcore, so unrelated Detcore changes cannot fail it.
+//! - `anchor` — rewrite the committed citation snapshot from live
+//!   Detcore (after a facts refresh; the hard gate reads it).
+//! - `report` — per-page prose status for reviewers (claim counts,
+//!   negative claims, triage, stamp lag); never gates.
+//! - `wave --from A --to B` — update-wave worklist over two revisions
+//!   of a git checkout at B: facts-changed, handler-touched, and
+//!   citation-stale syscalls. Reports only.
 //!
 //! What the census or dispatch parse cannot understand is
 //! `parser-failed`, never a pass. What `lint` cannot parse is an error,
 //! never a skip.
 //!
 //! Not ported from the predecessor system: its C08 rule resolving a
-//! recorded coverage token to a strict-container test. Facts-only pages
-//! record no coverage tokens at all, and SCHEMA.md states that no page
-//! claim is machine-verified coverage until that check exists.
+//! recorded coverage token to a strict-container test. Checked prose
+//! records named tests as evidence (existence-checked), and SCHEMA.md
+//! states that no page claim is machine-verified coverage until that
+//! check exists.
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -59,6 +74,21 @@ use std::process::Command;
 use std::process::exit;
 
 const SCHEMA: &str = "syscall-pages/v2";
+const SCHEMA_V3: &str = "syscall-pages/v3";
+/// The checked-prose section (v3 pages with a `prose` block only).
+const PROSE_SECTION: &str = "Determinism strategy";
+/// Rubric part lead-ins, in order (P37). The exact strings open each
+/// part of the Determinism strategy section.
+const RUBRIC_PARTS: [&str; 6] = [
+    "**What is nondeterministic natively.**",
+    "**What Hermit does.**",
+    "**Interface fidelity.**",
+    "**Record & replay.**",
+    "**Known gaps.**",
+    "**Tests.**",
+];
+/// Legal `passthrough_risk` values (P36); `none` selects the short form.
+const PASSTHROUGH_RISKS: [&str; 4] = ["none", "host-state", "identity", "timing"];
 const PAGES_DIR: &str = "docs/syscalls";
 const JSON_FILE: &str = "docs/syscalls/syscalls.json";
 const INDEX_FILE: &str = "docs/syscalls/README.md";
@@ -69,11 +99,14 @@ const INDEX_FILE: &str = "docs/syscalls/README.md";
 /// different measurement.
 const COVERAGE_URL: &str =
     "https://github.com/facebookexperimental/hermit/blob/main/docs/SYSCALL_TEST_COVERAGE.md";
-/// Facts-only page sections, in order. Analysis prose returns in batches
-/// after each paragraph is checked against Detcore; until then a page has
-/// the generated strategy, discussion link, and append-only status log.
-const SECTIONS: [&str; 3] = ["Strategy", "Discussion", "Status"];
+/// Page sections, in order, come from `section_order`: the generated
+/// strategy, optional checked prose, discussion link, and append-only
+/// status log.
 const DETCORE_CLASS: [&str; 3] = ["determinized", "passthrough", "unsupported"];
+/// GitHub Discussions category used by newly generated discussion
+/// links. The links work only once Discussions and this category are
+/// enabled on the public repository; generation never contacts GitHub.
+const DISCUSSION_CATEGORY: &str = "syscalls";
 
 fn repo_root() -> PathBuf {
     let script = Path::new(file!());
@@ -122,16 +155,133 @@ struct CodeFacts {
     subscribed_record_replay: bool,
 }
 
+/// Checked-prose stamps (schema v3). Human/agent-authored, in contrast
+/// to tool-owned `CodeFacts`: they move only when the Determinism
+/// strategy prose is re-verified against Detcore.
+#[derive(Debug, Clone, PartialEq)]
+struct Prose {
+    status: String,
+    reviewed_at: String,
+    based_on: String,
+    passthrough_risk: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Page {
+    schema: String,
     syscall: String,
     nr_x86_64: i32,
     related: Vec<String>,
     discussion_kind: String,
     discussion_url: String,
     code_facts: CodeFacts,
+    prose: Option<Prose>,
     /// Section heading -> body text (without the heading line).
     sections: BTreeMap<String, String>,
+}
+
+/// Level-2 headings a page carries, in order, by prose state (P02).
+/// A prose page reads summary-first: In short, the determinism prose,
+/// its gaps, the discussion link, then the evidence appendix (code
+/// facts, tests, citations) and the status log. Internally the prose
+/// is still modelled as one normalized Determinism strategy text plus
+/// a Strategy (code-facts) body; `display_sections` performs the split.
+fn section_order(has_prose: bool) -> Vec<&'static str> {
+    if has_prose {
+        vec![
+            "In short",
+            PROSE_SECTION,
+            "Known gaps",
+            "Discussion",
+            "Appendix",
+            "Status",
+        ]
+    } else {
+        vec!["Strategy", "Discussion", "Status"]
+    }
+}
+
+/// The generated final sentence of `## In short` (P45): a pure
+/// function of the page's gap bullets, so the summary cannot state a
+/// count the gaps section does not have.
+fn in_short_gaps_sentence(gaps: usize) -> String {
+    format!("Known gaps: {gaps}.")
+}
+
+/// Count of `- G…` bullets in the normalized Known gaps part.
+fn known_gap_count(normalized_ds: &str) -> usize {
+    let Some(at) = normalized_ds.find(RUBRIC_PARTS[4]) else {
+        return 0;
+    };
+    let tail = &normalized_ds[at..];
+    let end = tail.find(RUBRIC_PARTS[5]).unwrap_or(tail.len());
+    tail[..end]
+        .lines()
+        .filter(|l| l.trim_start().starts_with("- G"))
+        .count()
+}
+
+/// Split the normalized Determinism strategy text into its display
+/// pieces: (parts 1-4 body, gaps body, tests body, citations text).
+/// Missing markers yield empty pieces; lint reports the shape errors.
+fn decompose_prose(ds: &str) -> (String, String, String, String) {
+    let gaps_at = ds.find(RUBRIC_PARTS[4]).unwrap_or(ds.len());
+    let tests_at = ds.find(RUBRIC_PARTS[5]).unwrap_or(ds.len());
+    let main = ds[..gaps_at].trim().to_string();
+    let gaps = if gaps_at < tests_at {
+        ds[gaps_at + RUBRIC_PARTS[4].len()..tests_at]
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let rest = if tests_at < ds.len() {
+        &ds[tests_at + RUBRIC_PARTS[5].len()..]
+    } else {
+        ""
+    };
+    // Citations start at the first footnote-definition line.
+    let mut defs_at = rest.len();
+    let mut offset = 0usize;
+    for line in rest.lines() {
+        if line.starts_with("[^") && line.contains("]:") {
+            defs_at = offset;
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    let tests = rest[..defs_at].trim().to_string();
+    let defs = rest[defs_at.min(rest.len())..].trim().to_string();
+    (main, gaps, tests, defs)
+}
+
+/// Sections as displayed (and emitted), in order. Prose pages split
+/// the normalized model into the reading order; facts-only pages keep
+/// the v2 layout.
+fn display_sections(page: &Page) -> Vec<(&'static str, String)> {
+    let get = |h: &str| page.sections.get(h).cloned().unwrap_or_default();
+    if page.prose.is_none() {
+        return ["Strategy", "Discussion", "Status"]
+            .into_iter()
+            .filter(|h| page.sections.contains_key(*h))
+            .map(|h| (h, get(h)))
+            .collect();
+    }
+    let (main, gaps, tests, defs) = decompose_prose(&get(PROSE_SECTION));
+    let appendix = format!(
+        "### Code facts\n\n{}\n\n### Tests\n\n{}\n\n### Citations\n\n{}",
+        get("Strategy").trim(),
+        tests,
+        defs
+    );
+    vec![
+        ("In short", get("In short")),
+        (PROSE_SECTION, format!("\n{main}\n")),
+        ("Known gaps", format!("\n{gaps}\n")),
+        ("Discussion", get("Discussion")),
+        ("Appendix", format!("\n{appendix}\n")),
+        ("Status", get("Status")),
+    ]
 }
 
 struct Report {
@@ -208,6 +358,8 @@ struct FrontMatter {
     scalars: BTreeMap<(String, String), String>,
     related: Vec<String>,
     unknown: Vec<String>,
+    /// Whether a `prose:` block header appeared (even an empty one).
+    prose_present: bool,
 }
 
 fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
@@ -218,6 +370,7 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
         "related",
         "discussion",
         "code_facts",
+        "prose",
     ];
     let discussion_keys = ["kind", "url"];
     let facts_keys = [
@@ -229,10 +382,12 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
         "subscribed_run",
         "subscribed_record_replay",
     ];
+    let prose_keys = ["status", "reviewed_at", "based_on", "passthrough_risk"];
     let mut out = FrontMatter {
         scalars: BTreeMap::new(),
         related: Vec::new(),
         unknown: Vec::new(),
+        prose_present: false,
     };
     let mut block = String::new();
     for raw in fm.lines() {
@@ -267,9 +422,12 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
                 }
                 continue;
             }
-            if key == "discussion" || key == "code_facts" {
+            if key == "discussion" || key == "code_facts" || key == "prose" {
                 if !value.is_empty() {
                     return Err(format!("`{key}` must be a nested block"));
+                }
+                if key == "prose" {
+                    out.prose_present = true;
                 }
                 continue;
             }
@@ -289,6 +447,7 @@ fn parse_front_matter(fm: &str) -> Result<FrontMatter, String> {
             let known = match block.as_str() {
                 "discussion" => discussion_keys.contains(&key),
                 "code_facts" => facts_keys.contains(&key),
+                "prose" => prose_keys.contains(&key),
                 _ => false,
             };
             if !known {
@@ -355,9 +514,26 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
             }
         }
     };
-    if get("", "schema", rep) != SCHEMA {
-        rep.err("P05", format!("`schema` must be {SCHEMA}"));
+    let schema = get("", "schema", rep);
+    if schema != SCHEMA && schema != SCHEMA_V3 {
+        rep.err(
+            "P05",
+            format!("`schema` must be {SCHEMA} or {SCHEMA_V3}, got {schema:?}"),
+        );
     }
+    let prose = if fm.prose_present {
+        Some(Prose {
+            status: get("prose", "status", rep),
+            reviewed_at: get("prose", "reviewed_at", rep),
+            based_on: get("prose", "based_on", rep),
+            passthrough_risk: fm
+                .scalars
+                .get(&("prose".to_string(), "passthrough_risk".to_string()))
+                .cloned(),
+        })
+    } else {
+        None
+    };
     let b = |block: &str, key: &str, rep: &mut Report| -> bool {
         match parse_bool(&get(block, key, rep)) {
             Ok(v) => v,
@@ -367,7 +543,8 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
             }
         }
     };
-    let page = Page {
+    let mut page = Page {
+        schema,
         syscall: get("", "syscall", rep),
         nr_x86_64: get("", "nr_x86_64", rep).parse().unwrap_or(-1),
         related: fm.related.clone(),
@@ -382,8 +559,84 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
             subscribed_run: b("code_facts", "subscribed_run", rep),
             subscribed_record_replay: b("code_facts", "subscribed_record_replay", rep),
         },
+        prose,
         sections: split_sections(body),
     };
+    // Reading-order layout normalization: fold the Appendix and the
+    // Known gaps section back into the internal model (Strategy body
+    // plus one normalized Determinism strategy text) that every
+    // check below works on. `display_sections` performs the inverse.
+    if page.sections.contains_key("Appendix") {
+        let appendix = page.sections.remove("Appendix").unwrap_or_default();
+        let mut subs: BTreeMap<String, String> = BTreeMap::new();
+        let mut cur: Option<String> = None;
+        let mut buf = String::new();
+        let mut preamble = String::new();
+        for line in appendix.lines() {
+            if let Some(h) = line.strip_prefix("### ") {
+                if let Some(prev) = cur.take() {
+                    if subs.insert(prev.clone(), std::mem::take(&mut buf)).is_some() {
+                        rep.err(
+                            "P02",
+                            format!("duplicate Appendix subsection `### {prev}`"),
+                        );
+                    }
+                }
+                cur = Some(h.trim().to_string());
+                continue;
+            }
+            if cur.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            } else {
+                preamble.push_str(line);
+                preamble.push('\n');
+            }
+        }
+        if let Some(prev) = cur {
+            if subs.insert(prev.clone(), buf).is_some() {
+                rep.err("P02", format!("duplicate Appendix subsection `### {prev}`"));
+            }
+        }
+        // Nothing in the Appendix may sit outside the three known
+        // subsections: such text would be published in the page
+        // without ever reaching a lint rule.
+        if !preamble.trim().is_empty() {
+            rep.err(
+                "P02",
+                "text in `## Appendix` before its first `###` subsection is not allowed",
+            );
+        }
+        for name in subs.keys() {
+            if !["Code facts", "Tests", "Citations"].contains(&name.as_str()) {
+                rep.err(
+                    "P02",
+                    format!("unknown Appendix subsection `### {name}`"),
+                );
+            }
+        }
+        if let Some(facts) = subs.remove("Code facts") {
+            page.sections.insert("Strategy".into(), facts);
+        }
+        let gaps = page.sections.remove("Known gaps").unwrap_or_default();
+        let tests = subs.remove("Tests").unwrap_or_default();
+        let defs = subs.remove("Citations").unwrap_or_default();
+        // Never synthesize a missing Determinism strategy section:
+        // its absence is the P36 coupling error's job to report.
+        if let Some(main) = page.sections.get(PROSE_SECTION).cloned() {
+            let normalized = format!(
+                "{}\n\n{}\n{}\n\n{}\n{}\n\n{}",
+                main.trim(),
+                RUBRIC_PARTS[4],
+                gaps.trim(),
+                RUBRIC_PARTS[5],
+                tests.trim(),
+                defs.trim()
+            );
+            page.sections
+                .insert(PROSE_SECTION.into(), format!("\n{normalized}\n"));
+        }
+    }
     Some(page)
 }
 
@@ -394,7 +647,7 @@ fn bool_str(v: bool) -> &'static str {
 fn emit_page(page: &Page) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "---");
-    let _ = writeln!(s, "schema: {SCHEMA}");
+    let _ = writeln!(s, "schema: {}", page.schema);
     let _ = writeln!(s, "syscall: {}", page.syscall);
     let _ = writeln!(s, "nr_x86_64: {}", page.nr_x86_64);
     if page.related.is_empty() {
@@ -429,13 +682,24 @@ fn emit_page(page: &Page) -> String {
         "  subscribed_record_replay: {}",
         bool_str(f.subscribed_record_replay)
     );
-    let _ = writeln!(s, "---");
-    for h in SECTIONS {
-        let _ = writeln!(s, "\n## {h}\n");
-        if let Some(body) = page.sections.get(h) {
-            s.push_str(body.trim());
-            s.push('\n');
+    if let Some(p) = &page.prose {
+        let _ = writeln!(
+            s,
+            "# prose: human/agent-authored, machine-checked (syscall-pages.rs check); v3 only"
+        );
+        let _ = writeln!(s, "prose:");
+        let _ = writeln!(s, "  status: {}", p.status);
+        let _ = writeln!(s, "  reviewed_at: {}", p.reviewed_at);
+        let _ = writeln!(s, "  based_on: {}", p.based_on);
+        if let Some(risk) = &p.passthrough_risk {
+            let _ = writeln!(s, "  passthrough_risk: {risk}");
         }
+    }
+    let _ = writeln!(s, "---");
+    for (h, body) in display_sections(page) {
+        let _ = writeln!(s, "\n## {h}\n");
+        s.push_str(body.trim());
+        s.push('\n');
     }
     s
 }
@@ -464,9 +728,11 @@ fn strategy_body(page: &Page, classification_line: usize, dispatch_line: Option<
     if let Some(line) = dispatch_line {
         let _ = writeln!(s, "- Dispatch: `detcore/src/lib.rs:{line}`");
     }
-    s.push_str(
-        "\nThis facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.\n",
-    );
+    if page.prose.is_none() {
+        s.push_str(
+            "\nThis facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.\n",
+        );
+    }
     s
 }
 
@@ -482,6 +748,1230 @@ fn strategy_sentence(page: &Page) -> String {
         bool_str(f.subscribed_run),
         bool_str(f.subscribed_record_replay)
     )
+}
+
+// ---------------------------------------------------------------------------
+// Checked prose (schema v3, P36-P46). Claims in the Determinism
+// strategy section are pinned to Detcore code by citation footnotes
+// whose `sha256:` anchors this tool recomputes in the tree being
+// checked (P38), held to the page's own code facts (P40-P42), and kept
+// free of hand-typed numbers (P39). The SHA-256 below is implemented
+// in-file so the tool needs no dependency beyond serde_json in any
+// tree it runs in.
+// ---------------------------------------------------------------------------
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg: Vec<u8> = Vec::with_capacity(data.len() + 72);
+    msg.extend_from_slice(data);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut w = [0u32; 64];
+    for chunk in msg.chunks_exact(64) {
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// First 16 lowercase hex digits of the SHA-256 of `data` — the
+/// citation anchor form (P38).
+fn sha256_hex16(data: &[u8]) -> String {
+    let digest = sha256(data);
+    let mut s = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Bytes of lines `first..=last` exactly as stored (each line with its
+/// trailing newline), or None when the range leaves the file.
+fn lines_bytes(content: &[u8], first: usize, last: usize) -> Option<Vec<u8>> {
+    if first == 0 || last < first {
+        return None;
+    }
+    let lines: Vec<&[u8]> = content.split_inclusive(|b| *b == b'\n').collect();
+    if last > lines.len() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in &lines[first - 1..last] {
+        out.extend_from_slice(line);
+    }
+    Some(out)
+}
+
+/// One parsed code citation: `path:first-last` with its claimed anchor.
+#[derive(Debug, Clone, PartialEq)]
+struct Cite {
+    path: String,
+    first: usize,
+    last: usize,
+    hash: String,
+}
+
+/// The committed citation snapshot (`docs/syscalls/citations.json`):
+/// what the hard gate checks pages against, so it reads nothing
+/// under detcore/. Written by `anchor` from live Detcore after a
+/// facts refresh; one entry per prose page.
+const CITATIONS_FILE: &str = "docs/syscalls/citations.json";
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SnapshotEntry {
+    based_on: String,
+    citations: Vec<(String, Cite)>,
+    tests: Vec<(String, Vec<String>)>,
+    cited_errnos: BTreeSet<String>,
+}
+
+/// (path, test names) pairs from a Tests part, in order.
+fn tests_entries(tests: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (i, span) in tests.split('`').enumerate() {
+        if i % 2 == 0 {
+            continue;
+        }
+        let token = span.trim();
+        if token.ends_with(".rs") {
+            out.push((token.to_string(), Vec::new()));
+            continue;
+        }
+        let is_fn_name = token.len() > 3
+            && token.contains('_')
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !is_fn_name {
+            continue;
+        }
+        if let Some((_, names)) = out.last_mut() {
+            names.push(token.to_string());
+        }
+    }
+    out
+}
+
+/// The canonical snapshot document for a page set, verifying every
+/// citation against live Detcore on the way (anchor semantics).
+fn snapshot_document(pages: &[Page], root: &Path) -> Result<String, String> {
+    let mut page_objs = serde_json::Map::new();
+    for page in pages {
+        if page.prose.is_none() {
+            continue;
+        }
+        let mut cites_json = Vec::new();
+        let mut errnos: BTreeSet<String> = BTreeSet::new();
+        for (id, cite) in page_cites(page) {
+            let text = verify_cite(root, &cite)
+                .map_err(|e| format!("{}: [^{id}] {e}", page.syscall))?;
+            errnos.extend(errno_tokens(&text));
+            cites_json.push(serde_json::json!({
+                "id": id, "path": cite.path, "first": cite.first,
+                "last": cite.last, "hash": cite.hash,
+            }));
+        }
+        let ds = page.sections.get(PROSE_SECTION).cloned().unwrap_or_default();
+        let ranges = rubric_part_ranges(&split_footnotes(&ds).1);
+        let tests_text = match ranges[5] {
+            Some((s, e)) => split_footnotes(&ds).1[s..e].to_string(),
+            None => String::new(),
+        };
+        let tests_json: Vec<serde_json::Value> = tests_entries(&tests_text)
+            .into_iter()
+            .map(|(path, names)| serde_json::json!({"path": path, "names": names}))
+            .collect();
+        page_objs.insert(
+            page.syscall.clone(),
+            serde_json::json!({
+                "based_on": page.prose.as_ref().map(|p| p.based_on.clone()),
+                "citations": cites_json,
+                "tests": tests_json,
+                "cited_errnos": errnos.iter().collect::<Vec<_>>(),
+            }),
+        );
+    }
+    let doc = serde_json::json!({
+        "schema": "citations.json/v1",
+        "generated_by": "scripts/syscall-pages.rs anchor",
+        "pages": page_objs,
+    });
+    Ok(serde_json::to_string_pretty(&doc).unwrap() + "\n")
+}
+
+/// Parse the committed snapshot, if present.
+fn load_snapshot(root: &Path) -> Option<BTreeMap<String, SnapshotEntry>> {
+    let text = fs::read_to_string(root.join(CITATIONS_FILE)).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut out = BTreeMap::new();
+    for (name, entry) in doc.get("pages")?.as_object()? {
+        let mut snap = SnapshotEntry {
+            based_on: entry.get("based_on")?.as_str()?.to_string(),
+            ..SnapshotEntry::default()
+        };
+        for c in entry.get("citations")?.as_array()? {
+            snap.citations.push((
+                c.get("id")?.as_str()?.to_string(),
+                Cite {
+                    path: c.get("path")?.as_str()?.to_string(),
+                    first: c.get("first")?.as_u64()? as usize,
+                    last: c.get("last")?.as_u64()? as usize,
+                    hash: c.get("hash")?.as_str()?.to_string(),
+                },
+            ));
+        }
+        for t in entry.get("tests")?.as_array()? {
+            let names = t
+                .get("names")?
+                .as_array()?
+                .iter()
+                .filter_map(|n| n.as_str().map(|s| s.to_string()))
+                .collect();
+            snap.tests.push((t.get("path")?.as_str()?.to_string(), names));
+        }
+        for e in entry.get("cited_errnos")?.as_array()? {
+            if let Some(e) = e.as_str() {
+                snap.cited_errnos.insert(e.to_string());
+            }
+        }
+        out.insert(name.clone(), snap);
+    }
+    Some(out)
+}
+
+/// Exact (`--quick` and full) check's snapshot honesty: rebuild the
+/// snapshot from live Detcore and compare it byte for byte with the
+/// committed file. This catches hand edits the per-page agreement
+/// cannot see (an added `cited_errnos` entry, a malformed document,
+/// a stale `based_on`). A missing snapshot is a finding only when a
+/// prose page exists; a prose-free tree needs none. Committed mode
+/// never calls this: it would read live Detcore.
+fn exact_snapshot_finding(pages: &[Page], root: &Path) -> Option<String> {
+    let path = root.join(CITATIONS_FILE);
+    let got = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            if pages.iter().any(|p| p.prose.is_some()) {
+                return Some(format!(
+                    "{CITATIONS_FILE} is missing; run `scripts/syscall-pages.rs anchor`"
+                ));
+            }
+            return None;
+        }
+    };
+    match snapshot_document(pages, root) {
+        Ok(want) if got == want.as_bytes() => None,
+        Ok(_) => Some(format!(
+            "{CITATIONS_FILE} disagrees byte for byte with the snapshot rebuilt from live Detcore; run `scripts/syscall-pages.rs anchor` after refreshing facts"
+        )),
+        Err(e) => Some(format!("cannot rebuild {CITATIONS_FILE} from live Detcore: {e}")),
+    }
+}
+
+/// The hard tier's cross-page snapshot shape: every snapshot entry
+/// must belong to a page that exists and carries prose, and its
+/// `based_on` must equal that page's `prose.based_on`. Per-page lint
+/// cannot see an entry for a missing or prose-less page.
+fn committed_snapshot_findings(pages: &[Page], root: &Path) -> Vec<String> {
+    let Some(snapshot) = load_snapshot(root) else {
+        if pages.iter().any(|p| p.prose.is_some()) {
+            return vec![format!(
+                "{CITATIONS_FILE} is missing or malformed; run `scripts/syscall-pages.rs anchor`"
+            )];
+        }
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, entry) in &snapshot {
+        match pages
+            .iter()
+            .find(|p| &p.syscall == name)
+            .and_then(|p| p.prose.as_ref())
+        {
+            None => out.push(format!(
+                "{CITATIONS_FILE} has an entry for {name}, which is not a prose page; run `scripts/syscall-pages.rs anchor`"
+            )),
+            Some(prose) if entry.based_on != prose.based_on => out.push(format!(
+                "{CITATIONS_FILE} entry for {name} has based_on {}, but the page's prose.based_on is {}; run `scripts/syscall-pages.rs anchor`",
+                entry.based_on, prose.based_on
+            )),
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// Split a Determinism strategy section into (footnote definitions by
+/// id, body text with definitions removed). A definition starts at a
+/// `[^id]:` line and continues through following indented lines.
+fn split_footnotes(section: &str) -> (BTreeMap<String, String>, String) {
+    let mut defs: BTreeMap<String, String> = BTreeMap::new();
+    let mut body = String::new();
+    let mut in_def: Option<String> = None;
+    for line in section.lines() {
+        let def_id = line
+            .strip_prefix("[^")
+            .and_then(|rest| rest.split_once("]:"))
+            .map(|(id, _)| id.to_string())
+            .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace));
+        if let Some(id) = def_id {
+            let after = line.split_once("]:").map(|x| x.1).unwrap_or("");
+            defs.insert(id.clone(), after.trim().to_string());
+            in_def = Some(id);
+            continue;
+        }
+        if let Some(id) = &in_def {
+            if line.starts_with("  ") && !line.trim().is_empty() {
+                let entry = defs.get_mut(id).expect("def just inserted");
+                entry.push(' ');
+                entry.push_str(line.trim());
+                continue;
+            }
+            in_def = None;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    (defs, body)
+}
+
+/// Footnote references `[^id]` in body text (definitions removed).
+fn footnote_refs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("[^") {
+        let after = &rest[at + 2..];
+        match after.find(']') {
+            Some(end) => {
+                out.push(after[..end].to_string());
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Code citations inside one footnote definition: every
+/// `<path>:<a>[-<b>] sha256:<h>` pair, in order.
+fn cite_triples(def: &str) -> Vec<Cite> {
+    let tokens: Vec<&str> = def
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for w in tokens.windows(2) {
+        let Some(hash) = w[1].strip_prefix("sha256:") else {
+            continue;
+        };
+        let Some((path, range)) = w[0].rsplit_once(':') else {
+            continue;
+        };
+        let (first, last) = match range.split_once('-') {
+            Some((a, b)) => match (a.parse::<usize>(), b.parse::<usize>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => continue,
+            },
+            None => match range.parse::<usize>() {
+                Ok(a) => (a, a),
+                Err(_) => continue,
+            },
+        };
+        out.push(Cite {
+            path: path.to_string(),
+            first,
+            last,
+            hash: hash.trim_end_matches(',').to_string(),
+        });
+    }
+    out
+}
+
+/// GitHub source links inside one footnote definition (P46): every
+/// `.../hermit/blob/<rev>/<path>#L<a>[-L<b>]` token, as
+/// `(path, first, last)`. The link is a convenience copy of a
+/// citation's range; it must repeat that range exactly, so a range
+/// moved by `anchor` cannot leave a stale human-facing anchor.
+fn github_source_links(def: &str) -> Vec<(String, usize, usize)> {
+    const PREFIX: &str =
+        "https://github.com/facebookexperimental/hermit/blob/";
+    let mut out = Vec::new();
+    for token in def.split_whitespace() {
+        let token = token.trim_end_matches(|c| ",.;:)]".contains(c));
+        let Some(after_blob) = token.strip_prefix(PREFIX) else {
+            continue;
+        };
+        // Drop the revision component (`main` or a commit).
+        let Some((_rev, path_and_anchor)) = after_blob.split_once('/') else {
+            continue;
+        };
+        let Some((path, anchor)) = path_and_anchor.split_once("#L") else {
+            continue;
+        };
+        let (first, last) = match anchor.split_once("-L") {
+            Some((a, b)) => match (a.parse::<usize>(), b.parse::<usize>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => continue,
+            },
+            None => match anchor.parse::<usize>() {
+                Ok(a) => (a, a),
+                Err(_) => continue,
+            },
+        };
+        out.push((path.to_string(), first, last));
+    }
+    out
+}
+
+/// Verify one citation against this tree, at its recorded lines. On
+/// success returns the cited lines as text (for the errno
+/// cross-check); on failure, why not. The hard gate never calls
+/// this: it checks pages against the committed snapshot instead.
+fn verify_cite(root: &Path, cite: &Cite) -> Result<String, String> {
+    // Citations name Detcore code inside this tree (SCHEMA.md); an
+    // absolute path or a `..` escape is refused, never followed.
+    if cite.path.starts_with('/')
+        || !cite.path.starts_with("detcore/")
+        || cite.path.split('/').any(|part| part == "..")
+    {
+        return Err(format!(
+            "{}: citation path must stay under detcore/ in this tree",
+            cite.path
+        ));
+    }
+    if cite.last < cite.first || cite.first == 0 {
+        return Err(format!(
+            "{}:{}-{}: malformed citation range",
+            cite.path, cite.first, cite.last
+        ));
+    }
+    let full = root.join(&cite.path);
+    let content = fs::read(&full)
+        .map_err(|_| format!("{}:{}-{}: cited file does not exist in this tree", cite.path, cite.first, cite.last))?;
+    let Some(bytes) = lines_bytes(&content, cite.first, cite.last) else {
+        return Err(format!(
+            "{}:{}-{}: cited range leaves the file ({} lines)",
+            cite.path,
+            cite.first,
+            cite.last,
+            content.split_inclusive(|b| *b == b'\n').count()
+        ));
+    };
+    let got = sha256_hex16(&bytes);
+    if got != cite.hash {
+        return Err(format!(
+            "{}:{}-{}: citation hash {} does not recompute (got {got}); the cited code moved or the claim is stale",
+            cite.path, cite.first, cite.last, cite.hash
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Paragraph/bullet units of prose body (footnote definitions already
+/// removed): blank lines bound blocks; a `- ` line starts its own unit.
+fn prose_units(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |out: &mut Vec<String>, cur: &mut String| {
+        if !cur.trim().is_empty() {
+            out.push(std::mem::take(cur));
+        }
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            flush(&mut out, &mut cur);
+            continue;
+        }
+        if line.trim_start().starts_with("- ") {
+            flush(&mut out, &mut cur);
+        }
+        cur.push_str(line.trim());
+        cur.push(' ');
+    }
+    flush(&mut out, &mut cur);
+    out
+}
+
+/// Body text with `[^id]` footnote references removed.
+fn strip_footnote_refs(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        match rest.find("[^") {
+            Some(at) => {
+                out.push_str(&rest[..at]);
+                match rest[at..].find(']') {
+                    Some(end) => rest = &rest[at + end + 1..],
+                    None => break,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Sentences of a prose fragment, split coarsely on sentence ends.
+fn prose_sentences(text: &str) -> Vec<String> {
+    text.replace('\n', " ")
+        .split(". ")
+        .map(|s| s.trim().trim_end_matches('.').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Uppercase errno-shaped tokens (`EINVAL`, `ENOSYS`, ...) in text.
+fn errno_tokens(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut BTreeSet<String>| {
+        if cur.len() >= 3
+            && cur.starts_with('E')
+            && cur.chars().skip(1).any(|c| c.is_ascii_uppercase())
+            && cur.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
+            out.insert(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    for c in text.chars() {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+            cur.push(c);
+        } else {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// Sentences that claim an absence or a universal — the class most
+/// likely to be wrong by omission. Collected for reviewers by
+/// `report`; negative errno claims are exempt from P41 (see SCHEMA).
+fn negative_claims(section_body: &str) -> Vec<String> {
+    // Whole-word markers: the reviewer reads these sentences first.
+    // Substring matching missed plain "not"/"no" phrasing in review.
+    const WORDS: [&str; 7] = [
+        "never", "always", "cannot", "not", "no", "without", "instead",
+    ];
+    const PHRASES: [&str; 5] = [
+        "can not",
+        "does not",
+        "instead of",
+        "not modelled",
+        "not modeled",
+    ];
+    prose_sentences(&strip_footnote_refs(section_body))
+        .into_iter()
+        .filter(|s| {
+            let lower = s.to_lowercase();
+            let words: BTreeSet<&str> = lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            WORDS.iter().any(|m| words.contains(m))
+                || PHRASES.iter().any(|m| lower.contains(m))
+        })
+        .collect()
+}
+
+/// Every prose sentence of a page, in order (footnote definitions
+/// removed): the claim inventory `report` prints for the reviewer who
+/// checks every claim against code.
+fn prose_claims(section_body: &str) -> Vec<String> {
+    prose_sentences(&strip_footnote_refs(section_body))
+}
+
+/// Byte offset of `fn <name>` as a definition (the next character
+/// must be `(`, `<`, or whitespace before one of those), so a renamed
+/// `fn read_test_v2` does not satisfy a citation of `read_test`.
+fn fn_def_at(masked: &str, name: &str) -> Option<usize> {
+    let needle = format!("fn {name}");
+    let mut from = 0;
+    while let Some(pos) = masked[from..].find(&needle) {
+        let at = from + pos;
+        let after = masked[at + needle.len()..].trim_start();
+        if after.starts_with('(') || after.starts_with('<') {
+            return Some(at);
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
+/// The brace-matched extent of `fn <name>` in `content` (signature
+/// through the closing brace), using the same comment/string masking
+/// as the dispatch parser so braces in literals do not count.
+fn fn_extent(content: &str, name: &str) -> Option<String> {
+    let masked = mask_rust(content);
+    let at = fn_def_at(&masked, name)?;
+    let open = at + masked[at..].find('{')?;
+    let close = matching(masked.as_bytes(), open)?;
+    Some(content[at..=close].to_string())
+}
+
+/// Whether `word` occurs in `text` as a whole word (boundaries are
+/// non-identifier characters), so `time` does not match inside
+/// `successful_time_store_probe`.
+fn contains_word_str(text: &str, word: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(word) {
+        let start = from + pos;
+        let end = start + word.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+        let after_ok = end == text.len() || !is_word(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// P43 relevance: does this test exercise the syscall? The test's own
+/// extent (plus one level of same-file helpers it calls) must contain,
+/// as a whole word, `Sysno::<name>`, `SYS_<name>`, `handle_<name>`,
+/// the CamelCase type, or `libc::<name>(` — or call a function that
+/// the page's own hash-pinned cited ranges define or call. A test
+/// that merely exists in the right file is not evidence.
+fn test_fn_relevant(
+    content: &str,
+    fn_name: &str,
+    syscall: &str,
+    cited_fn_names: &BTreeSet<String>,
+) -> bool {
+    let Some(extent) = fn_extent(content, fn_name) else {
+        return false;
+    };
+    let mut hay = extent.clone();
+    // One level of same-file helpers the test calls. Identifiers are
+    // deduplicated first: a long test repeats its locals many times,
+    // and the cap must bound distinct helpers looked up, not words.
+    let called: BTreeSet<&str> = extent
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.len() > 2)
+        .collect();
+    for helper in called.iter().take(256) {
+        if let Some(body) = fn_extent(content, helper) {
+            hay.push_str(&body);
+        }
+        if hay.len() > 256_000 {
+            break;
+        }
+    }
+    // Scan the masked text: a token inside a comment or a string
+    // literal is not a mention.
+    let hay = mask_rust(&hay);
+    if contains_word_str(&hay, &format!("Sysno::{syscall}"))
+        || contains_word_str(&hay, &format!("SYS_{syscall}"))
+        || contains_word_str(&hay, &format!("SYS_{}", syscall.to_uppercase()))
+        || contains_word_str(&hay, &format!("handle_{syscall}"))
+        || contains_word_str(&hay, &camel(syscall))
+        || hay.contains(&format!("libc::{syscall}("))
+    {
+        return true;
+    }
+    // Or: it (or a same-file helper above) calls a credited function
+    // the page's cited code defines or calls.
+    let called: Vec<&str> = hay
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.len() > 2 && !RELEVANCE_STOPLIST.contains(w))
+        .collect();
+    called.iter().any(|w| cited_fn_names.contains(*w))
+}
+
+/// Names that never earn P43 relevance credit: prelude and std
+/// shapes that appear in almost every cited range and test body.
+const RELEVANCE_STOPLIST: [&str; 13] = [
+    "Some", "None", "Ok", "Err", "Errno", "Error", "into", "from", "map", "unwrap", "expect",
+    "clone", "cfg",
+];
+
+/// Function names the page's cited code calls that may earn a test
+/// relevance: a name counts only if it is actually defined in the
+/// cited file (cited files live under `detcore/`, P38) and is not a
+/// stoplisted prelude/std shape. Without the definition requirement,
+/// common call shapes (`Some(`, `Errno(`, `map(`) shared between a
+/// test and any cited range would credit unrelated tests.
+fn cited_fn_names(page: &Page, root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (_, cite) in page_cites(page) {
+        let Ok(content) = fs::read(root.join(&cite.path)) else {
+            continue;
+        };
+        let Some(bytes) = lines_bytes(&content, cite.first, cite.last) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let whole_file = String::from_utf8_lossy(&content).into_owned();
+        let masked_file = mask_rust(&whole_file);
+        // Only words in call or definition shape count: every long
+        // identifier would make the relevance check vacuous.
+        for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if word.len() > 2
+                && !RELEVANCE_STOPLIST.contains(&word)
+                && (text.contains(&format!("fn {word}"))
+                    || text.contains(&format!("{word}(")))
+                && fn_def_at(&masked_file, word).is_some()
+            {
+                out.insert(word.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_ymd(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes().get(4) == Some(&b'-')
+        && s.as_bytes().get(7) == Some(&b'-')
+        && s.chars().filter(|c| c.is_ascii_digit()).count() == 8
+}
+
+fn is_hex40(s: &str) -> bool {
+    s.len() == 40
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+/// Byte ranges of the rubric parts present in `body` (footnote
+/// definitions removed), indexed like RUBRIC_PARTS. A part runs from
+/// its lead-in to the next present lead-in or the end of the text.
+fn rubric_part_ranges(body: &str) -> [Option<(usize, usize)>; 6] {
+    let mut starts: [Option<usize>; 6] = [None; 6];
+    for (i, part) in RUBRIC_PARTS.iter().enumerate() {
+        starts[i] = body.find(part);
+    }
+    let mut out = [None; 6];
+    for i in 0..6 {
+        if let Some(start) = starts[i] {
+            let end = (i + 1..6)
+                .filter_map(|j| starts[j])
+                .filter(|s| *s > start)
+                .min()
+                .unwrap_or(body.len());
+            out[i] = Some((start, end));
+        }
+    }
+    out
+}
+
+/// All code citations on a page (for `wave`): (footnote id, cite).
+fn page_cites(page: &Page) -> Vec<(String, Cite)> {
+    let Some(section) = page.sections.get(PROSE_SECTION) else {
+        return Vec::new();
+    };
+    let (defs, _) = split_footnotes(section);
+    let mut out = Vec::new();
+    for (id, def) in &defs {
+        if id == "linux" {
+            continue;
+        }
+        for cite in cite_triples(def) {
+            out.push((id.clone(), cite));
+        }
+    }
+    out
+}
+
+/// P45, the In short summary: three or four plain sentences, no
+/// citations, no hand-typed numbers, and a final gap-count sentence
+/// that is a pure function of the Known gaps bullets. The summary
+/// may compress the prose below; whether it adds a claim is a
+/// review check the seat performs (SCHEMA, Done).
+fn lint_in_short(page: &Page, rep: &mut Report) {
+    let body = page.sections.get("In short").cloned().unwrap_or_default();
+    if body.contains("[^") {
+        rep.err("P45", "`## In short` carries no citations");
+    }
+    let ds = page.sections.get(PROSE_SECTION).cloned().unwrap_or_default();
+    let want_last = in_short_gaps_sentence(known_gap_count(&ds));
+    let sentences = prose_sentences(&body);
+    if !(3..=4).contains(&sentences.len()) {
+        rep.err(
+            "P45",
+            format!(
+                "`## In short` must be three or four sentences, got {}",
+                sentences.len()
+            ),
+        );
+    }
+    match sentences.last() {
+        Some(last) if format!("{last}.") == want_last => {}
+        _ => rep.err(
+            "P45",
+            format!("`## In short` must end with the generated sentence {want_last:?}"),
+        ),
+    }
+    // The digit ban applies to the authored sentences; the generated
+    // count sentence is the single allowed digit bearer.
+    let authored = body.replace(&want_last, "");
+    lint_prose_digits(page, &authored, rep);
+}
+
+/// The P36-P46 checks over one page's checked prose. Called only when
+/// the prose block and the section are both present; their coupling
+/// itself is checked by the caller.
+fn lint_prose(page: &Page, root: &Path, rep: &mut Report, committed: bool) {
+    let prose = page.prose.as_ref().expect("lint_prose needs a prose block");
+    let section = page
+        .sections
+        .get(PROSE_SECTION)
+        .cloned()
+        .unwrap_or_default();
+    // P36: stamp shape and triage legality.
+    if page.schema != SCHEMA_V3 {
+        rep.err("P36", "a `prose` block requires `schema: syscall-pages/v3`");
+    }
+    if prose.status != "checked" {
+        rep.err(
+            "P36",
+            format!("`prose.status` must be `checked`, got {:?}", prose.status),
+        );
+    }
+    if !is_ymd(&prose.reviewed_at) {
+        rep.err("P36", "`prose.reviewed_at` must be YYYY-MM-DD");
+    }
+    if !is_hex40(&prose.based_on) {
+        rep.err("P36", "`prose.based_on` must be a 40-hex source revision");
+    }
+    let strat = strategy(&page.code_facts);
+    if let Some(risk) = &prose.passthrough_risk {
+        if !PASSTHROUGH_RISKS.contains(&risk.as_str()) {
+            rep.err("P36", format!("`passthrough_risk` {risk:?} is not one of {PASSTHROUGH_RISKS:?}"));
+        }
+        if strat != "passthrough" {
+            rep.err("P36", "`passthrough_risk` on a non-passthrough page");
+        }
+    }
+    let short_form = prose.passthrough_risk.as_deref() == Some("none");
+    // P37: rubric shape over the definitions-free body.
+    let (defs, body) = split_footnotes(&section);
+    let ranges = rubric_part_ranges(&body);
+    let mut last_start: Option<usize> = None;
+    for (i, part) in RUBRIC_PARTS.iter().enumerate() {
+        let required = !short_form || i == 1 || i == 4 || i == 5;
+        match ranges[i] {
+            None => {
+                if required {
+                    rep.err("P37", format!("rubric part missing: {part}"));
+                }
+            }
+            Some((start, end)) => {
+                if matches!(last_start, Some(prev) if start < prev) {
+                    rep.err("P37", format!("rubric part out of order: {part}"));
+                }
+                last_start = Some(start);
+                let lo = (start + part.len()).min(end);
+                if body[lo..end].trim().is_empty() {
+                    rep.err("P37", format!("rubric part is empty: {part}"));
+                }
+            }
+        }
+    }
+    // P38: references, definitions, hashes, paragraph coverage.
+    let refs = footnote_refs(&body);
+    for id in &refs {
+        if !defs.contains_key(id) {
+            rep.err("P38", format!("footnote [^{id}] is referenced but not defined"));
+        }
+    }
+    for id in defs.keys() {
+        if !refs.contains(id) {
+            rep.err("P38", format!("footnote [^{id}] is defined but never referenced"));
+        }
+    }
+    // Snapshot state for this page, if a citations snapshot exists.
+    let snapshot = load_snapshot(root);
+    let snap_entry = snapshot
+        .as_ref()
+        .and_then(|s| s.get(&page.syscall));
+    if committed && snapshot.is_none() {
+        rep.err(
+            "P38",
+            "docs/syscalls/citations.json is missing; the hard gate checks pages against it (run `anchor`)",
+        );
+    }
+    let mut cited_text = String::new();
+    let mut page_triples: Vec<(String, Cite)> = Vec::new();
+    for (id, def) in &defs {
+        if id == "linux" {
+            if !def.contains("https://") {
+                rep.err("P38", "the [^linux] footnote must carry a public link");
+            }
+            // P44: the kernel pointer names a tag, never a moving
+            // branch, so the cited Linux behaviour stays checkable.
+            let tagged = (def.contains("?h=v") || def.contains("/blob/v"))
+                && def
+                    .chars()
+                    .zip(def.chars().skip(1))
+                    .any(|(a, b)| a == 'v' && b.is_ascii_digit());
+            if !tagged || def.contains("/master/") || def.contains("h=master") {
+                rep.err(
+                    "P44",
+                    "the [^linux] footnote must pin a kernel tag (for example `?h=v7.1.3`), not a moving branch",
+                );
+            }
+            continue;
+        }
+        let triples = cite_triples(def);
+        if triples.is_empty() {
+            rep.err(
+                "P38",
+                format!("footnote [^{id}] carries no `path:lines sha256:<hash>` citation"),
+            );
+        }
+        // P46: a GitHub source link in this footnote must repeat one
+        // of this footnote's own citation ranges exactly. This runs
+        // in committed mode too: it reads the page only, so the
+        // hard gate catches a stale anchor without reading Detcore.
+        for (path, first, last) in github_source_links(def) {
+            let matches_citation = triples
+                .iter()
+                .any(|c| c.path == path && c.first == first && c.last == last);
+            if !matches_citation {
+                rep.err(
+                    "P46",
+                    format!(
+                        "footnote [^{id}] GitHub link {path}#L{first}-L{last} does not match any citation range in that footnote; update the link to the citation's current lines"
+                    ),
+                );
+            }
+        }
+        for cite in &triples {
+            page_triples.push((id.clone(), cite.clone()));
+            if !committed {
+                match verify_cite(root, cite) {
+                    Ok(text) => {
+                        cited_text.push_str(&text);
+                        cited_text.push('\n');
+                    }
+                    Err(e) => rep.err("P38", e),
+                }
+            }
+        }
+    }
+    // Snapshot agreement: in committed mode this replaces live
+    // verification entirely; in exact modes a present snapshot must
+    // still agree, so a hand edit without re-anchoring fails.
+    if let Some(entry) = snap_entry {
+        if entry.citations != page_triples {
+            rep.err(
+                "P38",
+                "citations disagree with docs/syscalls/citations.json; run `anchor` after refreshing facts",
+            );
+        }
+    } else if committed {
+        rep.err(
+            "P38",
+            format!(
+                "no citations.json entry for {}; run `anchor`",
+                page.syscall
+            ),
+        );
+    }
+    // Coverage runs part by part. The Tests part is exempt only for
+    // its evidence entries (units naming an `.rs` path); any other
+    // paragraph in or after it still needs a citation, so prose
+    // cannot hide behind the Tests heading.
+    for (i, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        let lo = (start + RUBRIC_PARTS[i].len()).min(*end);
+        for unit in prose_units(&body[lo..*end]) {
+            let trimmed = unit.trim();
+            if i == 5 && trimmed.contains(".rs`") {
+                continue;
+            }
+            if !trimmed.contains("[^") {
+                rep.err(
+                    "P38",
+                    format!(
+                        "prose paragraph carries no citation: {:?}",
+                        trimmed.chars().take(72).collect::<String>()
+                    ),
+                );
+            }
+        }
+    }
+    // P39: no hand-typed numbers outside the allowed forms.
+    lint_prose_digits(page, &body, rep);
+    // P40: part 2 names the derived strategy.
+    if let Some((start, end)) = ranges[1] {
+        let lo = (start + RUBRIC_PARTS[1].len()).min(end);
+        let text = &body[lo..end];
+        let first_para = text.split("\n\n").next().unwrap_or("").to_lowercase();
+        let ok = match strat {
+            "determinized" => first_para.contains("determiniz"),
+            "determinized-refused" => first_para.contains("refus"),
+            "passthrough" => first_para.contains("pass") || first_para.contains("forward"),
+            _ => {
+                first_para.contains("unsupported")
+                    || first_para.contains("not supported")
+                    || first_para.contains("refus")
+            }
+        };
+        if !ok {
+            rep.err(
+                "P40",
+                format!("`**What Hermit does.**` does not name the derived strategy ({strat}) in its first paragraph"),
+            );
+        }
+    }
+    // P41: a positively-claimed errno must appear in cited code.
+    let cited_errnos: BTreeSet<String> = if committed {
+        snap_entry
+            .map(|e| e.cited_errnos.clone())
+            .unwrap_or_default()
+    } else {
+        errno_tokens(&cited_text)
+    };
+    let mut claim_text = String::new();
+    for i in [1usize, 2] {
+        if let Some((start, end)) = ranges[i] {
+            let lo = (start + RUBRIC_PARTS[i].len()).min(end);
+            claim_text.push_str(&body[lo..end]);
+            claim_text.push('\n');
+        }
+    }
+    for sentence in prose_sentences(&strip_footnote_refs(&claim_text)) {
+        let lower = sentence.to_lowercase().replace('`', "");
+        for errno in errno_tokens(&sentence) {
+            // The only exemption is an absence claim about this very
+            // errno ("there is no `EINTR` path"): the cited range is
+            // the whole handler, and the token's absence from it is
+            // the claim. Every occurrence must be inside such a
+            // phrase, so "no EINTR retry; it returns EINTR" still
+            // checks the positive claim.
+            let needle = errno.to_lowercase();
+            let occurrences: Vec<usize> = lower.match_indices(&needle).map(|(i, _)| i).collect();
+            let absence = !occurrences.is_empty()
+                && occurrences.iter().all(|&i| {
+                    lower[..i].ends_with("no ") || lower[..i].ends_with("never returns ")
+                });
+            if !absence && !cited_errnos.contains(&errno) {
+                rep.err(
+                    "P41",
+                    format!("errno `{errno}` is claimed but appears in no cited line range"),
+                );
+            }
+        }
+    }
+    // P42: subscription phrases held to the facts.
+    let lower = body.to_lowercase();
+    let f = &page.code_facts;
+    if lower.contains("not subscribed") && (f.subscribed_run || f.subscribed_record_replay) {
+        rep.err("P42", "prose says `not subscribed` but a subscription fact is true");
+    }
+    if lower.contains("subscribed in both") && !(f.subscribed_run && f.subscribed_record_replay) {
+        rep.err("P42", "prose says `subscribed in both` but a subscription fact is false");
+    }
+    // P43: named tests exist and exercise this syscall (or, in
+    // committed mode, match the snapshot's record of them).
+    if let Some((start, end)) = ranges[5] {
+        if committed {
+            let got = tests_entries(&body[start..end]);
+            match snap_entry {
+                Some(entry) if entry.tests == got => {}
+                Some(_) => rep.err(
+                    "P43",
+                    "Tests entries disagree with docs/syscalls/citations.json; run `anchor` after refreshing facts",
+                ),
+                None => rep.err(
+                    "P43",
+                    format!(
+                        "no citations.json entry for {}; run `anchor`",
+                        page.syscall
+                    ),
+                ),
+            }
+        } else {
+            lint_tests_evidence(page, root, &body[start..end], rep);
+        }
+    }
+}
+
+/// P39's digit scan over definitions-free prose body.
+fn lint_prose_digits(page: &Page, body: &str, rep: &mut Report) {
+    // Remove code spans, footnote references, and link targets; their
+    // digits are identifiers, not hand-typed quantities.
+    let mut cleaned = String::new();
+    let mut rest = body;
+    loop {
+        match rest.find('`') {
+            Some(at) => {
+                cleaned.push_str(&rest[..at]);
+                cleaned.push(' ');
+                rest = &rest[at + 1..];
+                match rest.find('`') {
+                    Some(end) => rest = &rest[end + 1..],
+                    None => break,
+                }
+            }
+            None => {
+                cleaned.push_str(rest);
+                break;
+            }
+        }
+    }
+    let no_refs = strip_footnote_refs(&cleaned);
+    for token in no_refs.split_whitespace() {
+        if !token.chars().any(|c| c.is_ascii_digit()) || token.starts_with("http") {
+            continue;
+        }
+        let bare = token.trim_matches(|c: char| ",.;:()[]".contains(c));
+        let allowed = is_ymd(bare)
+            || bare == "x86_64"
+            || bare == "x86-64"
+            || bare == page.nr_x86_64.to_string()
+            || (bare.starts_with('G')
+                && bare[1..].chars().all(|c| c.is_ascii_digit())
+                && bare.len() > 1);
+        if !allowed {
+            rep.err(
+                "P39",
+                format!("hand-typed number in checked prose: {bare:?} (facts belong in the generated sentence and tables)"),
+            );
+        }
+    }
+}
+
+/// P43: in the Tests part, every backticked `.rs` path exists in
+/// this tree, is followed by at least one backticked test name, each
+/// such name is a function in that file, and the test is relevant
+/// (`test_fn_relevant`): a test that merely exists is not evidence.
+fn lint_tests_evidence(page: &Page, root: &Path, tests: &str, rep: &mut Report) {
+    let cited = cited_fn_names(page, root);
+    let spans: Vec<&str> = tests.split('`').collect();
+    // (path, content, named a test yet)
+    let mut last_rs: Option<(String, String, bool)> = None;
+    let finish_path = |last: &Option<(String, String, bool)>, rep: &mut Report| {
+        if let Some((path, _, false)) = last {
+            rep.err(
+                "P43",
+                format!("Tests cite `{path}` without naming a test in it"),
+            );
+        }
+    };
+    for (i, span) in spans.iter().enumerate() {
+        if i % 2 == 0 {
+            continue;
+        }
+        let token = span.trim();
+        if token.ends_with(".rs") {
+            finish_path(&last_rs, rep);
+            if token.starts_with('/') || token.split('/').any(|part| part == "..") {
+                rep.err(
+                    "P43",
+                    format!("Tests cite `{token}`, which escapes this tree"),
+                );
+                last_rs = None;
+                continue;
+            }
+            match fs::read_to_string(root.join(token)) {
+                Ok(content) => last_rs = Some((token.to_string(), content, false)),
+                Err(_) => {
+                    rep.err("P43", format!("Tests cite `{token}`, which does not exist"));
+                    last_rs = None;
+                }
+            }
+            continue;
+        }
+        let is_fn_name = token.len() > 3
+            && token.contains('_')
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !is_fn_name {
+            continue;
+        }
+        let Some((path, content, named)) = &mut last_rs else {
+            continue;
+        };
+        *named = true;
+        if fn_def_at(&mask_rust(content), token).is_none() {
+            rep.err(
+                "P43",
+                format!("Tests name `{token}`, not a function in {path}"),
+            );
+        } else if !test_fn_relevant(content, token, &page.syscall, &cited) {
+            rep.err(
+                "P43",
+                format!(
+                    "Tests name `{token}` in {path}, whose extent never mentions `{}` or its handler and calls nothing the cited code defines or calls",
+                    page.syscall
+                ),
+            );
+        }
+    }
+    finish_path(&last_rs, rep);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +2119,12 @@ fn scrub_findings(text: &str) -> Vec<String> {
 // normative text for each id.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>) {
+    lint_page_committed(name_hint, text, root, false)
+}
+
+fn lint_page_committed(name_hint: &str, text: &str, root: &Path, committed: bool) -> (Report, Option<Page>) {
     let mut rep = Report::new();
     for hit in scrub_findings(text) {
         rep.err(
@@ -641,10 +2136,30 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
     // key may still appear inside historical Status entries, nowhere else.
     let page = parse_page(text, &mut rep);
     let Some(page) = page else { return (rep, None) };
-    // P02: sections exactly once, in order, nothing before the first.
+    // P36 coupling, then P02: sections exactly once, in order.
+    let has_prose_section = page.sections.contains_key(PROSE_SECTION);
+    let has_prose_block = page.prose.is_some();
+    if has_prose_block != has_prose_section {
+        rep.err(
+            "P36",
+            "the `prose` block and the `## Determinism strategy` section must be present together",
+        );
+    }
+    if page.schema == SCHEMA && (has_prose_block || has_prose_section) {
+        rep.err("P36", "checked prose requires `schema: syscall-pages/v3`");
+    }
+    if page.schema == SCHEMA_V3 && !has_prose_block {
+        rep.err(
+            "P36",
+            "`schema: syscall-pages/v3` requires checked prose; a facts-only page stays `syscall-pages/v2`",
+        );
+    }
     if let Ok((_, body)) = split_front_matter(text) {
         let got = headings_in_order(body);
-        let want: Vec<String> = SECTIONS.iter().map(|s| s.to_string()).collect();
+        let want: Vec<String> = section_order(has_prose_section)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         if got != want {
             rep.err(
                 "P02",
@@ -658,7 +2173,10 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
         }
     }
     // P03: facts sections non-empty.
-    for h in ["Strategy"] {
+    for h in ["Strategy", PROSE_SECTION]
+        .into_iter()
+        .filter(|h| *h == "Strategy" || has_prose_section)
+    {
         if page
             .sections
             .get(h)
@@ -730,7 +2248,10 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
             );
         }
     }
-    let _ = root;
+    if has_prose_block && has_prose_section {
+        lint_prose(&page, root, &mut rep, committed);
+        lint_in_short(&page, &mut rep);
+    }
     let want_strategy = strategy_sentence(&page);
     let got_strategy = page.sections.get("Strategy").cloned().unwrap_or_default();
     if !got_strategy.contains(&want_strategy) {
@@ -821,9 +2342,33 @@ fn lint_discussion(page: &Page, rep: &mut Report) {
                 rep.err("P34", "a `new` discussion must be a prefilled facebookexperimental/hermit new-issue URL");
             }
         }
+        "discussion/existing" => {
+            if !page
+                .discussion_url
+                .starts_with("https://github.com/facebookexperimental/hermit/discussions/")
+            {
+                rep.err(
+                    "P34",
+                    "a `discussion/existing` kind must link a facebookexperimental/hermit discussion",
+                );
+            }
+        }
+        "discussion/new" => {
+            if !page.discussion_url.starts_with(
+                "https://github.com/facebookexperimental/hermit/discussions/new?",
+            ) || !page
+                .discussion_url
+                .contains(&format!("category={DISCUSSION_CATEGORY}"))
+            {
+                rep.err(
+                    "P34",
+                    "a `discussion/new` kind must be a prefilled facebookexperimental/hermit new-discussion URL in the syscalls category",
+                );
+            }
+        }
         other => rep.err(
             "P34",
-            format!("discussion kind must be existing or new, got {other:?}"),
+            format!("discussion kind must be existing, new, discussion/existing, or discussion/new, got {other:?}"),
         ),
     }
     let sec = page.sections.get("Discussion").cloned().unwrap_or_default();
@@ -1960,6 +3505,10 @@ fn export_facts(root: &Path) -> Result<(String, BTreeMap<String, FactRow>), Stri
 // ---------------------------------------------------------------------------
 
 fn load_pages(root: &Path) -> Vec<(String, String, Report, Option<Page>)> {
+    load_pages_committed(root, false)
+}
+
+fn load_pages_committed(root: &Path, committed: bool) -> Vec<(String, String, Report, Option<Page>)> {
     let dir = root.join(PAGES_DIR);
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -1974,7 +3523,7 @@ fn load_pages(root: &Path) -> Vec<(String, String, Report, Option<Page>)> {
     names.sort();
     for name in names {
         let text = read(&dir.join(format!("{name}.md")));
-        let (rep, page) = lint_page(&name, &text, root);
+        let (rep, page) = lint_page_committed(&name, &text, root, committed);
         out.push((name, text, rep, page));
     }
     out
@@ -1992,11 +3541,16 @@ fn sorted_pages(pages: &[Page]) -> Vec<Page> {
 
 fn syscalls_json(pages: &[Page], sha: &str) -> String {
     let pages = sorted_pages(pages);
+    // Staging rule (schema v3 roll-out): a generation with no checked
+    // prose anywhere emits the exact v2 document, so the tool change
+    // can land alone with generated outputs untouched. The first
+    // prose batch flips the document to v3 in its own diff.
+    let any_prose = pages.iter().any(|p| p.prose.is_some());
     let rows: Vec<serde_json::Value> = pages
         .iter()
         .map(|p| {
             let f = &p.code_facts;
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "syscall": p.syscall,
                 "nr_x86_64": p.nr_x86_64,
                 "strategy": strategy(f),
@@ -2008,21 +3562,52 @@ fn syscalls_json(pages: &[Page], sha: &str) -> String {
                 "subscribed_record_replay": f.subscribed_record_replay,
                 "discussion": {"kind": p.discussion_kind, "url": p.discussion_url},
                 "page": format!("docs/syscalls/{}.md", p.syscall),
-            })
+            });
+            if any_prose {
+                let obj = row.as_object_mut().expect("row is an object");
+                let prose_status: serde_json::Value =
+                    if p.prose.is_some() { "checked" } else { "none" }.into();
+                obj.insert("prose_status".into(), prose_status);
+                obj.insert(
+                    "prose_based_on".into(),
+                    p.prose.as_ref().map(|x| x.based_on.clone()).into(),
+                );
+                obj.insert(
+                    "prose_reviewed_at".into(),
+                    p.prose.as_ref().map(|x| x.reviewed_at.clone()).into(),
+                );
+                obj.insert(
+                    "passthrough_risk".into(),
+                    p.prose
+                        .as_ref()
+                        .and_then(|x| x.passthrough_risk.clone())
+                        .into(),
+                );
+            }
+            row
         })
         .collect();
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut prose_counts: BTreeMap<&str, usize> = BTreeMap::new();
     for p in &pages {
         *counts.entry(strategy(&p.code_facts)).or_default() += 1;
+        *prose_counts
+            .entry(if p.prose.is_some() { "checked" } else { "none" })
+            .or_default() += 1;
     }
-    let doc = serde_json::json!({
-        "schema": "syscalls.json/v2",
+    let mut doc = serde_json::json!({
+        "schema": if any_prose { "syscalls.json/v3" } else { "syscalls.json/v2" },
         "generated_by": "scripts/syscall-pages.rs aggregate",
         "code_facts_as_of": sha,
         "total": pages.len(),
         "counts": counts,
         "syscalls": rows,
     });
+    if any_prose {
+        doc.as_object_mut()
+            .expect("document is an object")
+            .insert("prose_counts".into(), serde_json::json!(prose_counts));
+    }
     serde_json::to_string_pretty(&doc).unwrap() + "\n"
 }
 
@@ -2035,10 +3620,15 @@ fn index_md(pages: &[Page], sha: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# Per-syscall Detcore pages");
     let _ = writeln!(s);
-    let _ = writeln!(
-        s,
+    // Same staging rule as syscalls_json: with no checked prose
+    // anywhere, the index is byte-identical to the v2 generation.
+    let any_prose = pages.iter().any(|p| p.prose.is_some());
+    let intro = if any_prose {
+        "One page per Linux syscall in this tree's pinned x86-64 Detcore census: the code-derived strategy and a discussion link. Pages with checked determinism-strategy prose say so in the prose column; the rest are facts only for now. The machine-readable form is [syscalls.json](syscalls.json); the page format is [SCHEMA.md](SCHEMA.md). Regenerate with `scripts/syscall-pages.rs generate` and `aggregate`; verify with `scripts/syscall-pages.rs check`."
+    } else {
         "One facts-only page per Linux syscall in this tree's pinned x86-64 Detcore census: the code-derived strategy and a discussion link. Checked analysis prose returns in later batches. The machine-readable form is [syscalls.json](syscalls.json); the page format is [SCHEMA.md](SCHEMA.md). Regenerate with `scripts/syscall-pages.rs generate` and `aggregate`; verify with `scripts/syscall-pages.rs check`."
-    );
+    };
+    let _ = writeln!(s, "{intro}");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
@@ -2059,20 +3649,40 @@ fn index_md(pages: &[Page], sha: &str) -> String {
     }
     let _ = writeln!(s, "| **total** | **{}** |", pages.len());
     let _ = writeln!(s);
-    let _ = writeln!(s, "| syscall | nr | strategy | dispatch | discussion |");
-    let _ = writeln!(s, "|---|---:|---|---|---|");
+    if any_prose {
+        let _ = writeln!(s, "| syscall | nr | strategy | dispatch | prose | discussion |");
+        let _ = writeln!(s, "|---|---:|---|---|---|---|");
+    } else {
+        let _ = writeln!(s, "| syscall | nr | strategy | dispatch | discussion |");
+        let _ = writeln!(s, "|---|---:|---|---|---|");
+    }
     for p in &pages {
-        let _ = writeln!(
-            s,
-            "| [{}]({}.md) | {} | {} | {} | [{}]({}) |",
-            p.syscall,
-            p.syscall,
-            p.nr_x86_64,
-            strategy(&p.code_facts),
-            p.code_facts.dispatch,
-            p.discussion_kind,
-            p.discussion_url
-        );
+        if any_prose {
+            let _ = writeln!(
+                s,
+                "| [{}]({}.md) | {} | {} | {} | {} | [{}]({}) |",
+                p.syscall,
+                p.syscall,
+                p.nr_x86_64,
+                strategy(&p.code_facts),
+                p.code_facts.dispatch,
+                if p.prose.is_some() { "checked" } else { "facts only" },
+                p.discussion_kind,
+                p.discussion_url
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "| [{}]({}.md) | {} | {} | {} | [{}]({}) |",
+                p.syscall,
+                p.syscall,
+                p.nr_x86_64,
+                strategy(&p.code_facts),
+                p.code_facts.dispatch,
+                p.discussion_kind,
+                p.discussion_url
+            );
+        }
     }
     s
 }
@@ -2183,6 +3793,10 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Legacy prefilled-issue URL builder. Retained for the test
+/// fixtures that model shipped v2 pages; new pages use
+/// `github_discussion_new_url`.
+#[cfg(test)]
 fn discussion_url(name: &str) -> String {
     let page =
         format!("https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/{name}.md");
@@ -2191,6 +3805,22 @@ fn discussion_url(name: &str) -> String {
         "Discussion for the `{name}` syscall page: {page}\n\nWhat should change in how Detcore handles `{name}`, or in what the page says?\n"
     ));
     format!("https://github.com/facebookexperimental/hermit/issues/new?title={title}&body={body}")
+}
+
+/// Prefilled GitHub Discussions form for a newly generated page. The
+/// placeholder points back to the canonical page instead of copying
+/// its contents, and records which facts revision it was generated
+/// from. It creates nothing until a human submits the form.
+fn github_discussion_new_url(name: &str, facts_revision: &str) -> String {
+    let page =
+        format!("https://github.com/facebookexperimental/hermit/blob/main/docs/syscalls/{name}.md");
+    let title = url_encode(&format!("Syscall discussion: {name}"));
+    let body = url_encode(&format!(
+        "Discussion for the `{name}` syscall page: {page}\n\nPage facts revision when this link was generated: `{facts_revision}`\n\nWhat would you like to discuss?\n\n- Is the page's description of Detcore's behaviour wrong or missing a case?\n- Did a program hit a gap or refusal described there?\n- Should Hermit's handling of `{name}` change?\n"
+    ));
+    format!(
+        "https://github.com/facebookexperimental/hermit/discussions/new?category={DISCUSSION_CATEGORY}&title={title}&body={body}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2396,9 +4026,15 @@ fn cmd_aggregate(root: &Path, check_only: bool) -> i32 {
     0
 }
 
-fn cmd_check(root: &Path, quick: bool) -> i32 {
+/// `committed` is the hard CI tier: pages, generator, and committed
+/// facts only (lint including prose citation hashes, as_of/Status
+/// agreement, generated-output freshness). It derives nothing from
+/// live Detcore, so an unrelated Detcore change cannot fail it;
+/// comparing committed facts against live Detcore is the soft drift
+/// gate's job (`check --quick` in a target that always exits 0).
+fn cmd_check(root: &Path, quick: bool, committed: bool) -> i32 {
     let mut rc = 0;
-    let loaded = load_pages(root);
+    let loaded = load_pages_committed(root, committed);
     if loaded.is_empty() {
         eprintln!("syscall-pages: no pages under {PAGES_DIR}");
         return 1;
@@ -2408,6 +4044,15 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
         rc = 1;
     }
     let pages = good_pages(&loaded);
+    if committed {
+        for finding in committed_snapshot_findings(&pages, root) {
+            eprintln!("check: {finding}");
+            rc = 1;
+        }
+    } else if let Some(finding) = exact_snapshot_finding(&pages, root) {
+        eprintln!("check: {finding}");
+        rc = 1;
+    }
     {
         let sorted = sorted_pages(&pages);
         let sha = aggregate_sha(&sorted);
@@ -2477,7 +4122,7 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
             }
         }
     }
-    if quick {
+    if quick || committed {
         // One generation revision across the page set, echoed by every
         // Status log: ties `as_of` to the recorded generation instead of
         // leaving it a free per-page claim.
@@ -2503,6 +4148,9 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
         // Detcore sources, with no build and no VCS access. Exact syscall
         // numbers and refused/subscription facts are proven by the full
         // facts export (see SCHEMA.md); quick mode cannot see those.
+        // Committed mode skips this derivation entirely: comparing the
+        // committed facts against live Detcore is the soft gate's job.
+        if !committed {
         match census_at(root) {
             Err(e) => {
                 eprintln!("check: census parser-failed: {e}");
@@ -2649,7 +4297,15 @@ fn cmd_check(root: &Path, quick: bool) -> i32 {
                 }
             }
         }
-        println!("check --quick: {} pages (facts build skipped)", pages.len());
+        }
+        if committed {
+            println!(
+                "check --committed: {} pages (detcore derivation skipped)",
+                pages.len()
+            );
+        } else {
+            println!("check --quick: {} pages (facts build skipped)", pages.len());
+        }
         return rc;
     }
     match facts_context(root, &pages) {
@@ -2723,7 +4379,9 @@ fn existing_page_bits(
             url = Some(v.trim().to_string());
         }
     }
-    let status = if text.contains(&format!("schema: {SCHEMA}")) {
+    let status = if text.contains(&format!("schema: {SCHEMA}"))
+        || text.contains(&format!("schema: {SCHEMA_V3}"))
+    {
         split_sections(split_front_matter(&text).map(|x| x.1).unwrap_or(""))
             .get("Status")
             .cloned()
@@ -2742,10 +4400,24 @@ fn existing_page_bits(
     )
 }
 
-/// (Re)generate every facts-only page from this tree's Detcore sources.
-/// Numbers come from `--facts` (an exporter TSV), then `--nr-map`
-/// (`name<TAB>nr` lines), then an existing page; a census name with none
-/// fails closed rather than guessing a number.
+/// Checked prose a regeneration must preserve: (schema, prose stamps,
+/// Determinism strategy section) parsed from the existing page, when it
+/// has them. Best-effort by design, like `existing_page_bits`.
+fn existing_prose(root: &Path, name: &str) -> Option<(String, Prose, String, String)> {
+    let text = fs::read_to_string(root.join(PAGES_DIR).join(format!("{name}.md"))).ok()?;
+    let mut rep = Report::new();
+    let page = parse_page(&text, &mut rep)?;
+    let prose = page.prose?;
+    let section = page.sections.get(PROSE_SECTION)?.clone();
+    let in_short = page.sections.get("In short").cloned().unwrap_or_default();
+    Some((page.schema, prose, section, in_short))
+}
+
+/// (Re)generate every page's code facts from this tree's Detcore
+/// sources, preserving checked prose. Numbers come from `--facts`
+/// (an exporter TSV), then `--nr-map` (`name<TAB>nr` lines), then an
+/// existing page; a census name with none fails closed rather than
+/// guessing a number.
 fn cmd_generate(root: &Path, args: &[String]) -> i32 {
     let census = match census_at(root) {
         Ok(c) => c,
@@ -2854,9 +4526,14 @@ fn cmd_generate(root: &Path, args: &[String]) -> i32 {
             // it appears in no per-syscall mapping input.
             related.push("https://github.com/rrnewton/hermit/issues/26".into());
         }
-        let (discussion_kind, discussion_url) =
-            existing_discussion.unwrap_or_else(|| ("new".into(), discussion_url(name)));
+        let (discussion_kind, discussion_url) = existing_discussion.unwrap_or_else(|| {
+            (
+                "discussion/new".into(),
+                github_discussion_new_url(name, &sha),
+            )
+        });
         let mut page = Page {
+            schema: SCHEMA.to_string(),
             syscall: name.clone(),
             nr_x86_64: nr,
             related,
@@ -2871,19 +4548,34 @@ fn cmd_generate(root: &Path, args: &[String]) -> i32 {
                 subscribed_run: row.subscribed_run,
                 subscribed_record_replay: row.subscribed_record_replay,
             },
+            prose: None,
             sections: BTreeMap::new(),
         };
+        if let Some((schema, prose, section, in_short)) = existing_prose(root, name) {
+            page.schema = schema;
+            page.prose = Some(prose);
+            page.sections.insert(PROSE_SECTION.into(), section);
+            if !in_short.trim().is_empty() {
+                page.sections.insert("In short".into(), in_short);
+            }
+        }
         let class_line = census.classes.get(name).map(|(_, l)| *l).unwrap_or(0);
         page.sections.insert(
             "Strategy".into(),
             strategy_body(&page, class_line, dispatch.lines.get(name).copied()),
         );
-        page.sections.insert(
-            "Discussion".into(),
-            format!(
+        let discussion_text = match discussion_kind.as_str() {
+            "discussion/new" => format!(
+                "\n[Start a discussion about `{name}`]({discussion_url}) (opens a prefilled GitHub Discussion form; nothing is posted until you submit it).\n"
+            ),
+            "discussion/existing" | "existing" => {
+                format!("\n[Discuss `{name}` on GitHub]({discussion_url}).\n")
+            }
+            _ => format!(
                 "\n[Start a discussion about `{name}`]({discussion_url}) (opens a prefilled issue form; nothing is filed until you submit it).\n"
             ),
-        );
+        };
+        page.sections.insert("Discussion".into(), discussion_text);
         let status = existing_status.unwrap_or_else(|| {
             format!(
                 "\n- {date} · rev {} · facts-only page generated from Detcore code facts at this revision.\n",
@@ -2904,7 +4596,7 @@ fn cmd_generate(root: &Path, args: &[String]) -> i32 {
         return 1;
     }
     println!(
-        "generate: {written} facts-only pages at {sha} (census {}..={})",
+        "generate: {written} pages at {sha} (census {}..={})",
         census.expected_count, census.last_id
     );
     0
@@ -2953,6 +4645,19 @@ fn inline_md(escaped: &str) -> String {
                 }
                 None => {
                     out.push_str("**");
+                    rest = stripped;
+                }
+            }
+        } else if let Some(stripped) = rest.strip_prefix("[^") {
+            // Footnote reference: render as a plain superscript marker.
+            // The definition (with its links) renders as body text below.
+            match stripped.find(']') {
+                Some(end) => {
+                    out.push_str(&format!("<sup>[{}]</sup>", &stripped[..end]));
+                    rest = &stripped[end + 1..];
+                }
+                None => {
+                    out.push_str("[^");
                     rest = stripped;
                 }
             }
@@ -3118,7 +4823,20 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
     for (k, v) in &counts {
         let _ = write!(s, "{}: {} &middot; ", html_escape(k), v);
     }
-    let _ = writeln!(s, "total: {}</p>", pages.len());
+    // Staging rule: prose chrome appears only once some page has
+    // checked prose, keeping a prose-free render byte-stable.
+    let prose_checked = pages.iter().filter(|p| p.prose.is_some()).count();
+    if prose_checked > 0 {
+        let _ = writeln!(
+            s,
+            "total: {} &middot; checked prose: {} &middot; facts only: {}</p>",
+            pages.len(),
+            prose_checked,
+            pages.len() - prose_checked
+        );
+    } else {
+        let _ = writeln!(s, "total: {}</p>", pages.len());
+    }
     let _ = writeln!(
         s,
         "<label>Search <input id=\"q\" type=\"search\" placeholder=\"syscall, strategy, dispatch...\"></label>"
@@ -3131,23 +4849,46 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
         let _ = writeln!(s, "<option>{}</option>", html_escape(k));
     }
     let _ = writeln!(s, "</select></label>");
-    let _ = writeln!(
-        s,
-        "<table><thead><tr><th>syscall</th><th>nr</th><th>strategy</th><th>dispatch</th><th>discussion</th></tr></thead><tbody id=\"rows\">"
-    );
-    for p in &pages {
+    if prose_checked > 0 {
         let _ = writeln!(
             s,
-            "<tr data-strategy=\"{}\"><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">{}</a></td></tr>",
-            html_escape(strategy(&p.code_facts)),
-            html_escape(&p.syscall),
-            html_escape(&p.syscall),
-            p.nr_x86_64,
-            html_escape(strategy(&p.code_facts)),
-            html_escape(&p.code_facts.dispatch),
-            html_escape(&p.discussion_url),
-            html_escape(&p.discussion_kind),
+            "<table><thead><tr><th>syscall</th><th>nr</th><th>strategy</th><th>dispatch</th><th>prose</th><th>discussion</th></tr></thead><tbody id=\"rows\">"
         );
+    } else {
+        let _ = writeln!(
+            s,
+            "<table><thead><tr><th>syscall</th><th>nr</th><th>strategy</th><th>dispatch</th><th>discussion</th></tr></thead><tbody id=\"rows\">"
+        );
+    }
+    for p in &pages {
+        if prose_checked > 0 {
+            let _ = writeln!(
+                s,
+                "<tr data-strategy=\"{}\"><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">{}</a></td></tr>",
+                html_escape(strategy(&p.code_facts)),
+                html_escape(&p.syscall),
+                html_escape(&p.syscall),
+                p.nr_x86_64,
+                html_escape(strategy(&p.code_facts)),
+                html_escape(&p.code_facts.dispatch),
+                if p.prose.is_some() { "checked" } else { "facts only" },
+                html_escape(&p.discussion_url),
+                html_escape(&p.discussion_kind),
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "<tr data-strategy=\"{}\"><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">{}</a></td></tr>",
+                html_escape(strategy(&p.code_facts)),
+                html_escape(&p.syscall),
+                html_escape(&p.syscall),
+                p.nr_x86_64,
+                html_escape(strategy(&p.code_facts)),
+                html_escape(&p.code_facts.dispatch),
+                html_escape(&p.discussion_url),
+                html_escape(&p.discussion_kind),
+            );
+        }
     }
     let _ = writeln!(s, "</tbody></table>");
     let _ = writeln!(
@@ -3191,11 +4932,22 @@ fn site_page_html(page: &Page) -> String {
         html_escape(&page.discussion_url),
         html_escape(&page.discussion_kind),
     );
-    for h in SECTIONS {
-        let _ = writeln!(s, "<h2>{}</h2>", html_escape(h));
-        if let Some(body) = page.sections.get(h) {
-            s.push_str(&md_to_html(body));
+    let short = |rev: &str| html_escape(&rev[..12.min(rev.len())]);
+    match &page.prose {
+        Some(p) => {
+            let _ = writeln!(
+                s,
+                "<p>Facts as of <code>{}</code> &middot; prose checked {} at <code>{}</code></p>",
+                short(&page.code_facts.as_of),
+                html_escape(&p.reviewed_at),
+                short(&p.based_on),
+            );
         }
+        None => {}
+    }
+    for (h, body) in display_sections(page) {
+        let _ = writeln!(s, "<h2>{}</h2>", html_escape(h));
+        s.push_str(&md_to_html(&body));
     }
     let _ = writeln!(s, "</body></html>");
     s
@@ -3274,9 +5026,297 @@ fn cmd_render(root: &Path, check_only: bool) -> i32 {
     0
 }
 
+/// Reviewer-facing prose status: stamps, the full claim inventory,
+/// negative claims verbatim, passthrough triage, and stamp lag.
+/// Never gates; batch descriptions quote it (see SCHEMA.md, Done).
+/// Write `docs/syscalls/citations.json` from live Detcore: every
+/// prose citation verified at its recorded lines, every Tests entry
+/// recorded. Run after a facts refresh; this is the only writer.
+fn cmd_anchor(root: &Path) -> i32 {
+    let loaded = load_pages(root);
+    if loaded.is_empty() {
+        eprintln!("syscall-pages: no pages under {PAGES_DIR}");
+        return 1;
+    }
+    if print_reports(&loaded) > 0 {
+        eprintln!("anchor: refusing to snapshot while lint has errors");
+        return 1;
+    }
+    let pages = good_pages(&loaded);
+    match snapshot_document(&pages, root) {
+        Ok(doc) => {
+            if fs::write(root.join(CITATIONS_FILE), doc).is_err() {
+                eprintln!("anchor: cannot write {CITATIONS_FILE}");
+                return 1;
+            }
+            let n = pages.iter().filter(|p| p.prose.is_some()).count();
+            println!("anchor: {n} prose pages -> {CITATIONS_FILE}");
+            0
+        }
+        Err(e) => {
+            eprintln!("anchor: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_report(root: &Path) -> i32 {
+    let loaded = load_pages(root);
+    if loaded.is_empty() {
+        eprintln!("syscall-pages: no pages under {PAGES_DIR}");
+        return 1;
+    }
+    let _ = print_reports(&loaded);
+    let pages = sorted_pages(&good_pages(&loaded));
+    let checked: Vec<&Page> = pages.iter().filter(|p| p.prose.is_some()).collect();
+    println!("# Syscall prose report\n");
+    println!(
+        "checked prose: {} · facts only: {} · total: {}\n",
+        checked.len(),
+        pages.len() - checked.len(),
+        pages.len()
+    );
+    let lagging: Vec<&Page> = checked
+        .iter()
+        .filter(|p| {
+            p.prose.as_ref().expect("checked page").based_on != p.code_facts.as_of
+        })
+        .copied()
+        .collect();
+    if !lagging.is_empty() {
+        println!("## Prose stamp lag (based_on != code_facts.as_of)\n");
+        for p in &lagging {
+            let prose = p.prose.as_ref().expect("checked page");
+            println!(
+                "- {}: prose {} @{} · facts @{}",
+                p.syscall,
+                prose.reviewed_at,
+                &prose.based_on[..12.min(prose.based_on.len())],
+                &p.code_facts.as_of[..12.min(p.code_facts.as_of.len())]
+            );
+        }
+        println!();
+    }
+    for p in &checked {
+        let prose = p.prose.as_ref().expect("checked page");
+        let section = p.sections.get(PROSE_SECTION).cloned().unwrap_or_default();
+        let (_, body) = split_footnotes(&section);
+        let refs = footnote_refs(&body).len();
+        let negatives = negative_claims(&body);
+        println!(
+            "## {} ({}, {})",
+            p.syscall,
+            p.nr_x86_64,
+            strategy(&p.code_facts)
+        );
+        println!(
+            "- prose checked {} at {}{} · citation references: {} · negative claims: {}",
+            prose.reviewed_at,
+            &prose.based_on[..12.min(prose.based_on.len())],
+            prose
+                .passthrough_risk
+                .as_ref()
+                .map(|r| format!(" · passthrough_risk: {r}"))
+                .unwrap_or_default(),
+            refs,
+            negatives.len()
+        );
+        for claim in &negatives {
+            println!("  - negative: {claim}");
+        }
+        println!("  - claims (every one is checked against code in review):");
+        for (i, claim) in prose_claims(&body).into_iter().enumerate() {
+            println!("    {}. {claim}", i + 1);
+        }
+        println!();
+    }
+    let _ = root;
+    0
+}
+
+/// Word-boundary containment for syscall names (letters, digits, `_`).
+fn contains_word(line: &str, word: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = line[from..].find(word) {
+        let start = from + pos;
+        let end = start + word.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+        let after_ok = end == line.len() || !is_word(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Update-wave worklist over two revisions of a git checkout that is
+/// currently at `--to`. F (facts changed) reuses the exporter diff;
+/// T (handler touched) over-approximates by watched files, cited
+/// paths, and name mentions in the Detcore diff; S (citation-stale)
+/// is exact: a prose citation hash that no longer recomputes here.
+/// Reports only; apply with `facts --apply` / `generate`.
+fn cmd_wave(root: &Path, args: &[String]) -> i32 {
+    let (Some(from), Some(to)) = (arg_value(args, "--from"), arg_value(args, "--to")) else {
+        fail("wave: need --from <rev> --to <rev>");
+    };
+    let to_spec = format!("{to}^{{commit}}");
+    let resolved_to = match run_cmd(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", to_spec.as_str()]),
+    ) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => fail(&format!("wave: {e}")),
+    };
+    let head = git_head(root);
+    if head != resolved_to {
+        fail(&format!(
+            "wave: this checkout is at {head}, not at --to ({resolved_to}); citation hashes are verified against the working tree"
+        ));
+    }
+    let loaded = load_pages(root);
+    let _ = print_reports(&loaded);
+    let pages = sorted_pages(&good_pages(&loaded));
+    let changed_files: Vec<String> = match run_cmd(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--name-only", from.as_str(), to.as_str()]),
+    ) {
+        Ok(s) => s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        Err(e) => fail(&format!("wave: {e}")),
+    };
+    let changed: BTreeSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+    let mut cited_paths_all: BTreeSet<String> = BTreeSet::new();
+    cited_paths_all.insert("detcore/src/syscall_classification.rs".into());
+    cited_paths_all.insert("detcore/src/lib.rs".into());
+    for p in &pages {
+        for (_, cite) in page_cites(p) {
+            cited_paths_all.insert(cite.path);
+        }
+    }
+    let watched = |f: &str| {
+        cited_paths_all.contains(f) || f.starts_with("detcore/src/syscalls/")
+    };
+    let outside: Vec<&str> = changed_files
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|f| f.starts_with("detcore/src/") && !watched(f))
+        .collect();
+    // Name mentions in the Detcore diff (over-approximate on purpose).
+    // A failed diff is fatal, exactly like the name-only call above:
+    // degrading to an empty diff would silently drop candidates.
+    let diff_text = match run_cmd(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "diff",
+                "--unified=0",
+                from.as_str(),
+                to.as_str(),
+                "--",
+                "detcore/src",
+            ]),
+    ) {
+        Ok(s) => s,
+        Err(e) => fail(&format!("wave: {e}")),
+    };
+    let diff_lines: Vec<&str> = diff_text
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+        })
+        .collect();
+    let mentioned: BTreeSet<String> = pages
+        .iter()
+        .filter(|p| diff_lines.iter().any(|l| contains_word(l, &p.syscall)))
+        .map(|p| p.syscall.clone())
+        .collect();
+    println!("# Wave {from}..{to}\n");
+    let mut rc = 0;
+    println!("## F — facts changed\n");
+    match facts_context(root, &pages) {
+        Ok((sha, rows, dispatch)) => {
+            let diffs = facts_diff(&pages, &sha, &rows, &dispatch.dispatch);
+            if diffs.is_empty() {
+                println!("(none)");
+            }
+            for d in &diffs {
+                println!("- {d}");
+            }
+        }
+        Err(e) => {
+            println!("facts unavailable in this tree: {e}");
+            rc = 1;
+        }
+    }
+    println!("\n## S — citation-stale prose (re-read these claims)\n");
+    let mut stale: BTreeSet<String> = BTreeSet::new();
+    let mut stale_rows = Vec::new();
+    for p in pages.iter().filter(|p| p.prose.is_some()) {
+        for (id, cite) in page_cites(p) {
+            if let Err(e) = verify_cite(root, &cite) {
+                stale.insert(p.syscall.clone());
+                stale_rows.push(format!("- {} [^{id}]: {e}", p.syscall));
+            }
+        }
+    }
+    if stale_rows.is_empty() {
+        println!("(none)");
+    }
+    for row in &stale_rows {
+        println!("{row}");
+    }
+    println!("\n## T — handler touched\n");
+    let mut any_t = false;
+    for p in &pages {
+        let mut reasons = Vec::new();
+        for (_, cite) in page_cites(p) {
+            if changed.contains(cite.path.as_str()) {
+                reasons.push(format!("cited file changed: {}", cite.path));
+            }
+        }
+        if mentioned.contains(&p.syscall) {
+            reasons.push("named in the detcore/src diff".to_string());
+        }
+        if changed.contains("detcore/src/syscall_classification.rs") {
+            reasons.push("classification file changed".to_string());
+        }
+        reasons.sort();
+        reasons.dedup();
+        if reasons.is_empty() || stale.contains(&p.syscall) {
+            continue;
+        }
+        any_t = true;
+        let tag = if p.prose.is_some() {
+            "confirm-unchanged candidate (citations still match)"
+        } else {
+            "facts only"
+        };
+        println!("- {} ({tag}): {}", p.syscall, reasons.join("; "));
+    }
+    if !any_t {
+        println!("(none)");
+    }
+    if !outside.is_empty() {
+        println!("\n## Changed under detcore/src but outside the watched surface\n");
+        for f in &outside {
+            println!("- {f}");
+        }
+    }
+    rc
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: syscall-pages.rs <lint|facts [--apply] [--date YYYY-MM-DD]|generate [--facts TSV|--as-of SHA] [--nr-map TSV] [--mapping JSON] [--date YYYY-MM-DD]|aggregate [--check]|check [--quick]|render [--check]>"
+        "usage: syscall-pages.rs <lint|facts [--apply] [--date YYYY-MM-DD]|generate [--facts TSV|--as-of SHA] [--nr-map TSV] [--mapping JSON] [--date YYYY-MM-DD]|aggregate [--check]|check [--quick|--committed]|render [--check]|anchor|report|wave --from REV --to REV>"
     );
     exit(2)
 }
@@ -3287,6 +5327,7 @@ mod tests {
 
     fn sample_page_for(name: &str, nr: i32) -> Page {
         let mut page = Page {
+            schema: SCHEMA.into(),
             syscall: name.into(),
             nr_x86_64: nr,
             related: vec![],
@@ -3301,6 +5342,7 @@ mod tests {
                 subscribed_run: true,
                 subscribed_record_replay: true,
             },
+            prose: None,
             sections: BTreeMap::new(),
         };
         page.sections
@@ -3549,6 +5591,786 @@ mod tests {
     }
 
     #[test]
+    fn sha256_known_vectors() {
+        assert_eq!(sha256_hex16(b""), "e3b0c44298fc1c14");
+        assert_eq!(sha256_hex16(b"abc"), "ba7816bf8f01cfea");
+        assert_eq!(
+            sha256_hex16(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8"
+        );
+        assert_eq!(sha256_hex16(&vec![b'a'; 1_000_000]), "cdc76e5c9914fb92");
+    }
+
+    /// A temp tree holding one fake cited file, plus a v3 page whose
+    /// prose cites it with the correct anchor hash.
+    fn prose_fixture(tag: &str) -> (PathBuf, Page) {
+        let root = std::env::temp_dir()
+            .join(format!("syscall-pages-test-{}-{tag}", std::process::id()));
+        let dir = root.join("detcore/src/syscalls");
+        fs::create_dir_all(&dir).expect("temp tree");
+        let code = "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() { let _ = handle_read(); }\n#[test]\nfn unrelated_probe_test() { let _ = Some(Err(Errno::EINVAL)); }\n";
+        fs::write(dir.join("fake.rs"), code).expect("fake source");
+        let hash = sha256_hex16(&lines_bytes(code.as_bytes(), 1, 3).expect("lines"));
+        let mut page = sample_page_for("read", 0);
+        page.schema = SCHEMA_V3.into();
+        page.prose = Some(Prose {
+            status: "checked".into(),
+            reviewed_at: "2026-11-16".into(),
+            based_on: "0123456789abcdef0123456789abcdef01234567".into(),
+            passthrough_risk: None,
+        });
+        let strat = page
+            .sections
+            .get("Strategy")
+            .cloned()
+            .unwrap_or_default()
+            .replace(
+                "\nThis facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.\n",
+                "\n",
+            );
+        page.sections.insert("Strategy".into(), strat);
+        page.sections.insert(
+            "In short".into(),
+            "\nNative reads return host file contents. Detcore determinizes the call from its file model. Known gaps: 1.\n".into(),
+        );
+        page.sections.insert(
+            PROSE_SECTION.into(),
+            format!(
+                "\n**What is nondeterministic natively.** The bytes a native call returns depend on host file contents.[^linux]\n\n**What Hermit does.** Detcore determinizes the call and answers from its file model.[^c1]\n\n**Interface fidelity.** A bad flag combination is rejected with `EINVAL`.[^c1] There is no `EINTR` path.[^c1]\n\n**Record & replay.** The call is subscribed in both modes and replay regenerates the result from model state.[^c1]\n\n**Known gaps.**\n- G1 (by design): host file contents are an input, not made deterministic.[^c1]\n\n**Tests.** `detcore/src/syscalls/fake.rs` (`read_einval_test`) — part on interface fidelity.\n\n[^linux]: Linux `read(2)`: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/read_write.c?h=v7.1.3\n[^c1]: detcore/src/syscalls/fake.rs:1-3 sha256:{hash}\n  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/fake.rs#L1-L3\n"
+            ),
+        );
+        let docs = root.join("docs/syscalls");
+        fs::create_dir_all(&docs).expect("fixture docs dir");
+        let doc = snapshot_document(std::slice::from_ref(&page), &root).expect("fixture snapshot");
+        fs::write(docs.join("citations.json"), doc).expect("write fixture snapshot");
+        (root, page)
+    }
+
+    #[test]
+    fn v3_prose_page_lints_clean_and_round_trips() {
+        let (root, page) = prose_fixture("clean");
+        let text = emit_page(&page);
+        assert!(text.contains("prose:\n  status: checked"), "{text}");
+        assert!(text.contains("## In short\n"), "{text}");
+        assert!(text.contains("## Known gaps\n"), "{text}");
+        assert!(text.contains("## Appendix\n"), "{text}");
+        assert!(text.contains("### Code facts\n"), "{text}");
+        let (rep, parsed) = lint_page("read", &text, &root);
+        assert!(rep.errors.is_empty(), "errors: {:?}", rep.errors);
+        assert!(parsed.expect("parses").prose.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_citation_hash_fails_p38() {
+        let (root, page) = prose_fixture("stale");
+        let text = emit_page(&page);
+        fs::write(
+            root.join("detcore/src/syscalls/fake.rs"),
+            "pub fn handle_read() -> Result<(), Errno> {\n    Ok(())\n}\n",
+        )
+        .expect("mutate cited file");
+        let (rep, _) = lint_page("read", &text, &root);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P38")),
+            "moved code must fail the anchor: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prose_red_twins_each_rule_bites() {
+        let (root, page) = prose_fixture("twins");
+        let text = emit_page(&page);
+        // P39: a fossilizing hand-typed count.
+        let bad = text.replace(
+            "answers from its file model.",
+            "answers from its file model across 268 cases.",
+        );
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P39")), "{:?}", rep.errors);
+        // P41: an absence phrase early in the sentence does not
+        // shelter a positive claim later in the same sentence.
+        let bad = text.replace(
+            "There is no `EINTR` path.[^c1]",
+            "There is no `EINTR` retry; it returns `EINTR` on a signal.[^c1]",
+        );
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P41")), "{:?}", rep.errors);
+        // P41: a positively-claimed errno absent from the cited code.
+        let bad = text.replace("rejected with `EINVAL`", "rejected with `EACCES`");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P41")), "{:?}", rep.errors);
+        // P37: a rubric part renamed away.
+        let bad = text.replace("**Interface fidelity.**", "**Fidelity.**");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P37")), "{:?}", rep.errors);
+        // P36: prose under the v2 schema line.
+        let bad = text.replace("schema: syscall-pages/v3", "schema: syscall-pages/v2");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P36")), "{:?}", rep.errors);
+        // P40: part 2 no longer names the derived strategy.
+        let bad = text.replace("Detcore determinizes the call", "Detcore handles the call");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P40")), "{:?}", rep.errors);
+        // P43: a named test that does not exist in the cited file.
+        let bad = text.replace("`read_einval_test`", "`read_missing_test`");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(rep.errors.iter().any(|e| e.starts_with("P43")), "{:?}", rep.errors);
+        // P46: the GitHub link is a copy of the citation range; a
+        // stale anchor fails in exact mode and in committed (hard)
+        // mode, where no Detcore file is read. The citation triple
+        // itself is unchanged, so P38 alone cannot catch this.
+        let bad = text.replace(
+            "detcore/src/syscalls/fake.rs#L1-L3",
+            "detcore/src/syscalls/fake.rs#L2-L3",
+        );
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P46")),
+            "stale GitHub anchor must fail P46: {:?}",
+            rep.errors
+        );
+        let (rep, _) = lint_page_committed("read", &bad, &root, true);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P46")),
+            "stale GitHub anchor must fail P46 in committed mode: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discussion_links_accept_github_discussions_and_legacy_issues() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let url = github_discussion_new_url("futex", revision);
+        assert!(
+            url.starts_with(
+                "https://github.com/facebookexperimental/hermit/discussions/new?category=syscalls&title="
+            ),
+            "{url}"
+        );
+        assert!(url.contains("Syscall+discussion%3A+futex"), "{url}");
+        assert!(url.contains(revision), "{url}");
+
+        let mut page = sample_page_for("read", 0);
+        page.discussion_kind = "discussion/new".into();
+        page.discussion_url = github_discussion_new_url("read", revision);
+        page.sections.insert(
+            "Discussion".into(),
+            format!("\n[Start a discussion]({}) (prefilled form).\n", page.discussion_url),
+        );
+        let (rep, _) = lint_page("read", &emit_page(&page), Path::new("."));
+        assert!(
+            !rep.errors.iter().any(|e| e.starts_with("P34")),
+            "discussion/new must lint: {:?}",
+            rep.errors
+        );
+
+        page.discussion_kind = "discussion/existing".into();
+        page.discussion_url =
+            "https://github.com/facebookexperimental/hermit/discussions/123".into();
+        page.sections.insert(
+            "Discussion".into(),
+            format!("\n[Discuss]({}).\n", page.discussion_url),
+        );
+        let (rep, _) = lint_page("read", &emit_page(&page), Path::new("."));
+        assert!(
+            !rep.errors.iter().any(|e| e.starts_with("P34")),
+            "discussion/existing must lint: {:?}",
+            rep.errors
+        );
+    }
+
+    #[test]
+    fn prose_free_generation_keeps_v2_output_shape() {
+        // The staging guard: with no checked prose anywhere, the v3
+        // tool must emit the v2 generated shape so it lands green
+        // alone. If this fails, the tool diff stops being landable
+        // without a mass regeneration.
+        let pages = vec![sample_page_for("read", 0), sample_page_for("write", 1)];
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = syscalls_json(&pages, sha);
+        assert!(json.contains("\"syscalls.json/v2\""), "{json}");
+        assert!(!json.contains("prose_status"), "{json}");
+        assert!(!json.contains("prose_counts"), "{json}");
+        let index = index_md(&pages, sha);
+        assert!(index.contains("facts-only page"), "{index}");
+        assert!(!index.contains("| prose |"), "{index}");
+        let out = render_outputs(&pages, sha);
+        let site = &out[&PathBuf::from("index.html")];
+        assert!(!site.contains("<th>prose</th>"), "{site}");
+        assert!(!site.contains("checked prose:"), "{site}");
+        let page_html = &out[&PathBuf::from("read.html")];
+        assert!(!page_html.contains("Determinism strategy"), "{page_html}");
+        assert!(!page_html.contains("prose checked"), "{page_html}");
+    }
+
+    #[test]
+    fn prose_subrules_each_bite() {
+        let (root, page) = prose_fixture("subs");
+        let text = emit_page(&page);
+        let based_on = "0123456789abcdef0123456789abcdef01234567";
+        let has = |bad: &str, rule: &str, what: &str| {
+            let (rep, _) = lint_page("read", bad, &root);
+            assert!(
+                rep.errors.iter().any(|e| e.starts_with(rule)),
+                "{what} must fail {rule}: {:?}",
+                rep.errors
+            );
+        };
+        // Rule-specific variant: the seat requires these to bite on
+        // their own check, not on any error carrying the same id.
+        let has_msg = |bad: &str, needle: &str, what: &str| {
+            let (rep, _) = lint_page("read", bad, &root);
+            assert!(
+                rep.errors.iter().any(|e| e.contains(needle)),
+                "{what} must fail with {needle:?}: {:?}",
+                rep.errors
+            );
+        };
+        // P42, both phrases.
+        has(
+            &text.replace(
+                "subscribed in both modes and",
+                "subscribed in both modes. It is not subscribed anywhere, and",
+            ),
+            "P42",
+            "not-subscribed claim against true facts",
+        );
+        has(
+            &text.replacen("subscribed_run: true", "subscribed_run: false", 1),
+            "P42",
+            "subscribed-in-both claim against a false fact",
+        );
+        // P36 stamp and triage sub-rules.
+        has(&text.replace("status: checked", "status: draft"), "P36", "status");
+        has(
+            &text.replace(&format!("based_on: {based_on}"), "based_on: xyz"),
+            "P36",
+            "based_on shape",
+        );
+        has(
+            &text.replace(
+                &format!("based_on: {based_on}"),
+                &format!("based_on: {based_on}\n  passthrough_risk: none"),
+            ),
+            "P36",
+            "risk on a determinized page",
+        );
+        // P36 coupling, both directions, and v3 without prose. The
+        // block-without-section direction asserts on message text:
+        // by rule id alone it would also pass via the v3 check below.
+        let no_section = text.replace("## Determinism strategy\n", "## Strategy notes\n");
+        let (rep, _) = lint_page("read", &no_section, &root);
+        assert!(
+            rep.errors
+                .iter()
+                .any(|e| e.contains("must be present together")),
+            "prose block without its section must fail coupling by message: {:?}",
+            rep.errors
+        );
+        has(
+            &text.replace(&format!(
+                "# prose: human/agent-authored, machine-checked (syscall-pages.rs check); v3 only\nprose:\n  status: checked\n  reviewed_at: 2026-11-16\n  based_on: {based_on}\n"
+            ), ""),
+            "P36",
+            "section without its prose block",
+        );
+        has(
+            &sample_page().replace("schema: syscall-pages/v2", "schema: syscall-pages/v3"),
+            "P36",
+            "v3 without prose",
+        );
+        // P37 order and emptiness.
+        let swapped = text
+            .replace("**Interface fidelity.**", "**ZZZ.**")
+            .replace("**Record & replay.**", "**Interface fidelity.**")
+            .replace("**ZZZ.**", "**Record & replay.**");
+        has(&swapped, "P37", "out-of-order parts");
+        has(
+            &text.replace(
+                "A bad flag combination is rejected with `EINVAL`.[^c1] There is no `EINTR` path.[^c1]",
+                "",
+            ),
+            "P37",
+            "empty part",
+        );
+        // P38 reference integrity and range handling.
+        has(&text.replace("file model.[^c1]", "file model.[^c1][^c9]"), "P38", "undefined ref");
+        has(
+            &text.replace(
+                "file model.[^c1]",
+                "file model.[^c1]\n\nAn uncited extra claim stands here.",
+            ),
+            "P38",
+            "uncited paragraph",
+        );
+        let post_tests = text.replace(
+            "— part on interface fidelity.\n",
+            "— part on interface fidelity.\n\nA further uncited claim hides after the tests.\n",
+        );
+        assert!(
+            post_tests.contains("A further uncited claim"),
+            "twin setup must actually insert the paragraph"
+        );
+        has(&post_tests, "P38", "uncited paragraph after the Tests part");
+        has_msg(
+            &text.replace(
+                "`detcore/src/syscalls/fake.rs` (`read_einval_test`)",
+                "`/etc/passwd.rs` (`read_einval_test`)",
+            ),
+            "escapes this tree",
+            "tests path escapes the tree",
+        );
+        has(
+            &text.replacen("detcore/src/syscalls/fake.rs:1-3", "detcore/src/syscalls/nope.rs:1-3", 1),
+            "P38",
+            "missing cited file",
+        );
+        has(
+            &text.replacen("detcore/src/syscalls/fake.rs:1-3", "detcore/src/syscalls/fake.rs:1-99", 1),
+            "P38",
+            "range past end of file",
+        );
+        // P44: the linux pointer must pin a tag.
+        has(
+            &text.replace("?h=v7.1.3", "?h=master"),
+            "P44",
+            "untagged linux link",
+        );
+        // P40 arms beyond determinized.
+        has(&text.replacen("refused: false", "refused: true", 1), "P40", "refused arm");
+        has(
+            &text.replacen("detcore_class: determinized", "detcore_class: passthrough", 1),
+            "P40",
+            "passthrough arm",
+        );
+        has(
+            &text.replacen("detcore_class: determinized", "detcore_class: unsupported", 1),
+            "P40",
+            "unsupported arm",
+        );
+        // P43: missing file, and a path naming no test.
+        has(
+            &text.replace(
+                "`detcore/src/syscalls/fake.rs` (`read_einval_test`)",
+                "`detcore/src/syscalls/nope.rs` (`read_einval_test`)",
+            ),
+            "P43",
+            "missing tests file",
+        );
+        has(
+            &text.replace(" (`read_einval_test`)", ""),
+            "P43",
+            "path without a named test",
+        );
+        // P05 inside the prose block.
+        has(
+            &text.replace("  status: checked\n", "  status: checked\n  bogus: x\n"),
+            "P05",
+            "unknown prose key",
+        );
+        has(&text.replace("  status: checked\n", ""), "P05", "missing prose status");
+        // P36 stamp shapes not covered above.
+        has(
+            &text.replace("reviewed_at: 2026-11-16", "reviewed_at: 16 Nov 2026"),
+            "P36",
+            "reviewed_at shape",
+        );
+        has_msg(
+            &text.replace(
+                &format!("based_on: {based_on}"),
+                &format!("based_on: {based_on}\n  passthrough_risk: bogus"),
+            ),
+            "is not one of",
+            "illegal passthrough_risk value",
+        );
+        // P38: unreferenced definition, linkless linux note, triple-free note.
+        let code =
+            "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() {}\n";
+        let hash = sha256_hex16(&lines_bytes(code.as_bytes(), 1, 3).expect("lines"));
+        has(
+            &text.replace(
+                "[^c1]: detcore/src/syscalls/fake.rs:1-3",
+                &format!(
+                    "[^c7]: detcore/src/syscalls/fake.rs:1-3 sha256:{hash}\n[^c1]: detcore/src/syscalls/fake.rs:1-3"
+                ),
+            ),
+            "P38",
+            "defined but unreferenced footnote",
+        );
+        has(
+            &text.replace("https://git.kernel.org", "http://example.com"),
+            "P38",
+            "linux footnote without https",
+        );
+        has(
+            &text
+                .replace("file model.[^c1]", "file model.[^c1][^c8]")
+                .replace("[^linux]:", "[^c8]: just some words\n[^linux]:"),
+            "P38",
+            "footnote with no citation triple",
+        );
+        // Citation path containment (absolute, escape, outside detcore/).
+        for bad_path in [
+            "/etc/passwd:1-1",
+            "detcore/../outside.rs:1-1",
+            "scripts/syscall-pages.rs:1-3",
+        ] {
+            has_msg(
+                &text.replacen("detcore/src/syscalls/fake.rs:1-3", bad_path, 1),
+                "must stay under detcore/",
+                "citation path containment",
+            );
+        }
+        // P41 narrowed exemption: a merely negative sentence no longer
+        // shelters an unrelated errno claim.
+        has(
+            &text.replace(
+                "rejected with `EINVAL`.[^c1]",
+                "not served from the stream and rejected with `EACCES`.[^c1]",
+            ),
+            "P41",
+            "negative phrasing does not shelter another errno",
+        );
+        // P34 wrong shapes for the discussion kinds.
+        let mut p = sample_page_for("read", 0);
+        p.discussion_kind = "discussion/new".into();
+        let (rep, _) = lint_page("read", &emit_page(&p), Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P34")),
+            "discussion/new with an issue URL must fail: {:?}",
+            rep.errors
+        );
+        p.discussion_kind = "discussion/new".into();
+        p.discussion_url =
+            "https://github.com/facebookexperimental/hermit/discussions/new?title=x".into();
+        p.sections.insert(
+            "Discussion".into(),
+            format!("\n[Start a discussion]({}).\n", p.discussion_url),
+        );
+        let (rep, _) = lint_page("read", &emit_page(&p), Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P34")),
+            "discussion/new without the category must fail: {:?}",
+            rep.errors
+        );
+        p.discussion_kind = "discussion/existing".into();
+        p.discussion_url = "https://example.com/discussions/1".into();
+        p.sections.insert(
+            "Discussion".into(),
+            format!("\n[Discuss]({}).\n", p.discussion_url),
+        );
+        let (rep, _) = lint_page("read", &emit_page(&p), Path::new("."));
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P34")),
+            "discussion/existing on the wrong host must fail: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p43_common_call_shapes_do_not_earn_relevance() {
+        // The timer_create-as-gettimeofday shape: the test shares
+        // only prelude call shapes (`Some(`, `Err(`, `Errno::`) with
+        // the cited code. Those earn no credit.
+        let (root, page) = prose_fixture("commonshapes");
+        let text = emit_page(&page);
+        let bad = text.replace("`read_einval_test`", "`unrelated_probe_test`");
+        let (rep, _) = lint_page("read", &bad, &root);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P43")),
+            "a test sharing only prelude call shapes must fail P43: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p45_in_short_shape_and_count() {
+        let (root, page) = prose_fixture("inshort");
+        let text = emit_page(&page);
+        let has45 = |bad: &str, what: &str| {
+            let (rep, _) = lint_page("read", bad, &root);
+            assert!(
+                rep.errors.iter().any(|e| e.starts_with("P45")),
+                "{what} must fail P45: {:?}",
+                rep.errors
+            );
+        };
+        has45(
+            &text.replace("Known gaps: 1.", "Known gaps: 2."),
+            "stated gap count disagrees with the bullets",
+        );
+        has45(
+            &text.replace("Native reads return host file contents.", "Native reads return host file contents.[^c1]"),
+            "citation inside In short",
+        );
+        has45(
+            &text.replace("Detcore determinizes the call from its file model. ", ""),
+            "two-sentence summary",
+        );
+        has45(
+            &text.replace(
+                "Known gaps: 1.",
+                "Extra words here. More words here. Known gaps: 1.",
+            ),
+            "five-sentence summary",
+        );
+        // Mutate a phrase unique to In short: "host file contents."
+        // also occurs in prose part 1, where P39 would fire anyway
+        // and the twin could not tell the two scans apart.
+        assert_eq!(
+            text.matches("Native reads return host file contents.").count(),
+            1,
+            "twin mutation target must be unique to In short"
+        );
+        let (rep, _) = lint_page(
+            "read",
+            &text.replace(
+                "Native reads return host file contents.",
+                "Native reads return 268 host file contents.",
+            ),
+            &root,
+        );
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P39")),
+            "hand-typed digit in In short must fail: {:?}",
+            rep.errors
+        );
+        // Appendix strictness: nothing may sit outside the three
+        // known subsections, and none may repeat.
+        for (bad, what) in [
+            (
+                text.replace("## Appendix\n", "## Appendix\n\nStray unlinted text.\n"),
+                "Appendix preamble text",
+            ),
+            (
+                text.replace("### Tests\n", "### Notes\n\nStray unlinted text.\n\n### Tests\n"),
+                "unknown Appendix subsection",
+            ),
+            (
+                text.replace("### Citations\n", "### Tests\n\nDuplicate body.\n\n### Citations\n"),
+                "duplicate Appendix subsection",
+            ),
+        ] {
+            let (rep, _) = lint_page("read", &bad, &root);
+            assert!(
+                rep.errors.iter().any(|e| e.starts_with("P02")),
+                "{what} must fail P02: {:?}",
+                rep.errors
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn committed_mode_ignores_detcore_only_edits_but_not_snapshot_drift() {
+        // The two-tier ruling's proofs, on the fixture tree:
+        // (i) Detcore-only edits (a 30-line move, a content edit
+        // inside the cited range, a cited-test rename) leave the
+        // hard committed check green while exact mode reports drift;
+        // (ii) a page hash that disagrees with the committed
+        // snapshot fails the hard check.
+        let (root, page) = prose_fixture("committedproof");
+        let text = emit_page(&page);
+        let (rep, _) = lint_page_committed("read", &text, &root, true);
+        assert!(rep.errors.is_empty(), "clean committed: {:?}", rep.errors);
+        let fake = root.join("detcore/src/syscalls/fake.rs");
+        let code = fs::read_to_string(&fake).expect("fixture file");
+        let moved = format!(
+            "{}{}",
+            "// shift\n".repeat(30),
+            code.replace("read_einval_test", "read_einval_test_v2")
+                .replace("Err(Errno::EINVAL.into())", "Ok(())")
+        );
+        fs::write(&fake, moved).expect("mutate detcore only");
+        let (rep, _) = lint_page_committed("read", &text, &root, true);
+        assert!(
+            rep.errors.is_empty(),
+            "detcore-only edits must not fail committed mode: {:?}",
+            rep.errors
+        );
+        let (rep, _) = lint_page("read", &text, &root);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P38") || e.starts_with("P43")),
+            "exact mode must report the same edits as drift: {:?}",
+            rep.errors
+        );
+        // Stale snapshot agreement fails committed mode: corrupt the
+        // page's hash so page and snapshot disagree.
+        let fake_orig = "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() { let _ = handle_read(); }\n#[test]\nfn unrelated_probe_test() { let _ = Some(Err(Errno::EINVAL)); }\n";
+        fs::write(&fake, fake_orig).expect("restore fixture file");
+        let hash = sha256_hex16(&lines_bytes(fake_orig.as_bytes(), 1, 3).expect("lines"));
+        let bad = text.replace(&hash, "0000000000000000");
+        let (rep, _) = lint_page_committed("read", &bad, &root, true);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P38")),
+            "snapshot disagreement must fail committed mode: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_honesty_catches_hand_edits_and_bad_shape() {
+        // C1: exact modes rebuild the snapshot and compare bytes, so
+        // a hand-added errno (which the hard tier would trust for
+        // P41) and a malformed snapshot both fail. C2: the hard
+        // tier refuses entries for missing or prose-less pages and
+        // a based_on that differs from the page's own stamp.
+        let (root, page) = prose_fixture("snaphonesty");
+        let pages = std::slice::from_ref(&page);
+        let snap_path = root.join(CITATIONS_FILE);
+        let clean = fs::read_to_string(&snap_path).expect("fixture snapshot");
+        assert_eq!(exact_snapshot_finding(pages, &root), None);
+        assert!(committed_snapshot_findings(pages, &root).is_empty());
+
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&clean).expect("parse fixture snapshot");
+        doc["pages"]["read"]["cited_errnos"]
+            .as_array_mut()
+            .expect("cited_errnos array")
+            .push(serde_json::json!("EACCES"));
+        let tampered = serde_json::to_string_pretty(&doc).expect("serialize") + "\n";
+        fs::write(&snap_path, &tampered).expect("tamper snapshot");
+        let finding = exact_snapshot_finding(pages, &root).expect("tamper must be found");
+        assert!(
+            finding.contains("disagrees byte for byte"),
+            "hand-added errno must fail the exact byte compare: {finding}"
+        );
+        fs::write(&snap_path, "{\n").expect("malform snapshot");
+        assert!(
+            exact_snapshot_finding(pages, &root).is_some(),
+            "a malformed citations.json must not pass exact check silently"
+        );
+
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&clean).expect("reparse clean snapshot");
+        doc["pages"]["read"]["based_on"] =
+            serde_json::json!("0000000000000000000000000000000000000000");
+        fs::write(
+            &snap_path,
+            serde_json::to_string_pretty(&doc).expect("serialize") + "\n",
+        )
+        .expect("write based_on mismatch");
+        let findings = committed_snapshot_findings(pages, &root);
+        assert!(
+            findings.iter().any(|f| f.contains("based_on")),
+            "based_on mismatch must fail the hard tier: {findings:?}"
+        );
+
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&clean).expect("reparse clean snapshot");
+        let read_entry = doc["pages"]["read"].clone();
+        doc["pages"]
+            .as_object_mut()
+            .expect("pages object")
+            .insert("write".to_string(), read_entry);
+        fs::write(
+            &snap_path,
+            serde_json::to_string_pretty(&doc).expect("serialize") + "\n",
+        )
+        .expect("write extra entry");
+        let findings = committed_snapshot_findings(pages, &root);
+        assert!(
+            findings.iter().any(|f| f.contains("write")),
+            "entry for a missing page must fail the hard tier: {findings:?}"
+        );
+        let mut prose_less = page.clone();
+        prose_less.syscall = "write".to_string();
+        prose_less.prose = None;
+        let with_prose_less = vec![page.clone(), prose_less];
+        let findings = committed_snapshot_findings(&with_prose_less, &root);
+        assert!(
+            findings.iter().any(|f| f.contains("write")),
+            "entry for a prose-less page must fail the hard tier: {findings:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p43_renamed_test_no_longer_satisfies_the_page() {
+        let (root, page) = prose_fixture("renamed");
+        let text = emit_page(&page);
+        // Rename the test in the cited file only: the page still
+        // names the old one, which must stop counting as existing.
+        let fake = root.join("detcore/src/syscalls/fake.rs");
+        let code = fs::read_to_string(&fake).expect("fixture file");
+        fs::write(&fake, code.replace("read_einval_test", "read_einval_test_v2"))
+            .expect("rename fixture test");
+        let (rep, _) = lint_page("read", &text, &root);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P43")),
+            "renamed-away test must fail P43: {:?}",
+            rep.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn p43_relevance_extent_and_tokens() {
+        // Round-2 shape one: the token sits in the NEXT function,
+        // inside the old fixed window but outside this test's extent.
+        let spill = "fn wrong_test() { let x = 1; }\nfn helper_after() { unsafe { libc::mprotect(p) } }\n";
+        assert!(!test_fn_relevant(spill, "wrong_test", "mprotect", &BTreeSet::new()));
+        // Round-2 shape two: the syscall name inside the test's own
+        // name is not a whole-word mention.
+        let named = "fn successful_time_store_probe() { assert!(true); }";
+        assert!(!test_fn_relevant(
+            named,
+            "successful_time_store_probe",
+            "time",
+            &BTreeSet::new()
+        ));
+        // The passing component case: the test calls a helper the
+        // page's cited code defines (the adjtimex shape).
+        let comp = "fn timex_query_test() { assert!(timex_mode_is_query(0)); }";
+        let mut cited = BTreeSet::new();
+        cited.insert("timex_mode_is_query".to_string());
+        assert!(test_fn_relevant(comp, "timex_query_test", "adjtimex", &cited));
+        // One same-file helper level reaches the token (the fixed
+        // mprotect citation's shape).
+        let two = "fn real_test() { page_before_a_hole(0); }\nfn page_before_a_hole(p: i32) { unsafe { libc::mprotect(p) } }";
+        assert!(test_fn_relevant(two, "real_test", "mprotect", &BTreeSet::new()));
+    }
+
+    #[test]
+    fn prose_helpers_negative_claims_and_words() {
+        let claims = negative_claims("It never blocks. It sometimes waits. There is no EINTR path.");
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        // The markers a seat read found missing: each must be caught.
+        let marked = negative_claims(
+            "It does not read the host clock. The record is not consumed here. \
+             No handler runs. It falls back instead of resuming. A plain positive claim stands.",
+        );
+        assert_eq!(marked.len(), 4, "{marked:?}");
+        assert!(contains_word("Sysno::getrandom,", "getrandom"));
+        assert!(!contains_word("already_read", "read"));
+        assert!(errno_tokens("Err(Errno::EINVAL)").contains("EINVAL"));
+    }
+
+    #[test]
+    fn aggregate_and_render_carry_prose_stamps() {
+        let (root, page) = prose_fixture("stamps");
+        let pages = vec![page.clone(), sample_page_for("write", 1)];
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = syscalls_json(&pages, sha);
+        assert!(json.contains("\"syscalls.json/v3\""), "{json}");
+        assert!(json.contains("\"prose_status\": \"checked\""), "{json}");
+        assert!(json.contains("\"prose_status\": \"none\""), "{json}");
+        assert!(index_md(&pages, sha).contains("| checked |"), "index prose column");
+        let html = site_page_html(&page);
+        assert!(html.contains("<h2>Determinism strategy</h2>"), "{html}");
+        assert!(html.contains("prose checked 2026-11-16"), "{html}");
+        assert!(html.contains("<sup>[c1]</sup>"), "{html}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn facts_tsv_and_strategy_round_trip() {
         let (sha, rows) = parse_facts_tsv("# hermit abc\nname\tnr\tclass\trefused\tstrict_only_refused\tsub_run\tsub_record_replay\nread\t0\tdeterminized\t0\t0\t1\t1\n").unwrap();
         assert_eq!(sha, "abc");
@@ -3565,9 +6387,16 @@ fn main() {
         Some("lint") => cmd_lint(&root),
         Some("facts") => cmd_facts(&root, &args[1..]),
         Some("aggregate") => cmd_aggregate(&root, args.iter().any(|a| a == "--check")),
-        Some("check") => cmd_check(&root, args.iter().any(|a| a == "--quick")),
+        Some("check") => cmd_check(
+            &root,
+            args.iter().any(|a| a == "--quick"),
+            args.iter().any(|a| a == "--committed"),
+        ),
         Some("generate") => cmd_generate(&root, &args[1..]),
         Some("render") => cmd_render(&root, args.iter().any(|a| a == "--check")),
+        Some("report") => cmd_report(&root),
+        Some("anchor") => cmd_anchor(&root),
+        Some("wave") => cmd_wave(&root, &args[1..]),
         _ => usage(),
     };
     exit(rc);
