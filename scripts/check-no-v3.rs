@@ -59,7 +59,13 @@
 //! next symbol that happens to share it. The allowlist lives
 //! where the check is wired in, reviewed like any other
 //! exception; growing it is a visible act. `--hit-symbols` prints
-//! the per-symbol counts the allowlist is maintained from. AMD
+//! the per-symbol counts the allowlist is maintained from.
+//! Symbols are named as a Rust-v0-aware `objdump --demangle`
+//! (binutils 2.36 or later) prints them: an older objdump prints
+//! v0 names (`_R...`) still mangled, so the script demangles those
+//! itself, and an allowlist entry matches the same symbol on every
+//! host. A v0 name it cannot decode stays as objdump printed it,
+//! and the count of such names goes to stderr. AMD
 //! XOP/3DNow! encodings are not classified; no supported
 //! toolchain emits them.
 //!
@@ -192,16 +198,20 @@ fn main() -> ExitCode {
     for binary in &binaries {
         match scan(binary) {
             Ok(report) => {
+                if report.undecoded > 0 {
+                    eprintln!(
+                        "check-no-v3: {binary}: {} Rust v0 symbol names stayed mangled; \
+                         no allowlist entry can match them",
+                        report.undecoded
+                    );
+                }
                 if hit_symbols {
                     for (count, symbol) in hit_symbol_counts(&report) {
                         println!("{count} {symbol}");
                     }
                     continue;
                 }
-                let (hits, allowed): (Vec<&Hit>, Vec<&Hit>) = report
-                    .hits
-                    .iter()
-                    .partition(|hit| !allow.contains(hit.symbol.as_str()));
+                let (hits, allowed) = partition_hits(&report, &allow);
                 if within_baseline(hits.len(), baseline) {
                     if baseline.is_none() {
                         println!(
@@ -308,6 +318,19 @@ struct Hit {
 struct Report {
     hits: Vec<Hit>,
     alias: usize,
+    /// Rust v0 symbol names left mangled (see `header_symbol`).
+    undecoded: usize,
+}
+
+/// The hits outside the allowlist, then the allowlisted ones.
+fn partition_hits<'r>(
+    report: &'r Report,
+    allow: &std::collections::BTreeSet<&str>,
+) -> (Vec<&'r Hit>, Vec<&'r Hit>) {
+    report
+        .hits
+        .iter()
+        .partition(|hit| !allow.contains(hit.symbol.as_str()))
 }
 
 fn scan(binary: &str) -> Result<Report, String> {
@@ -322,15 +345,28 @@ fn scan(binary: &str) -> Result<Report, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(report_from_disassembly(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Classify every instruction of `objdump -d --demangle` output.
+fn report_from_disassembly(text: &str) -> Report {
     let mut symbol = String::new();
     let mut report = Report {
         hits: Vec::new(),
         alias: 0,
+        undecoded: 0,
     };
     for line in text.lines() {
         if let Some(name) = symbol_header(line) {
-            symbol = name.to_string();
+            symbol = match header_symbol(name) {
+                Some(symbol) => symbol,
+                None => {
+                    report.undecoded += 1;
+                    name.to_string()
+                }
+            };
             continue;
         }
         match classify(line) {
@@ -342,7 +378,579 @@ fn scan(binary: &str) -> Result<Report, String> {
             Class::Clean => {}
         }
     }
-    Ok(report)
+    report
+}
+
+/// The symbol a header names, as a v0-aware objdump prints it:
+/// `None` for a Rust v0 name (`_R...`) that `demangle_v0` cannot
+/// decode. Every other name is kept as objdump printed it.
+fn header_symbol(name: &str) -> Option<String> {
+    if !name.starts_with("_R") {
+        return Some(name.to_string());
+    }
+    demangle_v0(name)
+}
+
+/// Demangle a Rust v0 symbol name (`_R...`) the way binutils 2.36
+/// and later print it with `objdump --demangle`: no crate
+/// disambiguator hashes, no type suffix on const generic values,
+/// and any `.suffix` (`.llvm.N`, `.cold`) dropped. `None` for a
+/// name that is not v0 or uses a form decoded here only partly:
+/// punycode identifiers, consts other than integers, bool, char and
+/// the placeholder `_`, integer consts of more than 16 hex digits and
+/// char consts of more than 8 (binutils leaves the second mangled
+/// too), more than 200 levels of nesting (binutils allows about
+/// 1024), and names whose demangling exceeds `MAX_DEMANGLED_BYTES` or
+/// `MAX_DEMANGLE_STEPS`.
+fn demangle_v0(symbol: &str) -> Option<String> {
+    let mangled = symbol.strip_prefix("_R")?;
+    let mangled = mangled.split('.').next().unwrap_or(mangled);
+    let sym = mangled.as_bytes();
+    // A leading decimal is an encoding version other than v0.
+    if sym.first()?.is_ascii_digit()
+        || !sym
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut demangler = V0 {
+        sym,
+        at: 0,
+        out: String::new(),
+        depth: 0,
+        steps: 0,
+        bound: 0,
+    };
+    demangler.path(true)?;
+    if demangler.at < sym.len() {
+        // The instantiating crate, which objdump does not print.
+        demangler.skip(|d| d.path(false))?;
+    }
+    (demangler.at == sym.len() && demangler.out.len() <= MAX_DEMANGLED_BYTES)
+        .then_some(demangler.out)
+}
+
+/// Demangling gives `None` when the output passes this many bytes:
+/// checked at each nested parse step and once more at the end.
+/// Backrefs let a short name expand exponentially: a chain of
+/// tuples whose two elements both refer back to the previous tuple
+/// doubles the output at each link. Real symbols stay far below.
+const MAX_DEMANGLED_BYTES: usize = 1 << 20;
+
+/// Demangling gives `None` after this many nested parse steps, which
+/// bounds the number of steps even where a step prints nothing (as in
+/// a skipped impl path, which is parsed and then discarded). Each
+/// step does work proportional to at most the symbol's length.
+const MAX_DEMANGLE_STEPS: u32 = 1 << 20;
+
+/// A v0 demangler over the bytes after `_R`, following the v0
+/// grammar of the Rust symbol-mangling RFC (2603). Every method
+/// returns `None` on input it does not decode.
+struct V0<'a> {
+    sym: &'a [u8],
+    at: usize,
+    out: String,
+    /// Nesting depth, bounded so that recursion stays shallow. The
+    /// depth bound does not bound the work: see `steps`.
+    depth: u32,
+    /// Nested parse steps so far, bounded by `MAX_DEMANGLE_STEPS`;
+    /// every recursion, backrefs included, goes through `nest`.
+    steps: u32,
+    /// Lifetimes bound by the enclosing `for<...>` binders.
+    bound: u64,
+}
+
+impl<'a> V0<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.sym.get(self.at).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.at += 1;
+        Some(byte)
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        let found = self.peek() == Some(byte);
+        if found {
+            self.at += 1;
+        }
+        found
+    }
+
+    fn nest(&mut self, f: impl FnOnce(&mut Self) -> Option<()>) -> Option<()> {
+        if self.depth >= 200
+            || self.steps >= MAX_DEMANGLE_STEPS
+            || self.out.len() > MAX_DEMANGLED_BYTES
+        {
+            return None;
+        }
+        self.steps += 1;
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
+    }
+
+    /// Parse with `f` but discard what it prints.
+    fn skip(&mut self, f: impl FnOnce(&mut Self) -> Option<()>) -> Option<()> {
+        let printed = self.out.len();
+        f(self)?;
+        self.out.truncate(printed);
+        Some(())
+    }
+
+    /// `_` is 0; otherwise base-62 digits then `_`, one more than
+    /// their value.
+    fn base62(&mut self) -> Option<u64> {
+        if self.eat(b'_') {
+            return Some(0);
+        }
+        let mut value: u64 = 0;
+        loop {
+            let digit = match self.bump()? {
+                byte @ b'0'..=b'9' => byte - b'0',
+                byte @ b'a'..=b'z' => byte - b'a' + 10,
+                byte @ b'A'..=b'Z' => byte - b'A' + 36,
+                b'_' => return value.checked_add(1),
+                _ => return None,
+            };
+            value = value.checked_mul(62)?.checked_add(u64::from(digit))?;
+        }
+    }
+
+    /// An optional `tag` base-62 number: 0 when absent, else one
+    /// more than its value.
+    fn tagged_base62(&mut self, tag: u8) -> Option<u64> {
+        if self.eat(tag) {
+            self.base62()?.checked_add(1)
+        } else {
+            Some(0)
+        }
+    }
+
+    fn decimal(&mut self) -> Option<usize> {
+        let start = self.at;
+        if self.eat(b'0') {
+            return Some(0);
+        }
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.at += 1;
+        }
+        let sym = self.sym;
+        std::str::from_utf8(&sym[start..self.at]).ok()?.parse().ok()
+    }
+
+    /// An undisambiguated identifier: length, an optional `_`
+    /// separator, then the bytes. Punycode (`u`) is not decoded.
+    fn ident(&mut self) -> Option<&'a str> {
+        if self.peek() == Some(b'u') {
+            return None;
+        }
+        let len = self.decimal()?;
+        self.eat(b'_');
+        let end = self.at.checked_add(len)?;
+        let sym = self.sym;
+        let bytes = sym.get(self.at..end)?;
+        self.at = end;
+        std::str::from_utf8(bytes).ok()
+    }
+
+    /// Run `f` at an earlier position (`B` already eaten), then
+    /// resume after the backref.
+    fn backref(&mut self, f: impl FnOnce(&mut Self) -> Option<()>) -> Option<()> {
+        let start = self.at - 1;
+        let target = usize::try_from(self.base62()?).ok()?;
+        if target >= start {
+            return None;
+        }
+        let resume = self.at;
+        self.at = target;
+        self.nest(f)?;
+        self.at = resume;
+        Some(())
+    }
+
+    /// Print `item`s until `E`, separated by `separator`.
+    fn list(
+        &mut self,
+        separator: &str,
+        mut item: impl FnMut(&mut Self) -> Option<()>,
+    ) -> Option<usize> {
+        let mut count = 0;
+        while !self.eat(b'E') {
+            if count > 0 {
+                self.out.push_str(separator);
+            }
+            item(self)?;
+            count += 1;
+        }
+        Some(count)
+    }
+
+    /// A path; `in_value` paths spell generic arguments `::<...>`.
+    fn path(&mut self, in_value: bool) -> Option<()> {
+        self.nest(|d| {
+            let tag = d.bump()?;
+            match tag {
+                b'C' => {
+                    d.tagged_base62(b's')?;
+                    let name = d.ident()?;
+                    d.out.push_str(name);
+                }
+                b'N' => {
+                    let namespace = d.bump()?;
+                    if !namespace.is_ascii_alphabetic() {
+                        return None;
+                    }
+                    d.path(in_value)?;
+                    let disambiguator = d.tagged_base62(b's')?;
+                    let name = d.ident()?;
+                    if namespace.is_ascii_uppercase() {
+                        d.out.push_str("::{");
+                        match namespace {
+                            b'C' => d.out.push_str("closure"),
+                            b'S' => d.out.push_str("shim"),
+                            other => d.out.push(char::from(other)),
+                        }
+                        if !name.is_empty() {
+                            d.out.push(':');
+                            d.out.push_str(name);
+                        }
+                        d.out.push_str(&format!("#{disambiguator}}}"));
+                    } else if !name.is_empty() {
+                        d.out.push_str("::");
+                        d.out.push_str(name);
+                    }
+                }
+                b'M' | b'X' | b'Y' => {
+                    if tag != b'Y' {
+                        // The impl's own path, which is not printed.
+                        d.tagged_base62(b's')?;
+                        d.skip(|d| d.path(false))?;
+                    }
+                    d.out.push('<');
+                    d.ty()?;
+                    if tag != b'M' {
+                        d.out.push_str(" as ");
+                        d.path(false)?;
+                    }
+                    d.out.push('>');
+                }
+                b'I' => {
+                    d.path(in_value)?;
+                    if in_value {
+                        d.out.push_str("::");
+                    }
+                    d.out.push('<');
+                    d.list(", ", |d| d.generic_arg())?;
+                    d.out.push('>');
+                }
+                b'B' => d.backref(|d| d.path(in_value))?,
+                _ => return None,
+            }
+            Some(())
+        })
+    }
+
+    fn generic_arg(&mut self) -> Option<()> {
+        if self.eat(b'L') {
+            let lifetime = self.base62()?;
+            self.lifetime(lifetime)
+        } else if self.eat(b'K') {
+            self.konst()
+        } else {
+            self.ty()
+        }
+    }
+
+    /// Lifetime 0 is erased (`'_`); the rest count back through the
+    /// enclosing binders, named `'a`, `'b`, ...
+    fn lifetime(&mut self, index: u64) -> Option<()> {
+        if index == 0 {
+            self.out.push_str("'_");
+            return Some(());
+        }
+        let depth = self.bound.checked_sub(index)?;
+        match u8::try_from(depth) {
+            Ok(depth) if depth < 26 => {
+                self.out.push('\'');
+                self.out.push(char::from(b'a' + depth));
+            }
+            _ => self.out.push_str(&format!("'_{depth}")),
+        }
+        Some(())
+    }
+
+    /// An optional `for<...>` binder (`G`), then `f` inside it.
+    fn binder(&mut self, f: impl FnOnce(&mut Self) -> Option<()>) -> Option<()> {
+        let count = self.tagged_base62(b'G')?;
+        if count > 64 {
+            return None;
+        }
+        if count > 0 {
+            self.out.push_str("for<");
+            for i in 0..count {
+                if i > 0 {
+                    self.out.push_str(", ");
+                }
+                self.bound += 1;
+                self.lifetime(1)?;
+            }
+            self.out.push_str("> ");
+        }
+        let result = f(self);
+        self.bound -= count;
+        result
+    }
+
+    fn ty(&mut self) -> Option<()> {
+        self.nest(|d| {
+            let tag = d.bump()?;
+            if let Some(name) = basic_type(tag) {
+                d.out.push_str(name);
+                return Some(());
+            }
+            match tag {
+                b'R' | b'Q' => {
+                    d.out.push('&');
+                    if d.eat(b'L') {
+                        let lifetime = d.base62()?;
+                        if lifetime != 0 {
+                            d.lifetime(lifetime)?;
+                            d.out.push(' ');
+                        }
+                    }
+                    if tag == b'Q' {
+                        d.out.push_str("mut ");
+                    }
+                    d.ty()?;
+                }
+                b'P' => {
+                    d.out.push_str("*const ");
+                    d.ty()?;
+                }
+                b'O' => {
+                    d.out.push_str("*mut ");
+                    d.ty()?;
+                }
+                b'A' => {
+                    d.out.push('[');
+                    d.ty()?;
+                    d.out.push_str("; ");
+                    d.konst()?;
+                    d.out.push(']');
+                }
+                b'S' => {
+                    d.out.push('[');
+                    d.ty()?;
+                    d.out.push(']');
+                }
+                b'T' => {
+                    d.out.push('(');
+                    if d.list(", ", |d| d.ty())? == 1 {
+                        d.out.push(',');
+                    }
+                    d.out.push(')');
+                }
+                b'F' => d.binder(|d| d.fn_sig())?,
+                b'D' => {
+                    d.out.push_str("dyn ");
+                    d.binder(|d| d.list(" + ", |d| d.dyn_trait()).map(|_| ()))?;
+                    if !d.eat(b'L') {
+                        return None;
+                    }
+                    let lifetime = d.base62()?;
+                    if lifetime != 0 {
+                        d.out.push_str(" + ");
+                        d.lifetime(lifetime)?;
+                    }
+                }
+                b'B' => d.backref(|d| d.ty())?,
+                _ => {
+                    d.at -= 1;
+                    d.path(false)?;
+                }
+            }
+            Some(())
+        })
+    }
+
+    fn fn_sig(&mut self) -> Option<()> {
+        let is_unsafe = self.eat(b'U');
+        let abi = if !self.eat(b'K') {
+            None
+        } else if self.eat(b'C') {
+            Some("C".to_string())
+        } else {
+            Some(self.ident()?.replace('_', "-"))
+        };
+        if is_unsafe {
+            self.out.push_str("unsafe ");
+        }
+        if let Some(abi) = abi {
+            self.out.push_str(&format!("extern \"{abi}\" "));
+        }
+        self.out.push_str("fn(");
+        self.list(", ", |d| d.ty())?;
+        self.out.push(')');
+        if !self.eat(b'u') {
+            self.out.push_str(" -> ");
+            self.ty()?;
+        }
+        Some(())
+    }
+
+    /// One trait of a `dyn` type, with its associated-type bindings.
+    fn dyn_trait(&mut self) -> Option<()> {
+        let mut open = self.path_maybe_open_generics()?;
+        while self.eat(b'p') {
+            self.out.push_str(if open { ", " } else { "<" });
+            open = true;
+            let name = self.ident()?;
+            self.out.push_str(name);
+            self.out.push_str(" = ");
+            self.ty()?;
+        }
+        if open {
+            self.out.push('>');
+        }
+        Some(())
+    }
+
+    /// A path whose generic arguments stay open for bindings: true
+    /// when a `<` was printed and is still unclosed.
+    fn path_maybe_open_generics(&mut self) -> Option<bool> {
+        if self.eat(b'B') {
+            let mut open = false;
+            self.backref(|d| {
+                open = d.path_maybe_open_generics()?;
+                Some(())
+            })?;
+            Some(open)
+        } else if self.eat(b'I') {
+            self.path(false)?;
+            self.out.push('<');
+            self.list(", ", |d| d.generic_arg())?;
+            Some(true)
+        } else {
+            self.path(false)?;
+            Some(false)
+        }
+    }
+
+    /// A const generic value: integers in decimal, bool, char escaped
+    /// as binutils escapes it, and the placeholder `_`. Other const
+    /// kinds, integers of more than 16 hex digits and chars of more
+    /// than 8 are not decoded.
+    fn konst(&mut self) -> Option<()> {
+        if self.eat(b'B') {
+            return self.backref(|d| d.konst());
+        }
+        match self.bump()? {
+            b'p' => self.out.push('_'),
+            b'h' | b't' | b'm' | b'y' | b'o' | b'j' => self.const_uint()?,
+            b'a' | b's' | b'l' | b'x' | b'n' | b'i' => {
+                if self.eat(b'n') {
+                    self.out.push('-');
+                }
+                self.const_uint()?;
+            }
+            b'b' => match self.hex_nibbles()? {
+                "0" => self.out.push_str("false"),
+                "1" => self.out.push_str("true"),
+                _ => return None,
+            },
+            b'c' => {
+                // binutils refuses a char of more than 8 hex digits,
+                // leading zeros included.
+                let nibbles = self.hex_nibbles()?;
+                if nibbles.len() > 8 {
+                    return None;
+                }
+                let code = u32::from_str_radix(nibbles, 16).ok()?;
+                self.out.push('\'');
+                push_escaped_char(&mut self.out, code);
+                self.out.push('\'');
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Lowercase hex nibbles up to `_`; at least one.
+    fn hex_nibbles(&mut self) -> Option<&'a str> {
+        let start = self.at;
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            self.at += 1;
+        }
+        let sym = self.sym;
+        let nibbles = std::str::from_utf8(&sym[start..self.at]).ok()?;
+        (!nibbles.is_empty() && self.eat(b'_')).then_some(nibbles)
+    }
+
+    /// The value of at most 16 hex nibbles. binutils prints a longer
+    /// value in an altered hex form, which is not reproduced.
+    fn hex_value(&mut self) -> Option<u64> {
+        let nibbles = self.hex_nibbles()?;
+        if nibbles.len() > 16 {
+            return None;
+        }
+        u64::from_str_radix(nibbles, 16).ok()
+    }
+
+    fn const_uint(&mut self) -> Option<()> {
+        let value = self.hex_value()?;
+        self.out.push_str(&value.to_string());
+        Some(())
+    }
+}
+
+/// A char const's code point as binutils 2.37 prints it between the
+/// quotes: `\t`, `\r` and `\n` escaped, `!` through `}` as
+/// themselves (the quote and backslash included), and every other
+/// value, invalid ones included, as `\u{hex}`.
+fn push_escaped_char(out: &mut String, code: u32) {
+    match code {
+        0x09 => out.push_str("\\t"),
+        0x0d => out.push_str("\\r"),
+        0x0a => out.push_str("\\n"),
+        0x21..=0x7d => out.extend(char::from_u32(code)),
+        _ => out.push_str(&format!("\\u{{{code:x}}}")),
+    }
+}
+
+/// The basic types of the v0 grammar.
+fn basic_type(tag: u8) -> Option<&'static str> {
+    Some(match tag {
+        b'a' => "i8",
+        b'b' => "bool",
+        b'c' => "char",
+        b'd' => "f64",
+        b'e' => "str",
+        b'f' => "f32",
+        b'h' => "u8",
+        b'i' => "isize",
+        b'j' => "usize",
+        b'l' => "i32",
+        b'm' => "u32",
+        b'n' => "i128",
+        b'o' => "u128",
+        b'p' => "_",
+        b's' => "i16",
+        b't' => "u16",
+        b'u' => "()",
+        b'v' => "...",
+        b'x' => "i64",
+        b'y' => "u64",
+        b'z' => "!",
+        _ => return None,
+    })
 }
 
 /// `0000000000401000 <main>:` → `main`.
@@ -548,5 +1156,247 @@ mod tests {
     fn symbol_headers_parse() {
         assert_eq!(symbol_header("0000000000401000 <main>:"), Some("main"));
         assert_eq!(symbol_header("  401000:\tc3\tret"), None);
+    }
+
+    /// An objdump without v0 demangling (binutils before 2.36)
+    /// prints Rust names mangled; the allowlist names them
+    /// demangled, and must still match.
+    #[test]
+    fn allowlist_matches_rust_symbols_objdump_left_mangled() {
+        let text = "\
+0000000000401000 <_RINvNtNtNtCs8o9Cfoj3Yfu_4core9core_arch3x864avx217__mm256_slli_epi64Kl2a_E>:
+  401000:\tc5 fd 73 f0 2a       \tvpsllq $0x2a,%ymm0,%ymm0
+0000000000401010 <_RNvNtNtNtNtNtCs8o9Cfoj3Yfu_4core3num3imp7flt2dec8strategy6dragon12format_exact>:
+  401010:\tc5 f8 57 c0          \tvxorps %xmm0,%xmm0,%xmm0
+";
+        let report = report_from_disassembly(text);
+        let symbols: Vec<&str> = report.hits.iter().map(|hit| hit.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            [
+                "core::core_arch::x86::avx2::_mm256_slli_epi64::<42>",
+                "core::num::imp::flt2dec::strategy::dragon::format_exact",
+            ],
+            "each hit is named as a v0-aware objdump names it"
+        );
+        assert_eq!(report.undecoded, 0);
+        let allow = std::collections::BTreeSet::from([
+            "core::core_arch::x86::avx2::_mm256_slli_epi64::<42>",
+        ]);
+        let (hits, allowed) = partition_hits(&report, &allow);
+        assert_eq!(
+            (hits.len(), allowed.len()),
+            (1, 1),
+            "the allowlisted intrinsic is allowlisted; the formatting code still counts"
+        );
+    }
+
+    /// Each expected string is byte-identical to what binutils 2.37
+    /// `c++filt -i` prints for the mangled name; it demangles as
+    /// `objdump --demangle` does. LLVM's `llvm-cxxfilt` agrees except
+    /// that it keeps a `.llvm.N` suffix, escapes chars differently,
+    /// rejects leading zeros in a const value and leaves some large
+    /// char values (such as 0xffffffff) mangled.
+    #[test]
+    fn v0_names_demangle_as_objdump_prints_them() {
+        for (mangled, expected) in [
+            (
+                "_RNvNtNtNtNtNtCs8o9Cfoj3Yfu_4core3num3imp7flt2dec8strategy6dragon12format_exact",
+                "core::num::imp::flt2dec::strategy::dragon::format_exact",
+            ),
+            (
+                "_RINvNtNtNtCs8o9Cfoj3Yfu_4core9core_arch3x864avx217__mm256_slli_epi64Kl2a_E",
+                "core::core_arch::x86::avx2::_mm256_slli_epi64::<42>",
+            ),
+            (
+                "_RNvMNtNtNtNtCsaB12_6memchr4arch6x86_644avx26memchrNtNtNtNtNtCsaB12_6memchr4arch6x86_644avx26memchr3One13find_raw_avx2",
+                "<memchr::arch::x86_64::avx2::memchr::One>::find_raw_avx2",
+            ),
+            // The same impl path, reached through a backref.
+            (
+                "_RNvMNtNtNtNtCsaB12_6memchr4arch6x86_644avx26memchrNtB2_3One13new_unchecked",
+                "<memchr::arch::x86_64::avx2::memchr::One>::new_unchecked",
+            ),
+            (
+                "_RNvXNtNtNtNtCs5x_12aho_corasick6packed5teddy7builder6x86_64INtNtNtNtNtCs5x_12aho_corasick6packed5teddy7builder6x86_647FatAVX2Kj1_ENtNtNtNtCs5x_12aho_corasick6packed5teddy7builder9SearcherT4find",
+                "<aho_corasick::packed::teddy::builder::x86_64::FatAVX2<1> as aho_corasick::packed::teddy::builder::SearcherT>::find",
+            ),
+            (
+                "_RINvNtNtCs7_8chacha208backends4avx29rng_innerNtCs7_8chacha203R12NtNtCs7_8chacha208variants6LegacyE",
+                "chacha20::backends::avx2::rng_inner::<chacha20::R12, chacha20::variants::Legacy>",
+            ),
+            ("_RNCNvCs1_6hermit3foo0", "hermit::foo::{closure#0}"),
+            ("_RNCNvCs1_6hermit3foos_0", "hermit::foo::{closure#1}"),
+            // binutils drops a `.suffix`.
+            (
+                "_RNvNtNtNtNtNtCs8o9Cfoj3Yfu_4core3num3imp7flt2dec8strategy6dragon12format_exact.llvm.12345",
+                "core::num::imp::flt2dec::strategy::dragon::format_exact",
+            ),
+            ("_RINvCs1_6hermit3fooRShE", "hermit::foo::<&[u8]>"),
+            ("_RINvCs1_6hermit3fooQReE", "hermit::foo::<&mut &str>"),
+            ("_RINvCs1_6hermit3fooTlmEE", "hermit::foo::<(i32, u32)>"),
+            ("_RINvCs1_6hermit3fooKb1_E", "hermit::foo::<true>"),
+            ("_RINvCs1_6hermit3fooKln2a_E", "hermit::foo::<-42>"),
+            ("_RINvCs1_6hermit3fooKc61_E", "hermit::foo::<'a'>"),
+            // binutils escapes a char const its own way.
+            ("_RINvCs1_6hermit3fooKc20_E", "hermit::foo::<'\\u{20}'>"),
+            ("_RINvCs1_6hermit3fooKc7e_E", "hermit::foo::<'\\u{7e}'>"),
+            ("_RINvCs1_6hermit3fooKc27_E", "hermit::foo::<'''>"),
+            ("_RINvCs1_6hermit3fooKc5c_E", "hermit::foo::<'\\'>"),
+            ("_RINvCs1_6hermit3fooKca_E", "hermit::foo::<'\\n'>"),
+            ("_RINvCs1_6hermit3fooKc0_E", "hermit::foo::<'\\u{0}'>"),
+            ("_RINvCs1_6hermit3fooKce9_E", "hermit::foo::<'\\u{e9}'>"),
+            ("_RINvCs1_6hermit3fooKcd800_E", "hermit::foo::<'\\u{d800}'>"),
+            ("_RINvCs1_6hermit3fooKc0061_E", "hermit::foo::<'a'>"),
+            ("_RINvCs1_6hermit3fooKc00000061_E", "hermit::foo::<'a'>"),
+            (
+                "_RINvCs1_6hermit3fooKcffffffff_E",
+                "hermit::foo::<'\\u{ffffffff}'>",
+            ),
+            ("_RINvCs1_6hermit3fooKj00_E", "hermit::foo::<0>"),
+            ("_RINvCs1_6hermit3fooKln0_E", "hermit::foo::<-0>"),
+            (
+                "_RINvCs1_6hermit3fooKjffffffffffffffff_E",
+                "hermit::foo::<18446744073709551615>",
+            ),
+            ("_RINvCs1_6hermit3fooKb0_E", "hermit::foo::<false>"),
+            (
+                "_RINvCs1_6hermit3fooPAhj10_E",
+                "hermit::foo::<*const [u8; 16]>",
+            ),
+            ("_RINvCs1_6hermit3fooOShE", "hermit::foo::<*mut [u8]>"),
+            ("_RINvCs1_6hermit3fooFmEuE", "hermit::foo::<fn(u32)>"),
+            (
+                "_RINvCs1_6hermit3fooFUKCmEhE",
+                "hermit::foo::<unsafe extern \"C\" fn(u32) -> u8>",
+            ),
+            (
+                "_RINvCs1_6hermit3fooDNtCs1_6hermit5TraitEL_E",
+                "hermit::foo::<dyn hermit::Trait>",
+            ),
+        ] {
+            assert_eq!(demangle_v0(mangled).as_deref(), Some(expected), "{mangled}");
+        }
+    }
+
+    /// A name this cannot decode is left alone (and counted), never
+    /// renamed to something it might wrongly match.
+    #[test]
+    fn names_that_do_not_decode_stay_as_printed() {
+        for name in [
+            "_RNvC",                      // truncated
+            "_RNvCs1_6hermit3fooX",       // trailing junk
+            "_RNvCs1_6hermitu3foo",       // punycode: objdump decodes it, this does not
+            "_R1NvCs1_6hermit3foo",       // a later encoding version
+            "_RNvB1_3foo",                // a backref to itself
+            "_RINvCs1_6hermit3fooKeE",    // a str const, not decoded here
+            "_RINvCs1_6hermit3fooKj_E",   // an integer const with no digits
+            "_RINvCs1_6hermit3fooKb00_E", // a bool const other than 0 or 1
+            // 9 hex digits: binutils leaves a char of more than 8 mangled
+            "_RINvCs1_6hermit3fooKc100000000_E",
+            "_RINvCs1_6hermit3fooKc000000061_E",
+            // 17 hex digits: binutils prints an altered hex form, not reproduced
+            "_RINvCs1_6hermit3fooKj10000000000000000_E",
+        ] {
+            assert_eq!(demangle_v0(name), None, "{name}");
+            assert_eq!(header_symbol(name), None, "{name}");
+        }
+        assert_eq!(
+            header_symbol("hermit_xinuse_arm").as_deref(),
+            Some("hermit_xinuse_arm"),
+            "a C symbol is kept as printed"
+        );
+        let report = report_from_disassembly(
+            "0000000000401000 <_RNvC>:\n  401000:\tc5 f8 77             \tvzeroupper\n",
+        );
+        assert_eq!(report.undecoded, 1);
+        assert_eq!(report.hits[0].symbol, "_RNvC");
+    }
+
+    /// `value` as a v0 backref target: `_` for 0, else the base-62
+    /// digits of one less, then `_`.
+    fn base62(value: usize) -> String {
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let Some(mut rest) = value.checked_sub(1) else {
+            return "_".to_string();
+        };
+        let mut digits = Vec::new();
+        loop {
+            digits.push(DIGITS[rest % 62]);
+            rest /= 62;
+            if rest == 0 {
+                break;
+            }
+        }
+        digits.reverse();
+        format!(
+            "{}_",
+            String::from_utf8(digits).expect("base-62 digits are ASCII")
+        )
+    }
+
+    /// `hermit::foo::<LEAF, (LEAF, LEAF), ...>` with `links` tuples,
+    /// each of whose two elements is a backref to the previous
+    /// argument, so the demangled output doubles at each link.
+    fn tuple_chain(leaf: &str, links: usize) -> String {
+        let mut mangled = String::from("INvCs1_6hermit3foo");
+        let mut previous = mangled.len();
+        mangled.push_str(leaf);
+        for _ in 0..links {
+            let backref = format!("B{}", base62(previous));
+            previous = mangled.len();
+            mangled.push_str(&format!("T{backref}{backref}E"));
+        }
+        format!("_R{mangled}E")
+    }
+
+    /// A backref chain decodes in full while it is short, and is
+    /// stopped by the output cap or the step cap, without expanding,
+    /// when it is not.
+    #[test]
+    fn backref_chains_stop_at_the_work_caps() {
+        let types = (0..8).fold(vec!["u8".to_string()], |mut types, _| {
+            let last = types.last().expect("the chain starts with u8");
+            let next = format!("({last}, {last})");
+            types.push(next);
+            types
+        });
+        assert_eq!(
+            demangle_v0(&tuple_chain("h", 8)),
+            Some(format!("hermit::foo::<{}>", types.join(", "))),
+            "8 links: the last argument has 256 elements, as binutils 2.37 prints it"
+        );
+        assert_eq!(
+            demangle_v0(&tuple_chain("h", 40)),
+            None,
+            "40 links would print 2^40 elements"
+        );
+
+        // A 200-byte identifier as the leaf: 12 links print about
+        // 1.7 MB in about 60,000 steps, so only the output cap stops it.
+        let wide = format!("C200{}", "a".repeat(200));
+        assert!(
+            demangle_v0(&tuple_chain(&wide, 4)).is_some(),
+            "4 links decode in full"
+        );
+        assert_eq!(
+            demangle_v0(&tuple_chain(&wide, 12)),
+            None,
+            "12 links: more than MAX_DEMANGLED_BYTES of output"
+        );
+
+        // A leaf of 50 nested paths that print nothing: 14 links take
+        // about 1.9 million steps but print only about 130 kB, so only
+        // the step cap stops it.
+        let silent = format!("{}C0{}", "Nv".repeat(50), "0".repeat(50));
+        assert!(
+            demangle_v0(&tuple_chain(&silent, 4)).is_some(),
+            "4 links decode in full"
+        );
+        assert_eq!(
+            demangle_v0(&tuple_chain(&silent, 14)),
+            None,
+            "14 links: more than MAX_DEMANGLE_STEPS parse steps"
+        );
     }
 }
