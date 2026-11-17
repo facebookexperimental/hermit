@@ -1,7 +1,9 @@
 # LinuxEmu unsafe census baseline. Regenerated only by
 # scripts/check-linuxemu-unsafe.rs --write-baseline in the same diff
 # that moves unsafe; see that file for the counting method.
-total 612
+# An increase for a file requires a justify line below,
+# written with --justify <path>=<reason> and judged by the seat.
+total 644
 capture_identity.rs 7
 core_dump.rs 3
 credentials.rs 6
@@ -9,7 +11,7 @@ elf.rs 13
 executor/abi.rs 2
 executor/event_fds.rs 13
 executor/fd_table.rs 19
-executor/file.rs 52
+executor/file.rs 51
 executor/futex.rs 1
 executor/host_mount.rs 4
 executor/host_probe.rs 9
@@ -31,7 +33,7 @@ executor/syncfs.rs 1
 executor/sys_signal.rs 3
 executor/task.rs 4
 executor/time.rs 5
-executor/uaccess.rs 3
+executor/uaccess.rs 36
 executor/vfs_file.rs 2
 executor/vm_flags.rs 15
 executor/xattr.rs 8
@@ -45,3 +47,4 @@ proc_mechanics.rs 2
 signal.rs 5
 terminal_cleanup.rs 1
 terminal_read.rs 15
+justify executor/uaccess.rs 36 GuestOut admissions (D132368105): 32 unsafe impls + 1 unsafe trait replace two uncontracted generic write paths; file.rs flock copyout routed through the mirror (-1 block)
