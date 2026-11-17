@@ -3502,7 +3502,7 @@ struct SubmoduleFixtureChild {
     stderr: PathBuf,
     ledger: PathBuf,
     ledger_before: SubmoduleLedgerIdentity,
-    /// The no-submodules child's private rust-script cache; dropped, and so
+    /// The fresh-clone child's private rust-script cache; dropped, and so
     /// removed, after the child (fields drop after `Drop::drop` reaps it).
     _rust_script_cache: Option<tempfile::TempDir>,
 }
@@ -3519,7 +3519,7 @@ struct SubmoduleFixtureChild {
 /// 900-second wall for the brackets after it (ci/manifest-plan/src/step_limits.rs).
 const SUBMODULE_FIXTURE_CHILD_SECONDS: u64 = 780;
 
-/// The rust-script cache of the no-submodules child, private to its fixture.
+/// The rust-script cache of the fresh-clone child, private to its fixture.
 ///
 /// rust-script builds into one Cargo target directory under `XDG_CACHE_HOME`,
 /// and Cargo holds that directory's lock for a whole build. A validation run
@@ -3685,7 +3685,7 @@ impl SubmoduleFixtureChild {
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
         if prepared_source_root.is_none() {
-            // Only the no-submodules case tests copied-source compilation.
+            // Only the fresh-clone case tests copied-source compilation.
             // It must reach real rust-script, not a prepared executable.
             command
                 .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
@@ -3837,6 +3837,78 @@ impl Drop for SubmoduleFixtureChild {
     }
 }
 
+/// Populate the fixture clone's submodule `path` from the original root's
+/// checkout, at the commit the clone's own gitlink records, and return it.
+fn populate_fixture_submodule(root: &Path, checkout: &Path, path: &str) -> Result<String, String> {
+    submodule_checked_command(
+        scratch_git()
+            .args([
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--no-tags",
+            ])
+            .arg(root.join(path))
+            .arg(checkout.join(path)),
+        &format!("populate only {path}"),
+    )?;
+    let recorded = scratch_git()
+        .args(["ls-tree", "HEAD", path])
+        .current_dir(checkout)
+        .output()
+        .map_err(|error| format!("submodule service result: cannot read {path} pin: {error}"))?;
+    let expected = String::from_utf8_lossy(&recorded.stdout)
+        .split_whitespace()
+        .nth(2)
+        .ok_or_else(|| format!("submodule service result: {path} gitlink is absent"))?
+        .to_string();
+    submodule_checked_command(
+        scratch_git()
+            .args(["checkout", "--quiet", &expected])
+            .current_dir(checkout.join(path)),
+        &format!("checkout the recorded {path} pin"),
+    )?;
+    Ok(expected)
+}
+
+/// The fresh-clone case's precondition: Reverie, which the driver is compiled
+/// from, checked out at its gitlink, and no rr or agent-utils checkout.
+fn assert_fresh_clone_inputs(checkout: &Path, expected_reverie: &str) -> Result<(), String> {
+    let head = scratch_git()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(checkout.join("reverie"))
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot read the fresh clone's reverie HEAD: {error}")
+        })?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if head != expected_reverie {
+        return Err(format!(
+            "submodule service result: the fresh clone's reverie is at {head}, not at its gitlink {expected_reverie}"
+        ));
+    }
+    for absent in ["third-party/rr", "agent-utils"] {
+        let populated = match std::fs::read_dir(checkout.join(absent)) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "submodule service result: cannot inspect the fresh clone's {absent}: {error}"
+                ));
+            }
+        };
+        if populated {
+            return Err(format!(
+                "submodule service result: the fresh clone has a populated {absent}; only reverie may be checked out"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn submodule_checked_command(command: &mut Command, what: &str) -> Result<(), String> {
     let output = command
         .output()
@@ -3968,16 +4040,24 @@ impl EnclosingRunStateSentinel {
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
 /// The driver's dagrun dependency is a pinned git revision, so rust-script
-/// builds it from a clone with no submodules at all. A missing rr checkout must
-/// then become a schema-4 FAILED result from `pre.submodules`, even though
-/// cgroup setup replaces the process first: once compiled from the copied
-/// sources with every submodule absent, and once from the original root's
-/// prepared scripts with only agent-utils populated. The self-test drives the
-/// two halves separately.
+/// builds it without the agent-utils checkout. A missing rr checkout must then
+/// become a schema-4 FAILED result from `pre.submodules`, even though cgroup
+/// setup replaces the process first: once compiled from the copied sources of
+/// a fresh clone, and once from the original root's prepared scripts with
+/// agent-utils populated as well. The self-test drives the two halves
+/// separately.
+///
+/// The fresh clone holds exactly one submodule: Reverie, at the commit its
+/// gitlink records. Since Hermit began depending on Reverie by path
+/// (2026-11-15), the driver itself is compiled from `reverie/`, through
+/// hermit-manifest-plan and detcore-model, so a clone with no submodules at
+/// all can no longer build it and "every submodule absent" is no longer a
+/// state this bracket can reach. rr and agent-utils stay absent, and `start`
+/// asserts that before the child runs.
 ///
 /// The submodule service-result bracket, split so its slow first case can run
 /// while the rest of the self-test proceeds. `start` builds the fixture clone
-/// and launches the no-submodules child, whose copied-source rust-script
+/// and launches the fresh-clone child, whose copied-source rust-script
 /// compile dominates the bracket's cost; `finish` waits for it and runs the
 /// agent-utils case. Fields drop in declaration order, so an unfinished
 /// bracket stops its child before the fixture directory is removed.
@@ -4071,6 +4151,11 @@ impl SubmoduleServiceBracket {
             )?;
         }
 
+        // The driver is compiled from reverie/ (see the type's docs), so the
+        // fresh clone carries Reverie at its gitlink, and no other submodule.
+        let expected_reverie = populate_fixture_submodule(root, &checkout, "reverie")?;
+        assert_fresh_clone_inputs(&checkout, &expected_reverie)?;
+
         let bootstrap_result = fixture.path().join("bootstrap-result.json");
         let bootstrap =
             SubmoduleFixtureChild::spawn(&checkout, None, &bootstrap_result, ledger.path())?;
@@ -4093,43 +4178,11 @@ impl SubmoduleServiceBracket {
             ledger,
             fixture,
         } = self;
-        // The no-submodules case must finish before agent-utils is populated.
+        // The fresh-clone case must finish before agent-utils is populated.
         let bootstrap = bootstrap.wait()?;
-        expect_missing_rr_result("no submodules", &bootstrap, &bootstrap_result)?;
+        expect_missing_rr_result("fresh clone, Reverie only", &bootstrap, &bootstrap_result)?;
 
-        submodule_checked_command(
-            scratch_git()
-                .args([
-                    "clone",
-                    "--quiet",
-                    "--no-local",
-                    "--depth",
-                    "1",
-                    "--single-branch",
-                    "--no-tags",
-                ])
-                .arg(root.join("agent-utils"))
-                .arg(checkout.join("agent-utils")),
-            "populate only agent-utils",
-        )?;
-        let expected_agent_utils = scratch_git()
-            .args(["ls-tree", "HEAD", "agent-utils"])
-            .current_dir(&checkout)
-            .output()
-            .map_err(|error| {
-                format!("submodule service result: cannot read agent-utils pin: {error}")
-            })?;
-        let expected_agent_utils = String::from_utf8_lossy(&expected_agent_utils.stdout)
-            .split_whitespace()
-            .nth(2)
-            .ok_or("submodule service result: agent-utils gitlink is absent")?
-            .to_string();
-        submodule_checked_command(
-            scratch_git()
-                .args(["checkout", "--quiet", &expected_agent_utils])
-                .current_dir(checkout.join("agent-utils")),
-            "checkout the recorded agent-utils pin",
-        )?;
+        let expected_agent_utils = populate_fixture_submodule(&root, &checkout, "agent-utils")?;
 
         assert_submodule_fixture_source(&root, &checkout, &expected_agent_utils)?;
 
@@ -4139,7 +4192,7 @@ impl SubmoduleServiceBracket {
                 .wait()?;
         expect_missing_rr_result("agent-utils present", &output, &result_path)?;
 
-        Ok("with no submodules the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
+        Ok("in a fresh clone holding only Reverie, the driver's own build input, at its gitlink, the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
     }
 }
 
@@ -4579,7 +4632,7 @@ fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
 fn self_test() -> Result<(), String> {
     // The submodule service-result bracket clones the committed tree and
     // therefore must exercise the recorded submodule API rather than any
-    // locally materialized dependency. Its no-submodules case compiles
+    // locally materialized dependency. Its fresh-clone case compiles
     // scripts/validate.rs from the clone with real rust-script, which took
     // 119 s of this self-test's 287 s at a two-core cap on 2026-10-04. Start
     // that child now, before any bracket below edits this process's
@@ -37139,7 +37192,7 @@ mod submodule_service_tests {
     }
 
     #[test]
-    fn only_the_no_submodules_child_builds_in_a_private_rust_script_cache() {
+    fn only_the_fresh_clone_child_builds_in_a_private_rust_script_cache() {
         fn env(command: &Command, key: &str) -> Option<Option<PathBuf>> {
             command
                 .get_envs()
@@ -37534,7 +37587,7 @@ mod submodule_service_tests {
     /// Both children go through the real `spawn_with_cache_base` and
     /// `SubmoduleFixtureChild::command`, against a stub `scripts/validate.rs`
     /// that records the two values it was given. This test used to run the
-    /// whole bracket instead, so the no-submodules child compiled this script
+    /// whole bracket instead, so the fresh-clone child compiled this script
     /// in release from an empty cache (161 s serial, 2026-10-17 test audit),
     /// the same compile `selftest.validate_rs` already does. That real
     /// bracket, both children and their missing-rr diagnoses, now runs under
