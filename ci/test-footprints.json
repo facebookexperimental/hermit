@@ -742,7 +742,9 @@
         ".agents/**",
         ".claude/**",
         ".llms/**",
-        "scripts/check-skill-discovery.rs"
+        "scripts/check-skill-discovery.rs",
+        "scripts/agent-utils-skills.lock",
+        "scripts/import-agent-utils-skills.rs"
       ]
     },
     {
