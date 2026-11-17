@@ -27,11 +27,11 @@ Of **17822** total cells, **2437** are selected by full, **1845** are not select
 
 `dbt` (dynamic binary translation) retains the test catalogue for the [separately developed DynamoRIO implementation](https://github.com/rrnewton/hermit-dynamorio): **561** applicable cells, **0** selected by full. This is not a current Hermit command-line backend choice.
 
-**Archived:** `sabre` (backend, archived 2026-10-25) and `e9patch` (binary preprocessing with ptrace, archived 2026-10-25). These receive no feature development. The catalogue retains **480** applicable cells for `sabre`; **0** are selected by full and **480** are outside that suite.
+**Archived:** `sabre` (backend, archived 2026-10-25, test schedule: nightly only) and `e9patch` (binary preprocessing with ptrace, archived 2026-10-25, test schedule: nightly only). These receive no feature development. The listed schedules describe archive policy; the compatibility tracker shows recorded results. The catalogue retains **480** applicable cells for `sabre`; **0** are selected by full and **480** are outside that suite.
 
 ## Selection by mode
 
-Each backend entry is `selected by full / total cells`, including not-applicable combinations in the total. An em dash means that mode is not defined for that execution path.
+Each backend entry is `selected by full / total cells`, including not-applicable combinations in the total. An em dash means that mode is not defined for that backend or the native baseline.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | Total cells |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

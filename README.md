@@ -265,7 +265,8 @@ workflows. Check the recorded command and configuration, then test the workload
 you depend on. Run and record/replay have different compatibility limits.
 
 The [test selection scorecard](SCORECARD.md) lists applicable combinations and
-which ones the full regression suite selects. For a larger example, the
+which ones the full regression suite selects; it is not a pass/fail report.
+For a larger example, the
 [QEMU boot guide](docs/QEMU_BOOT.md) describes deterministic and relaxed Linux
 boot configurations and their limits.
 

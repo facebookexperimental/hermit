@@ -5135,14 +5135,18 @@ fn archived_paragraph(derived: &Derived) -> String {
                 ArchivedKind::Backend => "backend",
                 ArchivedKind::PreprocessingWithPtrace => "binary preprocessing with ptrace",
             };
-            format!("`{}` ({kind}, archived {})", entry.name, entry.since)
+            format!(
+                "`{}` ({kind}, archived {}, test schedule: {})",
+                entry.name, entry.since, entry.schedule
+            )
         })
         .collect();
     if entries.is_empty() {
         return String::new();
     }
     let mut out = format!(
-        "**Archived:** {}. These receive no feature development.",
+        "**Archived:** {}. These receive no feature development. \
+The listed schedules describe archive policy; the compatibility tracker shows recorded results.",
         entries.join(" and ")
     );
     for entry in ARCHIVED
@@ -5159,12 +5163,18 @@ fn archived_paragraph(derived: &Derived) -> String {
             .iter()
             .filter(|id| id.backend == entry.name)
             .count();
-        let unselected = applicable - selected;
-        out.push_str(&format!(
-            " The catalogue retains **{applicable}** applicable cells for `{}`; \
+        match applicable.checked_sub(selected) {
+            Some(unselected) => out.push_str(&format!(
+                " The catalogue retains **{applicable}** applicable cells for `{}`; \
 **{selected}** are selected by full and **{unselected}** are outside that suite.",
-            entry.name
-        ));
+                entry.name
+            )),
+            None => out.push_str(&format!(
+                " Selection data for `{}` are inconsistent: the selected count **{selected}** \
+exceeds the applicable count **{applicable}**; the unselected count is unavailable.",
+                entry.name
+            )),
+        }
     }
     out.push_str("\n\n");
     out
@@ -5810,7 +5820,7 @@ See the [test-suite documentation](ci/compat-envelope/README.md) for the detaile
     out.push_str(
         "## Selection by mode\n\n\
 Each backend entry is `selected by full / total cells`, including not-applicable combinations \
-in the total. An em dash means that mode is not defined for that execution path.\n\n| Mode",
+in the total. An em dash means that mode is not defined for that backend or the native baseline.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
@@ -6007,6 +6017,26 @@ mod scorecard_prose_tests {
     }
 
     #[test]
+    fn archived_counts_report_inconsistent_selection_without_inventing_a_count() {
+        let population = [cell("sabre", "fixture/a"), cell("sabre", "fixture/b")];
+        let archived = archived_paragraph(&fixture(&population, &population[..1], &population));
+        assert!(
+            archived.contains(
+                "Selection data for `sabre` are inconsistent: the selected count **2** exceeds the applicable count **1**; the unselected count is unavailable."
+            ),
+            "{archived}"
+        );
+        assert!(!archived.contains("are outside that suite"), "{archived}");
+
+        let empty = archived_paragraph(&fixture(&[], &[], &[]));
+        assert!(
+            empty.contains("**0** applicable cells for `sabre`; **0** are selected by full and **0** are outside"),
+            "{empty}"
+        );
+        assert!(!empty.contains("inconsistent"), "{empty}");
+    }
+
+    #[test]
     fn archived_counts_exclude_other_backends_and_inapplicable_cells() {
         let population = [
             cell("sabre", "fixture/a"),
@@ -6028,7 +6058,20 @@ mod scorecard_prose_tests {
         );
         assert!(archived.contains("`e9patch` (binary preprocessing with ptrace,"));
         assert!(!archived.contains("applicable cells for `e9patch`"));
-        assert!(!archived.contains("nightly"));
+        for entry in hermit_manifest_plan::archived::ARCHIVED {
+            let entry_text = archived
+                .split(&format!("`{}` (", entry.name))
+                .nth(1)
+                .expect("archive entry is missing")
+                .split(')')
+                .next()
+                .unwrap();
+            assert!(
+                entry_text.contains(&format!("test schedule: {}", entry.schedule)),
+                "{entry_text}"
+            );
+        }
+        assert!(archived.contains("The listed schedules describe archive policy"));
 
         derived.applicable.insert(population[2].clone());
         let archived = archived_paragraph(&derived);
