@@ -7,7 +7,7 @@ sys.dont_write_bytecode = True
 ASSETS=Path(__file__).resolve().parent.parent/'assets'
 ROOT='detcore_liteinst_mapped_entry'
 MAINTAINED=Path(__file__).resolve().parent.parent/'archive/prepare.py'
-MAINTAINED_SHA='11ebff546e9719fda0e4a5bb32e268327382496926e52cc731b54e6ce1c9d3f4'
+MAINTAINED_SHA='97d12180e7db83ceedef98bbb6b3066f633a28dcc1ecac5928fcc66dcccf222b'
 # Preserve the existing private static-image C/TLS ABI; retention is not provenance.
 ABI_ROOTS=['__init_tls', 'malloc', '__libc_malloc', '__libc_malloc_impl', 'calloc', '__libc_calloc', 'free', '__libc_free', 'realloc', '__libc_realloc', 'reallocarray', 'aligned_alloc', 'memalign', 'valloc', 'posix_memalign', 'malloc_usable_size', '__malloc_allzerop']
 RO_ROOTS={'.reverie_inguest_fixed_gate_template':(4096,4096,2),'.rodata.hermit_mapped_layout':(96,8,0x200002)} # measured SHF_ALLOC / SHF_ALLOC|SHF_GNU_RETAIN

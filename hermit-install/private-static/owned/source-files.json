@@ -5,9 +5,9 @@
     "sha256": "a099044a9e324a95e9951d398123c223ff9f1e2259aaf5d76bcfa0a1379e1c0b"
   },
   {
-    "bytes": 25250,
+    "bytes": 26279,
     "path": "archive/prepare.py",
-    "sha256": "11ebff546e9719fda0e4a5bb32e268327382496926e52cc731b54e6ce1c9d3f4"
+    "sha256": "97d12180e7db83ceedef98bbb6b3066f633a28dcc1ecac5928fcc66dcccf222b"
   },
   {
     "bytes": 16545,
@@ -30,9 +30,9 @@
     "sha256": "d05e3d63b7c914d2e2794d97dbda4a7e94f5c904aa7cdf8515c37c1c0d4bdda5"
   },
   {
-    "bytes": 8374,
+    "bytes": 8534,
     "path": "assets/source_guard.py",
-    "sha256": "034f5c4409cd37f59565896370cbaf482db9b3400139378a4389bb091172d269"
+    "sha256": "a8b74d7a35b5a5defcef4017191af45ec97b1fce8d13258554164c7c72bbe23a"
   },
   {
     "bytes": 7179,
@@ -72,7 +72,7 @@
   {
     "bytes": 92951,
     "path": "prepare.py",
-    "sha256": "7bf75d7f17fd8c09a9754907926eaface70676d5e3915d9cb34ea5100faed2a4"
+    "sha256": "eb257c57f1213f2ee4919698ec4786b1ff0f24f6f725e60e687f21f6d0eedc45"
   },
   {
     "bytes": 34384,
@@ -80,14 +80,14 @@
     "sha256": "7393e2a1069cf3b01f9610f9ab56813512993a251433a1feee783c8379dd454c"
   },
   {
-    "bytes": 69427,
+    "bytes": 69654,
     "path": "runtime_cohort.py",
-    "sha256": "55fd60cfd418c01531eb02e82d1b433902cc97206e1a51ea80496c12968e237a"
+    "sha256": "9dda0cbaacde9cba56ce05f38ed6466475739645c2de9a2bd92d378282a3e5ae"
   },
   {
     "bytes": 28022,
     "path": "section/prepare.py",
-    "sha256": "164b69763818ac7b31783b1d2d7ea9b555d7ce0e6eafa4bd1c455aaa1cd78d0c"
+    "sha256": "bd2cf6d01c135eda68595afb8658bacedeba10416bd70f81384fa2320cdbcce9"
   },
   {
     "bytes": 4716,
@@ -110,9 +110,9 @@
     "sha256": "672735bacdcee4ca9839b61fb4d9a093752858ad720e452f3dd4fbcb0a01d496"
   },
   {
-    "bytes": 19889,
+    "bytes": 19951,
     "path": "test_file_pins.py",
-    "sha256": "564e02fe7f2451350a2341b9de11dd15ddba4a42de933efa455f540e9200a72c"
+    "sha256": "5a536bd5c247212ff739bae1f8592b937b64ce8f0ecf27619d382b64d02cc429"
   },
   {
     "bytes": 6580,
@@ -130,9 +130,9 @@
     "sha256": "4b10d0316a9f4eec0263234308f8289442999e3c4b11d74362e0d8dba9ad97b7"
   },
   {
-    "bytes": 106019,
+    "bytes": 110935,
     "path": "test_runtime_cohort.py",
-    "sha256": "bdec6951fb5940d5e4961d654f867b745d18787320a2a1e8d874ff97d9c69953"
+    "sha256": "729abe18ae434ebbcb0557f172b51734a186f0204bd9034b07cb0b87c1db8267"
   },
   {
     "bytes": 3847,

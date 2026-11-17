@@ -80,10 +80,12 @@ def full_pins(h,rpin,head):
     # layout since Reverie became a path dependency) has no revision to compare.
     # Its authority rows are the active manifest lines that take a package from
     # under reverie/ and the root Cargo.lock name lines of those packages, which
-    # carry no source. runtime_cohort.lock_pins, which the same snapshot runs,
-    # holds the complete rule (gitlink member directories, no other source, no
-    # path leaving the checkout); this records the rows, refuses a mix of the
-    # two spellings and still refuses a tree with neither.
+    # carry no source. This records the rows, refuses a mix of the two spellings
+    # and still refuses a tree with neither. The complete rule is the runtime
+    # cohort's (lock_pins: gitlink member directories, no other source, no path
+    # leaving the checkout; derive: nothing untracked in the reverie checkout).
+    # pipeline.py runs it before any stage, and both stages' snapshot()
+    # (prepare.py, archive/prepare.py) run it beside this call.
     at=0;url=[];path_rows=[];declared=set();root_lock=b''
     for name,oid in names:
         end=stream.index(b'\n',at);fields=stream[at:end].split();at=end+1

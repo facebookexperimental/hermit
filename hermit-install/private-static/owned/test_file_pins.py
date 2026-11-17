@@ -319,6 +319,7 @@ class InTreeFilePins(unittest.TestCase):
         # source-files.json row is checked above, one per listed file.
         code_pins = {label for label, _, _ in checked if 'source-files.json' not in label}
         self.assertEqual({
+            'owned/archive/prepare.py RUNTIME_COHORT_SHA256',
             'owned/assets/final_inspection.py HELPERS[elf_metadata.py]',
             'owned/prepare.py RUNTIME_COHORT_SHA256',
             'owned/prepare.py LEGACY_SHA',

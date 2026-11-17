@@ -22,6 +22,8 @@ sys.dont_write_bytecode = True
 D = Path(__file__).resolve().parent
 ASSETS = D.parent / 'assets'
 BINDING = ASSETS / 'source_guard.py'
+RUNTIME_COHORT = D.parent / 'runtime_cohort.py'
+RUNTIME_COHORT_SHA256 = '9dda0cbaacde9cba56ce05f38ed6466475739645c2de9a2bd92d378282a3e5ae'
 PRIVATE_GUARD = ASSETS / 'native_guard.py'
 PRIVATE_INVENTORY_SHA256 = 'ecabca6176a177d2c1426caa9e2508fad967c4e4792a7c2bad9c513d26d99866'
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
@@ -93,6 +95,22 @@ def declared_child_environment(c, host=False):
     return child
 
 
+def runtime_content_preflight(c):
+    """The runtime cohort's binding of the chosen H head and its Reverie gitlink.
+
+    The same call as prepare.py's: it carries the complete Reverie rule
+    (runtime_cohort.lock_pins, and derive's refusal of any file, ignored or
+    not, that Git does not track in the reverie checkout). Running it in this
+    stage's snapshot makes the rule hold when the archive stage runs alone,
+    and at this stage's own prepare and close.
+    """
+    need(sha(RUNTIME_COHORT) == RUNTIME_COHORT_SHA256, 'runtime cohort declaration changed')
+    spec = importlib.util.spec_from_file_location('existing_runtime_content_cohort', RUNTIME_COHORT)
+    cohort = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cohort)
+    return cohort.bind(Path(c['H']), c['H_head'], c.get('runtime_R_pin'))
+
+
 def snapshot(c):
     # Existing tracked_source invokes git with its process environment. Put
     # that existing helper inside an exact-environment Python child as well;
@@ -115,7 +133,7 @@ print(json.dumps({'H':g.tracked_source(c['H'],c['H_head']),
                            stderr=subprocess.PIPE, env=declared_child_environment(c))
     need(len(child.stdout) <= STREAM and len(child.stderr) <= STREAM, 'source guard output exceeds bound')
     need(child.returncode == 0, 'source guard failed: ' + child.stderr.decode(errors='replace')[:2000])
-    return json.loads(child.stdout)
+    return dict(json.loads(child.stdout), runtime_content_cohort=runtime_content_preflight(c))
 
 
 def private_close(c):

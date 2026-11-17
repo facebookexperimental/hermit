@@ -679,6 +679,44 @@ class DerivedCohort(unittest.TestCase):
                         member + ' from ' + source + ', not from the gitlink')):
                     cohort.bind(tree.root, tree.h_head)
 
+    def test_every_dependency_table_binds_reverie_to_its_member_directory(self):
+        member = FIXTURE_MEMBERS[0]
+        refusal = ('runtime cohort derivation: Cargo.toml takes Reverie package %s from vendor/%s, not from its '
+                   'gitlink member directory reverie/%s' % (member, member, member))
+        for table in ['build-dependencies', 'dev-dependencies', 'build_dependencies', 'dev_dependencies',
+                      "target.'cfg(unix)'.dependencies", "target.'cfg(unix)'.build-dependencies",
+                      'workspace.dependencies', 'patch.crates-io',
+                      'patch."https://github.com/facebookexperimental/reverie"']:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                tree.path_spelled()
+                cohort.bind(tree.root, tree.h_head)
+                (tree.root / 'Cargo.toml').write_text('[%s]\n%s = { path = "vendor/%s" }\n' % (table, member, member))
+                tree.h_head = tree.commit(tree.root)
+                with self.assertRaisesRegex(RuntimeError, re.escape(refusal)):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_a_replace_table_is_refused_outright(self):
+        # Even an entry naming the member directory, or none at all: Cargo
+        # deprecates [replace], and its package ID keys are not dependency keys.
+        member = FIXTURE_MEMBERS[0]
+        for entry in ['"%s:0.1.0" = { path = "reverie/%s" }' % (member, member),
+                      '"%s@0.1.0" = { path = "vendor/%s" }' % (member, member),
+                      '"https://github.com/facebookexperimental/reverie#%s@0.1.0" = { path = "vendor/%s" }'
+                      % (member, member),
+                      '"other:0.1.0" = { path = "vendor/other" }',
+                      '']:
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                tree.path_spelled()
+                cohort.bind(tree.root, tree.h_head)
+                (tree.root / 'Cargo.toml').write_text('[dependencies]\n%s = { path = "reverie/%s" }\n\n[replace]\n%s\n'
+                                                      % (member, member, entry))
+                tree.h_head = tree.commit(tree.root)
+                with self.assertRaisesRegex(RuntimeError, re.escape(
+                        'runtime cohort derivation: Cargo.toml declares [replace], which Hermit does not use')):
+                    cohort.bind(tree.root, tree.h_head)
+
     def test_git_and_path_spellings_together_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
@@ -1075,8 +1113,8 @@ class RunModeSourceClose(unittest.TestCase):
             result = cohort.bind(tree.root, tree.h_head, tree.rpin)
             self.assertEqual(json.loads(json.dumps(result)), result)
 
-    def context(self, root, tree):
-        prepare = load('prepare')
+    def context(self, root, tree, producer='prepare'):
+        prepare = load(producer)
         (root / 'bin').mkdir()
         for name in ['cargo', 'rustc']:
             (root / 'bin' / name).write_text('')
@@ -1110,6 +1148,42 @@ class RunModeSourceClose(unittest.TestCase):
             (tree.root / 'detcore-liteinst/build.rs').write_bytes(b'uncommitted edit\n')
             with self.assertRaisesRegex(RuntimeError, 'tracked blob changed'):
                 prepare.files_close(bound)
+
+    def test_archive_stage_close_refuses_an_ignored_file_in_the_reverie_checkout(self):
+        # The archive stage's snapshot runs the runtime cohort's binding too, so
+        # its close sees what tracked_source's --exclude-standard cannot.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = manifest_tree(root / 'H')
+            archive, c = self.context(root, tree, 'archive/prepare')
+            self.assertEqual(c['source_before']['runtime_content_cohort']['cohort'], cohort.DERIVED_COHORT)
+            bound = json.loads(json.dumps(c))
+            archive.files_close(bound)
+            exclude = tree.reverie / fixture_git(tree.reverie, 'rev-parse', '--git-path', 'info/exclude')
+            tree.write(exclude, b'stray.rs\n')
+            tree.write(tree.reverie / 'reverie-inguest/src/stray.rs', b'pub const SMUGGLED: u8 = 1;\n')
+            self.assertEqual(fixture_git(tree.reverie, 'status', '--porcelain'), '')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: reverie submodule holds '
+                                        'untracked files: reverie-inguest/src/stray\\.rs'):
+                archive.files_close(bound)
+
+    def test_archive_stage_alone_applies_the_member_directory_rule(self):
+        # full_pins records a path under reverie/ without asking which member
+        # it is; the binding the archive snapshot now runs refuses the wrong one.
+        member, other = FIXTURE_MEMBERS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = PinnedTree(root / 'H')
+            tree.path_spelled()
+            tree.write(tree.root / 'Cargo.toml', ('[workspace.dependencies]\n%s = { path = "reverie/%s" }\n'
+                                                  % (member, other)).encode())
+            tree.h_head = tree.commit(tree.root)
+            with self.assertRaisesRegex(RuntimeError, re.escape(
+                    'runtime cohort derivation: Cargo.toml takes Reverie package %s from reverie/%s, not from its '
+                    'gitlink member directory reverie/%s' % (member, other, member))):
+                self.context(root, tree, 'archive/prepare')
 
     def test_commit_level_replace_ref_is_refused_by_the_snapshot(self):
         # coord7 delta S1: refs/replace/<H_head> -> B, with B's tree checked

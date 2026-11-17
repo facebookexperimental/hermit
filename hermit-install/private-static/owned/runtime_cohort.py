@@ -412,12 +412,16 @@ def manifest_path_dependencies(raw, name):
     """(key, package, directory in H) for each path dependency the manifest NAME declares.
 
     Every dependency table counts: the three kinds and their old underscore
-    spellings, under target.<cfg> too, workspace.dependencies, [patch] and
-    [replace]. A path that leaves the checkout is refused: nothing it names
-    is bound by H_head or the gitlink.
+    spellings, under target.<cfg> too, workspace.dependencies and [patch]. A
+    [replace] table is refused outright: Hermit uses none, Cargo deprecates
+    it for [patch], and its keys are package ID specs (name@version, a
+    source URL) that no dependency key rule reads. A path that leaves the
+    checkout is refused: nothing it names is bound by H_head or the gitlink.
     """
     where = 'runtime cohort derivation: ' + name
     manifest = toml_document(raw, where)
+    need('replace' not in manifest, where + ' declares [replace], which Hermit does not use; take the package '
+         'through [patch] or a dependency table')
     tables = []
 
     def collect(table):
@@ -429,14 +433,12 @@ def manifest_path_dependencies(raw, name):
     if isinstance(manifest.get('workspace'), dict) and isinstance(manifest['workspace'].get('dependencies'), dict):
         tables.append(manifest['workspace']['dependencies'])
     tables.extend(patch for patch in (manifest.get('patch') or {}).values() if isinstance(patch, dict))
-    if isinstance(manifest.get('replace'), dict):
-        tables.append(manifest['replace'])
     found = []
     for table in tables:
         for key, spec in table.items():
             if not (isinstance(spec, dict) and 'path' in spec):
                 continue
-            path, key = spec['path'], key.split(':', 1)[0]
+            path = spec['path']
             need(isinstance(path, str) and path and not path.startswith('/'),
                  where + ' dependency ' + key + ' has no relative path')
             directory = posixpath.normpath(posixpath.join(posixpath.dirname(name), path))
