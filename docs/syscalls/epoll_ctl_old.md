@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_ctl_old&body=Discussion+for+the+%60epoll_ctl_old%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_ctl_old.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_ctl_old%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 54bd03547df04c519fedfb6c97ede1933bda4182
+  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
   detcore_class: determinized
   dispatch: "typed"
   refused: true
@@ -22,7 +22,7 @@ code_facts:
 Detcore classifies `epoll_ctl_old` (214) as determinized-refused via typed dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1661`
-- Dispatch: `detcore/src/lib.rs:8170`
+- Dispatch: `detcore/src/lib.rs:8198`
 
 This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
 
@@ -33,3 +33,4 @@ This facts-only page was generated from Detcore code facts. Checked analysis pro
 ## Status
 
 - 2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.
+- 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
