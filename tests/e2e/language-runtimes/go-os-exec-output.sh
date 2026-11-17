@@ -80,7 +80,7 @@ func main() {
 GO
         printf 'module example.com/goosexecoutput\n\ngo 1.21\n' >"$E2E_FIXTURE_DIR/src/go.mod"
         env -C "$E2E_FIXTURE_DIR/src" GOCACHE="$E2E_FIXTURE_DIR/cache" GOPATH="$E2E_FIXTURE_DIR/cache/gopath" \
-            GOTOOLCHAIN=local GOFLAGS=-trimpath CGO_ENABLED=0 GO111MODULE=on \
+            GOTOOLCHAIN=local GOFLAGS="-trimpath -buildvcs=false" CGO_ENABLED=0 GO111MODULE=on \
             go build -o "$E2E_FIXTURE_DIR/program" .
         ;;
     --run)
