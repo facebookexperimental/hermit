@@ -8,9 +8,11 @@ from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
+import posixpath
 import re
 import stat
 import subprocess
+import tomllib
 
 # Historical reviewed cohorts, retained as fixtures. They were projected from
 # accepted source objects; since dh-gygs2r none of them admits a tree.
@@ -245,12 +247,22 @@ MAPPED_ENTRY_SOURCE = 'detcore-liteinst/src/exec_initial/mapped_entry.rs'
 # consumer descriptor: entry_source_relative is the file above and
 # accepted_entry_sources lists its accepted sha256 digests. Reverie's dh-axoec
 # change moved them there from terminal_observation.rs's ENTRY_SOURCE and
-# BOOTSTRAP_ENTRY_SOURCE literals.
+# BOOTSTRAP_ENTRY_SOURCE literals, and Reverie 6281d616 moved them again, into
+# each generation of the descriptor (first, and successor when present).
 CONSUMER_SOURCE = 'reverie-liteinst-artifact/src/private_static/selected_initializers.rs'
 CONSUMER_DESCRIPTOR = 'DETCORE'
 CONSUMER_TYPE = 'MappedConsumerSource'
+CONSUMER_GENERATION_TYPE = 'MappedGenerationSymbols'
+CONSUMER_GENERATIONS = ('first', 'successor')
 CONSUMER_FIELDS = ('entry_source_relative', 'accepted_entry_sources')
 LOCK_REVERIE = 'github.com/facebookexperimental/reverie'
+# The directory of Reverie's gitlink in H. In the path spelling it is the only
+# place a manifest may take a Reverie package from.
+REVERIE_GITLINK = 'reverie'
+# A git-spelled Reverie package's Cargo.lock source; its revision follows '#'.
+REVERIE_GIT_SOURCE = re.compile(r'git\+https://github\.com/facebookexperimental/reverie(?:\.git)?(?:\?[^#]*)?#[0-9a-f]{40}')
+DEPENDENCY_TABLES = ('dependencies', 'dev-dependencies', 'build-dependencies',
+                     'dev_dependencies', 'build_dependencies')
 # The gate shape the ordinary provider's DedicatedFunction cohort depends on.
 # ordinary_gate.rs compiles the other half: a 44-byte input section of exactly
 # this name (DEDICATED_SECTION, Cohort::text_size). The x86_64 global_asm!
@@ -348,12 +360,116 @@ def objects(repo, label, specs, limit=2 * 1024 * 1024):
     return result
 
 
+def toml_document(raw, where):
+    """A parsed TOML document; anything else is refused by name."""
+    try:
+        return tomllib.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as failure:
+        raise RuntimeError(where + ' is not TOML: ' + str(failure)) from failure
+
+
+def reverie_packages(workspace, rpin):
+    """Package name -> directory in H, for each member of the gitlinked Reverie workspace."""
+    reverie, where = Path(workspace) / REVERIE_GITLINK, 'runtime cohort derivation: Reverie ' + rpin + ':'
+    root = toml_document(objects(reverie, 'R', [rpin + ':Cargo.toml'])[rpin + ':Cargo.toml'], where + 'Cargo.toml')
+    members = root['workspace'].get('members') if isinstance(root.get('workspace'), dict) else None
+    need(isinstance(members, list) and members and
+         all(isinstance(member, str) and re.fullmatch(r'[\w.-]+(?:/[\w.-]+)*', member, re.A) and
+             not {'.', '..'} & set(member.split('/')) for member in members),
+         where + 'Cargo.toml must list its workspace members as plain relative paths')
+    specs = [rpin + ':' + member + '/Cargo.toml' for member in members]
+    manifests = objects(reverie, 'R', specs)
+    packages = {}
+    for member, spec in zip(members, specs):
+        package = toml_document(manifests[spec], where + spec.split(':', 1)[1]).get('package')
+        name = package.get('name') if isinstance(package, dict) else None
+        need(isinstance(name, str) and name and name not in packages,
+             where + spec.split(':', 1)[1] + ' names no package of its own')
+        packages[name] = posixpath.join(REVERIE_GITLINK, member)
+    return packages
+
+
+def lock_packages(raw, name):
+    """(package, source or None, line) for each [[package]] table of the lock NAME."""
+    where = 'runtime cohort derivation: ' + name
+    packages = toml_document(raw, where).get('package', [])
+    need(isinstance(packages, list) and all(
+        isinstance(package, dict) and isinstance(package.get('name'), str) and
+        isinstance(package.get('source', ''), str) for package in packages),
+         where + ' has a malformed [[package]] table')
+    lines, table = [], None
+    for number, line in enumerate(raw.decode('utf-8').splitlines(), 1):
+        if line.startswith('['):
+            table = line.strip()
+        elif table == '[[package]]' and line.startswith('name = '):
+            lines.append(number)
+            table = None
+    need(len(lines) == len(packages), where + ' has a [[package]] table that does not open with its name')
+    return [(package['name'], package.get('source'), number) for package, number in zip(packages, lines)]
+
+
+def manifest_path_dependencies(raw, name):
+    """(key, package, directory in H) for each path dependency the manifest NAME declares.
+
+    Every dependency table counts: the three kinds and their old underscore
+    spellings, under target.<cfg> too, workspace.dependencies, [patch] and
+    [replace]. A path that leaves the checkout is refused: nothing it names
+    is bound by H_head or the gitlink.
+    """
+    where = 'runtime cohort derivation: ' + name
+    manifest = toml_document(raw, where)
+    tables = []
+
+    def collect(table):
+        tables.extend(table[kind] for kind in DEPENDENCY_TABLES if isinstance(table.get(kind), dict))
+    collect(manifest)
+    for target in (manifest.get('target') or {}).values():
+        if isinstance(target, dict):
+            collect(target)
+    if isinstance(manifest.get('workspace'), dict) and isinstance(manifest['workspace'].get('dependencies'), dict):
+        tables.append(manifest['workspace']['dependencies'])
+    tables.extend(patch for patch in (manifest.get('patch') or {}).values() if isinstance(patch, dict))
+    if isinstance(manifest.get('replace'), dict):
+        tables.append(manifest['replace'])
+    found = []
+    for table in tables:
+        for key, spec in table.items():
+            if not (isinstance(spec, dict) and 'path' in spec):
+                continue
+            path, key = spec['path'], key.split(':', 1)[0]
+            need(isinstance(path, str) and path and not path.startswith('/'),
+                 where + ' dependency ' + key + ' has no relative path')
+            directory = posixpath.normpath(posixpath.join(posixpath.dirname(name), path))
+            need(directory != '..' and not directory.startswith('../'),
+                 where + ' dependency ' + key + ' path ' + path + ' leaves the checkout')
+            found.append((key, spec.get('package', key), directory))
+    return found
+
+
 def lock_pins(workspace, h_head, rpin):
-    """Every Cargo.lock reverie rev in H_head's objects must equal the gitlink."""
-    names = [os.fsdecode(name) for name in
-             git(workspace, 'ls-tree', '-rz', '--full-tree', '--name-only', h_head).split(b'\0')
-             if name == b'Cargo.lock' or name.endswith(b'/Cargo.lock')]
-    blobs = objects(workspace, 'H', [h_head + ':' + name for name in names], limit=16 * 1024 * 1024)
+    """Cargo must compile the Reverie commit the gitlink names.
+
+    The rows come from that commit's objects; this closes the gap between them
+    and what Cargo builds. Hermit has one Git layout, spelled in exactly one of
+    two ways across every manifest and lock in H_head's objects:
+    - git spelling: Cargo fetches Reverie by revision, so every Cargo.lock line
+      naming Reverie's repository pins the gitlink, and the root Cargo.lock
+      carries one;
+    - path spelling (Hermit's since Reverie became a path dependency): Cargo
+      compiles the submodule checkout itself, so a manifest may take a Reverie
+      package only from that package's member directory under the gitlink, the
+      root Cargo.lock lists Reverie packages with no source, and no Cargo.lock
+      lists one from any source. derive() requires that checkout to be the
+      gitlink commit: its HEAD, clean tracked files and nothing untracked.
+    The path spelling is not Reverie's content-only HermitPath layout: in both
+    spellings the gitlink identity decides. A Reverie package is a member of
+    the gitlinked Reverie workspace, and no path dependency leaves the checkout.
+    """
+    tracked = [os.fsdecode(name) for name in
+               git(workspace, 'ls-tree', '-rz', '--full-tree', '--name-only', h_head).split(b'\0') if name]
+    names = [name for name in tracked if name == 'Cargo.lock' or name.endswith('/Cargo.lock')]
+    manifests = [name for name in tracked if name == 'Cargo.toml' or name.endswith('/Cargo.toml')]
+    blobs = objects(workspace, 'H', [h_head + ':' + name for name in names + manifests], limit=16 * 1024 * 1024)
     rows = []
     for name in names:
         text = blobs[h_head + ':' + name].decode('utf-8', errors='replace')
@@ -366,9 +482,31 @@ def lock_pins(workspace, h_head, rpin):
             for pin in pins:
                 need(pin == rpin, where + ' reverie pin ' + pin + ' differs from the H_head gitlink ' + rpin)
             rows.append([name, number])
-    need(any(name == 'Cargo.lock' for name, _ in rows),
-         'runtime cohort derivation: root Cargo.lock carries no reverie pin')
-    return rows
+    packages = reverie_packages(workspace, rpin)
+    path_rows = []
+    for name in names:
+        for package, source, number in lock_packages(blobs[h_head + ':' + name], name):
+            if package not in packages or source is not None and REVERIE_GIT_SOURCE.fullmatch(source):
+                continue
+            need(source is None, 'runtime cohort derivation: ' + name + ':' + str(number) + ' takes Reverie package ' +
+                 package + ' from ' + str(source) + ', not from the gitlink')
+            path_rows.append([name, number])
+    for name in manifests:
+        for key, package, directory in manifest_path_dependencies(blobs[h_head + ':' + name], name):
+            for named in sorted({key, package} & packages.keys()):
+                need(directory == packages[named],
+                     'runtime cohort derivation: ' + name + ' takes Reverie package ' + named + ' from ' +
+                     directory + ', not from its gitlink member directory ' + packages[named])
+    need(not (rows and path_rows),
+         'runtime cohort derivation: Reverie is spelled both by git revision (' + ':'.join(map(str, rows[0] if rows else [])) +
+         ') and by path (' + ':'.join(map(str, path_rows[0] if path_rows else [])) + ')')
+    if rows:
+        need(any(name == 'Cargo.lock' for name, _ in rows),
+             'runtime cohort derivation: root Cargo.lock carries no reverie pin')
+        return rows
+    need(any(name == 'Cargo.lock' for name, _ in path_rows),
+         'runtime cohort derivation: root Cargo.lock carries no reverie pin and no path-spelled Reverie package')
+    return path_rows
 
 
 RUST_TOKEN = re.compile(rb'(?P<space>[ \t\n\r\f\v]+)|(?P<line>//[^\n]*)|(?P<comment>/\*)|'
@@ -423,37 +561,24 @@ def rust_tokens(source, refusal):
     return tokens
 
 
-def consumer_entry_sources(source, where):
-    """DETCORE's entry_source_relative and accepted_entry_sources, as written.
+def struct_fields(tokens, at, kind, refusal, what):
+    """The fields of the struct literal `KIND { field: value, ... }` at tokens[at].
 
-    This only recognizes the literal form Reverie uses: one
-    `const DETCORE: MappedConsumerSource = MappedConsumerSource { ... };` whose
-    top level names each field once, as `entry_source_relative: "<path>"` and
-    `accepted_entry_sources: &["<sha256>", ...]` with plain string literals.
-    Comments and literals are skipped, so an example cannot supply a missing
-    descriptor; every other form requires an explicit update here.
+    Returns {field: value tokens} and the index of the closing brace. Each
+    field is named once; a value is every token up to the next top-level comma
+    or brace, with its brackets balanced.
     """
-    refusal = (where + ' requires one literal ' + CONSUMER_DESCRIPTOR + ' descriptor naming ' +
-               ' and '.join(CONSUMER_FIELDS) + ' once each')
-    tokens = rust_tokens(source, refusal)
-    name, kind = CONSUMER_DESCRIPTOR.encode(), CONSUMER_TYPE.encode()
-    starts = [at for at in range(1, len(tokens)) if tokens[at - 1] == ('identifier', b'const') and
-              tokens[at][0] == 'identifier' and tokens[at][1].removeprefix(b'r#') == name]
-    need(len(starts) == 1, refusal + ': found ' + str(len(starts)))
-    at = starts[0]
-    head = [('identifier', name), ('punct', b':'), ('identifier', kind), ('punct', b'='),
-            ('identifier', kind), ('punct', b'{')]
-    need(tokens[at:at + len(head)] == head, refusal + ': malformed declaration')
-    at += len(head)
+    need(tokens[at:at + 2] == [('identifier', kind), ('punct', b'{')], refusal + ': malformed ' + what)
+    at += 2
     fields = {}
     while tokens[at:at + 1] != [('punct', b'}')]:
-        need(at < len(tokens), refusal + ': unterminated ' + CONSUMER_DESCRIPTOR)
+        need(at < len(tokens), refusal + ': unterminated ' + what)
         need(tokens[at][0] == 'identifier' and tokens[at + 1:at + 2] == [('punct', b':')],
              refusal + ': malformed field')
         field, value, pending = tokens[at][1].decode(errors='replace'), [], []
         at += 2
         while pending or tokens[at:at + 1] not in ([('punct', b',')], [('punct', b'}')]):
-            need(at < len(tokens), refusal + ': unterminated ' + CONSUMER_DESCRIPTOR)
+            need(at < len(tokens), refusal + ': unterminated ' + what)
             token = tokens[at]
             if token[0] == 'punct' and token[1] in BRACKETS:
                 pending.append(BRACKETS[token[1]])
@@ -465,37 +590,82 @@ def consumer_entry_sources(source, where):
         fields[field] = value
         if tokens[at] == ('punct', b','):
             at += 1
+    return fields, at
+
+
+def consumer_entry_sources(source, where):
+    """(generation, entry_source_relative, accepted_entry_sources) for each generation DETCORE names.
+
+    This only recognizes the literal form Reverie uses: one
+    `const DETCORE: MappedConsumerSource = MappedConsumerSource { ... };` whose
+    top level names `first: Some(MappedGenerationSymbols { ... })` once and
+    `successor:` once, as `None` or in the same form as first. Each generation
+    names each field once, as `entry_source_relative: "<path>"` and
+    `accepted_entry_sources: &["<sha256>", ...]` with plain string literals.
+    Comments and literals are skipped, so an example cannot supply a missing
+    descriptor; every other form, including the earlier one that named the two
+    fields at the descriptor's top level, requires an explicit update here.
+    """
+    refusal = (where + ' requires one literal ' + CONSUMER_DESCRIPTOR + ' descriptor naming ' +
+               ' and '.join(CONSUMER_FIELDS) + ' once each in each generation')
+    tokens = rust_tokens(source, refusal)
+    name, kind = CONSUMER_DESCRIPTOR.encode(), CONSUMER_TYPE.encode()
+    starts = [at for at in range(1, len(tokens)) if tokens[at - 1] == ('identifier', b'const') and
+              tokens[at][0] == 'identifier' and tokens[at][1].removeprefix(b'r#') == name]
+    need(len(starts) == 1, refusal + ': found ' + str(len(starts)))
+    at = starts[0]
+    head = [('identifier', name), ('punct', b':'), ('identifier', kind), ('punct', b'='),
+            ('identifier', kind), ('punct', b'{')]
+    need(tokens[at:at + len(head)] == head, refusal + ': malformed declaration')
+    fields, at = struct_fields(tokens, at + 4, kind, refusal, CONSUMER_DESCRIPTOR)
     need(tokens[at + 1:at + 2] == [('punct', b';')], refusal + ': malformed end')
-    relative = fields.get('entry_source_relative')
-    need(relative is not None and len(relative) == 1 and relative[0][0] == 'string',
-         refusal + ': malformed entry_source_relative')
-    listed = fields.get('accepted_entry_sources') or []
-    items = listed[2:-1]
-    need(listed[:2] == [('punct', b'&'), ('punct', b'[')] and listed[-1:] == [('punct', b']')] and
-         all(token == ('punct', b',') for token in items[1::2]) and
-         all(token[0] == 'string' and re.fullmatch(rb'[0-9a-f]{64}', token[1]) for token in items[0::2]),
-         refusal + ': malformed accepted_entry_sources')
-    return relative[0][1].decode(errors='replace'), [token[1].decode() for token in items[0::2]]
+    for field in CONSUMER_FIELDS:
+        need(field not in fields, refusal + ': ' + field + ' outside a generation')
+    generations = []
+    for generation in CONSUMER_GENERATIONS:
+        value = fields.get(generation)
+        need(value is not None, refusal + ': missing ' + generation)
+        if generation != 'first' and value == [('identifier', b'None')]:
+            continue
+        need(value[:2] == [('identifier', b'Some'), ('punct', b'(')] and value[-1:] == [('punct', b')')],
+             refusal + ': malformed ' + generation)
+        symbols, end = struct_fields(value, 2, CONSUMER_GENERATION_TYPE.encode(), refusal,
+                                     CONSUMER_DESCRIPTOR + ' ' + generation)
+        need(end == len(value) - 2, refusal + ': malformed ' + generation)
+        relative = symbols.get('entry_source_relative')
+        need(relative is not None and len(relative) == 1 and relative[0][0] == 'string',
+             refusal + ': malformed entry_source_relative')
+        listed = symbols.get('accepted_entry_sources') or []
+        items = listed[2:-1]
+        need(listed[:2] == [('punct', b'&'), ('punct', b'[')] and listed[-1:] == [('punct', b']')] and
+             all(token == ('punct', b',') for token in items[1::2]) and
+             all(token[0] == 'string' and re.fullmatch(rb'[0-9a-f]{64}', token[1]) for token in items[0::2]),
+             refusal + ': malformed accepted_entry_sources')
+        generations.append((generation, relative[0][1].decode(errors='replace'),
+                            [token[1].decode() for token in items[0::2]]))
+    return tuple(generations)
 
 
 def entry_source_guard(mapped, consumers, rpin):
-    """Refuse H's entry blob unless the pinned R's Detcore descriptor accepts it."""
+    """Refuse H's entry blob unless every generation of the pinned R's Detcore descriptor accepts it."""
     where = 'runtime cohort derivation: Reverie ' + rpin + ' ' + CONSUMER_SOURCE + ' ' + CONSUMER_DESCRIPTOR
-    relative, accepted = consumer_entry_sources(consumers, where)
-    need(relative == MAPPED_ENTRY_SOURCE,
-         where + ' entry_source_relative ' + relative + ' is not Hermit ' + MAPPED_ENTRY_SOURCE)
     digest = hashlib.sha256(mapped).hexdigest()
-    need(digest in accepted,
-         'runtime cohort derivation: Hermit ' + MAPPED_ENTRY_SOURCE + ' sha256 ' + digest +
-         ' is not accepted by Reverie ' + rpin + ' ' + CONSUMER_SOURCE + ' ' + CONSUMER_DESCRIPTOR +
-         ' accepted_entry_sources (' + (', '.join(accepted) or 'none') + ')')
+    for generation, relative, accepted in consumer_entry_sources(consumers, where):
+        need(relative == MAPPED_ENTRY_SOURCE,
+             where + ' entry_source_relative ' + relative + ' is not Hermit ' + MAPPED_ENTRY_SOURCE +
+             ' (generation ' + generation + ')')
+        need(digest in accepted,
+             'runtime cohort derivation: Hermit ' + MAPPED_ENTRY_SOURCE + ' sha256 ' + digest +
+             ' is not accepted by Reverie ' + rpin + ' ' + CONSUMER_SOURCE + ' ' + CONSUMER_DESCRIPTOR +
+             ' accepted_entry_sources (' + (', '.join(accepted) or 'none') + ') of generation ' + generation)
 
 
 def derive(workspace, h_head, runtime_r_pin=None):
     """Rows read from H_head's objects and the Reverie commit its gitlink names.
 
-    The working tree is never read here. A missing object, a disagreeing pin
-    or a dirty or moved submodule is refused by name.
+    The working tree is never read here. A missing object, a disagreeing pin,
+    or a dirty or moved submodule or one holding any untracked file, ignored
+    or not, is refused by name.
     """
     workspace = Path(workspace)
     need(isinstance(h_head, str) and re.fullmatch('[0-9a-f]{40}', h_head),
@@ -512,7 +682,6 @@ def derive(workspace, h_head, runtime_r_pin=None):
     need(runtime_r_pin is None or runtime_r_pin == rpin,
          'runtime cohort derivation: declared runtime_R_pin ' + str(runtime_r_pin) +
          ' differs from the H_head gitlink ' + rpin)
-    pins = lock_pins(workspace, h_head, rpin)
     reverie = workspace / 'reverie'
     need(reverie.is_dir() and not reverie.is_symlink() and
          Path(git(reverie, 'rev-parse', '--show-toplevel').decode().strip()).resolve() == reverie.resolve(),
@@ -523,6 +692,9 @@ def derive(workspace, h_head, runtime_r_pin=None):
     dirty = [os.fsdecode(e) for e in git(reverie, 'status', '--porcelain=v1', '-z', '--untracked-files=no',
                                          '--ignore-submodules=none').split(b'\0') if e]
     need(not dirty, 'runtime cohort derivation: reverie submodule is dirty: ' + ', '.join(dirty[:8]))
+    # After the submodule checks: the path spelling reads the gitlinked
+    # Reverie workspace's members from the submodule's objects.
+    pins = lock_pins(workspace, h_head, rpin)
     blobs = {}
     for label, repo, rev in [('H', workspace, h_head), ('R', reverie, rpin)]:
         paths = [path for owner, path in DERIVED_ROWS if owner == label]
@@ -532,6 +704,12 @@ def derive(workspace, h_head, runtime_r_pin=None):
                  for label, path in DERIVED_ROWS)
     consumers = rpin + ':' + CONSUMER_SOURCE
     entry_source_guard(blobs['H', MAPPED_ENTRY_SOURCE], objects(reverie, 'R', [consumers])[consumers], rpin)
+    # Cargo compiles the path-spelled submodule from its working tree, and a
+    # build script, include_str! or include_bytes! can read a file Git does not
+    # track, so the checkout holds nothing untracked, ignored files included.
+    untracked = [os.fsdecode(e) for e in git(reverie, 'ls-files', '-z', '--others').split(b'\0') if e]
+    need(not untracked, 'runtime cohort derivation: reverie submodule holds untracked files: ' +
+         ', '.join(untracked[:8]))
     return dict(h_head=h_head, runtime_R_pin=rpin, rows=rows, lock_pins=pins,
                 gate=gate_guard(blobs['R', TRAP_SOURCE]))
 

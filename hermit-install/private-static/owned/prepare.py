@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'ecabca6176a177d2c1426caa9e2508fad967c4e4792a7c2bad9c
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = '3773c94557db6d78890fe7acd4a65eb2d9ec1b016f65517cbcb93e0ccbd5c40c'
+RUNTIME_COHORT_SHA256 = '55fd60cfd418c01531eb02e82d1b433902cc97206e1a51ea80496c12968e237a'
 HANDOFF_SOURCE = 'reverie-loader/src/handoff.rs'
 
 
@@ -619,7 +619,7 @@ def bind_prepared(c, x):
     for name, digest in {
         'elf_metadata.py': '1fee4c7665f2fed7b8442a28b2733fe3327097dfc9c1c8f1003303149e57a3c7',
         'archive_metadata.py': 'd313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972',
-        'source_guard.py': '346752e3139f69977de89d25dc23e74ea08c49cded7a61f1c727a9e19e886fd8',
+        'source_guard.py': '034f5c4409cd37f59565896370cbaf482db9b3400139378a4389bb091172d269',
         'native_guard.py': 'd05e3d63b7c914d2e2794d97dbda4a7e94f5c904aa7cdf8515c37c1c0d4bdda5',
     }.items():
         need(sha(ASSETS / name) == digest, 'existing diagnostic helper changed')

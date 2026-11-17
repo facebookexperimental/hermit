@@ -165,6 +165,16 @@ def lock_text(pin):
             'source = "git+https://github.com/facebookexperimental/reverie.git?rev={0}#{0}"\n'.format(pin))
 
 
+# The fixture Reverie workspace: each R row's Cargo.toml is a member manifest.
+FIXTURE_MEMBERS = tuple(sorted(path[:-len('/Cargo.toml')] for label, path in cohort.DERIVED_ROWS
+                               if label == 'R' and path.endswith('/Cargo.toml')))
+
+
+def path_lock_text(packages):
+    """A Cargo.lock listing PACKAGES with no source: path-spelled Reverie."""
+    return ''.join('[[package]]\nname = "%s"\nversion = "0.1.0"\n\n' % package for package in packages)
+
+
 class PinnedTree:
     """A Hermit checkout with a Reverie submodule, built from real commits."""
 
@@ -175,8 +185,12 @@ class PinnedTree:
         fixture_git(self.reverie, 'init', '-q')
         for label, path in cohort.DERIVED_ROWS:
             if label == 'R':
-                self.write(self.reverie / path, live_reverie_object(TRAP) if path == TRAP
+                self.write(self.reverie / path, live_reverie_object(TRAP) if path == TRAP else
+                           ('[package]\nname = "%s"\nversion = "0.1.0"\n# runtime %s\n' %
+                            (path.split('/')[0], path)).encode() if path.endswith('/Cargo.toml')
                            else ('runtime ' + path + '\n').encode())
+        self.write(self.reverie / 'Cargo.toml', ('[workspace]\nmembers = [%s]\n' %
+                                                 ', '.join('"%s"' % member for member in FIXTURE_MEMBERS)).encode())
         self.entry_bytes = ('host ' + MAPPED_ENTRY + '\n').encode()
         self.entry_relative = MAPPED_ENTRY
         self.accepted = [hashlib.sha256(b'alternative fixture entry\n').hexdigest(),
@@ -193,26 +207,48 @@ class PinnedTree:
         self.locks(self.rpin)
         self.h_head = self.commit(root)
 
-    def consumer_source(self):
-        """Reverie's descriptor form: DETCORE, then another consumer's descriptor."""
-        def descriptor(name, relative, accepted):
+    def consumer_source(self, successor=None):
+        """Reverie's descriptor form: DETCORE, then another consumer's descriptor.
+
+        Each generation names its entry source and accepted digests (Reverie
+        6281d616). SUCCESSOR, as (relative, accepted), gives DETCORE a second
+        generation; LITEROOT always has one.
+        """
+        def generation(name, kind, relative, accepted):
+            return ('Some(MappedGenerationSymbols {\n'
+                    '        entry: "%s_mapped_%s_entry",\n'
+                    '        terminal_exact: Some("_RNv%s"),\n'
+                    '        entry_source_relative: "%s",\n'
+                    '        accepted_entry_sources: &[\n%s        ],\n'
+                    '    })' % (name.lower(), kind, name.lower(), relative,
+                               ''.join('            "%s",\n' % digest for digest in accepted)))
+
+        def descriptor(name, relative, accepted, successor):
             return ('const %s: MappedConsumerSource = MappedConsumerSource {\n'
                     '    layout: "%s_mapped_layout",\n'
-                    '    first: Some(MappedGenerationSymbols {\n'
-                    '        entry: "%s_mapped_entry",\n'
-                    '        terminal_exact: Some("_RNv%s"),\n'
-                    '    }),\n'
-                    '    successor: None,\n'
-                    '    entry_source_relative: "%s",\n'
-                    '    accepted_entry_sources: &[\n%s    ],\n'
+                    '    first: %s,\n'
+                    '    successor: %s,\n'
                     '    binding: WorkspaceBinding::HermitGitlink {\n'
                     '        reverie_gitlink_relative: "reverie",\n'
                     '    },\n'
                     '    features: &["exec-native-injection", "exec-private-init"],\n'
-                    '};\n' % (name, name.lower(), name.lower(), name.lower(), relative,
-                              ''.join('        "%s",\n' % digest for digest in accepted)))
-        return (descriptor('DETCORE', self.entry_relative, self.accepted) + '\n' +
-                descriptor('LITEROOT', 'preload/src/mapped_entry.rs', self.other_accepted)).encode()
+                    '};\n' % (name, name.lower(), generation(name, 'first', relative, accepted),
+                              generation(name, 'successor', *successor) if successor else 'None'))
+        return (descriptor('DETCORE', self.entry_relative, self.accepted, successor) + '\n' +
+                descriptor('LITEROOT', 'preload/src/mapped_initial_entry.rs', self.other_accepted,
+                           ('preload/src/mapped_entry.rs', self.other_accepted))).encode()
+
+    def path_spelled(self, root_lock=None, nested_lock=None):
+        """Commit the Hermit side in the path spelling, as Hermit spells Reverie today."""
+        self.write(self.root / 'Cargo.toml', ('[workspace.dependencies]\n' + ''.join(
+            '%s = { path = "reverie/%s", version = "0.1.0" }\n' % (member, member)
+            for member in FIXTURE_MEMBERS)).encode())
+        self.write(self.root / 'liteinst-runtime-build/Cargo.toml',
+                   ('[dependencies]\n%s = { path = "../reverie/%s" }\n' % (FIXTURE_MEMBERS[0], FIXTURE_MEMBERS[0])).encode())
+        self.write(self.root / 'Cargo.lock', (root_lock or path_lock_text(FIXTURE_MEMBERS)).encode())
+        self.write(self.root / 'liteinst-runtime-build/Cargo.lock',
+                   (nested_lock or path_lock_text(FIXTURE_MEMBERS[:1])).encode())
+        self.h_head = self.commit(self.root)
 
     @staticmethod
     def write(path, raw):
@@ -595,6 +631,104 @@ class DerivedCohort(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: root Cargo.lock carries no reverie pin'):
                 cohort.bind(tree.root, tree.h_head)
 
+    def test_path_spelled_reverie_binds_through_its_gitlink_member_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled()
+            result = cohort.bind(tree.root, tree.h_head)
+            self.assertEqual((result['cohort'], result['runtime_R_pin']), (cohort.DERIVED_COHORT, tree.rpin))
+            # The name line of each Reverie package listed with no source.
+            self.assertEqual(result['lock_pins'], [['Cargo.lock', 2], ['Cargo.lock', 6],
+                                                   ['liteinst-runtime-build/Cargo.lock', 2]])
+
+    def test_path_spelled_reverie_from_anywhere_but_its_member_directory_is_refused(self):
+        member, other = FIXTURE_MEMBERS
+        for dependency, refusal in [
+                ('%s = { path = "vendor/%s" }' % (member, member),
+                 'Cargo.toml takes Reverie package %s from vendor/%s, not from its gitlink member directory reverie/%s'
+                 % (member, member, member)),
+                ('%s = { path = "reverie/%s" }' % (member, other),
+                 'Cargo.toml takes Reverie package %s from reverie/%s' % (member, other)),
+                ('fork = { path = "vendor/fork", package = "%s" }' % member,
+                 'Cargo.toml takes Reverie package %s from vendor/fork' % member),
+                ('%s = { path = "vendor/fork", package = "fork" }' % member,
+                 'Cargo.toml takes Reverie package %s from vendor/fork' % member),
+                ('%s = { path = "../reverie/%s" }' % (member, member),
+                 'Cargo.toml dependency %s path ../reverie/%s leaves the checkout' % (member, member)),
+                ('%s = { path = "/srv/reverie/%s" }' % (member, member),
+                 'Cargo.toml dependency %s has no relative path' % member)]:
+            with self.subTest(dependency=dependency), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                tree.path_spelled()
+                cohort.bind(tree.root, tree.h_head)
+                (tree.root / 'Cargo.toml').write_text('[dependencies]\n' + dependency + '\n')
+                tree.h_head = tree.commit(tree.root)
+                with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: ' + re.escape(refusal)):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_reverie_package_from_any_other_source_is_refused(self):
+        member = FIXTURE_MEMBERS[0]
+        for source in ['registry+https://github.com/rust-lang/crates.io-index',
+                       'git+https://github.com/example/reverie-fork?rev=%s#%s' % ('a' * 40, 'a' * 40)]:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                tree.path_spelled(nested_lock=path_lock_text([member]) +
+                                  '[[package]]\nname = "%s"\nversion = "0.0.9"\nsource = "%s"\n' % (member, source))
+                with self.assertRaisesRegex(RuntimeError, re.escape(
+                        'runtime cohort derivation: liteinst-runtime-build/Cargo.lock:6 takes Reverie package ' +
+                        member + ' from ' + source + ', not from the gitlink')):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_git_and_path_spellings_together_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled(root_lock=lock_text(tree.rpin))
+            with self.assertRaisesRegex(RuntimeError, re.escape(
+                    'runtime cohort derivation: Reverie is spelled both by git revision (Cargo.lock:4) and by path '
+                    '(liteinst-runtime-build/Cargo.lock:2)')):
+                cohort.bind(tree.root, tree.h_head)
+
+    def test_path_spelled_root_lock_without_reverie_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled(root_lock='[[package]]\nname = "other"\nversion = "0.1.0"\n')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: root Cargo.lock carries no reverie '
+                                        'pin and no path-spelled Reverie package'):
+                cohort.bind(tree.root, tree.h_head)
+
+    def test_reverie_workspace_members_must_be_plain_paths(self):
+        for members in ['[]', '["reverie-*"]', '["../outside"]', '"reverie-inguest"']:
+            with self.subTest(members=members), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                tree.write(tree.reverie / 'Cargo.toml', ('[workspace]\nmembers = %s\n' % members).encode())
+                tree.commit(tree.reverie)
+                tree.repin()
+                with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: Reverie ' + tree.rpin +
+                                            ':Cargo.toml must list its workspace members as plain relative paths'):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_untracked_files_in_the_reverie_checkout_are_refused(self):
+        # A build script, include_str! or include_bytes! can read a file Git
+        # does not track, so an ignored file counts as much as any other.
+        for spelling in ['git', 'path']:
+            for name, ignore in [('reverie-inguest/src/stray.rs', None),
+                                 ('reverie-inguest/src/generated.rs', 'generated.rs\n')]:
+                with self.subTest(spelling=spelling, name=name), tempfile.TemporaryDirectory() as directory:
+                    tree = PinnedTree(Path(directory))
+                    if ignore:
+                        tree.write(tree.reverie / '.gitignore', ignore.encode())
+                        tree.commit(tree.reverie)
+                        tree.repin()
+                    if spelling == 'path':
+                        tree.path_spelled()
+                    cohort.bind(tree.root, tree.h_head)
+                    tree.write(tree.reverie / name, b'pub const SMUGGLED: u8 = 1;\n')
+                    if ignore:
+                        self.assertEqual(fixture_git(tree.reverie, 'status', '--porcelain'), '')
+                    with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: reverie submodule holds '
+                                                'untracked files: ' + re.escape(name)):
+                        cohort.derive(tree.root, tree.h_head)
+
     def test_absent_gitlink_is_refused_by_name(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
@@ -690,10 +824,33 @@ class EntrySourcePins(unittest.TestCase):
         tree.repin()
 
     def test_live_descriptor_accepts_the_live_entry(self):
-        relative, accepted = cohort.consumer_entry_sources(live_reverie_object(CONSUMER), 'live')
-        self.assertEqual(relative, MAPPED_ENTRY)
+        generations = cohort.consumer_entry_sources(live_reverie_object(CONSUMER), 'live')
+        self.assertEqual(generations[0][0], 'first')
         entry = fixture_git_bytes(LIVE, 'cat-file', 'blob', 'HEAD:' + MAPPED_ENTRY)
-        self.assertIn(hashlib.sha256(entry).hexdigest(), accepted)
+        for generation, relative, accepted in generations:
+            with self.subTest(generation=generation):
+                self.assertEqual(relative, MAPPED_ENTRY)
+                self.assertIn(hashlib.sha256(entry).hexdigest(), accepted)
+
+    def test_a_successor_generation_must_name_and_accept_the_entry_too(self):
+        digest = hashlib.sha256(b'host ' + MAPPED_ENTRY.encode() + b'\n').hexdigest()
+        for successor, refusal in [((MAPPED_ENTRY, [digest]), None),
+                                   ((MAPPED_ENTRY, [hashlib.sha256(b'other').hexdigest()]),
+                                    r'DETCORE accepted_entry_sources \(\w+\) of generation successor'),
+                                   (('detcore-liteinst/src/exec_initial/successor_entry.rs', [digest]),
+                                    re.escape(CONSUMER + ' DETCORE entry_source_relative '
+                                              'detcore-liteinst/src/exec_initial/successor_entry.rs is not Hermit ' +
+                                              MAPPED_ENTRY + ' (generation successor)'))]:
+            with self.subTest(successor=successor), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                self.recommit(tree, tree.consumer_source(successor))
+                self.assertEqual([g[0] for g in cohort.consumer_entry_sources(tree.consumer_source(successor), 'x')],
+                                 ['first', 'successor'])
+                if refusal is None:
+                    self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, refusal):
+                        cohort.derive(tree.root, tree.h_head)
 
     def test_each_listed_digest_accepts_the_committed_entry(self):
         for size, position in [(1, 0), (3, 0), (3, 1), (3, 2)]:
@@ -792,12 +949,21 @@ class EntrySourcePins(unittest.TestCase):
                                                           b'concat!("' + MAPPED_ENTRY.encode() + b'")'),
                             'malformed entry_source_relative'),
             'missing_list': (lambda tree, raw: without_list(raw), 'malformed accepted_entry_sources'),
-            'duplicate_list': (lambda tree, raw: raw.replace(b'    binding:', b'    accepted_entry_sources: &[],\n'
-                                                             b'    binding:', 1), 'duplicate accepted_entry_sources'),
-            'nested_list': (lambda tree, raw: without_list(raw).replace(
-                b'        entry: "detcore_mapped_entry",\n',
-                b'        entry: "detcore_mapped_entry",\n    ' + list_field(raw), 1),
-                            'malformed accepted_entry_sources'),
+            'duplicate_list': (lambda tree, raw: raw.replace(b'        accepted_entry_sources:',
+                                                             b'        accepted_entry_sources: &[],\n'
+                                                             b'        accepted_entry_sources:', 1),
+                               'duplicate accepted_entry_sources'),
+            # The form before Reverie 6281d616 named both fields at the
+            # descriptor's top level; neither is read there any more.
+            'top_level_list': (lambda tree, raw: without_list(raw).replace(
+                b'    binding:', list_field(raw) + b'    binding:', 1),
+                               'accepted_entry_sources outside a generation'),
+            'top_level_path': (lambda tree, raw: raw.replace(
+                b'    binding:', b'    entry_source_relative: "' + MAPPED_ENTRY.encode() + b'",\n    binding:', 1),
+                               'entry_source_relative outside a generation'),
+            'missing_successor': (lambda tree, raw: raw.replace(b'    successor: None,\n', b'', 1), 'missing successor'),
+            'first_none': (lambda tree, raw: raw[:raw.index(b'    first: ')] + b'    first: None,\n' +
+                           raw[raw.index(b'    successor: None'):], 'malformed first'),
             'shorthand': (lambda tree, raw: raw.replace(list_field(raw), b'    accepted_entry_sources,\n', 1),
                           'malformed field'),
             'const_reference': (lambda tree, raw: raw.replace(list_field(raw),
@@ -866,7 +1032,7 @@ class EntrySourcePins(unittest.TestCase):
                    b"const NAME: &'static str = \"const DETCORE: MappedConsumerSource = MappedConsumerSource {\";\n"
                    b'const ESCAPED: &str = "continued\\\n const DETCORE: MappedConsumerSource = \\"ignored\\";";\n'
                    b'const EXAMPLE: &str = r#"' + example + b'"#;\n' + raw)
-            self.assertEqual(cohort.consumer_entry_sources(raw, 'fixture'), (MAPPED_ENTRY, tree.accepted))
+            self.assertEqual(cohort.consumer_entry_sources(raw, 'fixture'), (('first', MAPPED_ENTRY, tree.accepted),))
             self.recommit(tree, raw)
             self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
 
@@ -1238,6 +1404,35 @@ class ActivePinsFromObjects(unittest.TestCase):
             rows = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
             self.assertEqual(sorted({row[0] for row in rows}),
                              ['Cargo.lock', 'Cargo.toml', 'liteinst-runtime-build/Cargo.lock'])
+
+    def test_path_spelled_authority_is_the_manifest_paths_and_the_root_lock_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled()
+            rows = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            self.assertEqual([row[:2] for row in rows],
+                             [['Cargo.toml', 2], ['Cargo.toml', 3], ['liteinst-runtime-build/Cargo.toml', 2],
+                              ['Cargo.lock', 2], ['Cargo.lock', 6]])
+
+    def test_path_spelled_tree_without_root_lock_entries_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled(root_lock='[[package]]\nname = "other"\nversion = "0.1.0"\n')
+            with self.assertRaisesRegex(RuntimeError, 'root manifest/lock pin authority missing'):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            source = path_lock_text(FIXTURE_MEMBERS[:1]).replace(
+                'version = "0.1.0"\n', 'version = "0.1.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n')
+            tree.path_spelled(root_lock=source)
+            with self.assertRaisesRegex(RuntimeError, 'root manifest/lock pin authority missing'):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+
+    def test_git_and_path_spellings_together_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.path_spelled(root_lock=lock_text(tree.rpin))
+            with self.assertRaisesRegex(RuntimeError, re.escape(
+                    'Reverie spelled both by git revision (Cargo.lock:4) and by path (Cargo.toml:2)')):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
 
     def test_committed_disagreeing_lock_is_refused_by_name(self):
         with tempfile.TemporaryDirectory() as directory:

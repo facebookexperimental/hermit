@@ -76,11 +76,20 @@ def full_pins(h,rpin,head):
         names.append((name,oid.decode()))
     stream=subprocess.run(['git','--no-replace-objects','-C',str(h),'cat-file','--batch'],input=''.join(oid+'\n' for _,oid in names).encode(),
                           stdout=subprocess.PIPE,check=True,env=exact).stdout
-    at=0
+    # The path spelling (Reverie by path into the reverie gitlink, Hermit's
+    # layout since Reverie became a path dependency) has no revision to compare.
+    # Its authority rows are the active manifest lines that take a package from
+    # under reverie/ and the root Cargo.lock name lines of those packages, which
+    # carry no source. runtime_cohort.lock_pins, which the same snapshot runs,
+    # holds the complete rule (gitlink member directories, no other source, no
+    # path leaving the checkout); this records the rows, refuses a mix of the
+    # two spellings and still refuses a tree with neither.
+    at=0;url=[];path_rows=[];declared=set();root_lock=b''
     for name,oid in names:
         end=stream.index(b'\n',at);fields=stream[at:end].split();at=end+1
         need(len(fields)==3 and fields[0].decode()==oid and fields[1]==b'blob','pin source object missing: '+name)
         size=int(fields[2]);text=stream[at:at+size];at+=size+1
+        if name=='Cargo.lock': root_lock=text
         if b'reverie' not in text.lower(): continue
         for n,line in enumerate(text.decode('utf-8',errors='replace').splitlines(),1):
             s=line.strip()
@@ -91,7 +100,26 @@ def full_pins(h,rpin,head):
             if 'github.com/facebookexperimental/reverie' in line or 'github.com/rrnewton/reverie' in line:
                 pins=re.findall(r'(?:rev[=\s"\x27:]+|#)([0-9a-f]{40})',line)
                 need(pins and all(p==rpin for p in pins),'active Reverie pin differs/missing: '+name+':'+str(n))
-                rows.append([name,n,line])
+                rows.append([name,n,line]);url.append([name,n,line])
+            if name.endswith('Cargo.toml'):
+                for path in re.findall(r'\bpath\s*=\s*"([^"]*)"',line):
+                    target=os.path.normpath(os.path.join(os.path.dirname(name),path))
+                    if path.startswith('/') or not (target=='reverie' or target.startswith('reverie/')): continue
+                    package=re.search(r'\bpackage\s*=\s*"([^"]+)"',line);key=re.match(r'\s*"?([\w-]+)"?\s*=',line,re.A)
+                    need(bool(package or key),'Reverie path dependency names no package: '+name+':'+str(n))
+                    declared.add(package.group(1) if package else key.group(1));path_rows.append([name,n,line])
     need(at==len(stream),'pin source object stream differs')
-    need(any(x[0].endswith('Cargo.toml') for x in rows) and any(x[0]=='Cargo.lock' for x in rows),'root manifest/lock pin authority missing')
-    return rows
+    blocks=[];block=None
+    for n,line in enumerate(root_lock.decode('utf-8',errors='replace').splitlines(),1):
+        if line.startswith('['):
+            block={'name':None} if line.strip()=='[[package]]' else None
+            if block is not None: blocks.append(block)
+        elif block is not None and block['name'] is None and line.startswith('name = '):
+            block.update(name=line[len('name = '):].strip().strip('"'),row=['Cargo.lock',n,line])
+        elif block is not None and line.startswith('source = '): block['source']=True
+    path_rows+=[b['row'] for b in blocks if b['name'] in declared and not b.get('source')]
+    need(not (url and path_rows),'Reverie spelled both by git revision ('+':'.join(map(str,url[0][:2]))+') and by path ('+
+         ':'.join(map(str,path_rows[0][:2]))+')' if url and path_rows else '')
+    authority=url or path_rows
+    need(any(x[0].endswith('Cargo.toml') for x in authority) and any(x[0]=='Cargo.lock' for x in authority),'root manifest/lock pin authority missing')
+    return rows+path_rows
