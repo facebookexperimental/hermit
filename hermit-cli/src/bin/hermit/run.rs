@@ -17620,6 +17620,13 @@ impl RunOpts {
         {
             super::replay_refusal_note::arm()?;
         }
+        // Before the clone, like the notes above: the helper process
+        // and the sink it serves are inherited by the container child,
+        // whose KVM backends then hand their VM destruction to it.
+        // Starting it cannot fail the run (see vm_teardown_helper).
+        if self.runtime_backend() == Backend::Kvm {
+            super::vm_teardown_helper::ensure_installed();
+        }
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, guards, native_plan, gdbserver_port),

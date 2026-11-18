@@ -106,6 +106,7 @@ mod verify;
 mod verify_inputs;
 mod verify_run;
 mod version;
+mod vm_teardown_helper;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -904,6 +905,15 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
             Ok(()) => return,
             Err(error) => {
                 display_entry_error("GDB helper failed", &error);
+                std::process::exit(125);
+            }
+        }
+    }
+    if let Some(result) = vm_teardown_helper::maybe_run() {
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                display_entry_error("VM teardown helper failed", &error);
                 std::process::exit(125);
             }
         }

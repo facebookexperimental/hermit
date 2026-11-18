@@ -76,6 +76,7 @@ pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
 pub mod sleep_registration_admission;
+pub mod vm_teardown;
 
 /// Re-runs the named test alone in a fresh process of this test binary and
 /// requires it to pass; returns false in that fresh process so the caller
@@ -3547,6 +3548,14 @@ async fn run_kvm(
     config.has_uts_namespace = false;
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    // If the binary installed its VM-teardown helper sink before the
+    // container clone, every backend in this run's guest tree hands its
+    // VM destruction to the helper process instead of waiting out the
+    // kernel's RCU grace period at drop (reverie#132). Without one,
+    // drops destroy synchronously, as before.
+    if let Some(sink) = crate::vm_teardown::vm_teardown_sink() {
+        backend.set_vm_teardown_sink(Some(sink));
+    }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
     backend
@@ -3616,16 +3625,33 @@ async fn run_kvm(
     let cleanup_started = Instant::now();
     let result =
         finish_kvm_tool_completion(completion, print_summary, print_summary_to_json_file).await;
+    // The run's observable result leaves before the backend drops: the
+    // status is unpacked and, for a non-capturing run, the guest's output
+    // is written, so neither waits for VM teardown (reverie#132). On the
+    // error path the backend still drops before the error propagates, as
+    // it did when the drop preceded this unpacking.
+    let (status, stdout, stderr) = match result {
+        Ok(triple) => triple,
+        Err(error) => {
+            drop(backend);
+            return Err(error);
+        }
+    };
+    if !capture_output {
+        std::io::stdout().write_all(&stdout)?;
+        std::io::stderr().write_all(&stderr)?;
+    }
     let teardown_started = Instant::now();
-    // Drop explicitly so the host's KVM VM teardown cost remains observable.
+    // Drop explicitly so the host's KVM VM teardown cost remains
+    // observable in `teardown_us`.
     drop(backend);
     let teardown_finished = Instant::now();
-    let (status, stdout, stderr) = result?;
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
     // DEBUG so it remains available for backend profiling without entering the
     // INFO stream exposed to canonical comparison. KVM's built-in verification
     // is still output/status-only; this classification does not claim KVM L2.
+    // `cleanup_us` includes writing the guest's output above.
     tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
@@ -3636,11 +3662,6 @@ async fn run_kvm(
         lifecycle_us = teardown_finished.duration_since(dispatch_started).as_micros() as u64,
         "reverie-kvm lifecycle phase timings",
     );
-
-    if !capture_output {
-        std::io::stdout().write_all(&stdout)?;
-        std::io::stderr().write_all(&stderr)?;
-    }
 
     Ok(Output {
         status,
