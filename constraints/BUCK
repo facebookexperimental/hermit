@@ -1,0 +1,29 @@
+oncall("hermit")
+
+# The liteinst-runtime rustc-flags constraint. The liteinst-runtime
+# configured alias (fb-only/liteinst-runtime-profile.bzl) adds
+# :liteinst-runtime-flags[applied] to the Detcore runtime closure's
+# configuration; Hermit's and Reverie's own rust targets and the
+# third-party rust fixups gate the liteinst-runtime rustc flags
+# (-Coverflow-checks=yes -Ccodegen-units=16 -Cdebuginfo=0) on it with
+# select(), defaulting to no added flags. Configurations that do not
+# select this package's [applied] value build exactly as before. This
+# package is the constraint only (one setting and its values, via the
+# supported fbcode constraint() rule instead of the raw
+# constraint_setting/constraint_value rules fbcode BUCK files may not
+# call), so that every configurable consumer (third-party fixups and
+# vendor BUCK files included) depends on nothing else of Hermit's.
+
+constraint(
+    name = "liteinst-runtime-flags",
+    default = "unspecified",
+    values = [
+        "applied",
+        "unspecified",
+    ],
+    visibility = [
+        "fbsource//third-party/rust/...",
+        "//hermetic_infra/hermit/...",
+        "//hermetic_infra/reverie:",
+    ],
+)
