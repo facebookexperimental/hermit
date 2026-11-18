@@ -529,6 +529,12 @@
       "why": "tests/c/dup_shared_offset.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "support-data",
+      "path": "tests/c/e2e_iterations.h",
+      "runner": "C guests that include e2e_iterations.h",
+      "why": "tests/c/e2e_iterations.h is owned by C guests that include e2e_iterations.h: The `e2e_iterations.h` header reads the optional E2E_ITERATIONS count with which a benchmark runs a guest's body N times in one process (1 when unset, as in every e2e cell). It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/environment_and_workdir.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

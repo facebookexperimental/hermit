@@ -6,6 +6,55 @@
 # LICENSE file in the root directory of this source tree.
 set -euo pipefail
 
+# The body of --run.
+run_once() {
+    work="${E2E_TMPDIR:-/tmp}/dd-partial"
+    rm -rf "$work"; mkdir -p "$work"
+    src="$work/src.bin"
+    size=512
+    # Deterministic, compressible-but-not-uniform payload.
+    awk -v n=$((size / 16)) 'BEGIN { for (i = 0; i < n; i++) printf "0123456789abcdef" }' >"$src"
+    src_size=$(wc -c <"$src" | tr -d '[:space:]')
+    printf 'SRC %s\n' "$src_size"
+    if [ "$src_size" -ne "$size" ]; then
+        echo "source size mismatch: got $src_size, want $size" >&2
+        exit 1
+    fi
+
+    # Byte-at-a-time through a pipe: the reader cannot get a full block, so
+    # every transfer is partial.
+    piped=$(cat "$src" | dd bs=1 status=none | wc -c | tr -d '[:space:]')
+    printf 'PIPED %s\n' "$piped"
+    if [ "$piped" -ne "$size" ]; then
+        echo "pipe transfer mismatch: got $piped, want $size" >&2
+        exit 1
+    fi
+
+    # Byte-at-a-time to a file, then compare content to prove no byte was
+    # dropped or duplicated by the split.
+    dd if="$src" of="$work/out.bin" bs=1 status=none
+    copied=$(wc -c <"$work/out.bin" | tr -d '[:space:]')
+    if cmp -s "$src" "$work/out.bin"; then
+        identical=yes
+    else
+        identical=no
+    fi
+    printf 'COPIED %s\n' "$copied"
+    printf 'IDENTICAL %s\n' "$identical"
+    if [ "$copied" -ne "$size" ] || [ "$identical" != yes ]; then
+        echo "file transfer mismatch: copied=$copied identical=$identical" >&2
+        exit 1
+    fi
+
+    # A short odd-sized block count exercises the final partial block.
+    odd=$(head -c 89 "$src" | dd bs=7 count=13 status=none | wc -c | tr -d '[:space:]')
+    printf 'ODDBLOCK %s\n' "$odd"
+    if [ "$odd" -ne 89 ]; then
+        echo "partial block mismatch: got $odd, want 89" >&2
+        exit 1
+    fi
+}
+
 # Surface: PARTIAL-TRANSFER file I/O in a REAL program.
 #
 # The corpus exercised partial transfers only through purpose-built C fixtures.
@@ -32,51 +81,21 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
-        work="${E2E_TMPDIR:-/tmp}/dd-partial"
-        rm -rf "$work"; mkdir -p "$work"
-        src="$work/src.bin"
-        size=512
-        # Deterministic, compressible-but-not-uniform payload.
-        awk -v n=$((size / 16)) 'BEGIN { for (i = 0; i < n; i++) printf "0123456789abcdef" }' >"$src"
-        src_size=$(wc -c <"$src" | tr -d '[:space:]')
-        printf 'SRC %s\n' "$src_size"
-        if [ "$src_size" -ne "$size" ]; then
-            echo "source size mismatch: got $src_size, want $size" >&2
-            exit 1
+        # E2E_ITERATIONS=N runs this body N times in one guest run, for a
+        # benchmark that fits wall time against N (tests/c/e2e_iterations.h);
+        # unset, it runs once, as every e2e cell runs it.
+        iterations=${E2E_ITERATIONS:-1}
+        if [[ ! $iterations =~ ^[1-9][0-9]{0,6}$ ]] || ((iterations > 1000000)); then
+            echo "E2E_ITERATIONS must be a decimal integer from 1 to 1000000, got \"$iterations\"" >&2
+            exit 2
         fi
-
-        # Byte-at-a-time through a pipe: the reader cannot get a full block, so
-        # every transfer is partial.
-        piped=$(cat "$src" | dd bs=1 status=none | wc -c | tr -d '[:space:]')
-        printf 'PIPED %s\n' "$piped"
-        if [ "$piped" -ne "$size" ]; then
-            echo "pipe transfer mismatch: got $piped, want $size" >&2
-            exit 1
-        fi
-
-        # Byte-at-a-time to a file, then compare content to prove no byte was
-        # dropped or duplicated by the split.
-        dd if="$src" of="$work/out.bin" bs=1 status=none
-        copied=$(wc -c <"$work/out.bin" | tr -d '[:space:]')
-        if cmp -s "$src" "$work/out.bin"; then
-            identical=yes
-        else
-            identical=no
-        fi
-        printf 'COPIED %s\n' "$copied"
-        printf 'IDENTICAL %s\n' "$identical"
-        if [ "$copied" -ne "$size" ] || [ "$identical" != yes ]; then
-            echo "file transfer mismatch: copied=$copied identical=$identical" >&2
-            exit 1
-        fi
-
-        # A short odd-sized block count exercises the final partial block.
-        odd=$(head -c 89 "$src" | dd bs=7 count=13 status=none | wc -c | tr -d '[:space:]')
-        printf 'ODDBLOCK %s\n' "$odd"
-        if [ "$odd" -ne 89 ]; then
-            echo "partial block mismatch: got $odd, want 89" >&2
-            exit 1
-        fi
+        # A while loop, not `for ((...))`: bash's arithmetic for loop blocks
+        # SIGCHLD once more when it ends, and an unset count must leave the
+        # run's system calls exactly as they were.
+        while :; do
+            run_once
+            ((--iterations > 0)) || break
+        done
         ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac

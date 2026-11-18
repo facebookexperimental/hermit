@@ -6,6 +6,62 @@
 # LICENSE file in the root directory of this source tree.
 set -euo pipefail
 
+# The body of --run.
+run_once() {
+    work="${E2E_TMPDIR:-/tmp}/hermit-git-repository-workflow"
+    repo="$work/repo"
+    git_bin=/usr/bin/git
+    rm -rf -- "$work"
+    mkdir -p -- "$repo" "$work/home" "$work/xdg"
+
+    # Git exports its repository-location variables to hooks and `git
+    # rebase --exec` steps, and they override `git -C`. The corpus
+    # repository is named explicitly, so run without them; otherwise its
+    # `git init` and commits land in the caller's repository
+    # (https://github.com/rrnewton/hermit/issues/3362).
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+
+    # Keep the transaction independent of developer and system Git config.
+    export HOME="$work/home"
+    export XDG_CONFIG_HOME="$work/xdg"
+    export GIT_CONFIG_NOSYSTEM=1
+    export GIT_AUTHOR_NAME='Hermit Corpus'
+    export GIT_AUTHOR_EMAIL='hermit-corpus@example.invalid'
+    export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME
+    export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
+
+    "$git_bin" init -q --initial-branch=main "$repo"
+    "$git_bin" -C "$repo" config commit.gpgsign false
+    "$git_bin" -C "$repo" config core.autocrlf false
+
+    printf 'alpha\nbeta\ngamma\n' >"$repo/records.txt"
+    printf '{"schema":1,"enabled":true}\n' >"$repo/config.json"
+    "$git_bin" -C "$repo" add records.txt config.json
+    GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' \
+        GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
+        "$git_bin" -C "$repo" commit -q -m 'seed deterministic corpus'
+
+    printf 'delta\n' >>"$repo/records.txt"
+    mkdir -p -- "$repo/nested"
+    printf 'payload-v2\n' >"$repo/nested/payload.txt"
+    "$git_bin" -C "$repo" add records.txt nested/payload.txt
+    GIT_AUTHOR_DATE='2000-01-02T00:00:00Z' \
+        GIT_COMMITTER_DATE='2000-01-02T00:00:00Z' \
+        "$git_bin" -C "$repo" commit -q -m 'extend deterministic corpus'
+
+    "$git_bin" -C "$repo" diff --quiet
+    "$git_bin" -C "$repo" diff --cached --quiet
+    "$git_bin" -C "$repo" fsck --no-dangling --no-progress >/dev/null
+    "$git_bin" -C "$repo" archive --format=tar --output="$work/head.tar" HEAD
+
+    printf 'GIT commits=%s status=clean\n' "$("$git_bin" -C "$repo" rev-list --count HEAD)"
+    printf 'GIT files=%s\n' "$("$git_bin" -C "$repo" ls-tree -r --name-only HEAD | paste -sd, -)"
+    printf 'GIT payload=%s\n' "$("$git_bin" -C "$repo" show HEAD:nested/payload.txt)"
+    printf 'GIT archive_entries=%s\n' "$(tar -tf "$work/head.tar" | paste -sd, -)"
+    printf 'GIT archive_sha256=%s\n' "$(sha256sum "$work/head.tar" | cut -d' ' -f1)"
+}
+
 case ${1:-} in
     --prepare)
         test -x /usr/bin/git || {
@@ -20,58 +76,21 @@ case ${1:-} in
         done
         ;;
     --run)
-        work="${E2E_TMPDIR:-/tmp}/hermit-git-repository-workflow"
-        repo="$work/repo"
-        git_bin=/usr/bin/git
-        rm -rf -- "$work"
-        mkdir -p -- "$repo" "$work/home" "$work/xdg"
-
-        # Git exports its repository-location variables to hooks and `git
-        # rebase --exec` steps, and they override `git -C`. The corpus
-        # repository is named explicitly, so run without them; otherwise its
-        # `git init` and commits land in the caller's repository
-        # (https://github.com/rrnewton/hermit/issues/3362).
-        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
-            GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
-
-        # Keep the transaction independent of developer and system Git config.
-        export HOME="$work/home"
-        export XDG_CONFIG_HOME="$work/xdg"
-        export GIT_CONFIG_NOSYSTEM=1
-        export GIT_AUTHOR_NAME='Hermit Corpus'
-        export GIT_AUTHOR_EMAIL='hermit-corpus@example.invalid'
-        export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME
-        export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
-
-        "$git_bin" init -q --initial-branch=main "$repo"
-        "$git_bin" -C "$repo" config commit.gpgsign false
-        "$git_bin" -C "$repo" config core.autocrlf false
-
-        printf 'alpha\nbeta\ngamma\n' >"$repo/records.txt"
-        printf '{"schema":1,"enabled":true}\n' >"$repo/config.json"
-        "$git_bin" -C "$repo" add records.txt config.json
-        GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' \
-            GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
-            "$git_bin" -C "$repo" commit -q -m 'seed deterministic corpus'
-
-        printf 'delta\n' >>"$repo/records.txt"
-        mkdir -p -- "$repo/nested"
-        printf 'payload-v2\n' >"$repo/nested/payload.txt"
-        "$git_bin" -C "$repo" add records.txt nested/payload.txt
-        GIT_AUTHOR_DATE='2000-01-02T00:00:00Z' \
-            GIT_COMMITTER_DATE='2000-01-02T00:00:00Z' \
-            "$git_bin" -C "$repo" commit -q -m 'extend deterministic corpus'
-
-        "$git_bin" -C "$repo" diff --quiet
-        "$git_bin" -C "$repo" diff --cached --quiet
-        "$git_bin" -C "$repo" fsck --no-dangling --no-progress >/dev/null
-        "$git_bin" -C "$repo" archive --format=tar --output="$work/head.tar" HEAD
-
-        printf 'GIT commits=%s status=clean\n' "$("$git_bin" -C "$repo" rev-list --count HEAD)"
-        printf 'GIT files=%s\n' "$("$git_bin" -C "$repo" ls-tree -r --name-only HEAD | paste -sd, -)"
-        printf 'GIT payload=%s\n' "$("$git_bin" -C "$repo" show HEAD:nested/payload.txt)"
-        printf 'GIT archive_entries=%s\n' "$(tar -tf "$work/head.tar" | paste -sd, -)"
-        printf 'GIT archive_sha256=%s\n' "$(sha256sum "$work/head.tar" | cut -d' ' -f1)"
+        # E2E_ITERATIONS=N runs this body N times in one guest run, for a
+        # benchmark that fits wall time against N (tests/c/e2e_iterations.h);
+        # unset, it runs once, as every e2e cell runs it.
+        iterations=${E2E_ITERATIONS:-1}
+        if [[ ! $iterations =~ ^[1-9][0-9]{0,6}$ ]] || ((iterations > 1000000)); then
+            echo "E2E_ITERATIONS must be a decimal integer from 1 to 1000000, got \"$iterations\"" >&2
+            exit 2
+        fi
+        # A while loop, not `for ((...))`: bash's arithmetic for loop blocks
+        # SIGCHLD once more when it ends, and an unset count must leave the
+        # run's system calls exactly as they were.
+        while :; do
+            run_once
+            ((--iterations > 0)) || break
+        done
         ;;
     *)
         echo "usage: $0 --prepare|--run" >&2

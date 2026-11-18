@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "e2e_iterations.h"
+
 enum { THREADS = 4, DEFAULT_ROUNDS = 500 };
 
 static unsigned rounds = DEFAULT_ROUNDS;
@@ -47,20 +49,8 @@ static void* run_worker(void* opaque) {
   return NULL;
 }
 
-/* An optional first argument replaces the default round count. */
-int main(int argc, char** argv) {
-  if (argc > 2) {
-    return 2;
-  }
-  if (argc == 2) {
-    char* end = NULL;
-    unsigned long requested = strtoul(argv[1], &end, 10);
-    if (*argv[1] == '\0' || *end != '\0' || requested == 0 ||
-        requested > DEFAULT_ROUNDS) {
-      return 2;
-    }
-    rounds = (unsigned)requested;
-  }
+/* One body: start the workers, join them and print their checksum. */
+static int run_once(void) {
   pthread_t threads[THREADS];
   struct worker workers[THREADS] = {0};
   uint64_t checksum = 0;
@@ -85,5 +75,31 @@ int main(int argc, char** argv) {
       THREADS,
       rounds,
       (unsigned long)checksum);
+  return EXIT_SUCCESS;
+}
+
+/* An optional first argument replaces the default round count, and
+ * E2E_ITERATIONS=N runs the whole body N times in one process
+ * (e2e_iterations.h). */
+int main(int argc, char** argv) {
+  if (argc > 2) {
+    return 2;
+  }
+  if (argc == 2) {
+    char* end = NULL;
+    unsigned long requested = strtoul(argv[1], &end, 10);
+    if (*argv[1] == '\0' || *end != '\0' || requested == 0 ||
+        requested > DEFAULT_ROUNDS) {
+      return 2;
+    }
+    rounds = (unsigned)requested;
+  }
+  unsigned long iterations = e2e_iterations();
+  for (unsigned long iteration = 0; iteration < iterations; iteration++) {
+    int status = run_once();
+    if (status != EXIT_SUCCESS) {
+      return status;
+    }
+  }
   return EXIT_SUCCESS;
 }

@@ -14,9 +14,13 @@
 // printed counts and checksum are identical across runs. This is distinct from
 // a spin-contention probe: the threads block on condition variables rather than
 // busy-waiting. Prints "prodcons success" as the final line on success.
+// E2E_ITERATIONS=N runs the whole body N times in one process
+// (e2e_iterations.h); unset, it runs once.
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+
+#include "e2e_iterations.h"
 
 #define CAP 8
 #define NPROD 4
@@ -74,7 +78,11 @@ static void* consumer(void* arg) {
   return NULL;
 }
 
-int main(void) {
+/* One body: the queue and the totals start empty, as at process start. */
+static int run_once(void) {
+  head = tail = count = 0;
+  produced_total = consumed_total = 0;
+  consumed_sum = 0;
   pthread_t p[NPROD], c[NCONS];
   for (long i = 0; i < NPROD; i++) {
     pthread_create(&p[i], NULL, producer, (void*)i);
@@ -108,5 +116,16 @@ int main(void) {
     return 1;
   }
   printf("prodcons success\n");
+  return 0;
+}
+
+int main(void) {
+  unsigned long iterations = e2e_iterations();
+  for (unsigned long iteration = 0; iteration < iterations; iteration++) {
+    int status = run_once();
+    if (status != 0) {
+      return status;
+    }
+  }
   return 0;
 }

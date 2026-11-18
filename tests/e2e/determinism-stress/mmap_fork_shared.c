@@ -18,6 +18,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../../c/e2e_iterations.h"
+
 enum {
   PARTICIPANT_COUNT = 2,
   ROUND_COUNT = 256,
@@ -69,7 +71,9 @@ static void take_turns(struct shared_state* state, unsigned participant) {
   }
 }
 
-int main(void) {
+/* One body: map the shared state, take turns with a forked child, check the
+ * trace and unmap it. */
+static int run_once(void) {
   struct shared_state* state = mmap(
       NULL,
       sizeof(*state),
@@ -108,6 +112,9 @@ int main(void) {
       "pthread_condattr_destroy");
 
   state->checksum = UINT64_C(0xcbf29ce484222325);
+  /* An earlier iteration's report must not sit in the buffer the child
+   * inherits, where a failing child's exit would print it again. */
+  fflush(stdout);
   const pid_t child = fork();
   if (child < 0) {
     fail("fork");
@@ -170,6 +177,19 @@ int main(void) {
   check_pthread(pthread_mutex_destroy(&state->mutex), "pthread_mutex_destroy");
   if (munmap(state, sizeof(*state)) != 0) {
     fail("munmap");
+  }
+  return EXIT_SUCCESS;
+}
+
+/* E2E_ITERATIONS=N runs the whole body N times in one process
+ * (tests/c/e2e_iterations.h); unset, it runs once. */
+int main(void) {
+  unsigned long iterations = e2e_iterations();
+  for (unsigned long iteration = 0; iteration < iterations; iteration++) {
+    int status = run_once();
+    if (status != EXIT_SUCCESS) {
+      return status;
+    }
   }
   return EXIT_SUCCESS;
 }

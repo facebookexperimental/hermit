@@ -19,7 +19,9 @@
  *
  * The program is its own oracle: it exits 1 unless every spawn read exactly
  * its child's line ("child-T-R\n", every byte and the count) to EOF and every
- * child exited 0, and it prints how many spawns did.
+ * child exited 0, and it prints how many spawns did. E2E_ITERATIONS=N runs
+ * the whole body N times in one process (e2e_iterations.h); unset, it runs
+ * once.
  */
 
 #include <fcntl.h>
@@ -30,6 +32,8 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "e2e_iterations.h"
 
 #define THREADS 2
 #define ROUNDS 5
@@ -137,7 +141,9 @@ static void* worker(void* argument) {
   return NULL;
 }
 
-int main(void) {
+/* One body: every round of both threads, then the report. */
+static int run_once(void) {
+  memset(succeeded, 0, sizeof succeeded);
   if (pthread_barrier_init(&barrier, NULL, THREADS) != 0)
     fail("pthread_barrier_init");
   pthread_t threads[THREADS];
@@ -147,6 +153,8 @@ int main(void) {
   for (int thread = 0; thread < THREADS; thread++)
     if (pthread_join(threads[thread], NULL) != 0)
       fail("pthread_join");
+  if (pthread_barrier_destroy(&barrier) != 0)
+    fail("pthread_barrier_destroy");
   int spawns = 0;
   for (int thread = 0; thread < THREADS; thread++)
     for (int round = 0; round < ROUNDS; round++) {
@@ -163,5 +171,15 @@ int main(void) {
   printf(
       "concurrent-piped-spawns: %d spawns, every pipe reached EOF with its child's word\n",
       spawns);
+  return 0;
+}
+
+int main(void) {
+  unsigned long iterations = e2e_iterations();
+  for (unsigned long iteration = 0; iteration < iterations; iteration++) {
+    int status = run_once();
+    if (status != 0)
+      return status;
+  }
   return 0;
 }
