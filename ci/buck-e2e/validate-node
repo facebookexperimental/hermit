@@ -21,8 +21,21 @@
 # scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH selects both nodes
 # and passes, through the environment (the cells, and the no-argument form, need it):
 #   HERMIT_VALIDATE_E2E_RUNNER  buck-local (every cell locally) or buck-hybrid (RE-routed
-#                               cells on Meta RE, the rest locally). Anything else,
-#                               including cargo or unset, exits 2: nothing falls back.
+#                               cells on Meta RE, the rest locally), or buck-stock (see
+#                               below). Anything else, including cargo or unset, exits 2:
+#                               nothing falls back.
+#
+# buck-stock (scripts/validate.rs --buck-s0 --buck2 PATH): a Buck-only run of one subset
+# (HERMIT_VALIDATE_E2E_SUBSET, a ci/buck-e2e/subsets/*.json file) with the public buck2's
+# stock test runner, in a checkout that needs no Cargo target directory. No cargo runs:
+# --stage-only stages with ci/buck-e2e/stage --from-buck; --cells-only does not
+# regenerate the third-party rules (Reindeer runs cargo metadata, so generating
+# shim/third-party/rust/BUCK is the slot's setup, done once with
+# bootstrap/regenerate-rust-deps, and this refuses without it, or when the stamp that
+# script writes, shim/third-party/rust/BUCK.inputs, does not match this checkout's
+# inputs: bootstrap/rust-deps-stamp.py check), runs the subset's
+# shell-test twins (//ci/buck-e2e:stock-local, -c hermit_e2e.stock_runner=true, every cell
+# on this host) and ingests their artifacts with ci/buck-e2e/ingest.py --local-listing.
 #   HERMIT_VALIDATE_BUCK2       the absolute path of the internal buck2 (a DotSlash file),
 #                               which is never committed.
 #   VALIDATE_RUN_STATE          the run's state directory. The rows go to
@@ -108,6 +121,11 @@ step() {
     [[ -z $kept ]] || printf '%s\t%s\n' "$(date -u +%s.%N)" "$*" >>"$kept/phases.tsv" || true
 }
 stage_inputs() {
+    if [[ ${HERMIT_VALIDATE_E2E_RUNNER:-} == buck-stock ]]; then
+        step "staging the subset's inputs with Buck (no cargo)"
+        ./ci/buck-e2e/stage --from-buck "${HERMIT_VALIDATE_BUCK2:-}" --subset "${HERMIT_VALIDATE_E2E_SUBSET:-}"
+        return
+    fi
     step "staging the inputs Buck does not build (cargo, target/)"
     "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
 }
@@ -144,14 +162,23 @@ runner=${HERMIT_VALIDATE_E2E_RUNNER:-}
 case $runner in
     buck-local) mode=local; buck_args=(@shim/modes/meta-local) ;;
     buck-hybrid) mode=hybrid; buck_args=(@shim/modes/hybrid) ;;
+    buck-stock) mode=stock; buck_args=() ;;
     *)
-        echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local or buck-hybrid; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH" >&2
+        echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local, buck-hybrid or buck-stock; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH or --buck-s0 --buck2 PATH" >&2
         exit 2 ;;
 esac
 buck2=${HERMIT_VALIDATE_BUCK2:-}
 if [[ $buck2 != /* || ! -f $buck2 || ! -x $buck2 ]]; then
     echo "validate-node: HERMIT_VALIDATE_BUCK2 is '${buck2}', not an absolute path to an executable file; pass scripts/validate.rs --buck2 PATH" >&2
     exit 2
+fi
+subset=
+if [[ $mode == stock ]]; then
+    subset=${HERMIT_VALIDATE_E2E_SUBSET:-}
+    if [[ $subset != /* || ! -f $subset ]]; then
+        echo "validate-node: HERMIT_VALIDATE_E2E_SUBSET is '${subset}', not the absolute path of a subset file (ci/buck-e2e/subsets/*.json)" >&2
+        exit 2
+    fi
 fi
 if [[ -z ${VALIDATE_RUN_STATE:-} ]]; then
     echo "validate-node: VALIDATE_RUN_STATE is unset; this node runs under scripts/validate.rs" >&2
@@ -208,7 +235,7 @@ else
 fi
 # ci/buck-e2e/run removes an earlier attempt's records from $state/work only once it starts;
 # a step that fails before then must not leave them to be kept as this attempt's.
-if [[ -n $kept ]] && ! rm -f -- "$state/work"/{re,local,all,rerun-local}.{log,rc,test_id,times,event-log.pb.zst}; then
+if [[ -n $kept ]] && ! rm -f -- "$state/work"/{re,local,all,rerun-local,stock}.{log,rc,test_id,times,event-log.pb.zst}; then
     echo "validate-node: cannot remove an earlier attempt's Buck invocation records from $state/work (above); this run keeps none" >&2
     kept=
 fi
@@ -222,7 +249,7 @@ keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Cop
     # before $1 and none starts after it, so a stalled copy or summary costs records, never the
     # node's status or its daemon cleanup.
     local deadline=$1 left name file
-    for name in re local all rerun-local; do
+    for name in re local all rerun-local stock; do
         for file in "$state/work/$name".{log,rc,test_id,times,event-log.pb.zst}; do
             [[ -f $file ]] || continue
             if ! time_left; then
@@ -287,8 +314,22 @@ trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 trap 'on_signal HUP' HUP
 
-step "regenerating the Buck third-party rules"
-"${proxy[@]}" ./bootstrap/regenerate-rust-deps
+if [[ $mode == stock ]]; then
+    if [[ ! -s shim/third-party/rust/BUCK ]]; then
+        echo "validate-node: buck-stock runs no cargo, so it does not generate the third-party rules; shim/third-party/rust/BUCK is missing: generate it once in this checkout with bootstrap/regenerate-rust-deps (slot setup)" >&2
+        exit 2
+    fi
+    # Generated for this checkout's inputs, or refused: rules generated for another
+    # Cargo.lock would build another commit's crates under this commit's SOURCE_SHA.
+    if ! python3 ./bootstrap/rust-deps-stamp.py check "$root"; then
+        echo "validate-node: shim/third-party/rust/BUCK was not generated from this checkout's inputs (above): regenerate it once with bootstrap/regenerate-rust-deps (slot setup)" >&2
+        exit 2
+    fi
+    step "using the third-party rules already generated in this checkout for its inputs (sha256 $(sha256sum shim/third-party/rust/BUCK | cut -c1-16))"
+else
+    step "regenerating the Buck third-party rules"
+    "${proxy[@]}" ./bootstrap/regenerate-rust-deps
+fi
 if [[ $mode == hybrid ]]; then
     step "staging the RE link inputs"
     "${proxy[@]}" ./shim/modes/stage-re-inputs
@@ -320,7 +361,42 @@ else
     echo "validate-node: cannot read the checked-out commit's committer time for HERMIT_EPOCH; export HERMIT_EPOCH to supply one" >&2
     exit 2
 fi
-step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
-./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
-    "${failed_logs_args[@]}" \
-    --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"
+if [[ $mode == stock ]]; then
+    # The cells' artifact root is in the run's state directory inside the checkout, never
+    # under host /tmp: Hermit gives a guest its own /tmp, so a guest program staged under
+    # host /tmp is refused. A fresh root per run, so the listing holds this run alone.
+    stock_root=$state/stock-execution
+    rm -rf -- "${stock_root:?}"
+    mkdir -p "$stock_root"
+    # Read whole, so a refusing subset.py stops the node under set -e (a process
+    # substitution would drop its status). ingest.py below refuses unless the cells Buck ran
+    # are exactly the subset plan's, none missing and none more, so the -c flags that define
+    # the subset in Buck (ci/buck-e2e/subset.bzl) and subset.py cannot silently disagree.
+    python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json plan "$state/subset-plan.json" >/dev/null
+    subset_counts=$(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json counts)
+    subset_config=$(python3 ./ci/buck-e2e/subset.py "$subset" ci/expected-e2e-plan.json buck-config)
+    mapfile -t subset_flags <<<"$subset_config"
+    step "subset $subset_counts"
+    step "running the $(basename "$subset") cells under the stock buck2 test runner, HERMIT_EPOCH=$epoch"
+    date +%s >"$state/work/stock.times"
+    stock_status=0
+    "$buck2" test -c hermit_release.unstamped=true "${subset_flags[@]}" -c hermit_e2e.stock_runner=true \
+        -c hermit_e2e.routing=local -c "hermit_e2e.epoch=$epoch" -c "hermit_e2e.stock_artifact_root=$stock_root" \
+        --no-remote-cache --event-log "$state/work/stock.event-log.pb.zst" //ci/buck-e2e:stock-local \
+        >"$state/work/stock.log" 2>&1 || stock_status=$?
+    date +%s >>"$state/work/stock.times"
+    echo "$stock_status" >"$state/work/stock.rc"
+    # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
+    if ((stock_status != 0 && stock_status != 32)); then
+        echo "validate-node: buck2 test failed with exit $stock_status; see $state/work/stock.log" >&2
+        exit 1
+    fi
+    step "ingesting the cells' artifacts"
+    python3 ./ci/buck-e2e/ingest.py --plan "$state/subset-plan.json" --out "$state/results" \
+        --local-artifacts "$stock_root" --local-listing "${failed_logs_args[@]}"
+else
+    step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
+    ./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
+        "${failed_logs_args[@]}" \
+        --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"
+fi

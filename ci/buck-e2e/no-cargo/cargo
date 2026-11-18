@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# The cargo of a Buck-only run: scripts/validate.rs --buck-s0 puts this directory first on
+# every node's PATH and sets CARGO to this file (validation_dag.rs BUCK_S0_NO_CARGO_PATH).
+# It runs nothing, exits 97, and appends the refused call to
+# <checkout>/ignored/validation/cargo-refused.log, found from this file's own path, so
+# the record survives where VALIDATE_RUN_STATE does not: the stage's fixture builds set
+# their own, and buck2 clears a test's environment but for PATH and a few others.
+# When a --buck-s0 run starts, validate.rs, holding the invocation lock, renames an
+# earlier run's log beside it (cargo-refused.before-<run>.log);
+# gate.manifest_s0 and gate.no_cargo_s0 refuse on it, so a cargo call fails the run
+# even where its caller tolerates the failure.
+echo "cargo: refused: a Buck-only run (scripts/validate.rs --buck-s0) runs no cargo: cargo $*" >&2
+self=$(readlink -f -- "${BASH_SOURCE[0]}")
+checkout=${self%/ci/buck-e2e/no-cargo/cargo}
+log=$checkout/ignored/validation/cargo-refused.log
+mkdir -p -- "${log%/*}" 2>/dev/null
+printf '%s\tcargo %s\t(from %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
+    "$(tr '\0\n' '  ' </proc/$PPID/cmdline 2>/dev/null | cut -c1-300)" >>"$log" ||
+    echo "cargo: could not record this call in $log" >&2
+exit 97

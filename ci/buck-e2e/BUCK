@@ -8,7 +8,9 @@
 # cell BY NAME, with its reason, and loading fails if the plan names one that
 # file does not list either way. The open-source build's stand-in for that file
 # (shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl) keeps every cell and gives
-# the bundle the inputs ./stage stages from a cargo build.
+# the bundle the inputs ./stage stages from a cargo build. A Buck-only subset
+# (-c hermit_e2e.subset_*, ci/buck-e2e/subset.bzl, as scripts/validate.rs
+# --buck-s0 passes it) narrows what that file keeps.
 load(
     "@fbcode//hermetic_infra/hermit/fb-only:e2e_cells.bzl",
     "E2E_PLAN",
@@ -23,6 +25,7 @@ load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 load(":defs.bzl", "hermit_e2e_bundle", "hermit_e2e_cells")
 load(":re_exclusions.json", _RE_EXCLUSIONS = "value")
+load(":subset.bzl", "subset_categories", "subset_cells", "subset_excluded_backends", "subset_required_host_caps")
 
 oncall("hermit")
 
@@ -106,9 +109,9 @@ buck_genrule(
             + " --category "
             + c
             + "".join(
-                [" --exclude-backend " + b for b in sorted(EXCLUDED_BACKENDS) if b != "in-guest-trap"],
+                [" --exclude-backend " + b for b in sorted(subset_excluded_backends(E2E_PLAN, EXCLUDED_BACKENDS)) if b != "in-guest-trap"],
             )
-            for c in KEPT_CATEGORIES
+            for c in subset_categories(E2E_PLAN, KEPT_CATEGORIES)
         ]
     ),
     remote = False,
@@ -210,12 +213,12 @@ hermit_e2e_bundle(
 
 hermit_e2e_cells(
     plan = {
-        "cells": kept_cells(E2E_PLAN),
+        "cells": subset_cells(E2E_PLAN, kept_cells(E2E_PLAN)),
         "schema": E2E_PLAN["schema"],
     },
     re_exclusions = _RE_EXCLUSIONS,
     # The host capabilities whose absence fails a cell instead of skipping it,
     # by fb-only/e2e_cells.bzl: fbsource's CI hosts must give the kvm cells
     # /dev/kvm. The open-source build's stand-in requires none.
-    require_host_caps_for = required_host_caps(),
+    require_host_caps_for = subset_required_host_caps(required_host_caps()),
 )

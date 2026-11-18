@@ -783,6 +783,9 @@ pub fn claim_active_marker() {
 /// A held, kernel-backed exclusive lock on this checkout's validate slot.
 pub struct InvocationLock {
     _file: File,
+    /// The `target/validation` lock a runner that drives `target/` also holds
+    /// ([`legacy_invocation_lock_path`]); released with this value.
+    _legacy: Option<File>,
     guard: File,
     holder: PathBuf,
     record: InvocationHolderRecord,
@@ -857,7 +860,11 @@ fn flock_unlock(fd: i32) {
 /// SCOPE IS PER-CHECKOUT, deliberately. Box-wide exclusivity belongs to `ci-hub
 /// validate-lock`; duplicating it here would give the fleet two independent
 /// admission controllers that can disagree. Two validates in ONE checkout are
-/// unambiguously wrong: both drive one `target/` tree and one ledger.
+/// unambiguously wrong: both drive one `target/` tree and one ledger, or, with a
+/// Buck runner, one `ci/buck-e2e/staged`, one `buck-out`, the project's one buck2
+/// daemon and one set of generated third-party rules. So the lock is ONE path
+/// for every runner ([`invocation_lock_root`]), and a runner that drives
+/// `target/` also holds the `target/validation` lock writeback checks for.
 ///
 /// The refusal is IMMEDIATE (never a wait) and names the holder - but only after
 /// a LIVENESS CHECK, so a record left by an earlier run can never be presented as
@@ -867,13 +874,51 @@ fn flock_unlock(fd: i32) {
 /// definition, so the writer, the refusal reader, and the log-path update
 /// cannot drift onto different files.
 fn invocation_holder_path(root: &Path) -> PathBuf {
-    root.join("target/validation")
-        .join("validate-invocation.holder")
+    invocation_lock_root(root).join("validate-invocation.holder")
 }
 
 fn invocation_holder_guard_path(root: &Path) -> PathBuf {
-    root.join("target/validation")
-        .join("validate-invocation-holder.lock")
+    invocation_lock_root(root).join("validate-invocation-holder.lock")
+}
+
+/// The directory of the per-checkout invocation lock and its holder record:
+/// ONE place for every runner, so a Buck-only run (`--buck-s0`) and any other
+/// validate in the same checkout exclude each other. Under ignored/, so a
+/// Buck-only checkout still holds no Cargo target directory.
+fn invocation_lock_root(root: &Path) -> PathBuf {
+    root.join("ignored/validation")
+}
+
+/// The lock a runner that drives `target/` holds as well: ci-hub's writeback
+/// delegate (ci-hub/series/mirror.py) checks that this path is locked while a
+/// validate writes back (see
+/// `versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock`).
+/// It also excludes the holders that take only this lock: a driver that
+/// predates [`invocation_lock_root`], and ci-hub's scorecard writer
+/// (ci-hub/validate/start_unit.py). The Buck-only runner, which writes back
+/// nothing and must create no target/, holds it only where it already exists.
+fn legacy_invocation_lock_path(root: &Path) -> PathBuf {
+    root.join("target/validation/validate-invocation.lock")
+}
+
+/// Whether this run is the Buck-only runner (`--buck-s0`, buck-stock), decided
+/// from the runner environment, which the driver sets before it creates any
+/// validation state and which the run-state scope re-exec and every node inherit.
+fn buck_stock_runner() -> bool {
+    std::env::var(crate::E2E_RUNNER_ENV).is_ok_and(|runner| runner == crate::E2E_RUNNER_BUCK_STOCK)
+}
+
+/// The directory that holds a checkout's run state: every run's state
+/// directory, its admission witness and the podman fixture configuration. It is
+/// target/validation, except for a Buck-only run, whose checkout must hold no
+/// Cargo target directory: ignored/validation. The invocation lock does not
+/// move with it ([`invocation_lock_root`]).
+pub(crate) fn validation_state_root(root: &Path) -> PathBuf {
+    if buck_stock_runner() {
+        root.join("ignored/validation")
+    } else {
+        root.join("target/validation")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1050,16 +1095,17 @@ pub fn record_invocation_log_path(lock: &mut InvocationLock, log: &Path) {
 }
 
 pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> LockOutcome {
-    acquire_invocation_lock_with_hook(root, profile, commit, || {})
+    acquire_invocation_lock_with_hook(root, profile, commit, buck_stock_runner(), || {})
 }
 
 fn acquire_invocation_lock_with_hook(
     root: &Path,
     profile: &str,
     commit: &str,
+    buck_stock: bool,
     after_lock_acquired: impl FnOnce(),
 ) -> LockOutcome {
-    let dir = root.join("target/validation");
+    let dir = invocation_lock_root(root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return LockOutcome::Unavailable(format!("cannot create {}: {e}", dir.display()));
     }
@@ -1168,7 +1214,8 @@ fn acquire_invocation_lock_with_hook(
         }
         msg.push(
             "this is a refusal, not a wait: two validates in one checkout share target/ and the \
-             ledger, and would corrupt each other's results"
+             ledger, or ci/buck-e2e/staged, buck-out and the buck2 daemon, and would corrupt \
+             each other's results"
                 .into(),
         );
         msg.push("wait for the holder to finish, or run in a different checkout".into());
@@ -1177,6 +1224,52 @@ fn acquire_invocation_lock_with_hook(
             epilogue: watch,
         };
     }
+    // The Buck-only runner creates no target/, so it takes this lock only where
+    // the file already exists. Where it does not, nothing in this checkout has
+    // taken it since target/ was last removed.
+    let path = legacy_invocation_lock_path(root);
+    let legacy = if buck_stock && !path.exists() {
+        None
+    } else {
+        if !buck_stock {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return LockOutcome::Unavailable(format!(
+                        "cannot create {}: {e}",
+                        parent.display()
+                    ));
+                }
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .create(!buck_stock)
+            .append(true)
+            .open(&path)
+        {
+            Ok(legacy) => {
+                if !flock_nb(legacy.as_raw_fd()) {
+                    return LockOutcome::Busy {
+                        detail: vec![
+                            format!("another holder of {} in THIS checkout", path.display()),
+                            format!("checkout: {root:?}"),
+                            "it holds only that lock: a validate driver that predates the \
+                             shared ignored/validation lock, or ci-hub's scorecard writer; this \
+                             is a refusal, not a wait"
+                                .into(),
+                            "wait for it to finish, or run in a different checkout".into(),
+                        ],
+                        epilogue: Vec::new(),
+                    };
+                }
+                Some(legacy)
+            }
+            // Removed since the check above: nothing holds it.
+            Err(e) if buck_stock && e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return LockOutcome::Unavailable(format!("cannot open {}: {e}", path.display()));
+            }
+        }
+    };
     after_lock_acquired();
     // The holder guard spans invocation-lock acquisition and record
     // publication. A contender cannot read a predecessor record during this
@@ -1195,10 +1288,89 @@ fn acquire_invocation_lock_with_hook(
     flock_unlock(guard.as_raw_fd());
     LockOutcome::Acquired(InvocationLock {
         _file: file,
+        _legacy: legacy,
         guard,
         holder,
         record,
     })
+}
+
+/// The invocation lock across runners, in `sandbox`: a Buck-only run
+/// (buck-stock) and a run of any other runner refuse each other through the one
+/// shared lock, a Buck-only claim creates no target/, the other runner also
+/// holds the target/validation lock writeback checks for, a holder of only that
+/// lock (an older driver, ci-hub's scorecard writer) refuses both runners, and a
+/// Buck-only claim holds that lock where it exists. Returns the number of
+/// refusals seen.
+pub(crate) fn runner_lock_self_test(sandbox: &Path) -> Result<usize, String> {
+    let claim = |buck_stock: bool| {
+        acquire_invocation_lock_with_hook(sandbox, "self-test", "runner", buck_stock, || {})
+    };
+    let busy = |outcome: LockOutcome, what: &str| match outcome {
+        LockOutcome::Busy { .. } => Ok(()),
+        LockOutcome::Acquired(_) => Err(format!("runner lock: {what} was granted")),
+        LockOutcome::SafetyRefusal(e) | LockOutcome::Unavailable(e) => {
+            Err(format!("runner lock: {what}: {e}"))
+        }
+    };
+    let target = sandbox.join("target");
+    let _ = std::fs::remove_dir_all(&target);
+    let mut refusals = 0usize;
+
+    let LockOutcome::Acquired(buck) = claim(true) else {
+        return Err("runner lock: a free Buck-only claim must be granted".into());
+    };
+    if target.exists() {
+        return Err("runner lock: a Buck-only claim created target/".into());
+    }
+    busy(
+        claim(false),
+        "a Cargo-runner claim beside a Buck-only holder",
+    )?;
+    refusals += 1;
+    drop(buck);
+
+    let LockOutcome::Acquired(cargo) = claim(false) else {
+        return Err("runner lock: a free Cargo-runner claim must be granted".into());
+    };
+    let legacy_path = legacy_invocation_lock_path(sandbox);
+    let probe = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&legacy_path)
+        .map_err(|e| format!("runner lock: {e}"))?;
+    if flock_nb(probe.as_raw_fd()) {
+        return Err("runner lock: a Cargo-runner holder left target/validation unlocked".into());
+    }
+    busy(
+        claim(true),
+        "a Buck-only claim beside a Cargo-runner holder",
+    )?;
+    refusals += 1;
+    drop(cargo);
+
+    // A holder of only target/validation (an older driver, ci-hub's scorecard
+    // writer) refuses both runners.
+    if !flock_nb(probe.as_raw_fd()) {
+        return Err("runner lock: target/validation stayed locked after release".into());
+    }
+    busy(claim(false), "a Cargo-runner claim beside an older driver")?;
+    refusals += 1;
+    busy(claim(true), "a Buck-only claim beside an older driver")?;
+    refusals += 1;
+    flock_unlock(probe.as_raw_fd());
+    // Where target/validation exists, a Buck-only holder holds it too.
+    let LockOutcome::Acquired(buck) = claim(true) else {
+        return Err("runner lock: a free Buck-only claim must be granted".into());
+    };
+    if flock_nb(probe.as_raw_fd()) {
+        return Err(
+            "runner lock: a Buck-only holder left the existing target/validation lock free".into(),
+        );
+    }
+    drop(buck);
+    let _ = std::fs::remove_dir_all(&target);
+    Ok(refusals)
 }
 
 // ------------------------------------------------------------------ box-wide live-run registry
@@ -2389,10 +2561,16 @@ pub fn self_test() -> Result<String, String> {
     let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(0);
     let new_root = sandbox.clone();
     let new_holder = std::thread::spawn(move || {
-        acquire_invocation_lock_with_hook(&new_root, "self-test", "new-holder-commit", || {
-            new_locked_tx.send(()).expect("handoff receiver exists");
-            publish_rx.recv().expect("handoff publisher exists");
-        })
+        acquire_invocation_lock_with_hook(
+            &new_root,
+            "self-test",
+            "new-holder-commit",
+            false,
+            || {
+                new_locked_tx.send(()).expect("handoff receiver exists");
+                publish_rx.recv().expect("handoff publisher exists");
+            },
+        )
     });
     new_locked_rx
         .recv_timeout(Duration::from_secs(2))
@@ -2555,6 +2733,7 @@ pub fn self_test() -> Result<String, String> {
         }
         LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
     }
+    let runner_refusals = runner_lock_self_test(&sandbox)?;
 
     // ---- registry census: live vs stale vs CPU-active ----
     let reg = sandbox.join("runs");
@@ -2688,7 +2867,8 @@ pub fn self_test() -> Result<String, String> {
          CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
-         {lock_safety_refuse} safety-refuse, \
+         {lock_safety_refuse} safety-refuse, {runner_refusals} cross-runner refuse (the shared \
+         lock; a Buck-only claim creates no target/), \
          registry registration 1 success / 1 lock-refuse / 1 write-refuse / 1 \
          create-before-flock race-refuse, census 1 live / 1 stale-reaped, burner peer \
          1 cpu-active / 4 idle (the CPU-bounded burn read active though starved to \

@@ -1042,6 +1042,14 @@ enum Focused {
     Envelope {
         baseline: Option<PathBuf>,
     },
+    /// `--buck-s0 --buck2 PATH`: a Buck-only validation of the subset in
+    /// ci/buck-e2e/subsets/s0.json with ZERO cargo nodes
+    /// (validation_dag::buck_s0_selection), in a checkout that needs no Cargo
+    /// target directory: its run state goes to ignored/validation. Off the
+    /// record until the open-source tree has the root .buckconfig and the
+    /// fb-only stand-in shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl: GitHub
+    /// main has carried the BUCK and .bzl files since 0afaf382, but not those two.
+    BuckS0,
 }
 
 impl Focused {
@@ -1063,6 +1071,7 @@ impl Focused {
             // envelope history stays continuous whether or not a baseline was
             // supplied.
             Focused::Envelope { .. } => "envelope-only".into(),
+            Focused::BuckS0 => "buck-s0".into(),
         }
     }
     /// `--all/--full-run` refuses to combine with any focused mode; this is the
@@ -1092,6 +1101,7 @@ impl Focused {
                     "envelope-only"
                 }
             }
+            Focused::BuckS0 => "buck-s0",
         }
     }
 }
@@ -1186,6 +1196,12 @@ const E2E_RUNNER_ENV: &str = "HERMIT_VALIDATE_E2E_RUNNER";
 const E2E_BUCK2_ENV: &str = "HERMIT_VALIDATE_BUCK2";
 const E2E_RUNNER_CARGO: &str = "cargo";
 const E2E_RUNNERS: [&str; 3] = [E2E_RUNNER_CARGO, "buck-local", "buck-hybrid"];
+/// The runner `--buck-s0` passes to ci/buck-e2e/validate-node: the public
+/// buck2's stock test runner over one subset, no cargo. Not a `--e2e-runner`
+/// value: only `--buck-s0` selects it.
+const E2E_RUNNER_BUCK_STOCK: &str = "buck-stock";
+/// The absolute path of the subset file a buck-stock run stages and runs.
+const E2E_SUBSET_ENV: &str = "HERMIT_VALIDATE_E2E_SUBSET";
 
 /// The binary every E2E cell of a run executes, as `build.e2e_artifact`
 /// publishes it for each builder.
@@ -1772,6 +1788,7 @@ mod build_mode_environment_tests {
 fn establish_e2e_runner_environment(args: &Args) -> Result<(), String> {
     std::env::remove_var(E2E_RUNNER_ENV);
     std::env::remove_var(E2E_BUCK2_ENV);
+    std::env::remove_var(E2E_SUBSET_ENV);
     let Some(buck2) = args.buck2.as_deref() else {
         return Ok(());
     };
@@ -1799,6 +1816,18 @@ fn establish_e2e_runner_environment(args: &Args) -> Result<(), String> {
     }
     std::env::set_var(E2E_RUNNER_ENV, args.e2e_runner);
     std::env::set_var(E2E_BUCK2_ENV, buck2);
+    if args.e2e_runner == E2E_RUNNER_BUCK_STOCK {
+        let subset = std::env::current_dir()
+            .map_err(|error| format!("--buck-s0 cannot read the working directory: {error}"))?
+            .join(hermit_manifest_plan::validation_dag::BUCK_S0_SUBSET);
+        if !subset.is_file() {
+            return Err(format!(
+                "--buck-s0 needs the subset file {}",
+                subset.display()
+            ));
+        }
+        std::env::set_var(E2E_SUBSET_ENV, subset);
+    }
     Ok(())
 }
 
@@ -1907,6 +1936,16 @@ fn usage() -> &'static str {
      \x20                  which own the same cells and result files. Full level only.\n\
      \x20 --buck2 PATH     Absolute path of the internal buck2 a Buck runner uses; never\n\
      \x20                  committed. Required with a Buck runner, refused without one.\n\
+     \x20 --buck-s0        Buck-only validation of the subset ci/buck-e2e/subsets/s0.json\n\
+     \x20                  with ZERO cargo nodes: Buck builds the harness and hermit, the\n\
+     \x20                  Buck-built harness builds the fixtures, the public buck2's stock\n\
+     \x20                  test runner runs the cells, and one import twin per category\n\
+     \x20                  judges them. Needs --buck2 PATH (a public buck2 executable) and,\n\
+     \x20                  while the open-source tree lacks the root .buckconfig and the\n\
+     \x20                  fb-only e2e_cells.bzl stand-in, --allow-local-off-the-record-run.\n\
+     \x20                  Run state goes to ignored/validation; the checkout needs no\n\
+     \x20                  target/ directory, and shim/third-party/rust/BUCK must already\n\
+     \x20                  be generated.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
      \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
@@ -2104,6 +2143,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 return Err(2);
             }
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
+            "--buck-s0" => focused.push(Focused::BuckS0),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
             "--hosted-portable-only" => focused.push(Focused::HostedPortable),
             "--hosted-privileged-only" => focused.push(Focused::HostedPrivileged),
@@ -2456,6 +2496,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.show_plan = show_plan;
     args.show_plan_json = show_plan_json;
     args.focused = focused.pop();
+    if args.focused == Some(Focused::BuckS0) && !e2e_runner_explicit {
+        args.e2e_runner = E2E_RUNNER_BUCK_STOCK;
+    }
     if args.buck_release_dotslash.is_some()
         && (args.selected.is_some()
             || !matches!(
@@ -2527,6 +2570,33 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
 /// A Buck E2E runner replaces only the full level's E2E buckets, so it refuses
 /// every other selection rather than running a plan nobody defined.
 fn e2e_runner_policy(args: &Args) -> Result<(), String> {
+    if args.focused == Some(Focused::BuckS0) {
+        if args.e2e_runner != E2E_RUNNER_BUCK_STOCK {
+            return Err(
+                "--buck-s0 picks its own runner (the stock buck2 test runner); drop --e2e-runner"
+                    .into(),
+            );
+        }
+        if args.buck2.is_none() {
+            return Err(
+                "--buck-s0 needs --buck2 PATH, the absolute path of a buck2 executable (the public \
+                 buck2 the checkout's bootstrap/buck2 descriptor names; see docs/BUCK2_OSS.md)"
+                    .into(),
+            );
+        }
+        if args.buck_release_dotslash.is_some() || args.selected.is_some() {
+            return Err("--buck-s0 runs its own plan; drop --buck-release and --selected".into());
+        }
+        if !args.allow_local_off_the_record_run && !args.show_plan && !args.show_plan_json {
+            return Err(
+                "--buck-s0 is off the record until the open-source tree has the root .buckconfig and \
+                 shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl, which a checkout supplies as \
+                 untracked files outside SOURCE_SHA: add --allow-local-off-the-record-run"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
     if args.e2e_runner == E2E_RUNNER_CARGO {
         return match args.buck2 {
             Some(_) => Err(
@@ -15728,6 +15798,39 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
+    if args.focused == Some(Focused::BuckS0) {
+        let subset_path = root.join(hermit_manifest_plan::validation_dag::BUCK_S0_SUBSET);
+        let subset = std::fs::read_to_string(&subset_path)
+            .map_err(|error| format!("--buck-s0: cannot read {}: {error}", subset_path.display()))
+            .and_then(|text| hermit_manifest_plan::validation_dag::BuckSubset::from_json(&text))?;
+        let plan_path = root.join("ci/expected-e2e-plan.json");
+        let plan_json: serde_json::Value = std::fs::read(&plan_path)
+            .map_err(|error| format!("--buck-s0: cannot read {}: {error}", plan_path.display()))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("--buck-s0: {}: {error}", plan_path.display()))
+            })?;
+        let plan_backends = plan_json["cells"]
+            .as_array()
+            .ok_or_else(|| format!("--buck-s0: {} has no cells", plan_path.display()))?
+            .iter()
+            .filter_map(|cell| cell["backend"].as_str().map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        let cfg = hermit_manifest_plan::validation_dag::buck_s0_selection(
+            &committed,
+            &subset,
+            &plan_backends,
+        )?;
+        let plan = Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            profile: "buck-s0".into(),
+            selection_mode: "buck-s0",
+            cacheable: false,
+            ..Default::default()
+        };
+        return finish_selection_for(args, plan, source_path, source_bytes);
+    }
     let committed_label = match (&args.focused, args.level) {
         (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
         (Some(Focused::HostedPortable), _) => Some("hosted-portable"),
@@ -30428,7 +30531,7 @@ fn validation_run_state_path(
                 "nested validation did not inherit VALIDATE_RUN_STATE from its outer run"
                     .to_string()
             })?;
-        let run_root = root.join("target/validation");
+        let run_root = validate_runtime::validation_state_root(root);
         if !path.starts_with(&run_root) {
             return Err(format!(
                 "nested validation inherited VALIDATE_RUN_STATE={} outside {}",
@@ -30451,9 +30554,7 @@ fn validation_run_state_path(
     {
         return Err(format!("validation profile is not path-safe: {profile:?}"));
     }
-    Ok(root
-        .join("target/validation")
-        .join(format!("run-{profile}-{pid}-{nonce}")))
+    Ok(validate_runtime::validation_state_root(root).join(format!("run-{profile}-{pid}-{nonce}")))
 }
 
 fn run_state_path_bracket() -> Result<(), String> {
@@ -30553,7 +30654,7 @@ fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bo
         return false;
     };
     if std::env::var_os(RUN_STATE_SCOPE_REEXEC_ENV).as_deref() != Some(inherited.as_os_str())
-        || !inherited.starts_with(root.join("target/validation"))
+        || !inherited.starts_with(validate_runtime::validation_state_root(root))
         || !is_in_scope()
     {
         return false;
@@ -30833,7 +30934,7 @@ fn install_fixture_first_hop(root: &Path) -> Result<(), String> {
         }
         fixtures.push((name.clone(), host));
     }
-    let dir = root.join("target/validation/podman-fixtures");
+    let dir = validate_runtime::validation_state_root(root).join("podman-fixtures");
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let conf = dir.join("containers.conf");
@@ -30846,6 +30947,46 @@ fn install_fixture_first_hop(root: &Path) -> Result<(), String> {
         conf.display()
     );
     Ok(())
+}
+
+/// A `--buck-s0` run's no-cargo shim records refused calls in the checkout's
+/// ignored/validation (validation_dag::BUCK_S0_CARGO_REFUSED_LOG), where the
+/// record outlives its run. A run that holds the invocation lock is the only
+/// run in the checkout, so a record there when it starts is an earlier run's:
+/// this renames it beside the log, named for this run (the run state is
+/// removed when a run ends), so the gates judge only this run's calls and the
+/// earlier record is kept. Returns where it was kept, if there was one.
+///
+/// Without the lock (`--show-plan`, a plan export, a nested payload) it does
+/// nothing: a live run may own the record, and moving it would let that run's
+/// cargo gates pass on calls they never saw.
+fn keep_earlier_buck_s0_refusals(
+    root: &Path,
+    run_state: &Path,
+    holds_invocation_lock: bool,
+) -> Result<Option<PathBuf>, String> {
+    if !holds_invocation_lock {
+        return Ok(None);
+    }
+    let log = root.join(hermit_manifest_plan::validation_dag::BUCK_S0_CARGO_REFUSED_LOG);
+    if !log.exists() {
+        return Ok(None);
+    }
+    let run = run_state
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let kept = log.with_file_name(format!(
+        "cargo-refused.before-{}.log",
+        run.as_deref().unwrap_or("this-run")
+    ));
+    std::fs::rename(&log, &kept).map_err(|error| {
+        format!(
+            "cannot move an earlier --buck-s0 run's refused cargo calls from {} to {}: {error}",
+            log.display(),
+            kept.display()
+        )
+    })?;
+    Ok(Some(kept))
 }
 
 fn run(
@@ -31541,6 +31682,20 @@ fn run(
         );
     }
     std::env::set_var("VALIDATE_RUN_STATE", &tmp);
+    // An earlier --buck-s0 run's no-cargo record, renamed only by a run that
+    // holds the invocation lock (never by --show-plan or a nested payload).
+    if args.focused == Some(Focused::BuckS0) {
+        match keep_earlier_buck_s0_refusals(&root, &tmp, invocation_lock.is_some()) {
+            Ok(Some(kept)) => eprintln!(
+                "validate: kept an earlier --buck-s0 run's refused cargo calls as {}, so this run's gates judge only this run's",
+                kept.display()
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                return RunSummary::refused(2, &profile_name, "run-state setup", vec![error]);
+            }
+        }
+    }
     // Every cargo and rustc the DAG starts inherits this: host nodes directly,
     // pinned-root nodes through `--env RUST_MIN_STACK`
     // (validation_dag::PINNED_ROOT_FORWARDED_ENV). rustc takes it for its main
@@ -38375,6 +38530,43 @@ mod scorecard_cutover_tests {
         );
         assert!(plan.super_mode);
         assert!(!plan.suite_complete);
+    }
+
+    #[test]
+    fn a_buck_s0_run_renames_the_refusal_record_only_holding_the_invocation_lock() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        let log = root.join(hermit_manifest_plan::validation_dag::BUCK_S0_CARGO_REFUSED_LOG);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let record = "2026-11-18T00:00:00Z\tcargo build\t(from a node)\n";
+        std::fs::write(&log, record).unwrap();
+        let state = root.join("ignored/validation/run-buck-s0-1-2");
+        // --show-plan, a plan export or a nested payload holds no lock: a live
+        // run may own the record, so it stays where the gates read it.
+        assert_eq!(keep_earlier_buck_s0_refusals(root, &state, false), Ok(None));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), record);
+        // The lock holder keeps it beside the log, named for its run.
+        let kept = keep_earlier_buck_s0_refusals(root, &state, true)
+            .unwrap()
+            .unwrap();
+        assert!(!log.exists());
+        assert_eq!(
+            kept,
+            root.join("ignored/validation/cargo-refused.before-run-buck-s0-1-2.log")
+        );
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), record);
+        // No record, nothing to keep.
+        assert_eq!(keep_earlier_buck_s0_refusals(root, &state, true), Ok(None));
+    }
+
+    #[test]
+    fn the_invocation_lock_is_one_lock_across_runners() {
+        // A Buck-only run and a run of any other runner refuse each other, a
+        // Buck-only claim creates no target/, the other runner still holds the
+        // target/validation lock the writeback below checks for, and a holder of
+        // only that lock refuses both runners.
+        let sandbox = tempfile::tempdir().unwrap();
+        assert_eq!(validate_runtime::runner_lock_self_test(sandbox.path()), Ok(4));
     }
 
     #[test]

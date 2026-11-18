@@ -1,0 +1,17 @@
+{
+  "name": "s0",
+  "description": "The Buck-only E2E subset S0: the portable lane of the categories fbsource's ci/buck-e2e keeps (fb-only/e2e_cells.bzl KEPT_CATEGORIES), on the ptrace and kvm backends. Every input of these cells is Buck-built in the open-source tree: the harness and hermit by Buck, the fixtures by the Buck-built harness, no cargo. scripts/validate.rs --buck-s0 runs exactly these cells and judges them with one import twin per category (validation_dag.rs buck_s0_selection).",
+  "lanes": ["portable"],
+  "backends": ["kvm", "ptrace"],
+  "categories": [
+    "bin-c",
+    "c-programs",
+    "chaos-c",
+    "data-handling",
+    "debugger-c",
+    "determinism-stress",
+    "determinism-stress-c",
+    "shared-futex-c",
+    "util-c"
+  ]
+}

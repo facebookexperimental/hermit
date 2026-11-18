@@ -1097,7 +1097,7 @@ impl AuthenticatedValidationAdmission {
     }
 
     pub(crate) fn check_witness(&self, root: &Path, run_state: &Path) -> Result<(), String> {
-        if !run_state.starts_with(root.join("target/validation")) {
+        if !run_state.starts_with(crate::validate_runtime::validation_state_root(root)) {
             return Err("admission witness is outside the verified run-state root".into());
         }
         let path = run_state.join("admission-floor-witness");
@@ -1117,9 +1117,10 @@ impl AuthenticatedValidationAdmission {
     pub(crate) fn write_witness(&self, root: &Path, run_state: &Path) -> Result<(), String> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        if !run_state.starts_with(root.join("target/validation")) {
+        if !run_state.starts_with(crate::validate_runtime::validation_state_root(root)) {
             return Err(
-                "admitted run-state witness must remain under ignored target/validation".into(),
+                "admitted run-state witness must remain under the checkout's validation state root"
+                    .into(),
             );
         }
         let mut file = std::fs::OpenOptions::new()

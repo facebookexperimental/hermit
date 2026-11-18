@@ -29,6 +29,7 @@ cargo metadata --locked --format-version 1 --no-deps >/dev/null
 for generated in \
   "$third_party_dir/.cargo" \
   "$third_party_dir/BUCK" \
+  "$third_party_dir/BUCK.inputs" \
   "$third_party_dir/vendor"
 do
   relative=${generated#"$repo_root/"}
@@ -48,6 +49,7 @@ fi
 rm -rf -- \
   "$third_party_dir/.cargo" \
   "$third_party_dir/BUCK" \
+  "$third_party_dir/BUCK.inputs" \
   "$third_party_dir/vendor"
 
 reindeer_args=(
@@ -186,3 +188,7 @@ cmp --silent "$first_output" "$third_party_dir/BUCK" || {
 sha256sum \
   Cargo.lock \
   "$third_party_dir/BUCK"
+# The inputs these rules were generated from, last, so only complete output is
+# stamped: a Buck-only run (ci/buck-e2e/validate-node under buck-stock) uses the
+# rules it finds and refuses when this stamp does not match its checkout.
+"$script_dir/rust-deps-stamp.py" write "$repo_root"

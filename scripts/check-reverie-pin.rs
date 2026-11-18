@@ -721,10 +721,44 @@ fn classify_cache_path(cache: &Path) -> Result<CacheState, String> {
     ))
 }
 
+/// The variable that moves the Reverie graph cache out of the checkout's
+/// `target/`. Only a Buck-only validation (scripts/validate.rs --buck-s0) sets
+/// it, because its checkout must hold no `target/`; every other caller keeps
+/// `target/ci/reverie-graph.git`, whatever its `CARGO_TARGET_DIR`.
+const GRAPH_CACHE_ROOT_ENV: &str = "HERMIT_REVERIE_GRAPH_CACHE_ROOT";
+
+/// [`GRAPH_CACHE_ROOT_ENV`] as `main` read it. Unset in the unit tests, which
+/// call the checks directly and so always see the checkout's `target/`,
+/// whatever environment runs them.
+static GRAPH_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The Reverie graph cache: `ci/reverie-graph.git` below
+/// [`GRAPH_CACHE_ROOT_ENV`] (relative to the checkout when relative), or below
+/// the checkout's `target/`.
+fn reverie_graph_cache(root: &Path) -> Result<PathBuf, String> {
+    reverie_graph_cache_in(root, GRAPH_CACHE_ROOT.get().cloned().flatten())
+}
+
+fn reverie_graph_cache_in(root: &Path, target_dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    match target_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) if dir.is_absolute() => {
+            fs::create_dir_all(&dir).map_err(|error| {
+                format!(
+                    "could not create the Reverie graph cache's root {}: {error}",
+                    dir.display()
+                )
+            })?;
+            resolve_cache_path(&dir, "ci/reverie-graph.git")
+        }
+        Some(dir) => resolve_cache_path(root, &format!("{}/ci/reverie-graph.git", dir.display())),
+        None => resolve_cache_path(root, "target/ci/reverie-graph.git"),
+    }
+}
+
 fn reverie_graph(root: &Path, remote: &str, branch: &str) -> Result<GuardedGitRepo, String> {
     // Resolved BEFORE anything is created, so `git init` and the guard below
     // both act on the same object.
-    let cache = resolve_cache_path(root, "target/ci/reverie-graph.git")?;
+    let cache = reverie_graph_cache(root)?;
     // Classified from the filesystem BEFORE any Git command is aimed at the
     // path, so a `.git`-file carrier or foreign contents can never be
     // initialised into and judged afterwards.
@@ -2684,6 +2718,9 @@ fn reverie_url_literal_violations(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The generated tree copy `ci/buck-e2e/stage` writes, relative to the root.
+const BUCK_E2E_STAGED_COPY: &str = "ci/buck-e2e/staged";
+
 fn check_reverie_repository_literals(root: &Path) -> Result<i32, String> {
     const TREES: [&str; 4] = [
         "liteinst-runtime-build",
@@ -2701,7 +2738,14 @@ fn check_reverie_repository_literals(root: &Path) -> Result<i32, String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if path.file_name().is_some_and(|name| name != "target") {
+                // ci/buck-e2e/staged/ is the gitignored copy of the whole tree
+                // (src/ is `git archive HEAD`) that ci/buck-e2e/stage leaves for
+                // the Buck cells; it repeats every tracked script, so a checkout
+                // that once staged would refuse here on every later run. The
+                // tracked sources themselves are scanned.
+                if path.file_name().is_some_and(|name| name != "target")
+                    && path != root.join(BUCK_E2E_STAGED_COPY)
+                {
                     stack.push(path);
                 }
             } else if path.extension().is_some_and(|ext| ext == "rs") {
@@ -3121,6 +3165,9 @@ fn run() -> Result<i32, String> {
 
 fn main() {
     rust_script_prelude::init();
+    GRAPH_CACHE_ROOT
+        .set(std::env::var_os(GRAPH_CACHE_ROOT_ENV).map(PathBuf::from))
+        .expect("main sets the graph cache root once");
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -3539,6 +3586,68 @@ mod tests {
         assert_eq!(reverie_url_literal_violations(stray), vec![1]);
         let link = "// see https://github.com/rrnewton/reverie/issues/1063\n";
         assert!(reverie_url_literal_violations(link).is_empty());
+    }
+
+    #[test]
+    fn the_reverie_graph_cache_follows_its_dedicated_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let base = env::temp_dir().join(format!(
+            "check-reverie-pin-graph-cache-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("checkout");
+        fs::create_dir_all(&root).expect("create checkout");
+        let root = fs::canonicalize(&root).expect("canonical checkout");
+        let outside = base.join("state/pin-check");
+        assert_eq!(
+            reverie_graph_cache_in(&root, None).unwrap(),
+            root.join("target/ci/reverie-graph.git")
+        );
+        assert_eq!(
+            reverie_graph_cache_in(&root, Some(PathBuf::new())).unwrap(),
+            root.join("target/ci/reverie-graph.git")
+        );
+        assert_eq!(
+            reverie_graph_cache_in(&root, Some(PathBuf::from("ignored/pin"))).unwrap(),
+            root.join("ignored/pin/ci/reverie-graph.git")
+        );
+        let cache = reverie_graph_cache_in(&root, Some(outside.clone())).unwrap();
+        assert_eq!(
+            cache,
+            fs::canonicalize(&outside)
+                .unwrap()
+                .join("ci/reverie-graph.git")
+        );
+        assert!(
+            !root.join("target").exists(),
+            "an outside target directory created target/"
+        );
+        fs::remove_dir_all(&base).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn the_staged_tree_copy_is_not_scanned_for_repository_literals() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "check-reverie-pin-staged-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let stray =
+            "let r = CargoGitRepository::new(\"https://github.com/rrnewton/reverie.git\");\n";
+        let staged = root.join(BUCK_E2E_STAGED_COPY).join("src/scripts");
+        fs::create_dir_all(&staged).expect("create staged copy");
+        fs::write(staged.join("copy.rs"), stray).expect("write staged copy");
+        assert_eq!(check_reverie_repository_literals(&root), Ok(0));
+        // The same line in a scanned tree is still refused.
+        fs::write(root.join("ci/tracked.rs"), stray).expect("write tracked source");
+        assert_eq!(check_reverie_repository_literals(&root), Ok(1));
+        fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
     #[test]

@@ -14,6 +14,9 @@
 #   SOURCE_SHA  HEAD
 #
 # usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
+#        ci/buck-e2e/stage --from-buck BUCK2 --subset FILE    build them with Buck, no cargo
+#                                                             (a subset whose cells need no
+#                                                             cargo-only input; see below)
 #        ci/buck-e2e/stage --bundle DIR                       copy them from a prebuilt bundle
 #                                                             (bin/ build/ src/ run-state/
 #                                                             hermit/{hermit,install} PROVENANCE.json)
@@ -23,17 +26,21 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
 staged=$here/staged
-mode= bundle= target_dir=$root/target
+mode= bundle= target_dir=$root/target buck2= subset=
 while [[ $# -gt 0 ]]; do
     case $1 in
         --from-cargo) mode=cargo; shift ;;
+        --from-buck) mode=buck; buck2=$2; shift 2 ;;
+        --subset) subset=$(realpath "$2"); shift 2 ;;
         --bundle) mode=bundle; bundle=$(realpath "$2"); shift 2 ;;
         --target-dir) target_dir=$2; shift 2 ;;
         -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "ci/buck-e2e/stage: unknown argument $1" >&2; exit 2 ;;
     esac
 done
-[[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR" >&2; exit 2; }
+[[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR | --from-buck BUCK2 --subset FILE" >&2; exit 2; }
+[[ $mode != buck || ( $buck2 == /* && -f $buck2 && -x $buck2 && -f $subset ) ]] ||
+    { echo "ci/buck-e2e/stage: --from-buck needs the absolute path of an executable buck2 and --subset FILE" >&2; exit 2; }
 # The host packages --from-cargo needs (docs/BUCK2_OSS.md, "Host prerequisites for Buck
 # validation"), checked before the previous staging is removed. Tests point
 # HERMIT_STAGE_HOST_LIBDIR elsewhere.
@@ -194,6 +201,67 @@ if [[ $mode == bundle ]]; then
     python3 "$root/ci/verify-packaged-detcore.py" "$staged/install"
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$bundle/PROVENANCE.json" >"$staged/SOURCE_SHA"
     echo "staged $(du -sh "$staged" | cut -f1) from $bundle (source $(cat "$staged/SOURCE_SHA"))"
+    exit 0
+fi
+
+# --from-buck: stage a subset (ci/buck-e2e/subsets/NAME.json) with Buck alone, for a
+# Buck-only validation (scripts/validate.rs --buck-s0) in a checkout with no Cargo target
+# directory. No cargo runs: bin/ is //ci/buck-e2e:harness-bin (Buck-built test-harness and
+# hermit-manifest-plan); build/ is `test-harness build` of the subset's lanes and
+# categories, other backends excluded, by that Buck-built harness, from src/ (`git
+# archive HEAD`, as above); install/ holds only the libunwind runtime closure the
+# Buck-built hermit finds through its DT_RPATH ($ORIGIN/install/rsrcs/hermit-runtime), so
+# a cell that runs in the pinned-root container, which has no libunwind, can start it;
+# run-state/ is empty (a subset holds no compat cell). There is no staged hermit: the
+# cells run the Buck-built //hermit-cli:hermit-release (-c hermit_e2e.hermit=release, the
+# default). The subset's backends must need no packaged resource (ptrace and kvm do not).
+if [[ $mode == buck ]]; then
+    sha=$(git -C "$root" rev-parse HEAD)
+    dirty=$(git -C "$root" status --porcelain --untracked-files=no) ||
+        { echo "ci/buck-e2e/stage: cannot read the status of $root" >&2; exit 2; }
+    [[ -z $dirty ]] ||
+        { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
+    # Each list is read whole before it is used, so a refusing subset.py (it names why)
+    # stops the stage: `mapfile < <(...)` drops its status and goes on with what it printed.
+    subset_lines() { # $1: a subset.py action; $2: the array to fill (empty for no lines)
+        local out
+        out=$(python3 "$here/subset.py" "$subset" "$root/ci/expected-e2e-plan.json" "$1") || exit 2
+        if [[ -n $out ]]; then mapfile -t "$2" <<<"$out"; else mapfile -t "$2" </dev/null; fi
+    }
+    lanes=() categories=() excluded=() buck_flags=()
+    subset_lines lanes lanes
+    subset_lines categories categories
+    subset_lines excluded-backends excluded
+    subset_lines buck-config buck_flags
+    tmp=$(mktemp -d)
+    trap 'rm -rf "${tmp:?}"' EXIT
+    env -C "$root" "$buck2" build -c hermit_release.unstamped=true "${buck_flags[@]}" \
+        //ci/buck-e2e:harness-bin --show-full-output >"$tmp/build.out"
+    harness_bin=$(awk '$1 ~ /:harness-bin$/ {print $2}' "$tmp/build.out")
+    [[ -x $harness_bin/test-harness && -x $harness_bin/hermit-manifest-plan ]] ||
+        { echo "ci/buck-e2e/stage: buck2 built no test-harness and hermit-manifest-plan in '$harness_bin'" >&2; exit 1; }
+    cp -a "$harness_bin" "$staged/bin"
+    chmod -R u+w "$staged/bin"
+    mkdir -p "$staged/install/rsrcs/hermit-runtime" "$staged/run-state" "$staged/src" "$staged/build" "$tmp/results"
+    for lib in libunwind.so.8 libunwind-x86_64.so.8; do
+        [[ -e $host_libdir/$lib ]] ||
+            { echo "ci/buck-e2e/stage: $host_libdir/$lib is missing; install it with  sudo dnf install -y libunwind-devel" >&2; exit 1; }
+        install -m 644 "$(readlink -f "$host_libdir/$lib")" "$staged/install/rsrcs/hermit-runtime/$lib"
+    done
+    git -C "$root" archive "$sha" | tar x -C "$staged/src"
+    exclude_args=()
+    for backend in "${excluded[@]}"; do exclude_args+=(--exclude-backend "$backend"); done
+    fixture_jobs=${CARGO_BUILD_JOBS:-32}
+    for lane in "${lanes[@]}"; do
+        for category in "${categories[@]}"; do
+            VALIDATE_RUN_STATE="$staged/run-state" E2E_RESULT_ROOT="$tmp/results" E2E_BUILD_ROOT="$staged/build" \
+                E2E_RUN_ID=buck-e2e-stage "$staged/bin/test-harness" build --repo-root "$staged/src" \
+                --source-sha "$sha" --ci-only --lane "$lane" --category "$category" "${exclude_args[@]}" \
+                --jobs "$fixture_jobs" --allow-empty >/dev/null
+        done
+    done
+    echo "$sha" >"$staged/SOURCE_SHA"
+    echo "staged $(du -sh "$staged" | cut -f1) for $sha with Buck ($(basename "$subset"), no cargo)"
     exit 0
 fi
 

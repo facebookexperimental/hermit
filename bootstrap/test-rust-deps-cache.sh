@@ -45,7 +45,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-for f in regenerate-rust-deps rust-deps-cache.sh rust-deps-cache-key.rs; do
+for f in regenerate-rust-deps rust-deps-cache.sh rust-deps-cache-key.rs rust-deps-stamp.py; do
   [[ -f $script_dir/$f ]] || { echo "test-rust-deps-cache: missing $script_dir/$f" >&2; exit 2; }
 done
 
@@ -89,7 +89,8 @@ repo=$tmp/repo
 cache=$tmp/cache
 mkdir -p "$tmp/bin" "$repo/bootstrap" "$repo/scripts" "$repo/reverie" \
   "$repo/shim/third-party/rust/fixups/one"
-cp -- "$script_dir/regenerate-rust-deps" "$script_dir/rust-deps-cache.sh" "$repo/bootstrap/"
+cp -- "$script_dir/regenerate-rust-deps" "$script_dir/rust-deps-cache.sh" "$script_dir/rust-deps-stamp.py" \
+  "$repo/bootstrap/"
 
 # The key helper is the real one, built and run from this checkout (where its
 # toolchain and any prepared binary resolve), against the fixture. rust-script
@@ -240,7 +241,7 @@ printf '[cargo]\n\n[platform.linux-x86_64]\ntarget = "x86_64-unknown-linux-gnu"\
 echo 'extra_srcs = []' >"$repo/shim/third-party/rust/fixups/one/fixups.toml"
 echo 'buck' >"$repo/reverie/BUCK"
 printf '[workspace]\nmembers = []\n' >"$repo/Cargo.toml"
-printf '/shim/third-party/rust/.cargo/\n/shim/third-party/rust/BUCK\n/shim/third-party/rust/vendor/\n' \
+printf '/shim/third-party/rust/.cargo/\n/shim/third-party/rust/BUCK\n/shim/third-party/rust/BUCK.inputs\n/shim/third-party/rust/vendor/\n' \
   >"$repo/.gitignore"
 lock_at() {
   cat >"$repo/Cargo.lock" <<EOF
@@ -336,12 +337,15 @@ expect_vendored first
 # not cached: it runs once on a generated or a restored BUCK.
 postprocessed='^# Appended by bootstrap/regenerate-rust-deps from shared-cell-aliases[.]txt[.]$'
 [[ $(grep -c "$postprocessed" "$buck") == 1 ]] || fail "first: postprocessing ran $(grep -c "$postprocessed" "$buck") times"
+# The generated rules are stamped with the inputs they came from.
+"$repo/bootstrap/rust-deps-stamp.py" check "$repo" || fail "first: the stamp does not match the fixture's inputs"
 
 # Same inputs: no Reindeer call, the same tree, postprocessing applied once.
 regen second
 expect_restored second
 cmp -s "$tmp/first.tree" "$tmp/second.tree" || fail "second: restored tree differs from the generated one"
 [[ $(entries) == 1 ]] || fail "second: expected 1 cache entry, found $(entries)"
+"$repo/bootstrap/rust-deps-stamp.py" check "$repo" || fail "second: the restored rules' stamp does not match the fixture's inputs"
 
 # A committed Cargo.lock that moves a git dependency vendors again, for its lock.
 lock_at "$rev_b"
