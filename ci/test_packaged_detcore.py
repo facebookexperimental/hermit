@@ -100,6 +100,41 @@ def buck_fixture_receipt(install, pin, *, core=False):
     return record
 
 
+def declared_inventory_sha256(inventory):
+    # The producer's digest input: serde's compact encoding of inventory
+    # entries in their declared (relative, size, sha256) field order.
+    canonical = [{"relative": entry["relative"], "size": entry["size"],
+                  "sha256": entry["sha256"]} for entry in inventory]
+    encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def path_fixture_receipt(install, pin, *, core=False):
+    # The Cargo fixture stamped as the step-1/2 path layout: the same
+    # receipt plus the declared-content authority a HermitPath compiled
+    # source record serializes (inventories, their digests, and the path
+    # compiler-root binding with no Cargo checkout).
+    resources = Path(install) / "rsrcs"
+    record = fixture_receipt(install, pin, core=core)
+    record = copy.deepcopy(record)
+    workspace = [{"relative": "Cargo.lock", "size": 11, "sha256": "7" * 64},
+                 {"relative": "Cargo.toml", "size": 3, "sha256": "1" * 64}]
+    reverie = [{"relative": "reverie-inguest/src/lib.rs", "size": 5, "sha256": "8" * 64},
+               {"relative": "reverie-liteinst-artifact/src/lib.rs", "size": 7, "sha256": "2" * 64}]
+    record["compiled_sources"].update({
+        "layout": "HermitPath", "workspace_root": "/fixture",
+        "authority": {"kind": "declared_content",
+            "workspace_inventory": workspace,
+            "workspace_sha256": declared_inventory_sha256(workspace),
+            "reverie_inventory": reverie,
+            "reverie_sha256": declared_inventory_sha256(reverie),
+            "compiler_root": {"logical_root": "/fixture/reverie",
+                              "canonical_root": "/fixture/reverie",
+                              "cargo_home": None}}})
+    (resources / "libdetcore_liteinst.package.json").write_text(json.dumps(record))
+    return record
+
+
 class ReceiptControls(unittest.TestCase):
     def test_receipt_binds_profile_feature_artifact_source_close_and_installed_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,6 +534,124 @@ class ReceiptControls(unittest.TestCase):
             bad = copy.deepcopy(buck)
             bad["builder"] = "ninja"
             refused(bad)
+
+    def _path_controls(self, core):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            resources = install / "rsrcs"
+            resources.mkdir()
+            (resources / "libdetcore_liteinst.so").write_bytes(
+                b"synthetic reader fixture, not an ELF proof")
+            receipt = resources / "libdetcore_liteinst.package.json"
+            # Round-trip so nested mutations cannot alias fixture dicts.
+            good = json.loads(json.dumps(
+                path_fixture_receipt(install, "a" * 40, core=core)))
+            verifier.verify(install, core=core)
+
+            def refused(bad, pattern=None):
+                receipt.write_text(json.dumps(bad))
+                if pattern is None:
+                    with self.assertRaises(ValueError):
+                        verifier.verify(install, core=core)
+                else:
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        verifier.verify(install, core=core)
+
+            def mutated_sources(mutate):
+                bad = copy.deepcopy(good)
+                mutate(bad["compiled_sources"])
+                return bad
+
+            # The path layout without its content authority is the gap this
+            # step closes: absence, the Git arm's authority kind, and a
+            # non-object authority all refuse by name.
+            refused(mutated_sources(lambda sources: sources.pop("authority")),
+                    "lacks declared-content authority")
+            refused(mutated_sources(
+                lambda sources: sources["authority"].__setitem__("kind", "git")),
+                "lacks declared-content authority")
+            refused(mutated_sources(
+                lambda sources: sources.__setitem__("authority", "declared")),
+                "lacks declared-content authority")
+            # Both declared inventories and both digests are required;
+            # junk digests refuse whether misshapen or merely unbound.
+            for field in ("workspace_inventory", "reverie_inventory",
+                          "workspace_sha256", "reverie_sha256", "compiler_root"):
+                refused(mutated_sources(
+                    lambda sources, field=field: sources["authority"].pop(field)))
+            refused(mutated_sources(
+                lambda sources: sources.pop("workspace_root")))
+            refused(mutated_sources(
+                lambda sources: sources["authority"].__setitem__(
+                    "reverie_inventory", [])))
+            refused(mutated_sources(
+                lambda sources: sources["authority"].__setitem__(
+                    "reverie_sha256", "junk")),
+                "lacks the declared reverie inventory digest")
+            refused(mutated_sources(
+                lambda sources: sources["authority"].__setitem__(
+                    "reverie_sha256", "0" * 64)),
+                "does not bind its inventory")
+            refused(mutated_sources(
+                lambda sources: sources["authority"].__setitem__(
+                    "workspace_sha256", "0" * 64)),
+                "does not bind its inventory")
+            for entry in ("reverie_inventory", "workspace_inventory"):
+                refused(mutated_sources(
+                    lambda sources, entry=entry: sources["authority"][entry][0]
+                    .__setitem__("sha256", "not-a-digest")))
+                # A well-formed but different entry digest no longer
+                # matches the retained inventory digest.
+                refused(mutated_sources(
+                    lambda sources, entry=entry: sources["authority"][entry][0]
+                    .__setitem__("sha256", "9" * 64)))
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["reverie_inventory"][0]
+                .__setitem__("size", -1)))
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["reverie_inventory"][0]
+                .__setitem__("extra", True)))
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["reverie_inventory"][0]
+                .pop("relative")))
+            # Reversed order refuses even with a digest recomputed over the
+            # reversed list: the serialized inventory is canonical.
+            def reversed_inventory(sources):
+                authority = sources["authority"]
+                authority["reverie_inventory"] = authority["reverie_inventory"][::-1]
+                authority["reverie_sha256"] = declared_inventory_sha256(
+                    authority["reverie_inventory"])
+            refused(mutated_sources(reversed_inventory), "canonical order")
+            # The compiler root is the path binding: logical
+            # <workspace>/reverie over the receipt's Reverie root, and no
+            # Cargo checkout.
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["compiler_root"]
+                .__setitem__("logical_root", "/other/reverie")))
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["compiler_root"]
+                .__setitem__("canonical_root", "/other/reverie")))
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["compiler_root"]
+                .__setitem__("cargo_home", ["/cargo", "/cargo"])),
+                "names a Cargo checkout")
+            refused(mutated_sources(
+                lambda sources: sources["authority"]["compiler_root"]
+                .pop("cargo_home")), "names a Cargo checkout")
+            # The same receipt as the Git layout, authority removed, takes
+            # the original Cargo arm unchanged.
+            git = copy.deepcopy(good)
+            git["compiled_sources"]["layout"] = "HermitGit"
+            del git["compiled_sources"]["authority"]
+            del git["compiled_sources"]["workspace_root"]
+            receipt.write_text(json.dumps(git))
+            verifier.verify(install, core=core)
+
+    def test_path_receipt_requires_declared_content_authority(self):
+        self._path_controls(core=False)
+
+    def test_core_path_receipt_requires_declared_content_authority(self):
+        self._path_controls(core=True)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,12 @@ own provenance; mixed or unknown builder keys are refused, and neither arm
 synthesizes the other builder's values. The Buck arm is plumbing: no Buck
 producer emits this receipt yet, so its literals pin the contract that
 producer must meet rather than attesting any built bytes.
+
+Within the Cargo arm, a receipt whose ``compiled_sources`` layout is the
+path variant (``HermitPath``) must carry the declared-content authority
+that layout resolves with: both declared inventories, their inventory
+digests, and the path compiler-root binding. Git-layout receipts and
+receipts predating the layout field take the original checks unchanged.
 """
 import hashlib
 import json
@@ -41,6 +47,64 @@ BUCK_CONSTRAINTS = ["ovr_config//build_mode/constraints:opt",
 BUCK_ARGV = ["buck2", "build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM,
              "--show-full-output", "--client-metadata",
              "id=stage-detcore-liteinst"]
+
+
+def _declared_inventory_sha256(inventory):
+    # The producer's digest is over serde's compact encoding of the
+    # inventory entries in their declared field order.
+    canonical = [{"relative": entry["relative"], "size": entry["size"],
+                  "sha256": entry["sha256"]} for entry in inventory]
+    encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _require_declared_inventory(inventory, label):
+    require(isinstance(inventory, list) and inventory,
+            f"path receipt lacks the declared {label} inventory")
+    relatives = []
+    for entry in inventory:
+        require(isinstance(entry, dict)
+                and set(entry) == {"relative", "size", "sha256"}
+                and isinstance(entry["relative"], str) and entry["relative"]
+                and isinstance(entry["size"], int)
+                and not isinstance(entry["size"], bool) and entry["size"] >= 0
+                and isinstance(entry["sha256"], str)
+                and re.fullmatch("[0-9a-f]{64}", entry["sha256"]),
+                f"malformed declared {label} inventory entry")
+        relatives.append(entry["relative"])
+    require(relatives == sorted(set(relatives)),
+            f"declared {label} inventory is not in canonical order")
+
+
+def _require_path_content_authority(sources):
+    authority = sources.get("authority")
+    require(isinstance(authority, dict)
+            and authority.get("kind") == "declared_content",
+            "path receipt lacks declared-content authority for its compiled sources")
+    for label in ("workspace", "reverie"):
+        inventory = authority.get(f"{label}_inventory")
+        _require_declared_inventory(inventory, label)
+        digest = authority.get(f"{label}_sha256")
+        require(isinstance(digest, str)
+                and re.fullmatch("[0-9a-f]{64}", digest),
+                f"path receipt lacks the declared {label} inventory digest")
+        require(digest == _declared_inventory_sha256(inventory),
+                f"declared {label} inventory digest does not bind its inventory")
+    binding = authority.get("compiler_root")
+    require(isinstance(binding, dict)
+            and isinstance(binding.get("logical_root"), str)
+            and binding["logical_root"]
+            and isinstance(binding.get("canonical_root"), str)
+            and binding["canonical_root"],
+            "path receipt lacks the compiler root binding")
+    workspace_root = sources.get("workspace_root")
+    require(isinstance(workspace_root, str) and workspace_root,
+            "path receipt lacks the compiled workspace root")
+    require(binding["logical_root"] == str(Path(workspace_root) / "reverie")
+            and binding["canonical_root"] == sources.get("reverie_root"),
+            "path compiler root differs from the compiled source roots")
+    require("cargo_home" in binding and binding["cargo_home"] is None,
+            "path compiler root names a Cargo checkout")
 
 
 def _receipt_builder(install):
@@ -98,6 +162,13 @@ def _verify(install, *, core=False):
                                       "overflow_checks": True, "test": False}, "wrong compiler profile")
     sources = record["compiled_sources"]
     require(sources["image_kind"] == "Detcore" and sources["reverie_pin"] == pin, "source authority differs from packaging inputs")
+    # For a HermitPath (content-only) receipt the reverie_pin checked
+    # above is only a label: it carries no checkout proof. The
+    # guarantee comes from producer routing (only a gitless Reverie
+    # root resolves as the path layout) plus the declared-content
+    # authority required here.
+    if isinstance(sources, dict) and sources.get("layout") == "HermitPath":
+        _require_path_content_authority(sources)
     package = artifact["package"]
     require(package == sources["leaf"] and package["name"] == "detcore-liteinst"
             and package["target"] == "detcore_liteinst" and package["source"] is None
