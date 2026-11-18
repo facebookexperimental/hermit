@@ -2296,6 +2296,45 @@ const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run --repo-ro
 /// caller of CARGO_TARGET_DIR moves its cache. Stable across runs, so the graph
 /// cache is fetched incrementally.
 const BUCK_S0_PIN_CHECK_ROOT: &str = "CARGO_TARGET_DIR=\"$PWD/ignored/validation/pin-check\" HERMIT_REVERIE_GRAPH_CACHE_ROOT=\"$PWD/ignored/validation/pin-check\" ";
+/// The job of the one `--buck-s0` node that stages and runs the cells.
+const BUCK_S0_NODE_JOB: &str = "buck_s0";
+/// The preflight nodes the `--buck-s0` node runs beside, in dependency order.
+/// Each records its exit status in [`BUCK_S0_PREFLIGHT_STATUS_DIR`], and
+/// ci/buck-e2e/validate-node (HERMIT_VALIDATE_AWAIT_PREFLIGHT) waits for every
+/// one before the first cell runs.
+const BUCK_S0_PREFLIGHT: [&str; 2] = ["pre.submodules", "pre.reverie_pin"];
+/// Where each `--buck-s0` preflight node writes `<tag>.rc`, its exit status;
+/// ci/buck-e2e/validate-node reads `$VALIDATE_RUN_STATE/preflight/$tag.rc`.
+const BUCK_S0_PREFLIGHT_STATUS_DIR: &str = "$VALIDATE_RUN_STATE/preflight";
+/// The job of the first `--buck-s0` node, which removes an earlier execution's
+/// preflight records before the preflight writes them or validate-node waits
+/// for them. A run state is reused by a plan export's scheduler
+/// (`<export dir>/run-state`) and by a nested payload, and a `0` left there by
+/// an earlier execution would otherwise pass validate-node's wait before this
+/// execution's preflight finished.
+const BUCK_S0_RECORDS_JOB: &str = "buck_s0_records";
+
+/// The command of the [`BUCK_S0_RECORDS_JOB`] node. It refuses (exit 2, nothing
+/// deleted) unless VALIDATE_RUN_STATE is an absolute path to an existing
+/// directory, not a symbolic link, whose last component is named like a run
+/// state (`run-<profile>-<pid>-<nonce>`, or a plan export's `run-state`); then
+/// it removes only that directory's `preflight` child.
+fn clear_preflight_records() -> String {
+    let script = [
+        r#"refuse() { echo "pre.buck_s0_records: $1; nothing was deleted" >&2; exit 2; }"#,
+        r#"d=${VALIDATE_RUN_STATE-}"#,
+        r#"[[ -n $d ]] || refuse "VALIDATE_RUN_STATE is unset or empty""#,
+        r#"[[ $d == /* ]] || refuse "VALIDATE_RUN_STATE=$d is not an absolute path""#,
+        r#"name=${d##*/}"#,
+        r#"[[ $name =~ ^run-[A-Za-z0-9-]+-[0-9]+-[0-9]+$ || $name == run-state ]] || refuse "VALIDATE_RUN_STATE=$d is not named like a run state (run-<profile>-<pid>-<nonce>, or a plan export's run-state)""#,
+        r#"[[ -d $d && ! -L $d ]] || refuse "VALIDATE_RUN_STATE=$d is not an existing directory""#,
+        r#"rm -rf -- "$d/preflight""#,
+    ]
+    .join("; ");
+    format!("bash -c {}", shell_quote(&script))
+}
+const BUCK_S0_AWAIT_PREFLIGHT_ENV: &str = "HERMIT_VALIDATE_AWAIT_PREFLIGHT";
+const BUCK_S0_AWAIT_PREFLIGHT_SECONDS_ENV: &str = "HERMIT_VALIDATE_AWAIT_PREFLIGHT_SECONDS";
 /// Put first on every `--buck-s0` node's PATH, and named by CARGO for the tools
 /// that run `$CARGO` (ci/manifest-plan's locked_cargo.rs,
 /// ci/build-compatible-cli.rs): [`BUCK_S0_NO_CARGO_SHIM`] runs nothing, exits 97
@@ -2320,8 +2359,32 @@ const BUCK_S0_NO_CARGO_JOB: &str = "no_cargo_s0";
 /// The `--buck-s0` stand-in for gate.manifest, which runs the Cargo-built
 /// target/debug/test-harness validate.
 const BUCK_S0_GATE_JOB: &str = "manifest_s0";
-/// What the `--buck-s0` stage and cells nodes say about their bounds.
-const BUCK_S0_UNBOUNDED_DAEMON: &str = "The buck2 daemon, and every cell it runs, lives in the daemon's own systemd scope (buck2.slice), outside this node's cgroup, so this node's memory box and CPU budget do not cover them; only the node's wall bound and dagrun's reap of the node's processes when it ends do.";
+/// The buck2 daemon runs in its own systemd scope (buck2.slice), outside the
+/// node's cgroup, so the node's box and CPU budget do not see the cells:
+/// ci/buck-e2e/validate-node sets the scope's MemoryMax to this many bytes and
+/// stops the daemon once the scope's CPU passes the node's CPU budget.
+const BUCK_S0_DAEMON_MEMORY_MAX_ENV: &str = "HERMIT_VALIDATE_BUCK_DAEMON_MEMORY_MAX";
+const BUCK_S0_DAEMON_CPU_SECONDS_ENV: &str = "HERMIT_VALIDATE_BUCK_DAEMON_CPU_SECONDS";
+/// 32 GiB: 1.5 times the highest daemon-scope memory.peak measured in a cold
+/// `--buck-s0` run of s0 (21.3 GiB, devbig014, 2026-11-17; the range was
+/// 12.4-21.3 GiB). Also the node's admission estimate, since dagrun cannot see
+/// the daemon's memory to correct it.
+const BUCK_S0_DAEMON_MEMORY_MAX_BYTES: i64 = 32 << 30;
+
+/// `cmd`, then its exit status written to
+/// `$VALIDATE_RUN_STATE/preflight/<tag>.rc` (by rename, so a reader never
+/// sees half a file) and returned as the node's own. `cmd` runs in a child
+/// `bash -c`, so an `exit` inside it cannot skip the record, and a `set -e`
+/// inside it still holds (a subshell on the left of `&&` would run it with
+/// errexit off). A record that cannot be written leaves the reader to refuse
+/// when its wait runs out.
+fn recording_preflight_status(cmd: &str, tag: &str) -> String {
+    let file = format!("{BUCK_S0_PREFLIGHT_STATUS_DIR}/{tag}.rc");
+    format!(
+        "bash -c {} && rc=0 || rc=$?; mkdir -p \"{BUCK_S0_PREFLIGHT_STATUS_DIR}\" && echo \"$rc\" > \"{file}.tmp\" && mv \"{file}.tmp\" \"{file}\"; exit $rc",
+        shell_quote(cmd)
+    )
+}
 
 /// A Buck-only E2E subset: the plan cells in every one of its lists.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -2384,10 +2447,11 @@ fn buck_s0_cargo_refusal_check(tag: &str) -> String {
 /// subset with ZERO cargo nodes, in a checkout that needs no Cargo target
 /// directory. It keeps the two preflight nodes (pre.submodules, and
 /// pre.reverie_pin with its rustc checkers compiled into the run's state), adds
-/// a stage and a cells node built from the committed e2e.buck_stage and
-/// e2e.buck_cells (ci/buck-e2e/validate-node under
-/// HERMIT_VALIDATE_E2E_RUNNER=buck-stock: ci/buck-e2e/stage --from-buck, then
-/// the public buck2's stock test runner over the subset's cells);
+/// ONE node, e2e.buck_s0, built from the committed e2e.buck_cells, that stages
+/// and runs the cells with one buck2 daemon (ci/buck-e2e/validate-node with no
+/// argument under HERMIT_VALIDATE_E2E_RUNNER=buck-stock: ci/buck-e2e/stage
+/// --from-buck, then the public buck2's stock test runner over the subset's
+/// cells) beside the preflight, waiting for the preflight before any cell;
 /// gate.manifest_s0, which refuses if any node ran cargo and runs the staged
 /// Buck-built harness's inventory check (sync-cells --check) in place of
 /// gate.manifest; and one import twin per (lane, category) of the subset,
@@ -2434,10 +2498,31 @@ pub fn buck_s0_selection(
     };
     let mut steps = Vec::new();
 
-    let mut submodules = find("pre.submodules")?;
+    // First, before the preflight writes its records or validate-node reads
+    // them, an earlier execution's records go (BUCK_S0_RECORDS_JOB).
+    let mut records = find(BUCK_S0_PREFLIGHT[0])?;
+    records.job = BUCK_S0_RECORDS_JOB.into();
+    records.cmd = clear_preflight_records();
+    records.desc = "Remove an earlier execution's --buck-s0 preflight records".into();
+    records.description = format!(
+        "Selected only by scripts/validate.rs --buck-s0, first. Removes {BUCK_S0_PREFLIGHT_STATUS_DIR}, so the preflight nodes ({}) and e2e.{BUCK_S0_NODE_JOB}, which depend on this node, see only this execution's records: a run state is reused by a plan export's scheduler and by a nested payload, and an earlier execution's 0 would otherwise pass e2e.{BUCK_S0_NODE_JOB}'s preflight wait before this execution's preflight finished. Refuses, deleting nothing, unless VALIDATE_RUN_STATE is an existing absolute directory named like a run state (run-<profile>-<pid>-<nonce>, or a plan export's run-state).",
+        BUCK_S0_PREFLIGHT.join(", ")
+    );
+    records.deps = Vec::new();
+    records.env.clear();
+    records.timeout = 60;
+    records.cpu_timeout = 30;
+    relabel(&mut records);
+    let records_tag = records.tag();
+    steps.push(records);
+
+    let mut submodules = find(BUCK_S0_PREFLIGHT[0])?;
+    submodules.cmd = recording_preflight_status(&submodules.cmd, BUCK_S0_PREFLIGHT[0]);
+    submodules.deps = vec![records_tag.clone()];
     relabel(&mut submodules);
+    let submodules_wall = submodules.timeout;
     steps.push(submodules);
-    let mut pin = find("pre.reverie_pin")?;
+    let mut pin = find(BUCK_S0_PREFLIGHT[1])?;
     let pin_call = "hermit_run_pin_check ./ci/run-reverie-pin-check.sh";
     if pin.cmd.matches(pin_call).count() != 1 {
         return Err("pre.reverie_pin lost its one ci/run-reverie-pin-check.sh call".into());
@@ -2445,27 +2530,61 @@ pub fn buck_s0_selection(
     pin.cmd = pin
         .cmd
         .replace(pin_call, &format!("{BUCK_S0_PIN_CHECK_ROOT}{pin_call}"));
+    pin.cmd = recording_preflight_status(&pin.cmd, BUCK_S0_PREFLIGHT[1]);
     relabel(&mut pin);
+    let pin_wall = pin.timeout;
     steps.push(pin);
 
-    let mut stage = find(BUCK_STAGE_TAG)?;
-    stage.job.push_str(BUCK_S0_SUFFIX);
-    stage.desc = "Stage the Buck-only subset's inputs with Buck (no cargo)".into();
-    stage.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host it runs ci/buck-e2e/stage --from-buck (ci/buck-e2e/validate-node --stage-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock): //ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads. No cargo runs and nothing is written to target/. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. {BUCK_S0_UNBOUNDED_DAEMON} Subset: {BUCK_S0_SUBSET}."
-    );
-    stage.deps = vec!["pre.reverie_pin".into()];
-    relabel(&mut stage);
-    steps.push(stage.clone());
-
+    // ONE node stages and runs the cells, so the stage's buck2 daemon is the
+    // cells' daemon. dagrun ends every node by killing each process that
+    // carries the node's DAGRUN_STEP nonce, and a buck2 daemon inherits it
+    // from its client, so a daemon never outlives its node: with a stage node
+    // and a cells node, the cells always started a cold daemon and analysed
+    // and built again. The node runs beside the preflight, which only reads
+    // the checkout (the pin check skips the staged copy). A failed preflight
+    // cancels it at once by the default fail-fast (validate collapses every
+    // family into the global eager exit), and under -k, which cancels
+    // nothing, validate-node waits for the preflight's exit statuses before
+    // the first cell and refuses on a failed or silent one.
+    let stage = find(BUCK_STAGE_TAG)?;
     let mut cells = find(BUCK_CELLS_TAG)?;
-    cells.job.push_str(BUCK_S0_SUFFIX);
-    cells.desc = "Run the Buck-only subset's cells under the stock buck2 test runner".into();
+    let cells_only = "./ci/buck-e2e/validate-node --cells-only";
+    if cells.cmd.matches(cells_only).count() != 1 {
+        return Err(format!("{BUCK_CELLS_TAG} lost its one {cells_only} call"));
+    }
+    cells.cmd = cells.cmd.replace(cells_only, "./ci/buck-e2e/validate-node");
+    cells.job = BUCK_S0_NODE_JOB.into();
+    cells.desc = "Stage and run the Buck-only subset's cells with one buck2 daemon".into();
     cells.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0. On the host (ci/buck-e2e/validate-node --cells-only under HERMIT_VALIDATE_E2E_RUNNER=buck-stock) it refuses with exit 2 unless {} staged the inputs for HEAD, runs no cargo (the third-party rules shim/third-party/rust/BUCK are the checkout's setup, generated once by bootstrap/regenerate-rust-deps for this checkout's inputs, and refused on a stamp mismatch), runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing, which refuses unless the cells Buck ran are exactly the subset plan's. {BUCK_S0_UNBOUNDED_DAEMON} It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
-        stage.tag()
+        "Selected only by scripts/validate.rs --buck-s0. One node, so the stage's buck2 daemon is the cells' daemon (dagrun reaps a node's processes, a daemon its client started included, when the node ends). On the host, ci/buck-e2e/validate-node with no argument under HERMIT_VALIDATE_E2E_RUNNER=buck-stock runs ci/buck-e2e/stage --from-buck (//ci/buck-e2e:harness-bin built by the given buck2, `git archive HEAD`, the subset's fixtures built by that Buck-built harness, and the libunwind runtime closure the Buck-built hermit loads; it refuses a tree with uncommitted changes to tracked files), then waits for the preflight it runs beside ({}, each one's exit status in {BUCK_S0_PREFLIGHT_STATUS_DIR}/<tag>.rc; a failed or silent preflight ends the node before any cell), then runs the subset's shell-test twins (//ci/buck-e2e:stock-local, every cell on this host, the Buck-built //hermit-cli:hermit-release) and ingests their artifacts into $VALIDATE_RUN_STATE/buck-e2e/results with ci/buck-e2e/ingest.py --local-listing, which refuses unless the cells Buck ran are exactly the subset plan's. No cargo runs and nothing is written to target/; the third-party rules shim/third-party/rust/BUCK are the checkout's setup, generated once by bootstrap/regenerate-rust-deps for this checkout's inputs (refused on a stamp mismatch). The buck2 daemon and the cells run in the daemon's own systemd scope, outside this node's cgroup, so this node's box and CPU budget do not cover them: before the stage, validate-node starts the daemon, sets the scope's MemoryMax to {BUCK_S0_DAEMON_MEMORY_MAX_ENV} bytes, stops the daemon (failing the node) once the scope's CPU passes {BUCK_S0_DAEMON_CPU_SECONDS_ENV} (this node's CPU budget), and records the scope's CPU and memory.peak. It judges nothing: the import twins own the verdicts. Subset: {BUCK_S0_SUBSET}.",
+        BUCK_S0_PREFLIGHT.join(", ")
     );
-    cells.deps = vec![stage.tag()];
+    // Beside the preflight: only after the first node's clear.
+    cells.deps = vec![records_tag.clone()];
+    // Both committed bounds: this node does the stage's work and the cells'.
+    cells.timeout += stage.timeout;
+    cells.cpu_timeout += stage.cpu_timeout;
+    cells.hint.est_duration_s += stage.hint.est_duration_s;
+    cells.hint.rss_baseline_bytes = Some(BUCK_S0_DAEMON_MEMORY_MAX_BYTES);
+    cells.env.insert(
+        BUCK_S0_DAEMON_MEMORY_MAX_ENV.into(),
+        BUCK_S0_DAEMON_MEMORY_MAX_BYTES.to_string(),
+    );
+    cells.env.insert(
+        BUCK_S0_DAEMON_CPU_SECONDS_ENV.into(),
+        cells.cpu_timeout.to_string(),
+    );
+    cells
+        .env
+        .insert(BUCK_STEP_WALL_ENV.into(), cells.timeout.to_string());
+    cells.env.insert(
+        BUCK_S0_AWAIT_PREFLIGHT_ENV.into(),
+        BUCK_S0_PREFLIGHT.join(" "),
+    );
+    cells.env.insert(
+        BUCK_S0_AWAIT_PREFLIGHT_SECONDS_ENV.into(),
+        (submodules_wall + pin_wall).to_string(),
+    );
     relabel(&mut cells);
     steps.push(cells.clone());
 
@@ -2485,7 +2604,7 @@ pub fn buck_s0_selection(
     gate.desc =
         "Buck-only gate: no node ran cargo, and the staged harness's inventory check".into();
     gate.description = format!(
-        "Selected only by scripts/validate.rs --buck-s0, in place of gate.manifest (the Cargo-built target/debug/test-harness validate). After {}, which runs after every other node before it: it refuses if any --buck-s0 node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to), then runs the staged Buck-built harness's ci/buck-e2e/staged/bin/test-harness sync-cells --check over the staged source, so manifests that drifted from ci/expected-e2e-plan.json or ci/optional-e2e-cells.txt fail the run as gate.manifest would (every harness command, the twins' included, also runs the front-door manifest schema and inventory authority). gate.manifest's other audits do not run in this mode: DAG correspondence, budget ordering, determinism-stress evidence, CLI brackets, and the generated test footprints (a Cargo-built target/debug/generate-test-footprints).",
+        "Selected only by scripts/validate.rs --buck-s0, in place of gate.manifest (the Cargo-built target/debug/test-harness validate). After {}, whose preflight wait means both preflight nodes have exited: it refuses if any --buck-s0 node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to), then runs the staged Buck-built harness's ci/buck-e2e/staged/bin/test-harness sync-cells --check over the staged source, so manifests that drifted from ci/expected-e2e-plan.json or ci/optional-e2e-cells.txt fail the run as gate.manifest would (every harness command, the twins' included, also runs the front-door manifest schema and inventory authority). gate.manifest's other audits do not run in this mode: DAG correspondence, budget ordering, determinism-stress evidence, CLI brackets, and the generated test footprints (a Cargo-built target/debug/generate-test-footprints).",
         cells.tag()
     );
     gate.deps = vec![cells.tag()];
@@ -2531,7 +2650,7 @@ pub fn buck_s0_selection(
                 cells.tag(),
                 excluded.trim()
             );
-            twin.deps = vec![cells.tag(), gate_tag.clone()];
+            twin.deps = vec![cells.tag(), gate_tag.clone(), BUCK_S0_PREFLIGHT[1].into()];
             relabel(&mut twin);
             let owner = twin.tag();
             twin_tags.push(owner.clone());
@@ -8642,10 +8761,10 @@ sys.exit(37)
         let selected = buck_s0_selection(&committed, &subset, &backends).unwrap();
         let tags = selected.steps.iter().map(Step::tag).collect::<Vec<_>>();
         let mut expected = vec![
-            "pre.submodules".to_string(),
+            "pre.buck_s0_records".to_string(),
+            "pre.submodules".into(),
             "pre.reverie_pin".into(),
-            "e2e.buck_stage_s0".into(),
-            "e2e.buck_cells_s0".into(),
+            "e2e.buck_s0".into(),
             "gate.manifest_s0".into(),
         ];
         for category in &subset.categories {
@@ -8695,30 +8814,62 @@ sys.exit(37)
             }
             assert_eq!(
                 twin.deps,
-                vec!["e2e.buck_cells_s0".to_string(), "gate.manifest_s0".into()],
-                "{}: its verdict waits on the cells and the gate",
+                vec![
+                    "e2e.buck_s0".to_string(),
+                    "gate.manifest_s0".into(),
+                    "pre.reverie_pin".into()
+                ],
+                "{}: its verdict waits on the cells, the gate and pre.reverie_pin",
                 twin.tag()
             );
         }
-        let pin = &selected.steps[1];
+        let pin = &selected.steps[2];
+        assert_eq!(pin.tag(), "pre.reverie_pin");
         assert!(pin.cmd.contains(BUCK_S0_PIN_CHECK_ROOT), "{}", pin.cmd);
         assert!(
             BUCK_S0_PIN_CHECK_ROOT.contains("HERMIT_REVERIE_GRAPH_CACHE_ROOT="),
             "the graph cache follows its own variable, not CARGO_TARGET_DIR"
         );
-        // Both say that their budgets do not cover the buck2 daemon's scope.
-        let (stage, cells) = (&selected.steps[2], &selected.steps[3]);
-        for step in [stage, cells] {
-            assert!(
-                step.description.contains(BUCK_S0_UNBOUNDED_DAEMON),
-                "{}",
-                step.tag()
-            );
-        }
-        // The gate runs after the cells, with the staged harness, and refuses
-        // on any refused cargo call, which the shim records where it reads.
+        // One node stages and runs the cells beside the preflight, and waits
+        // for the preflight's recorded exit statuses before any cell.
+        assert_eq!(pin.deps, vec!["pre.submodules".to_string()]);
+        let (submodules, node) = (&selected.steps[1], &selected.steps[3]);
+        // Both the preflight and the node start only after the first node's
+        // clear of an earlier execution's records.
+        assert_eq!(node.deps, vec!["pre.buck_s0_records".to_string()]);
+        assert_eq!(submodules.deps, vec!["pre.buck_s0_records".to_string()]);
+        assert!(
+            node.cmd.ends_with("./ci/buck-e2e/validate-node"),
+            "{}",
+            node.cmd
+        );
+        assert_eq!(
+            node.env[BUCK_S0_AWAIT_PREFLIGHT_ENV],
+            "pre.submodules pre.reverie_pin"
+        );
+        assert_eq!(
+            node.env[BUCK_S0_AWAIT_PREFLIGHT_SECONDS_ENV],
+            (submodules.timeout + pin.timeout).to_string()
+        );
+        assert_eq!(node.env[BUCK_STEP_WALL_ENV], node.timeout.to_string());
+        // The daemon's scope is bounded by the node's CPU budget and the
+        // measured memory, and the node is admitted for that memory.
+        assert_eq!(
+            node.env[BUCK_S0_DAEMON_CPU_SECONDS_ENV],
+            node.cpu_timeout.to_string()
+        );
+        assert_eq!(
+            node.env[BUCK_S0_DAEMON_MEMORY_MAX_ENV],
+            BUCK_S0_DAEMON_MEMORY_MAX_BYTES.to_string()
+        );
+        assert_eq!(
+            node.hint.rss_baseline_bytes,
+            Some(BUCK_S0_DAEMON_MEMORY_MAX_BYTES)
+        );
+        // The gate runs after the node, with the staged harness, and refuses
+        // on any refused cargo call.
         let gate = &selected.steps[4];
-        assert_eq!(gate.deps, vec!["e2e.buck_cells_s0".to_string()]);
+        assert_eq!(gate.deps, vec!["e2e.buck_s0".to_string()]);
         for needle in [
             "ci/buck-e2e/staged/bin/test-harness sync-cells --check",
             BUCK_S0_CARGO_REFUSED_LOG,
@@ -8729,6 +8880,33 @@ sys.exit(37)
                 gate.cmd
             );
         }
+        for step in [submodules, pin] {
+            assert!(
+                step.cmd
+                    .contains(&format!("{BUCK_S0_PREFLIGHT_STATUS_DIR}/{}.rc", step.tag())),
+                "{}",
+                step.cmd
+            );
+        }
+        // validate-node reads the statuses where the preflight writes them,
+        // and the daemon bounds the plan passes.
+        let validate_node = include_str!("../../buck-e2e/validate-node");
+        for needle in [
+            BUCK_S0_AWAIT_PREFLIGHT_ENV,
+            BUCK_S0_AWAIT_PREFLIGHT_SECONDS_ENV,
+            "$VALIDATE_RUN_STATE/preflight/$tag.rc",
+            BUCK_S0_DAEMON_MEMORY_MAX_ENV,
+            BUCK_S0_DAEMON_CPU_SECONDS_ENV,
+            "source \"$here/daemon-bound.sh\"",
+        ] {
+            assert!(
+                validate_node.contains(needle),
+                "validate-node lost {needle}"
+            );
+        }
+        // The bound kills the daemon's scope after `buck2 kill`
+        // (ci/buck-e2e/test-daemon-bound.sh runs its paths).
+        assert!(include_str!("../../buck-e2e/daemon-bound.sh").contains("/cgroup.kill\""));
         // The shim finds the log from its own path, not from VALIDATE_RUN_STATE,
         // which the stage's fixture builds override and buck2 clears for cells.
         let shim = include_str!("../../buck-e2e/no-cargo/cargo");
@@ -8749,6 +8927,136 @@ sys.exit(37)
         assert_eq!(last.tag(), "gate.no_cargo_s0");
         assert_eq!(last.deps, twins);
         assert!(last.cmd.contains(BUCK_S0_CARGO_REFUSED_LOG), "{}", last.cmd);
+        // The record holds the command's own status, an `exit` inside it
+        // included, and a `set -e` inside it holds; the node exits with that
+        // status.
+        let state =
+            std::env::temp_dir().join(format!("buck-s0-preflight-status-{}", std::process::id()));
+        for (cmd, status) in [
+            ("true", 0),
+            ("exit 3", 3),
+            ("false; exit 0", 0),
+            ("set -e; false; true", 1),
+            ("echo 'quoted' \"$HOME\" >/dev/null", 0),
+        ] {
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(recording_preflight_status(cmd, "pre.check"))
+                .env("VALIDATE_RUN_STATE", &state)
+                .output()
+                .expect("run bash");
+            assert_eq!(output.status.code(), Some(status), "{cmd}");
+            assert_eq!(
+                std::fs::read_to_string(state.join("preflight/pre.check.rc")).unwrap(),
+                format!("{status}\n"),
+                "{cmd}"
+            );
+        }
+        std::fs::remove_dir_all(&state).expect("remove the status fixture");
+        // The first node removes an earlier execution's records, so a stale 0
+        // no longer passes validate-node's preflight wait (its own
+        // await_preflight, run here); only the preflight child goes, and a bad
+        // VALIDATE_RUN_STATE is refused with nothing deleted.
+        let records = &selected.steps[0];
+        assert_eq!(records.tag(), "pre.buck_s0_records");
+        assert!(records.deps.is_empty(), "{:?}", records.deps);
+        let start = validate_node
+            .find("\nawait_preflight() {\n")
+            .expect("validate-node defines await_preflight")
+            + 1;
+        let end = start
+            + validate_node[start..]
+                .find("\n}\n")
+                .expect("await_preflight ends")
+            + 3;
+        let await_preflight = &validate_node[start..end];
+        let fixture = std::env::temp_dir().join(format!("buck-s0-records-{}", std::process::id()));
+        let plant = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir.join("preflight")).unwrap();
+            for tag in BUCK_S0_PREFLIGHT {
+                std::fs::write(dir.join(format!("preflight/{tag}.rc")), "0\n").unwrap();
+            }
+        };
+        let wait = |dir: &std::path::Path| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("step() {{ :; }}\n{await_preflight}await_preflight"))
+                .env(BUCK_S0_AWAIT_PREFLIGHT_ENV, BUCK_S0_PREFLIGHT.join(" "))
+                .env(BUCK_S0_AWAIT_PREFLIGHT_SECONDS_ENV, "1")
+                .env("VALIDATE_RUN_STATE", dir)
+                .output()
+                .expect("run bash")
+        };
+        let clear = |value: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&records.cmd)
+                .env("VALIDATE_RUN_STATE", value)
+                .current_dir(&fixture)
+                .output()
+                .expect("run bash")
+        };
+        let state = fixture.join("run-buck-s0-12-34");
+        plant(&state);
+        std::fs::write(state.join("kept"), "").unwrap();
+        assert_eq!(
+            wait(&state).status.code(),
+            Some(0),
+            "a stale record passes the wait"
+        );
+        let cleared = clear(state.to_str().unwrap());
+        assert_eq!(
+            cleared.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&cleared.stderr)
+        );
+        assert!(!state.join("preflight").exists());
+        assert!(
+            state.join("kept").exists(),
+            "only the preflight child is removed"
+        );
+        let waited = wait(&state);
+        assert_eq!(waited.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&waited.stderr).contains("wrote no exit status"),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+        let export = fixture.join("export/run-state");
+        plant(&export);
+        assert_eq!(clear(export.to_str().unwrap()).status.code(), Some(0));
+        assert!(!export.join("preflight").exists());
+        let unnamed = fixture.join("not-a-run-state");
+        plant(&unnamed);
+        let relative = "run-buck-s0-56-78";
+        plant(&fixture.join(relative));
+        let missing = fixture.join("run-buck-s0-90-12");
+        for (value, why) in [
+            ("", "is unset or empty"),
+            ("/", "is not named like a run state"),
+            (relative, "is not an absolute path"),
+            (unnamed.to_str().unwrap(), "is not named like a run state"),
+            (missing.to_str().unwrap(), "is not an existing directory"),
+        ] {
+            let refused = clear(value);
+            assert_eq!(refused.status.code(), Some(2), "{value:?}");
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains(why) && stderr.contains("nothing was deleted"),
+                "{value:?}: {stderr}"
+            );
+        }
+        for dir in [unnamed, fixture.join(relative)] {
+            for tag in BUCK_S0_PREFLIGHT {
+                assert!(
+                    dir.join(format!("preflight/{tag}.rc")).exists(),
+                    "a refusal deleted {}",
+                    dir.display()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&fixture).expect("remove the records fixture");
         // A subset naming a backend the plan lacks is refused, never shrunk.
         let mut typo = subset.clone();
         typo.backends.push("ptrace2".into());

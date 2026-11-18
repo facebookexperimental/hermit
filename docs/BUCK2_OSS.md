@@ -506,6 +506,22 @@ those capabilities fail closed with exit 3: select the twins for your host
 product failures. The default target graph is unchanged without the `-c`
 flag.
 
+`scripts/validate.rs --buck-s0` drives this runner over the subset in
+`ci/buck-e2e/subsets/s0.json`, in one DAG node (`ci/buck-e2e/validate-node`).
+The buck2 daemon, and every cell it runs, lives in the daemon's own systemd
+scope, outside the node's cgroup, and buck2 clears each test's environment, so
+dagrun's reap of the node does not reach the cells. The node therefore bounds
+that scope itself (`ci/buck-e2e/daemon-bound.sh`): it stops any daemon already
+running for the checkout (exit 1 if that `buck2 kill` fails or times out),
+starts its own, sets the scope's `MemoryMax`, and watches its CPU. A breach of
+either bound kills the scope and sends the node SIGTERM. The node stops at its
+next command boundary (bash runs the trap when the foreground command returns;
+the killed daemon fails a running buck2 client), so no later buck2 command in
+the node starts an unbounded daemon. At every end (exit,
+signal, or a breach) the node kills the scope with `cgroup.kill` after
+`buck2 kill`. A host whose buck2 daemon has no
+systemd scope cannot run `--buck-s0`: the node exits 2 before any cell runs.
+
 ## Host prerequisites for Buck validation
 
 The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then
