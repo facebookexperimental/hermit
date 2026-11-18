@@ -8608,7 +8608,7 @@ mod e2e_runner_tests {
         let cargo = e2e_payload_identity(RELEASE_BUILDER_CARGO);
         assert_eq!(cargo["path"], "target/validate/hermit");
         let stage = std::fs::read_to_string(test_source_root().join("ci/buck-e2e/stage")).unwrap();
-        assert!(stage.contains("target_dir=$root/target\n"));
+        assert!(stage.contains("\nmode= bundle= target_dir=$root/target buck2= subset=\n"));
         assert!(stage.contains("--profile validate -p hermit-run --bin hermit"));
         assert!(stage.contains("install -m 755 \"$target_dir/validate/hermit\""));
         let node =
