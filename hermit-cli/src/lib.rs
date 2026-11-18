@@ -141,12 +141,13 @@ pub(crate) fn unit_guest() -> Option<PathBuf> {
     GUEST
         .get_or_init(|| {
             let Some(named) = std::env::var_os("HERMIT_UNIT_GUEST") else {
-                assert!(
-                    !cfg!(fbcode_build),
-                    "HERMIT_UNIT_GUEST is unset: the fbcode build supplies \
-                     //hermetic_infra/hermit/tests:unit_guest through \
-                     :libhermit-unittest-gated"
-                );
+                if cfg!(fbcode_build) {
+                    panic!(
+                        "HERMIT_UNIT_GUEST is unset: the fbcode build supplies \
+                         //hermetic_infra/hermit/tests:unit_guest through \
+                         :libhermit-unittest-gated"
+                    );
+                }
                 return None;
             };
             let guest = fs::canonicalize(&named).unwrap_or_else(|error| {

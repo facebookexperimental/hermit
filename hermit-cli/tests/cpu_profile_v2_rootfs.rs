@@ -251,13 +251,22 @@ fn compile(build: &Path, name: &str, args: &[&str]) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// The guest binaries that `build_fixture` packs into the image.
+struct Guests {
+    probe: Vec<u8>,
+    dep: Vec<u8>,
+    twin: Vec<u8>,
+    lib: Vec<u8>,
+    undeclared: Vec<u8>,
+}
+
 /// The guests, compiled against no host libc symbols (see the probe's
 /// comment), so the same binaries run against the fixture libc
 /// whatever the build host's distribution is. The sources travel with
 /// this test binary (`include_str!`), so neither Cargo's
 /// `CARGO_MANIFEST_DIR` nor a Buck staging layout decides whether
 /// they are found.
-fn build_guests(build: &Path) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
+fn build_guests(build: &Path) -> Result<Guests, String> {
     let write_src = |name: &str, text: &str| -> Result<String, String> {
         let path = build.join(name);
         std::fs::write(&path, text).map_err(|e| format!("writing {name}: {e}"))?;
@@ -357,13 +366,13 @@ fn build_guests(build: &Path) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec
         ],
     )?;
     let read = |p: PathBuf| std::fs::read(p).map_err(|e| e.to_string());
-    Ok((
-        read(probe)?,
-        read(dep)?,
-        read(twin)?,
-        read(lib)?,
-        read(undeclared)?,
-    ))
+    Ok(Guests {
+        probe: read(probe)?,
+        dep: read(dep)?,
+        twin: read(twin)?,
+        lib: read(lib)?,
+        undeclared: read(undeclared)?,
+    })
 }
 
 /// Build the OCI fixture under `build` (an `oci` directory plus a
@@ -379,7 +388,13 @@ fn build_fixture(test: &str, build: &Path) -> Option<PathBuf> {
         return None;
     };
     std::fs::create_dir_all(build).unwrap();
-    let (probe, dep, twin, lib, undeclared) = match build_guests(build) {
+    let Guests {
+        probe,
+        dep,
+        twin,
+        lib,
+        undeclared,
+    } = match build_guests(build) {
         Ok(guests) => guests,
         Err(why) => {
             skip(test, &why);
