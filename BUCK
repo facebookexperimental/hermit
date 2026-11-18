@@ -441,6 +441,19 @@ buck_export_file(
     visibility = ["//hermetic_infra/hermit/fb-only/integration_tests/tests:"],
 )
 
+# The finalizer source and this BUCK file are resources of
+# ci:test_packaged_detcore, whose Buck-literal cross-checks read them at
+# their repository paths (hermit/ in the resources tree).
+buck_export_file(
+    name = "hermit-install/src/bin/stage-detcore-liteinst.rs",
+    visibility = ["//hermetic_infra/hermit/ci:"],
+)
+
+buck_export_file(
+    name = "BUCK",
+    visibility = ["//hermetic_infra/hermit/ci:"],
+)
+
 # The per-test budgets and validation environment that the generator carries
 # into the DAG nodes' wrappers.
 [

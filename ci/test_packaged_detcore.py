@@ -1,18 +1,110 @@
 #!/usr/bin/env python3
-"""Receipt-reader controls. Synthetic receipts are not constructor qualification."""
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Receipt-reader controls. Synthetic receipts are not constructor qualification.
+
+The Buck-literal cross-checks are split by the file each one reads. The
+finalizer comparison needs only exported files and always runs. The
+profile and root BUCK comparisons read fb-only/liteinst-runtime-profile.bzl
+and BUCK, which ShipIt strips from the GitHub export,
+facebookexperimental/hermit, with every other BUCK and .bzl file until
+dh-2y5z03 V4. There those comparisons are skipped and the run prints one
+line beginning SKIPPED for each. Only an absent file with
+GITHUB_REPOSITORY naming the export skips (BuckLiteralExportSkipControls):
+any other checkout missing the file still fails, a file that is present
+but corrupt still fails, and an export that has the file runs the
+comparison. V4 deletes the skips. In fbsource the Buck test
+//hermetic_infra/hermit/ci:test_packaged_detcore runs the whole suite
+with every file present as resources, so the comparisons execute there.
+"""
 import copy
 import hashlib
+import importlib.resources
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location("packaged_detcore", Path(__file__).with_name("verify-packaged-detcore.py"))
-verifier = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(verifier)
+# The GitHub export ShipIt publishes, which has no BUCK or .bzl file until
+# dh-2y5z03 V4.
+EXPORT_REPOSITORY = "facebookexperimental/hermit"
+PROFILE_NAME = "fb-only/liteinst-runtime-profile.bzl"
+BUCK_NAME = "BUCK"
+FINALIZER_NAME = "hermit-install/src/bin/stage-detcore-liteinst.rs"
+VERIFIER_NAME = "ci/verify-packaged-detcore.py"
+
+
+def _load_verifier():
+    sibling = Path(__file__).with_name("verify-packaged-detcore.py")
+    try:
+        sibling.lstat()
+    except FileNotFoundError:
+        # Under Buck the verifier is a resource, laid out as hermit/ci/.
+        text = (importlib.resources.files(__package__) / "hermit"
+                / "ci" / "verify-packaged-detcore.py").read_text()
+        module = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("packaged_detcore", loader=None))
+        exec(compile(text, "verify-packaged-detcore.py", "exec"), module.__dict__)
+        return module
+    spec = importlib.util.spec_from_file_location("packaged_detcore", sibling)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+verifier = _load_verifier()
+
+
+def hermit_root(case):
+    """The Hermit tree these tests read, at its repository paths.
+
+    In a source checkout (and the GitHub export) it is the parent of ci/.
+    Under Buck, where __file__ is not in that tree, the same files are
+    the test's resources, laid out as hermit/.
+    """
+    candidate = Path(__file__).resolve().parent.parent
+    try:
+        (candidate / VERIFIER_NAME).lstat()
+    except FileNotFoundError:
+        return case.enterContext(importlib.resources.as_file(
+            importlib.resources.files(__package__) / "hermit"))
+    return candidate
+
+
+def export_skip_reason(path, name, repository, what):
+    """The SKIPPED line for the GitHub export, or None to run the comparison.
+
+    It skips only when repository is EXPORT_REPOSITORY and nothing at all
+    is at path: any other checkout missing the file still fails, and an
+    export that has it runs the comparison. dh-2y5z03 V4 deletes this skip.
+    """
+    if repository != EXPORT_REPOSITORY:
+        return None
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return (f"SKIPPED on {EXPORT_REPOSITORY}: {name} is absent, because ShipIt "
+                f"strips it from this export; {what} is skipped until dh-2y5z03 V4 "
+                "exports it and deletes this skip")
+    return None
+
+
+def export_file_text(root, name, repository, what):
+    """The fb-only file `name` below root. On the GitHub export without it,
+    skips the calling comparison instead; a present file is read, so a
+    corrupt one fails the comparison rather than skipping it."""
+    reason = export_skip_reason(root / name, name, repository, what)
+    if reason:
+        raise unittest.SkipTest(reason)
+    return (root / name).read_text()
 
 
 def fixture_receipt(install, pin, *, core=False):
@@ -133,6 +225,127 @@ def path_fixture_receipt(install, pin, *, core=False):
                               "cargo_home": None}}})
     (resources / "libdetcore_liteinst.package.json").write_text(json.dumps(record))
     return record
+
+
+def buck_fixture_record():
+    with tempfile.TemporaryDirectory() as tmp:
+        install = Path(tmp)
+        resources = install / "rsrcs"
+        resources.mkdir()
+        (resources / "libdetcore_liteinst.so").write_bytes(
+            b"synthetic reader fixture, not an ELF proof")
+        record = buck_fixture_receipt(install, "a" * 40)
+        verifier.verify(install)
+    return record
+
+
+def finalizer_literals(case, root):
+    finalizer = (root / FINALIZER_NAME).read_text()
+
+    def rust_const(name):
+        match = re.search(rf'const {name}: &str = "([^"]+)";', finalizer)
+        case.assertIsNotNone(match, name)
+        return match.group(1)
+
+    def rust_list(name):
+        match = re.search(rf"const {name}: \[&str; \d+\] = \[(.*?)\];", finalizer, re.S)
+        case.assertIsNotNone(match, name)
+        return re.findall(r'"([^"]*)"', match.group(1))
+
+    target = rust_const("BUCK_TARGET")
+    platform = rust_const("BUCK_PLATFORM")
+    # The finalizer's buck_argv(), resolved token by token.
+    argv_match = re.search(r"fn buck_argv\(\)[^{]*\{.*?vec!\[(.*?)\]\s*\}", finalizer, re.S)
+    case.assertIsNotNone(argv_match)
+    resolved = []
+    for literal, constant in re.findall(
+            r'"([^"]+)"\.into\(\)|(BUCK_TARGET|BUCK_PLATFORM)\.into\(\)', argv_match.group(1)):
+        resolved.append(literal or {"BUCK_TARGET": target,
+                                     "BUCK_PLATFORM": platform}[constant])
+    return {"target": target, "platform": platform,
+            "constraints": rust_list("BUCK_CONSTRAINTS"),
+            "flags": rust_list("BUCK_RUSTC_FLAGS"), "argv": resolved}
+
+
+def profile_literals(case, root, repository):
+    # The profile .bzl: the flag list, the alias platform and its
+    # additional (opt) constraints.
+    profile = export_file_text(root, PROFILE_NAME, repository,
+                               "the liteinst-runtime profile comparison")
+    flags = re.search(r"LITEINST_RUNTIME_RUSTC_FLAGS = \[(.*?)\]", profile, re.S)
+    case.assertIsNotNone(flags, PROFILE_NAME)
+    platform = re.search(r'platform = "([^"]+)"', profile)
+    case.assertIsNotNone(platform, PROFILE_NAME)
+    additional = re.search(r"additional_constraints = \[([^\]]*)\]", profile)
+    case.assertIsNotNone(additional, PROFILE_NAME)
+    return {"flags": re.findall(r'"([^"]*)"', flags.group(1)),
+            "platform": platform.group(1),
+            "additional": re.findall(r'"([^"]*)"', additional.group(1))}
+
+
+def buck_literals(case, root, repository):
+    # The root BUCK: the profiled alias name and the runtime target's
+    # declared cpu/os compatibility.
+    buck = export_file_text(root, BUCK_NAME, repository,
+                            "the root BUCK comparison")
+    alias = re.search(r'detcore_liteinst_runtime_alias\(\s*name = "([^"]+)"', buck)
+    case.assertIsNotNone(alias, BUCK_NAME)
+    compat = re.search(r'name = "detcore-liteinst",.*?target_compatible_with = \[(.*?)\]',
+                       buck, re.S)
+    case.assertIsNotNone(compat, BUCK_NAME)
+    return {"compat": re.findall(r'"([^"]*)"', compat.group(1)),
+            "canonical_target": f"//hermetic_infra/hermit:{alias.group(1)}[cdylib]"}
+
+
+def check_finalizer_literals(case, root):
+    rust = finalizer_literals(case, root)
+    record = buck_fixture_record()
+    case.assertEqual(record["buck_target"], rust["target"])
+    case.assertEqual(record["buck_target"], verifier.BUCK_TARGET)
+    case.assertEqual(record["buck_platform"], rust["platform"])
+    case.assertEqual(record["buck_platform"], verifier.BUCK_PLATFORM)
+    case.assertEqual(record["buck_constraints"], rust["constraints"])
+    case.assertEqual(record["buck_constraints"], verifier.BUCK_CONSTRAINTS)
+    case.assertEqual(record["buck_constraints"], sorted(record["buck_constraints"]))
+    flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
+    case.assertEqual(len(flags), 8)
+    case.assertEqual(flags, rust["flags"])
+    case.assertEqual(flags, verifier.BUCK_RUSTC_FLAGS)
+    case.assertEqual(record["buck_argv"], rust["argv"])
+    case.assertEqual(record["buck_argv"], verifier.BUCK_ARGV)
+    buck2_entries = [command for command in record["commands"]
+                     if command["program"] == "buck2"]
+    case.assertEqual([entry["arguments"] for entry in buck2_entries],
+                     [record["buck_argv"][1:]])
+
+
+def check_profile_literals(case, root, repository):
+    bzl = profile_literals(case, root, repository)
+    record = buck_fixture_record()
+    case.assertEqual(record["buck_platform"], bzl["platform"])
+    flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
+    case.assertEqual(flags, bzl["flags"])
+
+
+def check_buck_literals(case, root, repository):
+    buck = buck_literals(case, root, repository)
+    record = buck_fixture_record()
+    case.assertEqual(buck["canonical_target"],
+                     "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]")
+    case.assertEqual(record["buck_target"], buck["canonical_target"])
+
+
+def check_profile_and_buck_literals(case, root, repository):
+    bzl = profile_literals(case, root, repository)
+    buck = buck_literals(case, root, repository)
+    record = buck_fixture_record()
+    case.assertEqual(record["buck_constraints"],
+                     sorted(buck["compat"] + bzl["additional"]))
+    case.assertEqual(record["buck_argv"],
+                     ["buck2", "build", buck["canonical_target"],
+                      "--target-platforms", bzl["platform"],
+                      "--show-full-output", "--client-metadata",
+                      "id=stage-detcore-liteinst"])
 
 
 class ReceiptControls(unittest.TestCase):
@@ -406,93 +619,29 @@ class ReceiptControls(unittest.TestCase):
     def test_core_buck_receipt_binds_profile_feature_artifact_source_close_and_installed_bytes(self):
         self._buck_controls(core=True)
 
-    def test_buck_literals_match_finalizer_profile_and_buck_alias(self):
+    def test_buck_literals_match_finalizer(self):
         """Guard against copy drift: the fixture/verifier Buck literals must
-        equal the constants extracted from the finalizer source and the
-        profile .bzl / BUCK alias texts, not merely agree with each other."""
-        root = Path(__file__).resolve().parent.parent
-        finalizer = (root / "hermit-install/src/bin/stage-detcore-liteinst.rs").read_text()
-        profile = (root / "fb-only/liteinst-runtime-profile.bzl").read_text()
-        buck = (root / "BUCK").read_text()
+        equal the constants extracted from the finalizer source, not merely
+        agree with each other. The finalizer is exported, so this always runs."""
+        check_finalizer_literals(self, hermit_root(self))
 
-        def rust_const(name):
-            match = re.search(rf'const {name}: &str = "([^"]+)";', finalizer)
-            self.assertIsNotNone(match, name)
-            return match.group(1)
+    def test_buck_literals_match_profile(self):
+        """The fixture/verifier literals equal the profile .bzl texts.
+        Skipped only on the GitHub export without that file."""
+        check_profile_literals(self, hermit_root(self),
+                               os.environ.get("GITHUB_REPOSITORY"))
 
-        def rust_list(name):
-            match = re.search(rf"const {name}: \[&str; \d+\] = \[(.*?)\];", finalizer, re.S)
-            self.assertIsNotNone(match, name)
-            return re.findall(r'"([^"]*)"', match.group(1))
+    def test_buck_literals_match_buck_alias(self):
+        """The fixture/verifier target equals the root BUCK alias.
+        Skipped only on the GitHub export without that file."""
+        check_buck_literals(self, hermit_root(self),
+                            os.environ.get("GITHUB_REPOSITORY"))
 
-        rust_target = rust_const("BUCK_TARGET")
-        rust_platform = rust_const("BUCK_PLATFORM")
-        rust_constraints = rust_list("BUCK_CONSTRAINTS")
-        rust_flags = rust_list("BUCK_RUSTC_FLAGS")
-
-        # The finalizer's buck_argv(), resolved token by token.
-        argv_match = re.search(r"fn buck_argv\(\)[^{]*\{.*?vec!\[(.*?)\]\s*\}", finalizer, re.S)
-        self.assertIsNotNone(argv_match)
-        resolved = []
-        for literal, constant in re.findall(
-                r'"([^"]+)"\.into\(\)|(BUCK_TARGET|BUCK_PLATFORM)\.into\(\)', argv_match.group(1)):
-            resolved.append(literal or {"BUCK_TARGET": rust_target,
-                                         "BUCK_PLATFORM": rust_platform}[constant])
-
-        # The profile .bzl: the flag list, the alias platform and its
-        # additional (opt) constraints.
-        bzl_flags = re.findall(r'"([^"]*)"',
-                               re.search(r"LITEINST_RUNTIME_RUSTC_FLAGS = \[(.*?)\]", profile, re.S).group(1))
-        bzl_platform = re.search(r'platform = "([^"]+)"', profile).group(1)
-        bzl_additional = re.findall(r'"([^"]*)"',
-                                     re.search(r"additional_constraints = \[([^\]]*)\]", profile).group(1))
-
-        # The root BUCK: the profiled alias name and the runtime target's
-        # declared cpu/os compatibility.
-        alias = re.search(r'detcore_liteinst_runtime_alias\(\s*name = "([^"]+)"', buck).group(1)
-        compat = re.findall(r'"([^"]*)"',
-                             re.search(r'name = "detcore-liteinst",.*?target_compatible_with = \[(.*?)\]',
-                                       buck, re.S).group(1))
-        canonical_target = f"//hermetic_infra/hermit:{alias}[cdylib]"
-        expected_constraints = sorted(compat + bzl_additional)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            install = Path(tmp)
-            resources = install / "rsrcs"
-            resources.mkdir()
-            (resources / "libdetcore_liteinst.so").write_bytes(
-                b"synthetic reader fixture, not an ELF proof")
-            record = buck_fixture_receipt(install, "a" * 40)
-            verifier.verify(install)
-
-        self.assertEqual(canonical_target,
-                         "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]")
-        self.assertEqual(record["buck_target"], rust_target)
-        self.assertEqual(record["buck_target"], verifier.BUCK_TARGET)
-        self.assertEqual(record["buck_target"], canonical_target)
-        self.assertEqual(record["buck_platform"], rust_platform)
-        self.assertEqual(record["buck_platform"], verifier.BUCK_PLATFORM)
-        self.assertEqual(record["buck_platform"], bzl_platform)
-        self.assertEqual(record["buck_constraints"], rust_constraints)
-        self.assertEqual(record["buck_constraints"], verifier.BUCK_CONSTRAINTS)
-        self.assertEqual(record["buck_constraints"], expected_constraints)
-        self.assertEqual(record["buck_constraints"], sorted(record["buck_constraints"]))
-        flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
-        self.assertEqual(len(flags), 8)
-        self.assertEqual(flags, rust_flags)
-        self.assertEqual(flags, verifier.BUCK_RUSTC_FLAGS)
-        self.assertEqual(flags, bzl_flags)
-        self.assertEqual(record["buck_argv"], resolved)
-        self.assertEqual(record["buck_argv"], verifier.BUCK_ARGV)
-        self.assertEqual(record["buck_argv"],
-                         ["buck2", "build", canonical_target,
-                          "--target-platforms", bzl_platform,
-                          "--show-full-output", "--client-metadata",
-                          "id=stage-detcore-liteinst"])
-        buck2_entries = [command for command in record["commands"]
-                         if command["program"] == "buck2"]
-        self.assertEqual([entry["arguments"] for entry in buck2_entries],
-                         [record["buck_argv"][1:]])
+    def test_buck_literals_match_profile_and_buck_alias(self):
+        """The constraints and buck_argv the profile and the root BUCK
+        name together. Skipped only on the GitHub export without one of them."""
+        check_profile_and_buck_literals(self, hermit_root(self),
+                                        os.environ.get("GITHUB_REPOSITORY"))
 
     def test_builder_dispatch_refuses_mixed_and_unknown_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -652,6 +801,99 @@ class ReceiptControls(unittest.TestCase):
 
     def test_core_path_receipt_requires_declared_content_authority(self):
         self._path_controls(core=True)
+
+
+class BuckLiteralExportSkipControls(unittest.TestCase):
+    """The profile/BUCK comparisons skip only on the export, and only
+    without their file; a present file is compared and can fail."""
+
+    def _scratch_root(self, profile=True, buck=True, tamper_profile=False):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        flags = list(verifier.BUCK_RUSTC_FLAGS)
+        if tamper_profile:
+            flags[0] += "X"
+        quoted = ", ".join(f'"{flag}"' for flag in flags)
+        if profile:
+            path = root / PROFILE_NAME
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                f"LITEINST_RUNTIME_RUSTC_FLAGS = [{quoted}]\n"
+                'additional_constraints = ["ovr_config//build_mode/constraints:opt"]\n'
+                f'platform = "{verifier.BUCK_PLATFORM}"\n')
+        if buck:
+            (root / BUCK_NAME).write_text(
+                'detcore_liteinst_runtime_alias(\n'
+                '    name = "detcore-liteinst-liteinst-runtime",\n)\n'
+                'rust_library(\n'
+                '    name = "detcore-liteinst",\n'
+                '    target_compatible_with = ["ovr_config//cpu:x86_64", '
+                '"ovr_config//os:linux"],\n)\n')
+        return root
+
+    def test_only_the_export_without_the_file_skips(self):
+        root = self._scratch_root(profile=False, buck=False)
+        for name in (PROFILE_NAME, BUCK_NAME):
+            reason = export_skip_reason(root / name, name, EXPORT_REPOSITORY, "the comparison")
+            self.assertIsNotNone(reason)
+            self.assertTrue(reason.startswith("SKIPPED on facebookexperimental/hermit: "), reason)
+            self.assertIn(name, reason)
+            self.assertIn("dh-2y5z03 V4", reason)
+            for other in (None, "rrnewton/hermit", "", "FacebookExperimental/hermit",
+                          "facebookexperimental/hermit-fork", "facebookexperimental/hermit "):
+                self.assertIsNone(
+                    export_skip_reason(root / name, name, other, "the comparison"), other)
+
+    def test_the_export_with_the_file_runs_the_comparison(self):
+        root = self._scratch_root(profile=False, buck=False)
+        profile = root / PROFILE_NAME
+        profile.parent.mkdir(parents=True)
+        profile.write_text("")
+        self.assertIsNone(export_skip_reason(
+            profile, PROFILE_NAME, EXPORT_REPOSITORY, "the comparison"))
+        # Something at the path that is not a readable file is not absent
+        # either: the comparison runs and fails on it rather than skips.
+        profile.unlink()
+        profile.symlink_to(root / "nowhere")
+        self.assertIsNone(export_skip_reason(
+            profile, PROFILE_NAME, EXPORT_REPOSITORY, "the comparison"))
+        profile.unlink()
+        profile.mkdir()
+        self.assertIsNone(export_skip_reason(
+            profile, PROFILE_NAME, EXPORT_REPOSITORY, "the comparison"))
+
+    def test_profile_missing_skips_only_the_profile_comparison(self):
+        root = self._scratch_root(profile=False, buck=True)
+        with self.assertRaises(unittest.SkipTest) as skipped:
+            check_profile_literals(self, root, EXPORT_REPOSITORY)
+        self.assertIn(PROFILE_NAME, str(skipped.exception))
+        self.assertTrue(str(skipped.exception).startswith(
+            "SKIPPED on facebookexperimental/hermit: "), str(skipped.exception))
+        # The BUCK comparison still runs on the same tree.
+        check_buck_literals(self, root, EXPORT_REPOSITORY)
+        # A missing profile outside the export is a failure, not a skip.
+        with self.assertRaises(FileNotFoundError):
+            check_profile_literals(self, root, None)
+
+    def test_buck_missing_skips_only_the_buck_comparison(self):
+        root = self._scratch_root(profile=True, buck=False)
+        with self.assertRaises(unittest.SkipTest) as skipped:
+            check_buck_literals(self, root, EXPORT_REPOSITORY)
+        self.assertIn(BUCK_NAME, str(skipped.exception))
+        self.assertTrue(str(skipped.exception).startswith(
+            "SKIPPED on facebookexperimental/hermit: "), str(skipped.exception))
+        # The profile comparison still runs on the same tree.
+        check_profile_literals(self, root, EXPORT_REPOSITORY)
+        with self.assertRaises(FileNotFoundError):
+            check_buck_literals(self, root, None)
+
+    def test_both_present_run_and_a_tampered_profile_fails_not_skips(self):
+        root = self._scratch_root(profile=True, buck=True)
+        check_profile_literals(self, root, EXPORT_REPOSITORY)
+        check_buck_literals(self, root, EXPORT_REPOSITORY)
+        check_profile_and_buck_literals(self, root, EXPORT_REPOSITORY)
+        tampered = self._scratch_root(profile=True, buck=True, tamper_profile=True)
+        with self.assertRaises(AssertionError):
+            check_profile_literals(self, tampered, EXPORT_REPOSITORY)
 
 
 if __name__ == "__main__":
