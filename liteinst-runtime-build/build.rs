@@ -131,9 +131,9 @@ fn main() {
     let layout = if path_sourced
         && !artifact::reverie_root_has_git_metadata(&source_root.join("reverie"))
     {
-        qualifier::CompiledSourceLayout::HermitPath
+        qualifier::CompiledSourceLayout::PathCheckout
     } else {
-        qualifier::CompiledSourceLayout::HermitGit
+        qualifier::CompiledSourceLayout::GitlinkCheckout
     };
     let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
         &qualifier::CompiledSourceExpectation {
@@ -142,6 +142,7 @@ fn main() {
             workspace_root: source_root,
             manifest: &source_manifest,
             reverie_pin: &requested_pin,
+            consumer: Some(artifact::consumer_source_declaration()),
         },
         artifact::reverie_repository(),
         &mut source_runner,

@@ -62,6 +62,61 @@ fn text(path: &Path) -> Result<String> {
 /// liteinst-runtime-build).
 const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
 
+/// This consumer's declared workspace facts for the compiled-source
+/// factories: the Reverie tree's relative path, the leaf package, the
+/// producer packages and their lockfile, and both workspace
+/// inventories, spelled exactly as this tree's manifests name them.
+fn consumer_source_declaration() -> crate::artifact::ConsumerSourceDeclaration<'static> {
+    crate::artifact::ConsumerSourceDeclaration {
+        reverie_relative: Path::new("reverie"),
+        leaf: Some(crate::artifact::DeclaredLeafPackage {
+            name: "detcore-liteinst",
+            target: "detcore_liteinst",
+            manifest_relative: "detcore-liteinst/Cargo.toml",
+            version: "0.5.7",
+        }),
+        runtime_packages: &[
+            crate::artifact::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-build",
+                manifest_relative: "liteinst-runtime-build/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-artifact",
+                dependency_kind: Some("build"),
+                target: None,
+                version: None,
+            },
+            crate::artifact::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-artifact",
+                manifest_relative: "liteinst-runtime-build/runtime/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-preload",
+                dependency_kind: None,
+                target: Some("hermit_liteinst_runtime_artifact"),
+                version: Some("0.5.1"),
+            },
+        ],
+        runtime_lock_relative: "liteinst-runtime-build/Cargo.lock",
+        standalone_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+        ],
+        leaf_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "detcore-liteinst/Cargo.toml",
+            "detcore-liteinst/src/lib.rs",
+        ],
+    }
+}
+
 fn reverie_repository() -> reverie_liteinst_artifact::private_static::CargoGitRepository<'static> {
     reverie_liteinst_artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
@@ -110,17 +165,17 @@ fn manifest_is_path_sourced(root: &Path) -> Result<bool> {
 }
 
 /// The routed layout for this workspace (see the same route in
-/// liteinst-runtime-build): `HermitPath` only for a gitless
+/// liteinst-runtime-build): `PathCheckout` only for a gitless
 /// path-sourced Reverie root; a root with its own Git metadata takes
-/// `HermitGit`, so the pin proof runs for a real checkout.
+/// `GitlinkCheckout`, so the pin proof runs for a real checkout.
 fn source_layout(root: &Path) -> Result<CompiledSourceLayout> {
     Ok(
         if manifest_is_path_sourced(root)?
             && !reverie_root_has_git_metadata(&root.join("reverie"))
         {
-            CompiledSourceLayout::HermitPath
+            CompiledSourceLayout::PathCheckout
         } else {
-            CompiledSourceLayout::HermitGit
+            CompiledSourceLayout::GitlinkCheckout
         },
     )
 }
@@ -141,6 +196,7 @@ fn resolve_as(
             workspace_root: root,
             manifest: &root.join("liteinst-runtime-build/Cargo.toml"),
             reverie_pin: env!("HERMIT_REVERIE_PIN"),
+            consumer: Some(consumer_source_declaration()),
         },
         reverie_repository(),
         runner,
@@ -235,7 +291,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
     assert!(!private_reverie.join(".git").exists());
     assert_eq!(
         source_layout(&copied)?,
-        CompiledSourceLayout::HermitPath,
+        CompiledSourceLayout::PathCheckout,
         "gitless copy must route to the content-only layout",
     );
     let original_context = resolve(original, runner)?;
@@ -273,7 +329,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
         6
     );
     match source_layout(original)? {
-        CompiledSourceLayout::HermitPath => {
+        CompiledSourceLayout::PathCheckout => {
             assert_eq!(expected["layout"], "HermitPath");
             assert_eq!(
                 expected["authority"]["reverie_sha256"],
@@ -288,7 +344,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
                 507,
             );
         }
-        CompiledSourceLayout::HermitGit => {
+        CompiledSourceLayout::GitlinkCheckout => {
             assert_eq!(expected["layout"], "HermitGit");
             // The Git layout binds the reviewed catalog (the 89-entry
             // set the git family's checks pin for the same arm: the
@@ -417,7 +473,7 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
         // bound qualifier reverie-liteinst-artifact/src/lib.rs:
         // 88 + 1 = 89. Detcore adds the fixed-gate row for 90; the
         // library test pins both (89/90). Measured in the Git
-        // layout 2026-11-17: the HermitGit arm above failed
+        // layout 2026-11-17: the GitlinkCheckout arm above failed
         // left 89 vs the stale 87 pinned here and there.
         89
     );
@@ -771,16 +827,17 @@ fn path_transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
     let copied = case.join("source");
     assert_eq!(
         source_layout(&copied)?,
-        CompiledSourceLayout::HermitPath,
+        CompiledSourceLayout::PathCheckout,
         "gitless copy must route to the content-only layout",
     );
     let private_reverie = case.join("reverie-private");
     let expected = CompiledSourceExpectation {
-        layout: CompiledSourceLayout::HermitPath,
+        layout: CompiledSourceLayout::PathCheckout,
         image_kind: FixedImageKind::Standalone,
         workspace_root: &copied,
         manifest: &copied.join("liteinst-runtime-build/Cargo.toml"),
         reverie_pin: env!("HERMIT_REVERIE_PIN"),
+        consumer: Some(consumer_source_declaration()),
     };
     let refused = VerifiedCompiledSources::with_resolved_with_repository(
         &expected,
@@ -857,6 +914,7 @@ fn transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
         workspace_root: &root,
         manifest: &manifest,
         reverie_pin: env!("HERMIT_REVERIE_PIN"),
+        consumer: None,
     };
     let (value, owned_record) =
         VerifiedCompiledSources::with_resolved(&expected, runner, |context| {

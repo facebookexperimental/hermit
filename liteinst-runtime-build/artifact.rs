@@ -16,6 +16,62 @@ pub(crate) const REVERIE_GIT_REPOSITORY: &str =
 
 /// The compiled-source repository selection for this build.
 #[cfg(not(test))]
+/// This consumer's declared workspace facts for the compiled-source
+/// factories: the Reverie tree's relative path, the leaf package, the
+/// producer packages and their lockfile, and both workspace
+/// inventories, spelled exactly as this tree's manifests name them.
+pub(crate) fn consumer_source_declaration() -> qualifier::ConsumerSourceDeclaration<'static> {
+    qualifier::ConsumerSourceDeclaration {
+        reverie_relative: Path::new("reverie"),
+        leaf: Some(qualifier::DeclaredLeafPackage {
+            name: "detcore-liteinst",
+            target: "detcore_liteinst",
+            manifest_relative: "detcore-liteinst/Cargo.toml",
+            version: "0.5.7",
+        }),
+        runtime_packages: &[
+            qualifier::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-build",
+                manifest_relative: "liteinst-runtime-build/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-artifact",
+                dependency_kind: Some("build"),
+                target: None,
+                version: None,
+            },
+            qualifier::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-artifact",
+                manifest_relative: "liteinst-runtime-build/runtime/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-preload",
+                dependency_kind: None,
+                target: Some("hermit_liteinst_runtime_artifact"),
+                version: Some("0.5.1"),
+            },
+        ],
+        runtime_lock_relative: "liteinst-runtime-build/Cargo.lock",
+        standalone_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+        ],
+        leaf_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "detcore-liteinst/Cargo.toml",
+            "detcore-liteinst/src/lib.rs",
+        ],
+    }
+}
+
+#[cfg(not(test))]
 pub(crate) fn reverie_repository() -> qualifier::private_static::CargoGitRepository<'static> {
     qualifier::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
@@ -1252,9 +1308,9 @@ pub(crate) mod native {
         // is for gitless Reverie roots alone; a root with its own Git
         // metadata takes the Git layout so the pin proof runs.
         let layout = if path_sourced && !reverie_root_has_git_metadata(&root.join("reverie")) {
-            qualifier::CompiledSourceLayout::HermitPath
+            qualifier::CompiledSourceLayout::PathCheckout
         } else {
-            qualifier::CompiledSourceLayout::HermitGit
+            qualifier::CompiledSourceLayout::GitlinkCheckout
         };
         let sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
             &qualifier::CompiledSourceExpectation {
@@ -1263,6 +1319,7 @@ pub(crate) mod native {
                 workspace_root: root,
                 manifest: &qualification_manifest,
                 reverie_pin: &pin,
+                consumer: Some(consumer_source_declaration()),
             },
             reverie_repository(),
             &mut runner,

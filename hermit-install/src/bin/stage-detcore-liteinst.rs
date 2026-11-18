@@ -48,6 +48,61 @@ include!("../../../hermit-cli/reverie_gitlink.rs");
 /// constant in liteinst-runtime-build).
 const REVERIE_GIT_REPOSITORY: &str = "https://github.com/facebookexperimental/reverie.git";
 
+/// This consumer's declared workspace facts for the compiled-source
+/// factories: the Reverie tree's relative path, the leaf package, the
+/// producer packages and their lockfile, and both workspace
+/// inventories, spelled exactly as this tree's manifests name them.
+fn consumer_source_declaration() -> proof::ConsumerSourceDeclaration<'static> {
+    proof::ConsumerSourceDeclaration {
+        reverie_relative: Path::new("reverie"),
+        leaf: Some(proof::DeclaredLeafPackage {
+            name: "detcore-liteinst",
+            target: "detcore_liteinst",
+            manifest_relative: "detcore-liteinst/Cargo.toml",
+            version: "0.5.7",
+        }),
+        runtime_packages: &[
+            proof::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-build",
+                manifest_relative: "liteinst-runtime-build/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-artifact",
+                dependency_kind: Some("build"),
+                target: None,
+                version: None,
+            },
+            proof::DeclaredRuntimePackage {
+                name: "hermit-liteinst-runtime-artifact",
+                manifest_relative: "liteinst-runtime-build/runtime/Cargo.toml",
+                reverie_dependency: "reverie-liteinst-preload",
+                dependency_kind: None,
+                target: Some("hermit_liteinst_runtime_artifact"),
+                version: Some("0.5.1"),
+            },
+        ],
+        runtime_lock_relative: "liteinst-runtime-build/Cargo.lock",
+        standalone_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+        ],
+        leaf_workspace_files: &[
+            "liteinst-runtime-build/Cargo.toml",
+            "liteinst-runtime-build/Cargo.lock",
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "liteinst-runtime-build/runtime/src/lib.rs",
+            "liteinst-runtime-build/build.rs",
+            "liteinst-runtime-build/artifact.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "detcore-liteinst/Cargo.toml",
+            "detcore-liteinst/src/lib.rs",
+        ],
+    }
+}
+
 fn reverie_repository() -> proof::private_static::CargoGitRepository<'static> {
     proof::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
@@ -92,8 +147,8 @@ fn reverie_is_path_sourced(manifest_text: &str) -> proof::Result<bool> {
 }
 
 /// The compiled-source layout for this workspace: the content-only
-/// `HermitPath` layout only for a gitless path-sourced Reverie root;
-/// a root carrying its own Git metadata takes `HermitGit` even when
+/// `PathCheckout` layout only for a gitless path-sourced Reverie root;
+/// a root carrying its own Git metadata takes `GitlinkCheckout` even when
 /// the manifests spell path dependencies, so the content factory's
 /// pin proof (HEAD and gitlink equal to the pin) always runs for a
 /// real checkout. This only selects the factory arm; the arm binds
@@ -104,9 +159,9 @@ fn reverie_layout(
 ) -> proof::Result<proof::CompiledSourceLayout> {
     Ok(
         if reverie_is_path_sourced(manifest_text)? && !reverie_root_has_git_metadata(reverie_root) {
-            proof::CompiledSourceLayout::HermitPath
+            proof::CompiledSourceLayout::PathCheckout
         } else {
-            proof::CompiledSourceLayout::HermitGit
+            proof::CompiledSourceLayout::GitlinkCheckout
         },
     )
 }
@@ -799,6 +854,17 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
         constraints: &constraints,
         workspace_files: &workspace_files,
         reverie_files: &reverie_files,
+        leaf_name: "detcore-liteinst",
+        leaf_target: "detcore_liteinst",
+        leaf_source_relative: "detcore-liteinst/src/lib.rs",
+        workspace_extra_files: &[
+            "detcore-liteinst/build.rs",
+            "common/inguest/glibc_compat.rs",
+            BUCK_WORKSPACE_BUCK_FILE,
+            BUCK_PROFILE_RELATIVE,
+        ],
+        profile_relative: BUCK_PROFILE_RELATIVE,
+        stage_id: "stage-detcore-liteinst",
     };
     let sources = proof::VerifiedCompiledSources::resolve_buck(&expectation)?;
     let sources = sources.with_buck_build(&runner, &artifact.path)?;
@@ -995,6 +1061,7 @@ fn run() -> proof::Result<()> {
         workspace_root: &root,
         manifest: &manifest,
         reverie_pin: &pin,
+        consumer: Some(consumer_source_declaration()),
     };
     // Explicit authority; a failed Git resolution never downgrades to content.
     let sources = if authority == "--git" {
@@ -1225,7 +1292,7 @@ mod tests {
         let gitless = Path::new("/nonexistent-reverie-root");
         assert_eq!(
             reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", gitless).unwrap(),
-            proof::CompiledSourceLayout::HermitPath,
+            proof::CompiledSourceLayout::PathCheckout,
         );
         assert_eq!(
             reverie_layout(
@@ -1233,7 +1300,7 @@ mod tests {
                 gitless,
             )
             .unwrap(),
-            proof::CompiledSourceLayout::HermitGit,
+            proof::CompiledSourceLayout::GitlinkCheckout,
         );
         // A path-spelled root with its own .git takes the Git layout,
         // so the pin proof runs; content alone never certifies it.
@@ -1248,7 +1315,7 @@ mod tests {
         fs::create_dir_all(checkout.join(".git")).unwrap();
         assert_eq!(
             reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", &checkout).unwrap(),
-            proof::CompiledSourceLayout::HermitGit,
+            proof::CompiledSourceLayout::GitlinkCheckout,
         );
         fs::remove_dir_all(&checkout).unwrap();
         assert!(
