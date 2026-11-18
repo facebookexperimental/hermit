@@ -40,10 +40,28 @@
 //! or `}` (a variable, `select()`, a concatenation, a conditional, and so a
 //! top-level `features = [...]` assignment, which makes a variable) or the
 //! table described next, the string `"features"` used anywhere but as such a
-//! dict key (`kwargs["features"]`), and a string that sets a cfg feature the
-//! way a rustc flag does (`--cfg=feature="x"`). A spelling that builds the name
-//! `features` at run time, or a build file of another kind, is outside what it
-//! reads.
+//! dict key (`kwargs["features"]`) or as an entry of a loop that only copies
+//! keyword arguments unchanged into another call (described below), a
+//! string that sets a cfg feature the way a rustc flag does
+//! (`--cfg=feature="x"`), and an f-string with a replacement field
+//! (`f"{...}"`, a `{` that is neither doubled nor escaped by a backslash,
+//! after an `f`, `fr` or `rf` prefix in any case), whose expression
+//! open-source Buck2 evaluates and this check cannot read. A spelling that builds the name `features` at run time, or a
+//! build file of another kind, is outside what it reads.
+//!
+//! The one loop read is a pure forward, as the shim's routed unittests copy
+//! their base target's arguments: `for NAME in ("crate_root", "features",
+//! ...):`, a literal tuple or list of plain strings, whose whole body is
+//! `DEST[NAME] = kwargs[NAME]`, optionally guarded by
+//! `if kwargs.get(NAME) != None:`, inside a function (the nearest `def` at the
+//! start of a line before it, with no other statement at the start of a line
+//! between), where NAME occurs nowhere else: not before the loop, not after it
+//! (where it still names the last string), and not in a nested `def`, lambda
+//! or comprehension (and no f-string anywhere can name it: each one is
+//! refused). Such a copy holds what a caller passed as
+//! `features = [...]`, which the scan reads at that call, so it enables
+//! nothing new. Any other loop body, or a value built from the copy, is
+//! refused like any other use of the string.
 //!
 //! One `features` value of another form is read and enables nothing: the
 //! `"features": {...}` table of a target's `autocargo` `cargo_toml_config`,
@@ -154,6 +172,14 @@ const READABLE_VALUE: &str = "this check reads only a literal list of plain stri
 const CARGO_TOML_CONFIG: &str = "cargo_toml_config";
 /// Why a file the tokenizer stops in yields no features at all.
 const UNREADABLE_FILE: &str = "so this check cannot read the file";
+/// The string prefixes, compared without regard to case, that make a string
+/// literal an f-string. Starlark reads them as part of the literal; the
+/// tokenizer reads them as a name directly before it.
+const F_STRING_PREFIXES: [&str; 3] = ["f", "fr", "rf"];
+/// Why an f-string with a replacement field is refused.
+const UNREADABLE_F_STRING: &str = "open-source Buck2 evaluates the expression in an f-string's \
+     replacement field, which this check cannot read, so it could name a `features` value or \
+     call a rule; write the value without an f-string";
 /// Why an unresolved feature is refused, printed once under the violations.
 const RESOLUTION_RULE: &str = "Reindeer must resolve each workspace member with every cargo \
      feature its Buck targets enable, or the optional dependencies and dependency features \
@@ -192,6 +218,9 @@ enum Token {
 struct Lexeme {
     token: Token,
     line: usize,
+    /// The token's column, 0 at the start of its line, so the end of an
+    /// indented block can be found.
+    column: usize,
 }
 
 /// What one build file says about cargo features.
@@ -204,6 +233,10 @@ struct Scan {
     /// How many autocargo feature tables were read. They declare cargo
     /// features rather than enable them, so they add nothing to `features`.
     tables: usize,
+    /// How many loops forward a `features` keyword argument unchanged
+    /// ([`forwards_kwargs_entry`]). A forwarded value is a copy of one some
+    /// caller set, which the scan reads where that caller sets it.
+    forwards: usize,
     /// The line of each value the scan refuses to read, and why.
     refusals: Vec<(usize, String)>,
 }
@@ -238,27 +271,34 @@ fn string_literal(text: &str, quote: char) -> Option<(&str, usize)> {
 fn tokenize(text: &str) -> Result<Vec<Lexeme>, (usize, String)> {
     let mut tokens = Vec::new();
     let mut line = 1;
+    let mut line_start = 0;
     let mut rest = text;
     while let Some(character) = rest.chars().next() {
+        let column = text.len() - rest.len() - line_start;
         let length = if character == '\n' {
             line += 1;
+            line_start = text.len() - rest.len() + 1;
             1
         } else if character.is_whitespace() {
             character.len_utf8()
         } else if character == '#' {
             rest.find('\n').unwrap_or(rest.len())
         } else if character == '"' || character == '\'' {
-            let (text, length) = string_literal(rest, character).ok_or_else(|| {
+            let (literal, length) = string_literal(rest, character).ok_or_else(|| {
                 (
                     line,
                     format!("the string literal here is unterminated, {UNREADABLE_FILE}"),
                 )
             })?;
             tokens.push(Lexeme {
-                token: Token::Str(text.to_owned()),
+                token: Token::Str(literal.to_owned()),
                 line,
+                column,
             });
             line += rest[..length].matches('\n').count();
+            if let Some(newline) = rest[..length].rfind('\n') {
+                line_start = text.len() - rest.len() + newline + 1;
+            }
             length
         } else if character.is_alphanumeric() || character == '_' {
             let length = rest
@@ -273,23 +313,76 @@ fn tokenize(text: &str) -> Result<Vec<Lexeme>, (usize, String)> {
                 tokens.push(Lexeme {
                     token: Token::Name(name.to_owned()),
                     line,
+                    column,
                 });
                 rest = &rest[name.len()..];
                 continue;
             };
-            tokens.push(Lexeme { token, line });
+            tokens.push(Lexeme {
+                token,
+                line,
+                column,
+            });
             length
         } else {
             let (token, length) = match PUNCTUATION.iter().find(|punct| rest.starts_with(**punct)) {
                 Some(punct) => (Token::Punct(punct), punct.len()),
                 None => (Token::Other, character.len_utf8()),
             };
-            tokens.push(Lexeme { token, line });
+            tokens.push(Lexeme {
+                token,
+                line,
+                column,
+            });
             length
         };
         rest = &rest[length..];
     }
     Ok(tokens)
+}
+
+/// Whether the string literal at `tokens[index]` is an f-string with a
+/// replacement field: it directly follows, on the same line with nothing
+/// between, a name that is one of [`F_STRING_PREFIXES`], and holds a `{` that
+/// is not doubled (`{{` is a literal brace). As in Starlark's f-string lexer,
+/// raw or not, a backslash takes the next character as text, so `\{` opens
+/// no field and in `\{{a}` the `{a}` is one. The longer escapes (`\x7b`,
+/// `\u....`, octal) go on with digits only, so skipping one character is
+/// enough.
+fn is_f_string_with_field(tokens: &[Lexeme], index: usize) -> bool {
+    let Some(Lexeme {
+        token: Token::Str(text),
+        line,
+        column,
+    }) = tokens.get(index)
+    else {
+        return false;
+    };
+    let Some(Lexeme {
+        token: Token::Name(prefix),
+        line: prefix_line,
+        column: prefix_column,
+    }) = index.checked_sub(1).and_then(|before| tokens.get(before))
+    else {
+        return false;
+    };
+    if prefix_line != line
+        || prefix_column + prefix.len() != *column
+        || !F_STRING_PREFIXES
+            .iter()
+            .any(|known| prefix.eq_ignore_ascii_case(known))
+    {
+        return false;
+    }
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            characters.next();
+        } else if character == '{' && characters.next() != Some('{') {
+            return true;
+        }
+    }
+    false
 }
 
 /// How a refusal names the token it stopped at.
@@ -413,6 +506,165 @@ fn entry_key(tokens: &[Lexeme], index: usize) -> Option<&str> {
     }
 }
 
+/// Whether the string `"features"` at `tokens[index]` is an entry of a loop
+/// that only copies keyword arguments unchanged into another call's
+/// arguments. That is the one form, besides a literal dict key, in which the
+/// string is read:
+///
+/// ```text
+/// for NAME in ("crate_root", "features", ...):   # a literal tuple or list of plain strings
+///     if kwargs.get(NAME) != None:               # optional
+///         DEST[NAME] = kwargs[NAME]
+/// ```
+///
+/// The copy holds exactly what a caller passed as `features = [...]`, which
+/// the scan reads at that call. So the loop must be exactly this: its body
+/// ends at the copy (the next token is on a later line, no further right than
+/// `for`); it is inside a function (the nearest `def` at the start of a line
+/// before it, with only punctuation, such as a parameter list's closing `):`,
+/// at the start of a line between them); and NAME occurs nowhere else in that
+/// function, which ends at the next `def` at the start of a line. NAME still
+/// names the last string after the loop, and code before the loop can run
+/// after it (an enclosing loop, a closure), so any other occurrence, nested
+/// `def`s, lambdas and comprehensions included, is refused. Any other use of
+/// the string, a built value (`kwargs[NAME] + [...]`), a construction, or a
+/// run-time name, stays refused.
+fn forwards_kwargs_entry(tokens: &[Lexeme], index: usize) -> bool {
+    let token = |index: usize| tokens.get(index).map(|lexeme| &lexeme.token);
+    let is_name =
+        |index: usize, want: &str| matches!(token(index), Some(Token::Name(name)) if name == want);
+    let plain =
+        |index: usize| matches!(token(index), Some(Token::Str(text)) if !text.contains('\\'));
+    // The literal tuple or list of plain strings around `index`.
+    let mut open = index;
+    loop {
+        match open.checked_sub(1).and_then(|before| token(before)) {
+            Some(Token::Punct(",")) => open -= 1,
+            Some(Token::Str(_)) if plain(open - 1) => open -= 1,
+            Some(Token::Punct("(" | "[")) => {
+                open -= 1;
+                break;
+            }
+            _ => return false,
+        }
+    }
+    let close_bracket = if token(open) == Some(&Token::Punct("(")) {
+        ")"
+    } else {
+        "]"
+    };
+    let mut close = index;
+    loop {
+        close += 1;
+        match token(close) {
+            Some(Token::Punct(",")) => {}
+            Some(Token::Str(_)) if plain(close) => {}
+            Some(Token::Punct(punct)) if *punct == close_bracket => break,
+            _ => return false,
+        }
+    }
+    // `for NAME in` before it and `:` after it.
+    let Some(for_index) = open.checked_sub(3) else {
+        return false;
+    };
+    let Some(Token::Name(name)) = token(for_index + 1) else {
+        return false;
+    };
+    if !is_name(for_index, "for")
+        || !is_name(open - 1, "in")
+        || token(close + 1) != Some(&Token::Punct(":"))
+    {
+        return false;
+    }
+    // The body: an optional `if kwargs.get(NAME) != None:`, then the copy.
+    let mut body = close + 2;
+    if is_name(body, "if") {
+        let guard = [
+            is_name(body + 1, "kwargs"),
+            token(body + 2) == Some(&Token::Punct(".")),
+            is_name(body + 3, "get"),
+            token(body + 4) == Some(&Token::Punct("(")),
+            is_name(body + 5, name),
+            token(body + 6) == Some(&Token::Punct(")")),
+            token(body + 7) == Some(&Token::Punct("!=")),
+            is_name(body + 8, "None"),
+            token(body + 9) == Some(&Token::Punct(":")),
+        ];
+        if !guard.iter().all(|ok| *ok) {
+            return false;
+        }
+        body += 10;
+    }
+    let destination =
+        matches!(token(body), Some(Token::Name(dest)) if dest != "kwargs" && dest != name);
+    let copy = [
+        destination,
+        token(body + 1) == Some(&Token::Punct("[")),
+        is_name(body + 2, name),
+        token(body + 3) == Some(&Token::Punct("]")),
+        token(body + 4) == Some(&Token::Punct("=")),
+        is_name(body + 5, "kwargs"),
+        token(body + 6) == Some(&Token::Punct("[")),
+        is_name(body + 7, name),
+        token(body + 8) == Some(&Token::Punct("]")),
+    ];
+    if !copy.iter().all(|ok| *ok) {
+        return false;
+    }
+    // The loop ends at the copy.
+    let end = body + 9;
+    let for_column = tokens[for_index].column;
+    let copy_line = tokens[body + 8].line;
+    if let Some(next) = tokens.get(end) {
+        if next.line == copy_line || next.column > for_column {
+            return false;
+        }
+    }
+    // Inside a function: the nearest `def` at the start of a line before the
+    // loop, with no name, string or number at the start of a line between them
+    // (a parameter list's closing `):` may be there).
+    let starts_line = |index: usize| index == 0 || tokens[index - 1].line != tokens[index].line;
+    let mut def_index = None;
+    for before in (0..for_index).rev() {
+        let lexeme = &tokens[before];
+        if lexeme.column != 0 || !starts_line(before) {
+            continue;
+        }
+        match &lexeme.token {
+            Token::Name(word) if word == "def" => {
+                def_index = Some(before);
+                break;
+            }
+            Token::Punct(_) => {}
+            _ => return false,
+        }
+    }
+    let Some(def_index) = def_index else {
+        return false;
+    };
+    if for_column == 0 {
+        return false;
+    }
+    // NAME occurs nowhere else in that function, which ends at the next `def`
+    // at the start of a line.
+    let allowed = [
+        Some(for_index + 1),
+        (body > close + 2).then_some(close + 7),
+        Some(body + 2),
+        Some(body + 7),
+    ];
+    let mut at = def_index + 1;
+    while let Some(lexeme) = tokens.get(at) {
+        match &lexeme.token {
+            Token::Name(word) if word == "def" && lexeme.column == 0 && starts_line(at) => break,
+            Token::Name(word) if word == name && !allowed.contains(&Some(at)) => return false,
+            _ => {}
+        }
+        at += 1;
+    }
+    true
+}
+
 /// Whether a string literal sets a cfg feature the way a rustc flag does
 /// (`--cfg=feature="x"`), which enables a cargo feature with no `features`
 /// list.
@@ -451,6 +703,15 @@ fn scan(text: &str) -> Scan {
     for (index, lexeme) in tokens.iter().enumerate() {
         let next = token(index + 1);
         let value = match &lexeme.token {
+            Token::Str(_) if is_f_string_with_field(&tokens, index) => {
+                scan.refusals.push((
+                    lexeme.line,
+                    format!(
+                        "this string is an f-string with a replacement field; {UNREADABLE_F_STRING}"
+                    ),
+                ));
+                continue;
+            }
             Token::Punct("(" | "[" | "{") => {
                 open.push(entry_key(&tokens, index));
                 continue;
@@ -489,6 +750,10 @@ fn scan(text: &str) -> Scan {
             }
             Token::Str(text) if text == "features" && next == Some(&Token::Punct(":")) => {
                 list(index + 2)
+            }
+            Token::Str(text) if text == "features" && forwards_kwargs_entry(&tokens, index) => {
+                scan.forwards += 1;
+                continue;
             }
             Token::Str(text) if text == "features" => Err(format!(
                 "the string \"features\" is followed by {} rather than `:`, as in \
@@ -632,6 +897,7 @@ fn summary(
     files: usize,
     lists: usize,
     tables: usize,
+    forwards: usize,
     named: &BTreeSet<String>,
     platforms: &Platforms,
     members: &[Member],
@@ -660,11 +926,16 @@ fn summary(
             checked.join(" and ")
         )
     };
+    let loops = if forwards == 1 {
+        "loop forwards"
+    } else {
+        "loops forward"
+    };
     format!(
         "check-buck-reindeer-features.rs: {lists} literal `features` lists in {files} tracked \
          build files name {named:?}; {outcome}; {tables} autocargo `features` tables declare \
-         cargo features and enable none; {featureless} of {} workspace members have no cargo \
-         features",
+         cargo features and enable none; {forwards} {loops} a `features` argument unchanged; \
+         {featureless} of {} workspace members have no cargo features",
         members.len()
     )
 }
@@ -859,12 +1130,14 @@ fn check(inputs: &Inputs) -> Result<String, Vec<String>> {
     let mut named = BTreeSet::new();
     let mut lists = 0;
     let mut tables = 0;
+    let mut forwards = 0;
     let mut refused = Vec::new();
     for (path, text) in &inputs.files {
         let scan = scan(text);
         named.extend(scan.features);
         lists += scan.lists;
         tables += scan.tables;
+        forwards += scan.forwards;
         refused.extend(
             scan.refusals
                 .into_iter()
@@ -883,6 +1156,7 @@ fn check(inputs: &Inputs) -> Result<String, Vec<String>> {
             inputs.files.len(),
             lists,
             tables,
+            forwards,
             &named,
             &inputs.platforms,
             &inputs.members,
@@ -972,7 +1246,9 @@ mod tests {
         let scan = scan(text);
         for (_, why) in &scan.refusals {
             assert!(
-                why.contains(READABLE_VALUE) || why.contains(UNREADABLE_FILE),
+                why.contains(READABLE_VALUE)
+                    || why.contains(UNREADABLE_FILE)
+                    || why.contains(UNREADABLE_F_STRING),
                 "{why}"
             );
         }
@@ -1240,6 +1516,153 @@ mod tests {
             [2]
         );
         assert_eq!(refused_lines("ARGS = {\"features\": FEATS}\n"), [1]);
+    }
+
+    /// The shim's routed-unittest forward (shim/shims.bzl), as it is written.
+    // As the shim writes it: the parameter list's closing `):` at the start
+    // of a line, and later functions with loops over the same name.
+    const SHIM_FORWARD: &str = "def _inline_unittest(\n    name, kwargs, deps, mapped_srcs = None\n):\n    test_kwargs = {\n        \"visibility\": [\"PUBLIC\"],\n    }\n    for attr in (\"crate_root\", \"features\", \"resources\", \"target_compatible_with\"):\n        if kwargs.get(attr) != None:\n            test_kwargs[attr] = kwargs[attr]\n    if mapped_srcs:\n        test_kwargs[\"mapped_srcs\"] = mapped_srcs\n    prelude.rust_test(name = name, **test_kwargs)\n\ndef rust_library(name, **kwargs):\n    for attr in (\"compatible_with\",):\n        kwargs[attr] = kwargs.get(attr)\n";
+
+    #[test]
+    fn reads_a_loop_that_forwards_keyword_arguments_unchanged() {
+        let read = scan(SHIM_FORWARD);
+        assert_eq!(read.refusals, Vec::new());
+        assert_eq!((read.forwards, read.lists, read.features.len()), (1, 0, 0));
+        // Unguarded, and as a list, it is the same forward.
+        let unguarded = "def m(**kwargs):\n    out = {}\n    for a in [\"features\"]:\n        out[a] = kwargs[a]\n    return out\n";
+        assert_eq!(refused_lines(unguarded), Vec::<usize>::new());
+        assert_eq!(scan(unguarded).forwards, 1);
+    }
+
+    #[test]
+    fn refuses_a_loop_that_does_more_than_forward() {
+        let cases = [
+            // The copy is built on.
+            "def m(**kwargs):\n    out = {}\n    for a in (\"features\",):\n        out[a] = kwargs[a] + [\"x\"]\n",
+            // The body goes on past the copy.
+            "def m(**kwargs):\n    out = {}\n    for a in (\"features\",):\n        out[a] = kwargs[a]\n        out[a].append(\"x\")\n",
+            // The guard tests some other name.
+            "def m(other, **kwargs):\n    out = {}\n    for a in (\"features\",):\n        if kwargs.get(other) != None:\n            out[a] = kwargs[a]\n",
+            // The guard's body has an else branch.
+            "def m(**kwargs):\n    out = {}\n    for a in (\"features\",):\n        if kwargs.get(a) != None:\n            out[a] = kwargs[a]\n        else:\n            out[a] = [\"x\"]\n",
+            // The loop name, still \"features\" after the loop, is read again.
+            "def m(**kwargs):\n    out = {}\n    for a in (\"crate_root\", \"features\"):\n        out[a] = kwargs[a]\n    out[a] = [\"x\"]\n",
+            // A tuple holding something other than plain strings.
+            "def m(**kwargs):\n    out = {}\n    for a in (\"features\", NAME):\n        out[a] = kwargs[a]\n",
+            // A tuple not iterated by a loop.
+            "ATTRS = (\"crate_root\", \"features\")\n",
+            // A copy from somewhere other than kwargs.
+            "def m(other, **kwargs):\n    out = {}\n    for a in (\"features\",):\n        out[a] = other[a]\n",
+        ];
+        for text in cases {
+            let read = scan(text);
+            assert_eq!(read.forwards, 0, "{text}");
+            assert_eq!(read.refusals.len(), 1, "{text}");
+        }
+    }
+
+    // NAME may occur nowhere else in the function: after the loop it still
+    // names the last string, code before the loop can run after it, and a
+    // later loop, comprehension or nested scope binding NAME does not end that
+    // (a comprehension is its own scope; an empty or untaken loop binds
+    // nothing). A loop outside a function is refused too: NAME is a global.
+    #[test]
+    fn refuses_a_forward_whose_name_occurs_elsewhere_or_outside_a_function() {
+        let head = "def m(name, **kwargs):\n    out = {}\n    for a in (\"features\",):\n        out[a] = kwargs[a]\n";
+        let cases = [
+            // A later loop rebinding NAME.
+            (format!("{head}    for a in (\"labels\",):\n        out[a] = kwargs.get(a)\n"), 3),
+            // E1: a later comprehension binding NAME.
+            (format!("{head}    [None for a in ()]\n    out[a] = out[a] + [\"liteinst\"]\n"), 3),
+            // E2: an empty later loop.
+            (format!("{head}    for a in ():\n        pass\n    out[a] = [\"liteinst\"]\n"), 3),
+            // E3: the rebinding loop under an untaken branch.
+            (format!("{head}    if False:\n        for a in (\"labels\",):\n            pass\n    out[a] = [\"liteinst\"]\n"), 3),
+            // E4: the rebinding loop's iterable reads NAME.
+            (format!("{head}    for a in [out.update({{a: [\"liteinst\"]}})]:\n        pass\n"), 3),
+            // A nested def after the loop, then a read of NAME.
+            (format!("{head}    def g():\n        pass\n    out[a] = [\"liteinst\"]\n"), 3),
+            // A lambda reading NAME.
+            (format!("{head}    f = lambda: out.update({{a: [\"liteinst\"]}})\n"), 3),
+            // E5: an enclosing loop runs code written before the forward after it.
+            ("def m(**kwargs):\n    out = {}\n    for i in range(2):\n        if i == 1:\n            kwargs[a] = [\"liteinst\"]\n        for a in (\"features\",):\n            if kwargs.get(a) != None:\n                out[a] = kwargs[a]\n".to_string(), 6),
+            // E6: a closure written before the loop, called after it.
+            ("def m(**kwargs):\n    out = {}\n    def put():\n        out[a] = [\"liteinst\"]\n    for a in (\"features\",):\n        out[a] = kwargs[a]\n    put()\n".to_string(), 5),
+            // E7: a module-level forward; NAME is a global.
+            ("kwargs = {}\nOUT = {}\nfor a in (\"features\",):\n    if kwargs.get(a) != None:\n        OUT[a] = kwargs[a]\n\ndef m(name):\n    d = {}\n    d[a] = [\"liteinst\"]\n    native.rust_library(name = name, **d)\n".to_string(), 3),
+            // N6: a module-level loop right after a function.
+            ("def f():\n    pass\nfor a in (\"features\",):\n    if kwargs.get(a) != None:\n        OUT[a] = kwargs[a]\n".to_string(), 3),
+            // A forward under a module-level block after a function.
+            ("def f():\n    pass\nif True:\n    for a in (\"features\",):\n        OUT[a] = kwargs[a]\n".to_string(), 4),
+            // The body goes on, deeper, without reading NAME.
+            (format!("{head}        x = 1\n"), 3),
+            // A comprehension over the tuple, then a copy: no `:` after it.
+            ("def m(**kwargs):\n    out = {}\n    [None for a in (\"features\",)]\n    out[a] = kwargs[a]\n".to_string(), 3),
+        ];
+        for (text, line) in &cases {
+            let read = scan(text);
+            assert_eq!(read.forwards, 0, "{text}");
+            assert_eq!(refused_lines(text), vec![*line], "{text}");
+        }
+    }
+
+    // Open-source Buck2 evaluates an f-string's replacement field, which the
+    // check cannot read: it can name a forward's NAME where the scan does not
+    // see it (N1 after the loop, N1b in a closure before it), or call a rule
+    // with a `features` list (N3, with no loop at all).
+    #[test]
+    fn refuses_an_f_string_with_a_replacement_field() {
+        let head = "def m(name, **kwargs):\n    out = {}\n    for a in (\"features\",):\n        out[a] = kwargs[a]\n";
+        let cases = [
+            // N1: NAME read in an f-string after the loop.
+            (format!("{head}    out[f\"{{a}}\"] = [\"liteinst\"]\n"), 5),
+            // N1b: the same in a closure written before the loop.
+            ("def m(**kwargs):\n    out = {}\n    def put():\n        out[f\"{a}\"] = [\"liteinst\"]\n    for a in (\"features\",):\n        out[a] = kwargs[a]\n    put()\n".to_string(), 4),
+            // N3: a rule called inside an f-string.
+            ("def m(name):\n    _ = f\"{native.rust_library(name = name, features = ['liteinst'])}\"\n".to_string(), 2),
+            // Each prefix, in any case, raw or not, with either quote, triple-quoted.
+            ("X = F'{a}'\n".to_string(), 1),
+            ("X = fr\"{a}\"\n".to_string(), 1),
+            ("X = Rf\"{a}\"\n".to_string(), 1),
+            ("X = fR'''\n{a}'''\n".to_string(), 1),
+            // A field after a doubled brace.
+            ("X = f\"{{{a}\"\n".to_string(), 1),
+            // A field after an escaped brace, which pairs with no other:
+            // NAME read through a forward, raw or not, after an escaped
+            // backslash; a rule called; a field holding a nested quote.
+            (head.to_string() + "    out[f\"\\{{a}\"[2:]] = [\"liteinst\"]\n", 5),
+            (head.to_string() + "    out[fr\"\\{{a}\"[2:]] = [\"liteinst\"]\n", 5),
+            (head.to_string() + "    out[f\"\\\\\\{{a}\"[3:]] = [\"liteinst\"]\n", 5),
+            ("def m(name):\n    _ = f\"\\{{native.rust_library(name = name, features = ['liteinst'])}\"\n".to_string(), 2),
+            ("X = f\"\\{{d[\"k\"]}\"\n".to_string(), 1),
+        ];
+        for (text, line) in &cases {
+            let read = scan(text);
+            assert_eq!(refused_lines(text), vec![*line], "{text}");
+            assert!(
+                read.refusals
+                    .iter()
+                    .all(|(_, why)| why.contains(UNREADABLE_F_STRING)),
+                "{text}: {:?}",
+                read.refusals
+            );
+        }
+        // Not f-strings with a field: only doubled braces (after an escaped
+        // backslash too), only an escaped brace, no braces, a function named
+        // `f` called with a string, the name `f` before a string it is not
+        // part of, a plain string holding braces.
+        for text in [
+            "X = f\"{{a}}\"\n",
+            "X = f\"\\\\{{a}}\"\n",
+            "X = f\"\\{\"\n",
+            "X = f\"plain\"\n",
+            "X = f(\"{a}\")\n",
+            "X = [f, \"{a}\"]\n",
+            "X = f\n\"{a}\"\n",
+            "X = \"{a}\".format(a = 1)\n",
+        ] {
+            assert_eq!(refused_lines(text), Vec::<usize>::new(), "{text}");
+        }
     }
 
     #[test]
@@ -1582,6 +2005,10 @@ mod tests {
             line.contains(
                 "; 1 autocargo `features` tables declare cargo features and enable none;"
             ),
+            "{line}"
+        );
+        assert!(
+            line.contains("; 0 loops forward a `features` argument unchanged;"),
             "{line}"
         );
         fs::remove_dir_all(&root).unwrap();
