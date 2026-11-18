@@ -1409,7 +1409,9 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
             .map_err(|error| format!("input snapshot entries {}: {error}", source.display()))?;
         children.sort();
         for child in children {
-            let name = child.file_name().ok_or("input snapshot child has no name")?;
+            let name = child
+                .file_name()
+                .ok_or("input snapshot child has no name")?;
             copy_tree(&child, &target.join(name))?;
         }
     } else if metadata.file_type().is_symlink() {
@@ -1431,9 +1433,8 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
 
 /// Copy one executable into the snapshot, keeping its mode.
 fn copy_executable(source: &Path, target: &Path) -> Result<(), String> {
-    fs::copy(source, target).map_err(|error| {
-        format!("input snapshot executable {}: {error}", source.display())
-    })?;
+    fs::copy(source, target)
+        .map_err(|error| format!("input snapshot executable {}: {error}", source.display()))?;
     Ok(())
 }
 
@@ -1466,10 +1467,7 @@ fn input_inventory(prepared: &Prepared) -> Result<String, String> {
         }
     }
     for (snapshot, path) in &prepared.verification_snapshots {
-        rows.push(format!(
-            "SOURCE {snapshot} sha256={}\n",
-            digest(path)?
-        ));
+        rows.push(format!("SOURCE {snapshot} sha256={}\n", digest(path)?));
     }
     if let Some(registry) = &prepared.descriptor_registry {
         for (path, expected) in &registry.references {
@@ -2249,8 +2247,7 @@ impl Prepared {
         // copied beside the artifacts for inputs.sha256; the inventory
         // hashes those copies through verification_snapshots below.
         let snapshot = artifacts.join("input-snapshot");
-        fs::create_dir(&snapshot)
-            .map_err(|error| format!("input snapshot root: {error}"))?;
+        fs::create_dir(&snapshot).map_err(|error| format!("input snapshot root: {error}"))?;
         let hermit = {
             let copy = snapshot.join("hermit");
             copy_executable(&hermit, &copy)?;
@@ -2274,9 +2271,7 @@ impl Prepared {
                     sources: sources
                         .iter()
                         .enumerate()
-                        .map(|(index, _)| {
-                            artifacts.join(format!("executor-source-{index}.rs"))
-                        })
+                        .map(|(index, _)| artifacts.join(format!("executor-source-{index}.rs")))
                         .collect(),
                     binary: copy,
                 }
@@ -2824,15 +2819,23 @@ mod inventory_difference_tests {
         let before = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
         let after = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n";
         let difference = inventory_difference(before, after);
-        assert!(difference.contains("SOURCE workspace-Cargo.lock"), "{difference}");
-        assert!(difference.contains("bbbbbbbbbbbb -> cccccccccccc"), "{difference}");
+        assert!(
+            difference.contains("SOURCE workspace-Cargo.lock"),
+            "{difference}"
+        );
+        assert!(
+            difference.contains("bbbbbbbbbbbb -> cccccccccccc"),
+            "{difference}"
+        );
         assert!(!difference.contains("EXECUTABLE hermit"), "{difference}");
     }
 
     #[test]
     fn added_and_removed_inputs_are_named() {
-        let before = "FILE 00 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
-        let after = "FILE 11 sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let before =
+            "FILE 00 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let after =
+            "FILE 11 sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
         let difference = inventory_difference(before, after);
         assert!(difference.contains("removed"), "{difference}");
         assert!(difference.contains("added"), "{difference}");
@@ -2841,8 +2844,12 @@ mod inventory_difference_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
-    use super::{copy_executable, copy_tree, digest, inventory_tree};
     use std::fs;
+
+    use super::copy_executable;
+    use super::copy_tree;
+    use super::digest;
+    use super::inventory_tree;
 
     /// dh-j8eb7 option-B fixture: snapshot the hashed executables and
     /// installation at prepare, then mutate the ORIGINALS mid-collection
@@ -2851,10 +2858,8 @@ mod snapshot_tests {
     /// not move, and the copies must hold the prepared bytes.
     #[test]
     fn mutating_the_originals_mid_collection_moves_no_snapshot_digest() {
-        let root = std::env::temp_dir().join(format!(
-            "hermit-isolation-snapshot-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("hermit-isolation-snapshot-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let originals = root.join("originals");
         let snapshot = root.join("input-snapshot");
@@ -2870,7 +2875,10 @@ mod snapshot_tests {
         copy_tree(&originals.join("installation"), &installation_copy).unwrap();
 
         let digests = |hermit_path: &std::path::Path, installation: &std::path::Path| {
-            let mut rows = vec![format!("EXECUTABLE hermit sha256={}\n", digest(hermit_path).unwrap())];
+            let mut rows = vec![format!(
+                "EXECUTABLE hermit sha256={}\n",
+                digest(hermit_path).unwrap()
+            )];
             inventory_tree(installation, installation, &mut rows).unwrap();
             rows.concat()
         };

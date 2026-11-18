@@ -29,7 +29,8 @@
 mod rust_script_prelude;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 fn day_of(record: &serde_json::Value) -> String {
     for key in ["finished_at", "recorded_at", "started_at"] {
@@ -95,8 +96,10 @@ fn count_record(
         return;
     };
     *runs.entry(day.clone()).or_default() += 1;
-    *totals.entry(day.clone()).or_default() +=
-        rollup.get("total_retries").and_then(|v| v.as_u64()).unwrap_or(0);
+    *totals.entry(day.clone()).or_default() += rollup
+        .get("total_retries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let daily = by_day.entry(day).or_default();
     let counts = &mut daily.counts;
     if let Some(tests) = rollup.get("tests").and_then(|v| v.as_array()) {
@@ -215,7 +218,10 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
                 collect(&entry.path(), out);
             }
         }
-    } else if path.extension().is_some_and(|e| e == "json" || e == "jsonl") {
+    } else if path
+        .extension()
+        .is_some_and(|e| e == "json" || e == "jsonl")
+    {
         out.push(path.to_path_buf());
     }
 }

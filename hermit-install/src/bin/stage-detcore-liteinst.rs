@@ -103,9 +103,7 @@ fn reverie_layout(
     reverie_root: &Path,
 ) -> proof::Result<proof::CompiledSourceLayout> {
     Ok(
-        if reverie_is_path_sourced(manifest_text)?
-            && !reverie_root_has_git_metadata(reverie_root)
-        {
+        if reverie_is_path_sourced(manifest_text)? && !reverie_root_has_git_metadata(reverie_root) {
             proof::CompiledSourceLayout::HermitPath
         } else {
             proof::CompiledSourceLayout::HermitGit
@@ -550,7 +548,12 @@ fn needed_refusal(needed: &[String]) -> Option<String> {
 fn needed_from_readelf(dump: &str) -> Vec<String> {
     dump.lines()
         .filter(|line| line.contains("(NEEDED)"))
-        .filter_map(|line| line.split_once('[')?.1.split_once(']').map(|(s, _)| s.to_owned()))
+        .filter_map(|line| {
+            line.split_once('[')?
+                .1
+                .split_once(']')
+                .map(|(s, _)| s.to_owned())
+        })
         .collect()
 }
 
@@ -643,9 +646,7 @@ fn buck_rustc_version(comment_dump: &str) -> proof::Result<String> {
     versions.dedup();
     match versions.as_slice() {
         [only] => Ok(format!("rustc version {only}")),
-        _ => Err(
-            "Buck artifact .comment does not carry exactly one rustc version identity".into(),
-        ),
+        _ => Err("Buck artifact .comment does not carry exactly one rustc version identity".into()),
     }
 }
 
@@ -765,9 +766,8 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
     // The ELF and its digest come from that retained run alone: the path
     // from its --show-full-output stdout (canonicalized through buck-out's
     // symlink to the real file) and the sha256 computed here from it.
-    let artifact_path = parse_buck_output(
-        std::str::from_utf8(&buck_stdout).map_err(|e| e.to_string())?,
-    )?;
+    let artifact_path =
+        parse_buck_output(std::str::from_utf8(&buck_stdout).map_err(|e| e.to_string())?)?;
     let artifact_path = fs::canonicalize(&artifact_path).map_err(|e| e.to_string())?;
     require(
         artifact_path.is_file(),
@@ -860,7 +860,10 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
     artifact.verify()?;
     let pending = resources.join(format!(".libdetcore_liteinst.so.{serial}"));
     let staged = (|| {
-        proof::write_new(&pending, &fs::read(&artifact.path).map_err(|e| e.to_string())?)?;
+        proof::write_new(
+            &pending,
+            &fs::read(&artifact.path).map_err(|e| e.to_string())?,
+        )?;
         fs::set_permissions(
             &pending,
             fs::metadata(&artifact.path)
@@ -905,10 +908,8 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
                 qualifier_source: serde_json::to_value(&qualifier_source)
                     .map_err(|e| e.to_string())?,
                 compiled_sources: record,
-                qualification: serde_json::to_value(&qualification)
-                    .map_err(|e| e.to_string())?,
-                installed: serde_json::to_value(installed_identity)
-                    .map_err(|e| e.to_string())?,
+                qualification: serde_json::to_value(&qualification).map_err(|e| e.to_string())?,
+                installed: serde_json::to_value(installed_identity).map_err(|e| e.to_string())?,
                 commands: serde_json::to_value(runner.commands()).map_err(|e| e.to_string())?,
             },
             &retained_argv,
@@ -1246,8 +1247,7 @@ mod tests {
         ));
         fs::create_dir_all(checkout.join(".git")).unwrap();
         assert_eq!(
-            reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", &checkout)
-                .unwrap(),
+            reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", &checkout).unwrap(),
             proof::CompiledSourceLayout::HermitGit,
         );
         fs::remove_dir_all(&checkout).unwrap();
@@ -1630,13 +1630,17 @@ mod tests {
             buck_rustc_version(dump).unwrap(),
             "rustc version 1.97.1 (8bab26f4f 2026-07-14)"
         );
-        assert!(buck_rustc_version("no compiler identity\n")
-            .unwrap_err()
-            .contains("exactly one rustc version identity"));
+        assert!(
+            buck_rustc_version("no compiler identity\n")
+                .unwrap_err()
+                .contains("exactly one rustc version identity")
+        );
         let two = format!("{dump}  [    40]  rustc version 1.98.0\n");
-        assert!(buck_rustc_version(&two)
-            .unwrap_err()
-            .contains("exactly one rustc version identity"));
+        assert!(
+            buck_rustc_version(&two)
+                .unwrap_err()
+                .contains("exactly one rustc version identity")
+        );
     }
 
     #[test]
@@ -1733,8 +1737,10 @@ mod tests {
             0x000000006ffffffb (FLAGS_1)            Flags: NOW\n \
             0x0000000000000016 (TEXTREL)            0x0\n";
         assert_eq!(dt_flags_from_readelf(dump), 0xc);
-        assert!(dt_flags_refusal(dt_flags_from_readelf(dump))
-            .is_some_and(|refusal| refusal.contains("TEXTREL")));
+        assert!(
+            dt_flags_refusal(dt_flags_from_readelf(dump))
+                .is_some_and(|refusal| refusal.contains("TEXTREL"))
+        );
         // Eager binding alone, and no FLAGS entry at all, name nothing.
         assert!(dt_flags_refusal(0x8).is_none());
         assert_eq!(dt_flags_from_readelf("(NEEDED) libc.so.6\n"), 0);

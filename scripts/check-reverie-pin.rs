@@ -1677,7 +1677,10 @@ fn parse_gitlink_stage_line(line: &str) -> Option<String> {
     if fields.next() != Some("160000") {
         return None;
     }
-    fields.next().filter(|sha| is_full_sha(sha)).map(str::to_owned)
+    fields
+        .next()
+        .filter(|sha| is_full_sha(sha))
+        .map(str::to_owned)
 }
 
 /// Parse `git ls-tree <ref> -- reverie` output (`160000 commit <sha>\t...`).
@@ -1686,7 +1689,10 @@ fn parse_gitlink_tree(text: &str) -> Option<String> {
     if fields.next() != Some("160000") || fields.next() != Some("commit") {
         return None;
     }
-    fields.next().filter(|sha| is_full_sha(sha)).map(str::to_owned)
+    fields
+        .next()
+        .filter(|sha| is_full_sha(sha))
+        .map(str::to_owned)
 }
 
 /// The recorded gitlink of the working checkout: the index entry when an
@@ -2855,7 +2861,9 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let gitlink = gitlink_pin(&root);
     eprintln!(
         "Canonical pin (reverie gitlink): {}.",
-        gitlink.as_deref().unwrap_or("none recorded; manifest coherence decides")
+        gitlink
+            .as_deref()
+            .unwrap_or("none recorded; manifest coherence decides")
     );
     report_provenance(provenance.as_ref());
 
@@ -2872,10 +2880,8 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         (gitlink.as_deref(), checkout_head.as_deref()),
         (Some(pin), Some(head)) if pin != head
     );
-    let stray_from_gitlink = gitlink.is_some()
-        && by_rev
-            .keys()
-            .any(|rev| Some(*rev) != gitlink.as_deref());
+    let stray_from_gitlink =
+        gitlink.is_some() && by_rev.keys().any(|rev| Some(*rev) != gitlink.as_deref());
     let incoherent = by_rev.len() > 1
         || stray_from_gitlink
         || checkout_mismatch
@@ -3789,10 +3795,7 @@ mod tests {
         // Post-migration steady state: gitlink only, zero named revisions.
         assert_eq!(resolve_recorded_pin(Some(pin), &scan(&[])).unwrap(), pin);
         // A named revision agreeing with the gitlink is coherent.
-        assert_eq!(
-            resolve_recorded_pin(Some(pin), &scan(&[pin])).unwrap(),
-            pin
-        );
+        assert_eq!(resolve_recorded_pin(Some(pin), &scan(&[pin])).unwrap(), pin);
         // A surviving second copy at another revision is refused by name.
         let stray = resolve_recorded_pin(Some(pin), &scan(&[other])).unwrap_err();
         assert!(stray.contains(other), "{stray}");
@@ -4375,10 +4378,13 @@ mod tests {
 
         init_fixture_repo(&fork);
         assert!(
-            git_in(&fork, &["fetch", "--quiet", export.to_str().unwrap(), "main"])
-                .unwrap()
-                .status
-                .success()
+            git_in(
+                &fork,
+                &["fetch", "--quiet", export.to_str().unwrap(), "main"]
+            )
+            .unwrap()
+            .status
+            .success()
         );
         assert!(
             git_in(&fork, &["checkout", "-q", "-B", "main", "FETCH_HEAD~1"])

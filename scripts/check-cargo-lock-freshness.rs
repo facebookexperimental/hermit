@@ -416,7 +416,13 @@ mod tests {
 
         // Regenerate: the same probe must now pass.
         let regenerated = Command::new("cargo")
-            .args(["metadata", "--offline", "--format-version", "1", "--manifest-path"])
+            .args([
+                "metadata",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
             .arg(root_dir.join("Cargo.toml"))
             .output()
             .expect("regenerate fixture lockfile");

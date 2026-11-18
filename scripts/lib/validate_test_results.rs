@@ -129,9 +129,8 @@ fn checked_results(
             .count(),
     )
     .map_err(|_| "structured diagnostic-failure count does not fit u64".to_string())?;
-    let skipped_tests =
-        u64::try_from(sorted.iter().filter(|result| result.is_skipped()).count())
-            .map_err(|_| "structured skipped-test count does not fit u64")?;
+    let skipped_tests = u64::try_from(sorted.iter().filter(|result| result.is_skipped()).count())
+        .map_err(|_| "structured skipped-test count does not fit u64")?;
     let failed_tests = row_count
         .checked_sub(passed_tests)
         .and_then(|rest| rest.checked_sub(diagnostic_failed_tests))

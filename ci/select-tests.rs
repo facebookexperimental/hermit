@@ -941,10 +941,7 @@ fn emit_full_selection_record(format: &str) {
 fn fail_load(path: &Path, detail: &str) -> ! {
     let format = FORMAT.get().map_or("human", String::as_str);
     emit_full_selection_record(format);
-    eprintln!(
-        "select-tests: cannot load {}: {detail}",
-        path.display()
-    );
+    eprintln!("select-tests: cannot load {}: {detail}", path.display());
     eprintln!(
         "select-tests: remedy: fix the file, or regenerate it with \
          `cargo run -p hermit-manifest-plan --bin generate-validation-dag -- --write ci/dag/validate.json`; \
@@ -1417,7 +1414,11 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 sel.decision == Decision::Full,
                 sel.nodes.len(),
                 sel.nodes.iter().cloned().collect::<Vec<_>>().join(" "),
-                sel.super_nodes.iter().cloned().collect::<Vec<_>>().join(" "),
+                sel.super_nodes
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 rp.shards.len(),
                 rp.cells.len(),
                 rp.build_debug,
@@ -3047,9 +3048,13 @@ fn self_test() {
     let pmu = "super.pmu_analyze_hello_race_stress_calibrated_skid";
     check(
         "4741: super selector source selects its super node",
-        select(&core_fp, &core_dag, &["scripts/lib/validate_super.rs".into()])
-            .super_nodes
-            .contains(pmu),
+        select(
+            &core_fp,
+            &core_dag,
+            &["scripts/lib/validate_super.rs".into()],
+        )
+        .super_nodes
+        .contains(pmu),
     );
     check(
         "4741: per-test budget file selects its super node",
@@ -3082,12 +3087,7 @@ fn self_test() {
     // budget, or harness file - still names exactly that node.
     check(
         "4741: analyze.rs-only edit selects the pmu analyze node",
-        select(
-            &core_fp,
-            &core_dag,
-            &["hermit-cli/tests/analyze.rs".into()],
-        )
-        .super_nodes
+        select(&core_fp, &core_dag, &["hermit-cli/tests/analyze.rs".into()]).super_nodes
             == BTreeSet::from([pmu.to_string()]),
     );
     check(

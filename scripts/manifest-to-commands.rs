@@ -333,7 +333,12 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
 /// the program its verify cell runs, so for a backend its replay recipe does not
 /// name it takes `modes.verify.guest_args.<backend>`, the same rule as
 /// `hermit-manifest-plan`'s `cell_guest_args`.
-fn cell_guest_args(modes: &BTreeMap<String, Value>, mode: &str, backend: &str, id: &str) -> Vec<String> {
+fn cell_guest_args(
+    modes: &BTreeMap<String, Value>,
+    mode: &str,
+    backend: &str,
+    id: &str,
+) -> Vec<String> {
     let declares = |spec: &Value| {
         spec.get("guest_args")
             .and_then(Value::as_table)

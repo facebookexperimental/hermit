@@ -439,9 +439,8 @@ fn workspace_member_packages(root: &Path) -> Result<Vec<String>, String> {
         let member_path = root.join(&dir).join("Cargo.toml");
         let member_text = fs::read_to_string(&member_path)
             .map_err(|error| format!("{}: {error}", member_path.display()))?;
-        let name = package_name(&member_text).ok_or_else(|| {
-            format!("{} names no [package] name", member_path.display())
-        })?;
+        let name = package_name(&member_text)
+            .ok_or_else(|| format!("{} names no [package] name", member_path.display()))?;
         packages.push(name);
     }
     if packages.is_empty() {
@@ -586,9 +585,7 @@ mod tests {
             workspace_member_dirs("[workspace]\nmembers = [\"only\"]\n").unwrap(),
             ["only"]
         );
-        assert!(
-            workspace_member_dirs("[workspace]\nmembers = [\"crates/*\"]\n").is_err()
-        );
+        assert!(workspace_member_dirs("[workspace]\nmembers = [\"crates/*\"]\n").is_err());
         assert_eq!(
             package_name("[package]\nname = \"hermit-run\"\nversion = \"0.5.7\"\n").as_deref(),
             Some("hermit-run")

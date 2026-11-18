@@ -58,7 +58,8 @@
 //! negative-control failure).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use syn::visit::Visit;
@@ -116,11 +117,10 @@ fn cfg_is_test_only(tokens: &proc_macro2::TokenStream) -> bool {
     let trees: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     match trees.as_slice() {
         [proc_macro2::TokenTree::Ident(ident)] => ident == "test",
-        [proc_macro2::TokenTree::Ident(ident), proc_macro2::TokenTree::Group(group)]
-            if ident == "all" =>
-        {
-            split_commas(&group.stream()).iter().any(cfg_is_test_only)
-        }
+        [
+            proc_macro2::TokenTree::Ident(ident),
+            proc_macro2::TokenTree::Group(group),
+        ] if ident == "all" => split_commas(&group.stream()).iter().any(cfg_is_test_only),
         _ => false,
     }
 }
@@ -255,8 +255,8 @@ fn census_source(source: &str) -> Result<Census, String> {
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
     let mut paths: Vec<PathBuf> = entries
         .map(|entry| entry.map(|e| e.path()))
         .collect::<Result<_, _>>()
@@ -317,7 +317,10 @@ struct Baseline {
     justifies: BTreeMap<String, (usize, String)>,
 }
 
-fn render_baseline(per_file: &BTreeMap<String, Census>, justifies: &BTreeMap<String, (usize, String)>) -> String {
+fn render_baseline(
+    per_file: &BTreeMap<String, Census>,
+    justifies: &BTreeMap<String, (usize, String)>,
+) -> String {
     let total = totals(per_file);
     let mut out = String::new();
     out.push_str("# LinuxEmu unsafe census baseline. Regenerated only by\n");
@@ -359,7 +362,10 @@ fn parse_baseline(text: &str) -> Result<Baseline, String> {
                 .insert(path.to_string(), (count, reason.trim().to_string()))
                 .is_some()
             {
-                return Err(format!("baseline line {}: duplicate justify {path}", index + 1));
+                return Err(format!(
+                    "baseline line {}: duplicate justify {path}",
+                    index + 1
+                ));
             }
             continue;
         }
@@ -391,7 +397,10 @@ fn parse_baseline(text: &str) -> Result<Baseline, String> {
     }
     let summed: usize = per_file.values().sum();
     match declared_total {
-        Some(total) if total == summed => Ok(Baseline { counts: per_file, justifies }),
+        Some(total) if total == summed => Ok(Baseline {
+            counts: per_file,
+            justifies,
+        }),
         Some(total) => Err(format!("baseline total {total} != summed {summed}")),
         None => Err("baseline has no total line".to_string()),
     }
@@ -402,17 +411,27 @@ fn negative_controls() -> Result<(), String> {
         (
             "plain block",
             "fn f() { unsafe {} }",
-            Census { blocks: 1, ..Census::default() },
+            Census {
+                blocks: 1,
+                ..Census::default()
+            },
         ),
         (
             "nested blocks count twice",
             "fn f() { unsafe { unsafe {} } }",
-            Census { blocks: 2, ..Census::default() },
+            Census {
+                blocks: 2,
+                ..Census::default()
+            },
         ),
         (
             "unsafe fn and impl",
             "unsafe fn f() {} struct S; unsafe impl Send for S {}",
-            Census { fns: 1, impls: 1, ..Census::default() },
+            Census {
+                fns: 1,
+                impls: 1,
+                ..Census::default()
+            },
         ),
         (
             "cfg(test) excluded",
@@ -432,12 +451,18 @@ fn negative_controls() -> Result<(), String> {
         (
             "cfg(not(test)) counted",
             "#[cfg(not(test))] fn t() { unsafe {} }",
-            Census { blocks: 1, ..Census::default() },
+            Census {
+                blocks: 1,
+                ..Census::default()
+            },
         ),
         (
             "cfg(any(test, ...)) counted",
             "#[cfg(any(test, feature = \"test-support\"))] fn t() { unsafe {} }",
-            Census { blocks: 1, ..Census::default() },
+            Census {
+                blocks: 1,
+                ..Census::default()
+            },
         ),
         (
             "cfg(test) impl-item fn excluded",
@@ -447,7 +472,10 @@ fn negative_controls() -> Result<(), String> {
         (
             "macro token counted",
             "macro_rules! m { () => { unsafe {} } } fn f() { m!() }",
-            Census { macro_tokens: 1, ..Census::default() },
+            Census {
+                macro_tokens: 1,
+                ..Census::default()
+            },
         ),
         (
             "comment and string not counted",
@@ -505,18 +533,19 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .split_once('=')
                     .filter(|(p, r)| !p.is_empty() && !r.trim().is_empty())
                     .ok_or_else(|| format!("--justify needs <path>=<reason>, got {spec:?}"))?;
-                args.justifies.push((path.to_string(), reason.trim().to_string()));
+                args.justifies
+                    .push((path.to_string(), reason.trim().to_string()));
             }
             "--repo-root" => {
                 args.repo_root = PathBuf::from(iter.next().ok_or("--repo-root needs a path")?);
             }
             "--linuxemu-src" => {
-                args.linuxemu_src =
-                    Some(PathBuf::from(iter.next().ok_or("--linuxemu-src needs a path")?));
+                args.linuxemu_src = Some(PathBuf::from(
+                    iter.next().ok_or("--linuxemu-src needs a path")?,
+                ));
             }
             "--baseline" => {
-                args.baseline =
-                    Some(PathBuf::from(iter.next().ok_or("--baseline needs a path")?));
+                args.baseline = Some(PathBuf::from(iter.next().ok_or("--baseline needs a path")?));
             }
             "--write-baseline" => args.write_baseline = true,
             "--init" => args.init = true,
@@ -591,13 +620,18 @@ fn base_baseline(repo_root: &Path, baseline_path: &Path) -> Result<BaseCompariso
         root.join(baseline_path)
     };
     let Ok(relative) = absolute_baseline.strip_prefix(&root) else {
-        return Ok(BaseComparison::Skipped("baseline outside the git top-level"));
+        return Ok(BaseComparison::Skipped(
+            "baseline outside the git top-level",
+        ));
     };
     let shown = std::process::Command::new("git")
         .args(["-C"])
         .arg(&root)
         .arg("show")
-        .arg(format!("HEAD:{}", relative.to_string_lossy().replace('\\', "/")))
+        .arg(format!(
+            "HEAD:{}",
+            relative.to_string_lossy().replace('\\', "/")
+        ))
         .output()
         .map_err(|err| format!("cannot run git show: {err}"))?;
     if !shown.status.success() {
@@ -721,7 +755,8 @@ fn run() -> u8 {
             for (path, count) in &actual {
                 let before = [
                     old.as_ref().and_then(|old| old.counts.get(path).copied()),
-                    base.as_ref().and_then(|base| base.counts.get(path).copied()),
+                    base.as_ref()
+                        .and_then(|base| base.counts.get(path).copied()),
                 ]
                 .into_iter()
                 .flatten()
@@ -743,7 +778,10 @@ fn run() -> u8 {
         justifies.retain(|path, (count, _)| actual.get(path).copied() == Some(*count));
         let rendered = render_baseline(&per_file, &justifies);
         if let Err(err) = std::fs::write(&baseline_path, rendered) {
-            eprintln!("CHECKER ERROR: cannot write {}: {err}", baseline_path.display());
+            eprintln!(
+                "CHECKER ERROR: cannot write {}: {err}",
+                baseline_path.display()
+            );
             return CHECKER_ERROR;
         }
         println!(
@@ -782,9 +820,7 @@ fn run() -> u8 {
     if let Some(base) = &base {
         for (path, count) in &baseline.counts {
             let before = base.counts.get(path).copied().unwrap_or(0);
-            if *count > before
-                && baseline.justifies.get(path).map(|(c, _)| *c) != Some(*count)
-            {
+            if *count > before && baseline.justifies.get(path).map(|(c, _)| *c) != Some(*count) {
                 eprintln!(
                     "REFUSE: {path}: baseline {count} raised over HEAD {before} \
                      without a justification"

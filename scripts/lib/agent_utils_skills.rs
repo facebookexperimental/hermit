@@ -51,7 +51,10 @@ pub struct Lock {
 }
 
 fn is_hex(text: &str, len: usize) -> bool {
-    text.len() == len && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn read_lock(root: &Path) -> Result<Lock, String> {
@@ -109,9 +112,11 @@ pub fn render(upstream: &str, commit: &str, name: &str) -> Result<String, String
 /// The upstream bytes an imported copy was generated from.
 fn recover(copy: &str, commit: &str, name: &str) -> Result<String, String> {
     let end = frontmatter_end(copy).ok_or("has no frontmatter")?;
-    let body = copy[end..].strip_prefix(&header(commit, name)).ok_or_else(|| {
-        format!("lacks the generated-from line for agent-utils {commit} after its frontmatter")
-    })?;
+    let body = copy[end..]
+        .strip_prefix(&header(commit, name))
+        .ok_or_else(|| {
+            format!("lacks the generated-from line for agent-utils {commit} after its frontmatter")
+        })?;
     Ok(format!("{}{body}", &copy[..end]))
 }
 
@@ -148,7 +153,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(format!("git {} failed in {}", args.join(" "), dir.display()))
+        Err(format!(
+            "git {} failed in {}",
+            args.join(" "),
+            dir.display()
+        ))
     }
 }
 
@@ -165,7 +174,13 @@ pub fn upstream_file(checkout: &Path, commit: &str, name: &str) -> Result<String
 pub fn upstream_entries(checkout: &Path, commit: &str, name: &str) -> Result<Vec<String>, String> {
     let listing = git(
         checkout,
-        &["ls-tree", "-r", "--name-only", commit, &format!("skills/{name}/")],
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit,
+            &format!("skills/{name}/"),
+        ],
     )?;
     Ok(String::from_utf8_lossy(&listing)
         .lines()
@@ -175,7 +190,11 @@ pub fn upstream_entries(checkout: &Path, commit: &str, name: &str) -> Result<Vec
 
 fn holds_commit(checkout: &Path, commit: &str) -> bool {
     checkout.join(".git").exists()
-        && git(checkout, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+        && git(
+            checkout,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )
+        .is_ok()
 }
 
 /// Verify every imported copy against `LOCK`, and against agent-utils itself
@@ -225,8 +244,8 @@ pub fn check(root: &Path, explicit: Option<&Path>) -> Result<String, String> {
         let path = dir.join("SKILL.md");
         let copy = fs::read_to_string(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        let original =
-            recover(&copy, &lock.commit, name).map_err(|error| format!("{} {error}", path.display()))?;
+        let original = recover(&copy, &lock.commit, name)
+            .map_err(|error| format!("{} {error}", path.display()))?;
         let actual = sha256(original.as_bytes())?;
         if &actual != recorded {
             return Err(format!(
@@ -244,7 +263,11 @@ pub fn check(root: &Path, explicit: Option<&Path>) -> Result<String, String> {
                     lock.commit
                 ));
             }
-            let fresh = render(&upstream_file(checkout, &lock.commit, name)?, &lock.commit, name)?;
+            let fresh = render(
+                &upstream_file(checkout, &lock.commit, name)?,
+                &lock.commit,
+                name,
+            )?;
             if fresh != copy {
                 return Err(format!(
                     "{} differs from agent-utils {} skills/{name}/SKILL.md; run {IMPORTER}",

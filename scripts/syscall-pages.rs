@@ -575,11 +575,11 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
         for line in appendix.lines() {
             if let Some(h) = line.strip_prefix("### ") {
                 if let Some(prev) = cur.take() {
-                    if subs.insert(prev.clone(), std::mem::take(&mut buf)).is_some() {
-                        rep.err(
-                            "P02",
-                            format!("duplicate Appendix subsection `### {prev}`"),
-                        );
+                    if subs
+                        .insert(prev.clone(), std::mem::take(&mut buf))
+                        .is_some()
+                    {
+                        rep.err("P02", format!("duplicate Appendix subsection `### {prev}`"));
                     }
                 }
                 cur = Some(h.trim().to_string());
@@ -609,10 +609,7 @@ fn parse_page(text: &str, rep: &mut Report) -> Option<Page> {
         }
         for name in subs.keys() {
             if !["Code facts", "Tests", "Citations"].contains(&name.as_str()) {
-                rep.err(
-                    "P02",
-                    format!("unknown Appendix subsection `### {name}`"),
-                );
+                rep.err("P02", format!("unknown Appendix subsection `### {name}`"));
             }
         }
         if let Some(facts) = subs.remove("Code facts") {
@@ -925,15 +922,19 @@ fn snapshot_document(pages: &[Page], root: &Path) -> Result<String, String> {
         let mut cites_json = Vec::new();
         let mut errnos: BTreeSet<String> = BTreeSet::new();
         for (id, cite) in page_cites(page) {
-            let text = verify_cite(root, &cite)
-                .map_err(|e| format!("{}: [^{id}] {e}", page.syscall))?;
+            let text =
+                verify_cite(root, &cite).map_err(|e| format!("{}: [^{id}] {e}", page.syscall))?;
             errnos.extend(errno_tokens(&text));
             cites_json.push(serde_json::json!({
                 "id": id, "path": cite.path, "first": cite.first,
                 "last": cite.last, "hash": cite.hash,
             }));
         }
-        let ds = page.sections.get(PROSE_SECTION).cloned().unwrap_or_default();
+        let ds = page
+            .sections
+            .get(PROSE_SECTION)
+            .cloned()
+            .unwrap_or_default();
         let ranges = rubric_part_ranges(&split_footnotes(&ds).1);
         let tests_text = match ranges[5] {
             Some((s, e)) => split_footnotes(&ds).1[s..e].to_string(),
@@ -989,7 +990,8 @@ fn load_snapshot(root: &Path) -> Option<BTreeMap<String, SnapshotEntry>> {
                 .iter()
                 .filter_map(|n| n.as_str().map(|s| s.to_string()))
                 .collect();
-            snap.tests.push((t.get("path")?.as_str()?.to_string(), names));
+            snap.tests
+                .push((t.get("path")?.as_str()?.to_string(), names));
         }
         for e in entry.get("cited_errnos")?.as_array()? {
             if let Some(e) = e.as_str() {
@@ -1026,7 +1028,9 @@ fn exact_snapshot_finding(pages: &[Page], root: &Path) -> Option<String> {
         Ok(_) => Some(format!(
             "{CITATIONS_FILE} disagrees byte for byte with the snapshot rebuilt from live Detcore; run `scripts/syscall-pages.rs anchor` after refreshing facts"
         )),
-        Err(e) => Some(format!("cannot rebuild {CITATIONS_FILE} from live Detcore: {e}")),
+        Err(e) => Some(format!(
+            "cannot rebuild {CITATIONS_FILE} from live Detcore: {e}"
+        )),
     }
 }
 
@@ -1155,8 +1159,7 @@ fn cite_triples(def: &str) -> Vec<Cite> {
 /// citation's range; it must repeat that range exactly, so a range
 /// moved by `anchor` cannot leave a stale human-facing anchor.
 fn github_source_links(def: &str) -> Vec<(String, usize, usize)> {
-    const PREFIX: &str =
-        "https://github.com/facebookexperimental/hermit/blob/";
+    const PREFIX: &str = "https://github.com/facebookexperimental/hermit/blob/";
     let mut out = Vec::new();
     for token in def.split_whitespace() {
         let token = token.trim_end_matches(|c| ",.;:)]".contains(c));
@@ -1208,8 +1211,12 @@ fn verify_cite(root: &Path, cite: &Cite) -> Result<String, String> {
         ));
     }
     let full = root.join(&cite.path);
-    let content = fs::read(&full)
-        .map_err(|_| format!("{}:{}-{}: cited file does not exist in this tree", cite.path, cite.first, cite.last))?;
+    let content = fs::read(&full).map_err(|_| {
+        format!(
+            "{}:{}-{}: cited file does not exist in this tree",
+            cite.path, cite.first, cite.last
+        )
+    })?;
     let Some(bytes) = lines_bytes(&content, cite.first, cite.last) else {
         return Err(format!(
             "{}:{}-{}: cited range leaves the file ({} lines)",
@@ -1293,7 +1300,9 @@ fn errno_tokens(text: &str) -> BTreeSet<String> {
         if cur.len() >= 3
             && cur.starts_with('E')
             && cur.chars().skip(1).any(|c| c.is_ascii_uppercase())
-            && cur.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && cur
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         {
             out.insert(std::mem::take(cur));
         } else {
@@ -1335,8 +1344,7 @@ fn negative_claims(section_body: &str) -> Vec<String> {
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|w| !w.is_empty())
                 .collect();
-            WORDS.iter().any(|m| words.contains(m))
-                || PHRASES.iter().any(|m| lower.contains(m))
+            WORDS.iter().any(|m| words.contains(m)) || PHRASES.iter().any(|m| lower.contains(m))
         })
         .collect()
 }
@@ -1478,8 +1486,7 @@ fn cited_fn_names(page: &Page, root: &Path) -> BTreeSet<String> {
         for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
             if word.len() > 2
                 && !RELEVANCE_STOPLIST.contains(&word)
-                && (text.contains(&format!("fn {word}"))
-                    || text.contains(&format!("{word}(")))
+                && (text.contains(&format!("fn {word}")) || text.contains(&format!("{word}(")))
                 && fn_def_at(&masked_file, word).is_some()
             {
                 out.insert(word.to_string());
@@ -1552,7 +1559,11 @@ fn lint_in_short(page: &Page, rep: &mut Report) {
     if body.contains("[^") {
         rep.err("P45", "`## In short` carries no citations");
     }
-    let ds = page.sections.get(PROSE_SECTION).cloned().unwrap_or_default();
+    let ds = page
+        .sections
+        .get(PROSE_SECTION)
+        .cloned()
+        .unwrap_or_default();
     let want_last = in_short_gaps_sentence(known_gap_count(&ds));
     let sentences = prose_sentences(&body);
     if !(3..=4).contains(&sentences.len()) {
@@ -1606,7 +1617,10 @@ fn lint_prose(page: &Page, root: &Path, rep: &mut Report, committed: bool) {
     let strat = strategy(&page.code_facts);
     if let Some(risk) = &prose.passthrough_risk {
         if !PASSTHROUGH_RISKS.contains(&risk.as_str()) {
-            rep.err("P36", format!("`passthrough_risk` {risk:?} is not one of {PASSTHROUGH_RISKS:?}"));
+            rep.err(
+                "P36",
+                format!("`passthrough_risk` {risk:?} is not one of {PASSTHROUGH_RISKS:?}"),
+            );
         }
         if strat != "passthrough" {
             rep.err("P36", "`passthrough_risk` on a non-passthrough page");
@@ -1641,19 +1655,23 @@ fn lint_prose(page: &Page, root: &Path, rep: &mut Report, committed: bool) {
     let refs = footnote_refs(&body);
     for id in &refs {
         if !defs.contains_key(id) {
-            rep.err("P38", format!("footnote [^{id}] is referenced but not defined"));
+            rep.err(
+                "P38",
+                format!("footnote [^{id}] is referenced but not defined"),
+            );
         }
     }
     for id in defs.keys() {
         if !refs.contains(id) {
-            rep.err("P38", format!("footnote [^{id}] is defined but never referenced"));
+            rep.err(
+                "P38",
+                format!("footnote [^{id}] is defined but never referenced"),
+            );
         }
     }
     // Snapshot state for this page, if a citations snapshot exists.
     let snapshot = load_snapshot(root);
-    let snap_entry = snapshot
-        .as_ref()
-        .and_then(|s| s.get(&page.syscall));
+    let snap_entry = snapshot.as_ref().and_then(|s| s.get(&page.syscall));
     if committed && snapshot.is_none() {
         rep.err(
             "P38",
@@ -1732,10 +1750,7 @@ fn lint_prose(page: &Page, root: &Path, rep: &mut Report, committed: bool) {
     } else if committed {
         rep.err(
             "P38",
-            format!(
-                "no citations.json entry for {}; run `anchor`",
-                page.syscall
-            ),
+            format!("no citations.json entry for {}; run `anchor`", page.syscall),
         );
     }
     // Coverage runs part by part. The Tests part is exempt only for
@@ -1828,10 +1843,16 @@ fn lint_prose(page: &Page, root: &Path, rep: &mut Report, committed: bool) {
     let lower = body.to_lowercase();
     let f = &page.code_facts;
     if lower.contains("not subscribed") && (f.subscribed_run || f.subscribed_record_replay) {
-        rep.err("P42", "prose says `not subscribed` but a subscription fact is true");
+        rep.err(
+            "P42",
+            "prose says `not subscribed` but a subscription fact is true",
+        );
     }
     if lower.contains("subscribed in both") && !(f.subscribed_run && f.subscribed_record_replay) {
-        rep.err("P42", "prose says `subscribed in both` but a subscription fact is false");
+        rep.err(
+            "P42",
+            "prose says `subscribed in both` but a subscription fact is false",
+        );
     }
     // P43: named tests exist and exercise this syscall (or, in
     // committed mode, match the snapshot's record of them).
@@ -2129,7 +2150,12 @@ fn lint_page(name_hint: &str, text: &str, root: &Path) -> (Report, Option<Page>)
     lint_page_committed(name_hint, text, root, false)
 }
 
-fn lint_page_committed(name_hint: &str, text: &str, root: &Path, committed: bool) -> (Report, Option<Page>) {
+fn lint_page_committed(
+    name_hint: &str,
+    text: &str,
+    root: &Path,
+    committed: bool,
+) -> (Report, Option<Page>) {
     let mut rep = Report::new();
     for hit in scrub_findings(text) {
         rep.err(
@@ -3513,7 +3539,10 @@ fn load_pages(root: &Path) -> Vec<(String, String, Report, Option<Page>)> {
     load_pages_committed(root, false)
 }
 
-fn load_pages_committed(root: &Path, committed: bool) -> Vec<(String, String, Report, Option<Page>)> {
+fn load_pages_committed(
+    root: &Path,
+    committed: bool,
+) -> Vec<(String, String, Report, Option<Page>)> {
     let dir = root.join(PAGES_DIR);
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -3655,7 +3684,10 @@ fn index_md(pages: &[Page], sha: &str) -> String {
     let _ = writeln!(s, "| **total** | **{}** |", pages.len());
     let _ = writeln!(s);
     if any_prose {
-        let _ = writeln!(s, "| syscall | nr | strategy | dispatch | prose | discussion |");
+        let _ = writeln!(
+            s,
+            "| syscall | nr | strategy | dispatch | prose | discussion |"
+        );
         let _ = writeln!(s, "|---|---:|---|---|---|---|");
     } else {
         let _ = writeln!(s, "| syscall | nr | strategy | dispatch | discussion |");
@@ -3671,7 +3703,11 @@ fn index_md(pages: &[Page], sha: &str) -> String {
                 p.nr_x86_64,
                 strategy(&p.code_facts),
                 p.code_facts.dispatch,
-                if p.prose.is_some() { "checked" } else { "facts only" },
+                if p.prose.is_some() {
+                    "checked"
+                } else {
+                    "facts only"
+                },
                 p.discussion_kind,
                 p.discussion_url
             );
@@ -4156,152 +4192,153 @@ fn cmd_check(root: &Path, quick: bool, committed: bool) -> i32 {
         // Committed mode skips this derivation entirely: comparing the
         // committed facts against live Detcore is the soft gate's job.
         if !committed {
-        match census_at(root) {
-            Err(e) => {
-                eprintln!("check: census parser-failed: {e}");
-                rc = 1;
-            }
-            Ok(census) => {
-                let page_names: BTreeSet<String> =
-                    pages.iter().map(|p| p.syscall.clone()).collect();
-                for name in census.classes.keys() {
-                    if !page_names.contains(name) {
-                        eprintln!("check: {name}: in Detcore census but has no page");
-                        rc = 1;
-                    }
+            match census_at(root) {
+                Err(e) => {
+                    eprintln!("check: census parser-failed: {e}");
+                    rc = 1;
                 }
-                for p in &pages {
-                    let Some((class, class_line)) = census.classes.get(&p.syscall) else {
-                        eprintln!("check: {}: page is not in Detcore census", p.syscall);
-                        rc = 1;
-                        continue;
-                    };
-                    if &p.code_facts.detcore_class != class {
-                        eprintln!(
-                            "check: {}: detcore_class {} disagrees with census {class}",
-                            p.syscall, p.code_facts.detcore_class
-                        );
-                        rc = 1;
-                    }
-                    if p.nr_x86_64 > census.last_id {
-                        eprintln!(
-                            "check: {}: nr_x86_64 {} exceeds census last id {}",
-                            p.syscall, p.nr_x86_64, census.last_id
-                        );
-                        rc = 1;
-                    }
-                    let strategy_text = p.sections.get("Strategy").cloned().unwrap_or_default();
-                    let want_cite = format!("detcore/src/syscall_classification.rs:{class_line}");
-                    if !strategy_text.contains(&want_cite) {
-                        eprintln!(
-                            "check: {}: Strategy does not cite its classification at {want_cite}",
-                            p.syscall
-                        );
-                        rc = 1;
-                    }
-                }
-                let mut nrs: BTreeMap<i32, String> = BTreeMap::new();
-                for p in &pages {
-                    if let Some(other) = nrs.insert(p.nr_x86_64, p.syscall.clone()) {
-                        eprintln!(
-                            "check: nr_x86_64 {} is claimed by both {other} and {}",
-                            p.nr_x86_64, p.syscall
-                        );
-                        rc = 1;
-                    }
-                }
-                // Source-derived refused/subscription facts are compared
-                // too: deriving them at generation time but never
-                // re-checking them is how a missed subscription list
-                // shipped a wrong `access` fact. The independent cfg-list
-                // scan below is a second read of that same class.
-                let lib_src = read(&root.join("detcore/src/lib.rs"));
-                let cls_src = read(&root.join("detcore/src/syscall_classification.rs"));
-                match source_fact_rows(&lib_src, &cls_src, &census) {
-                    Ok(rows) => {
-                        for p in &pages {
-                            let Some(row) = rows.get(&p.syscall) else {
-                                continue;
-                            };
-                            let f = &p.code_facts;
-                            if f.refused != row.refused
-                                || f.refused_only_when_fail_closed
-                                    != row.refused_only_when_fail_closed
-                                || f.subscribed_run != row.subscribed_run
-                                || f.subscribed_record_replay != row.subscribed_record_replay
-                            {
-                                eprintln!(
-                                    "check: {}: refused/subscription facts disagrees with source derivation (refused {}, strict {}, run {}, record/replay {})",
-                                    p.syscall,
-                                    row.refused,
-                                    row.refused_only_when_fail_closed,
-                                    row.subscribed_run,
-                                    row.subscribed_record_replay
-                                );
-                                rc = 1;
-                            }
+                Ok(census) => {
+                    let page_names: BTreeSet<String> =
+                        pages.iter().map(|p| p.syscall.clone()).collect();
+                    for name in census.classes.keys() {
+                        if !page_names.contains(name) {
+                            eprintln!("check: {name}: in Detcore census but has no page");
+                            rc = 1;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("check: {e}");
-                        rc = 1;
-                    }
-                }
-                for name in x86_cfg_subscription_names(&lib_src) {
-                    if let Some(p) = pages.iter().find(|p| p.syscall == name) {
-                        if p.code_facts.detcore_class == "passthrough"
-                            && !p.code_facts.subscribed_record_replay
-                        {
+                    for p in &pages {
+                        let Some((class, class_line)) = census.classes.get(&p.syscall) else {
+                            eprintln!("check: {}: page is not in Detcore census", p.syscall);
+                            rc = 1;
+                            continue;
+                        };
+                        if &p.code_facts.detcore_class != class {
                             eprintln!(
-                                "check: {name}: x86_64 subscription list subscribes it under passthru_opt but page says subscribed_record_replay: false"
+                                "check: {}: detcore_class {} disagrees with census {class}",
+                                p.syscall, p.code_facts.detcore_class
+                            );
+                            rc = 1;
+                        }
+                        if p.nr_x86_64 > census.last_id {
+                            eprintln!(
+                                "check: {}: nr_x86_64 {} exceeds census last id {}",
+                                p.syscall, p.nr_x86_64, census.last_id
+                            );
+                            rc = 1;
+                        }
+                        let strategy_text = p.sections.get("Strategy").cloned().unwrap_or_default();
+                        let want_cite =
+                            format!("detcore/src/syscall_classification.rs:{class_line}");
+                        if !strategy_text.contains(&want_cite) {
+                            eprintln!(
+                                "check: {}: Strategy does not cite its classification at {want_cite}",
+                                p.syscall
                             );
                             rc = 1;
                         }
                     }
-                }
-                let classes: BTreeMap<String, String> = census
-                    .classes
-                    .iter()
-                    .map(|(k, (v, _))| (k.clone(), v.clone()))
-                    .collect();
-                let dispatch = dispatch_at(root, &classes);
-                if dispatch.status != "ok" {
-                    eprintln!(
-                        "check: dispatch parser-failed: {}",
-                        dispatch.errors.join("; ")
-                    );
-                    rc = 1;
-                } else {
-                    for name in &dispatch.missing_arm {
-                        eprintln!("check: {name}: determinized but reaches the fallback arm");
-                        rc = 1;
-                    }
+                    let mut nrs: BTreeMap<i32, String> = BTreeMap::new();
                     for p in &pages {
-                        if let Some(d) = dispatch.dispatch.get(&p.syscall) {
-                            if d != &p.code_facts.dispatch {
+                        if let Some(other) = nrs.insert(p.nr_x86_64, p.syscall.clone()) {
+                            eprintln!(
+                                "check: nr_x86_64 {} is claimed by both {other} and {}",
+                                p.nr_x86_64, p.syscall
+                            );
+                            rc = 1;
+                        }
+                    }
+                    // Source-derived refused/subscription facts are compared
+                    // too: deriving them at generation time but never
+                    // re-checking them is how a missed subscription list
+                    // shipped a wrong `access` fact. The independent cfg-list
+                    // scan below is a second read of that same class.
+                    let lib_src = read(&root.join("detcore/src/lib.rs"));
+                    let cls_src = read(&root.join("detcore/src/syscall_classification.rs"));
+                    match source_fact_rows(&lib_src, &cls_src, &census) {
+                        Ok(rows) => {
+                            for p in &pages {
+                                let Some(row) = rows.get(&p.syscall) else {
+                                    continue;
+                                };
+                                let f = &p.code_facts;
+                                if f.refused != row.refused
+                                    || f.refused_only_when_fail_closed
+                                        != row.refused_only_when_fail_closed
+                                    || f.subscribed_run != row.subscribed_run
+                                    || f.subscribed_record_replay != row.subscribed_record_replay
+                                {
+                                    eprintln!(
+                                        "check: {}: refused/subscription facts disagrees with source derivation (refused {}, strict {}, run {}, record/replay {})",
+                                        p.syscall,
+                                        row.refused,
+                                        row.refused_only_when_fail_closed,
+                                        row.subscribed_run,
+                                        row.subscribed_record_replay
+                                    );
+                                    rc = 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("check: {e}");
+                            rc = 1;
+                        }
+                    }
+                    for name in x86_cfg_subscription_names(&lib_src) {
+                        if let Some(p) = pages.iter().find(|p| p.syscall == name) {
+                            if p.code_facts.detcore_class == "passthrough"
+                                && !p.code_facts.subscribed_record_replay
+                            {
                                 eprintln!(
-                                    "check: {}: dispatch {} disagrees with source parse {d}",
-                                    p.syscall, p.code_facts.dispatch
+                                    "check: {name}: x86_64 subscription list subscribes it under passthru_opt but page says subscribed_record_replay: false"
                                 );
                                 rc = 1;
                             }
                         }
-                        if let Some(line) = dispatch.lines.get(&p.syscall) {
-                            let strategy_text =
-                                p.sections.get("Strategy").cloned().unwrap_or_default();
-                            let want_cite = format!("detcore/src/lib.rs:{line}");
-                            if !strategy_text.contains(&want_cite) {
-                                eprintln!(
-                                    "check: {}: Strategy does not cite its dispatch at {want_cite}",
-                                    p.syscall
-                                );
-                                rc = 1;
+                    }
+                    let classes: BTreeMap<String, String> = census
+                        .classes
+                        .iter()
+                        .map(|(k, (v, _))| (k.clone(), v.clone()))
+                        .collect();
+                    let dispatch = dispatch_at(root, &classes);
+                    if dispatch.status != "ok" {
+                        eprintln!(
+                            "check: dispatch parser-failed: {}",
+                            dispatch.errors.join("; ")
+                        );
+                        rc = 1;
+                    } else {
+                        for name in &dispatch.missing_arm {
+                            eprintln!("check: {name}: determinized but reaches the fallback arm");
+                            rc = 1;
+                        }
+                        for p in &pages {
+                            if let Some(d) = dispatch.dispatch.get(&p.syscall) {
+                                if d != &p.code_facts.dispatch {
+                                    eprintln!(
+                                        "check: {}: dispatch {} disagrees with source parse {d}",
+                                        p.syscall, p.code_facts.dispatch
+                                    );
+                                    rc = 1;
+                                }
+                            }
+                            if let Some(line) = dispatch.lines.get(&p.syscall) {
+                                let strategy_text =
+                                    p.sections.get("Strategy").cloned().unwrap_or_default();
+                                let want_cite = format!("detcore/src/lib.rs:{line}");
+                                if !strategy_text.contains(&want_cite) {
+                                    eprintln!(
+                                        "check: {}: Strategy does not cite its dispatch at {want_cite}",
+                                        p.syscall
+                                    );
+                                    rc = 1;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
         }
         if committed {
             println!(
@@ -4876,7 +4913,11 @@ fn site_index_html(pages: &[Page], sha: &str) -> String {
                 p.nr_x86_64,
                 html_escape(strategy(&p.code_facts)),
                 html_escape(&p.code_facts.dispatch),
-                if p.prose.is_some() { "checked" } else { "facts only" },
+                if p.prose.is_some() {
+                    "checked"
+                } else {
+                    "facts only"
+                },
                 html_escape(&p.discussion_url),
                 html_escape(&p.discussion_kind),
             );
@@ -5080,9 +5121,7 @@ fn cmd_report(root: &Path) -> i32 {
     );
     let lagging: Vec<&Page> = checked
         .iter()
-        .filter(|p| {
-            p.prose.as_ref().expect("checked page").based_on != p.code_facts.as_of
-        })
+        .filter(|p| p.prose.as_ref().expect("checked page").based_on != p.code_facts.as_of)
         .copied()
         .collect();
     if !lagging.is_empty() {
@@ -5183,13 +5222,17 @@ fn cmd_wave(root: &Path, args: &[String]) -> i32 {
     let loaded = load_pages(root);
     let _ = print_reports(&loaded);
     let pages = sorted_pages(&good_pages(&loaded));
-    let changed_files: Vec<String> = match run_cmd(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["diff", "--name-only", from.as_str(), to.as_str()]),
-    ) {
-        Ok(s) => s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+    let changed_files: Vec<String> = match run_cmd(Command::new("git").arg("-C").arg(root).args([
+        "diff",
+        "--name-only",
+        from.as_str(),
+        to.as_str(),
+    ])) {
+        Ok(s) => s
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
         Err(e) => fail(&format!("wave: {e}")),
     };
     let changed: BTreeSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
@@ -5201,9 +5244,7 @@ fn cmd_wave(root: &Path, args: &[String]) -> i32 {
             cited_paths_all.insert(cite.path);
         }
     }
-    let watched = |f: &str| {
-        cited_paths_all.contains(f) || f.starts_with("detcore/src/syscalls/")
-    };
+    let watched = |f: &str| cited_paths_all.contains(f) || f.starts_with("detcore/src/syscalls/");
     let outside: Vec<&str> = changed_files
         .iter()
         .map(|s| s.as_str())
@@ -5212,19 +5253,14 @@ fn cmd_wave(root: &Path, args: &[String]) -> i32 {
     // Name mentions in the Detcore diff (over-approximate on purpose).
     // A failed diff is fatal, exactly like the name-only call above:
     // degrading to an empty diff would silently drop candidates.
-    let diff_text = match run_cmd(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args([
-                "diff",
-                "--unified=0",
-                from.as_str(),
-                to.as_str(),
-                "--",
-                "detcore/src",
-            ]),
-    ) {
+    let diff_text = match run_cmd(Command::new("git").arg("-C").arg(root).args([
+        "diff",
+        "--unified=0",
+        from.as_str(),
+        to.as_str(),
+        "--",
+        "detcore/src",
+    ])) {
         Ok(s) => s,
         Err(e) => fail(&format!("wave: {e}")),
     };
@@ -5608,8 +5644,8 @@ mod tests {
     /// A temp tree holding one fake cited file, plus a v3 page whose
     /// prose cites it with the correct anchor hash.
     fn prose_fixture(tag: &str) -> (PathBuf, Page) {
-        let root = std::env::temp_dir()
-            .join(format!("syscall-pages-test-{}-{tag}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("syscall-pages-test-{}-{tag}", std::process::id()));
         let dir = root.join("detcore/src/syscalls");
         fs::create_dir_all(&dir).expect("temp tree");
         let code = "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() { let _ = handle_read(); }\n#[test]\nfn unrelated_probe_test() { let _ = Some(Err(Errno::EINVAL)); }\n";
@@ -5693,7 +5729,11 @@ mod tests {
             "answers from its file model across 268 cases.",
         );
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P39")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P39")),
+            "{:?}",
+            rep.errors
+        );
         // P41: an absence phrase early in the sentence does not
         // shelter a positive claim later in the same sentence.
         let bad = text.replace(
@@ -5701,27 +5741,51 @@ mod tests {
             "There is no `EINTR` retry; it returns `EINTR` on a signal.[^c1]",
         );
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P41")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P41")),
+            "{:?}",
+            rep.errors
+        );
         // P41: a positively-claimed errno absent from the cited code.
         let bad = text.replace("rejected with `EINVAL`", "rejected with `EACCES`");
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P41")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P41")),
+            "{:?}",
+            rep.errors
+        );
         // P37: a rubric part renamed away.
         let bad = text.replace("**Interface fidelity.**", "**Fidelity.**");
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P37")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P37")),
+            "{:?}",
+            rep.errors
+        );
         // P36: prose under the v2 schema line.
         let bad = text.replace("schema: syscall-pages/v3", "schema: syscall-pages/v2");
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P36")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P36")),
+            "{:?}",
+            rep.errors
+        );
         // P40: part 2 no longer names the derived strategy.
         let bad = text.replace("Detcore determinizes the call", "Detcore handles the call");
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P40")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P40")),
+            "{:?}",
+            rep.errors
+        );
         // P43: a named test that does not exist in the cited file.
         let bad = text.replace("`read_einval_test`", "`read_missing_test`");
         let (rep, _) = lint_page("read", &bad, &root);
-        assert!(rep.errors.iter().any(|e| e.starts_with("P43")), "{:?}", rep.errors);
+        assert!(
+            rep.errors.iter().any(|e| e.starts_with("P43")),
+            "{:?}",
+            rep.errors
+        );
         // P46: the GitHub link is a copy of the citation range; a
         // stale anchor fails in exact mode and in committed (hard)
         // mode, where no Detcore file is read. The citation triple
@@ -5763,7 +5827,10 @@ mod tests {
         page.discussion_url = github_discussion_new_url("read", revision);
         page.sections.insert(
             "Discussion".into(),
-            format!("\n[Start a discussion]({}) (prefilled form).\n", page.discussion_url),
+            format!(
+                "\n[Start a discussion]({}) (prefilled form).\n",
+                page.discussion_url
+            ),
         );
         let (rep, _) = lint_page("read", &emit_page(&page), Path::new("."));
         assert!(
@@ -5849,7 +5916,11 @@ mod tests {
             "subscribed-in-both claim against a false fact",
         );
         // P36 stamp and triage sub-rules.
-        has(&text.replace("status: checked", "status: draft"), "P36", "status");
+        has(
+            &text.replace("status: checked", "status: draft"),
+            "P36",
+            "status",
+        );
         has(
             &text.replace(&format!("based_on: {based_on}"), "based_on: xyz"),
             "P36",
@@ -5902,7 +5973,11 @@ mod tests {
             "empty part",
         );
         // P38 reference integrity and range handling.
-        has(&text.replace("file model.[^c1]", "file model.[^c1][^c9]"), "P38", "undefined ref");
+        has(
+            &text.replace("file model.[^c1]", "file model.[^c1][^c9]"),
+            "P38",
+            "undefined ref",
+        );
         has(
             &text.replace(
                 "file model.[^c1]",
@@ -5929,12 +6004,20 @@ mod tests {
             "tests path escapes the tree",
         );
         has(
-            &text.replacen("detcore/src/syscalls/fake.rs:1-3", "detcore/src/syscalls/nope.rs:1-3", 1),
+            &text.replacen(
+                "detcore/src/syscalls/fake.rs:1-3",
+                "detcore/src/syscalls/nope.rs:1-3",
+                1,
+            ),
             "P38",
             "missing cited file",
         );
         has(
-            &text.replacen("detcore/src/syscalls/fake.rs:1-3", "detcore/src/syscalls/fake.rs:1-99", 1),
+            &text.replacen(
+                "detcore/src/syscalls/fake.rs:1-3",
+                "detcore/src/syscalls/fake.rs:1-99",
+                1,
+            ),
             "P38",
             "range past end of file",
         );
@@ -5945,14 +6028,26 @@ mod tests {
             "untagged linux link",
         );
         // P40 arms beyond determinized.
-        has(&text.replacen("refused: false", "refused: true", 1), "P40", "refused arm");
         has(
-            &text.replacen("detcore_class: determinized", "detcore_class: passthrough", 1),
+            &text.replacen("refused: false", "refused: true", 1),
+            "P40",
+            "refused arm",
+        );
+        has(
+            &text.replacen(
+                "detcore_class: determinized",
+                "detcore_class: passthrough",
+                1,
+            ),
             "P40",
             "passthrough arm",
         );
         has(
-            &text.replacen("detcore_class: determinized", "detcore_class: unsupported", 1),
+            &text.replacen(
+                "detcore_class: determinized",
+                "detcore_class: unsupported",
+                1,
+            ),
             "P40",
             "unsupported arm",
         );
@@ -5976,7 +6071,11 @@ mod tests {
             "P05",
             "unknown prose key",
         );
-        has(&text.replace("  status: checked\n", ""), "P05", "missing prose status");
+        has(
+            &text.replace("  status: checked\n", ""),
+            "P05",
+            "missing prose status",
+        );
         // P36 stamp shapes not covered above.
         has(
             &text.replace("reviewed_at: 2026-11-16", "reviewed_at: 16 Nov 2026"),
@@ -5992,8 +6091,7 @@ mod tests {
             "illegal passthrough_risk value",
         );
         // P38: unreferenced definition, linkless linux note, triple-free note.
-        let code =
-            "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() {}\n";
+        let code = "pub fn handle_read() -> Result<(), Errno> {\n    Err(Errno::EINVAL.into())\n}\n#[test]\nfn read_einval_test() {}\n";
         let hash = sha256_hex16(&lines_bytes(code.as_bytes(), 1, 3).expect("lines"));
         has(
             &text.replace(
@@ -6110,7 +6208,10 @@ mod tests {
             "stated gap count disagrees with the bullets",
         );
         has45(
-            &text.replace("Native reads return host file contents.", "Native reads return host file contents.[^c1]"),
+            &text.replace(
+                "Native reads return host file contents.",
+                "Native reads return host file contents.[^c1]",
+            ),
             "citation inside In short",
         );
         has45(
@@ -6128,7 +6229,8 @@ mod tests {
         // also occurs in prose part 1, where P39 would fire anyway
         // and the twin could not tell the two scans apart.
         assert_eq!(
-            text.matches("Native reads return host file contents.").count(),
+            text.matches("Native reads return host file contents.")
+                .count(),
             1,
             "twin mutation target must be unique to In short"
         );
@@ -6153,11 +6255,17 @@ mod tests {
                 "Appendix preamble text",
             ),
             (
-                text.replace("### Tests\n", "### Notes\n\nStray unlinted text.\n\n### Tests\n"),
+                text.replace(
+                    "### Tests\n",
+                    "### Notes\n\nStray unlinted text.\n\n### Tests\n",
+                ),
                 "unknown Appendix subsection",
             ),
             (
-                text.replace("### Citations\n", "### Tests\n\nDuplicate body.\n\n### Citations\n"),
+                text.replace(
+                    "### Citations\n",
+                    "### Tests\n\nDuplicate body.\n\n### Citations\n",
+                ),
                 "duplicate Appendix subsection",
             ),
         ] {
@@ -6200,7 +6308,9 @@ mod tests {
         );
         let (rep, _) = lint_page("read", &text, &root);
         assert!(
-            rep.errors.iter().any(|e| e.starts_with("P38") || e.starts_with("P43")),
+            rep.errors
+                .iter()
+                .any(|e| e.starts_with("P38") || e.starts_with("P43")),
             "exact mode must report the same edits as drift: {:?}",
             rep.errors
         );
@@ -6310,8 +6420,11 @@ mod tests {
         // names the old one, which must stop counting as existing.
         let fake = root.join("detcore/src/syscalls/fake.rs");
         let code = fs::read_to_string(&fake).expect("fixture file");
-        fs::write(&fake, code.replace("read_einval_test", "read_einval_test_v2"))
-            .expect("rename fixture test");
+        fs::write(
+            &fake,
+            code.replace("read_einval_test", "read_einval_test_v2"),
+        )
+        .expect("rename fixture test");
         let (rep, _) = lint_page("read", &text, &root);
         assert!(
             rep.errors.iter().any(|e| e.starts_with("P43")),
@@ -6325,8 +6438,14 @@ mod tests {
     fn p43_relevance_extent_and_tokens() {
         // Round-2 shape one: the token sits in the NEXT function,
         // inside the old fixed window but outside this test's extent.
-        let spill = "fn wrong_test() { let x = 1; }\nfn helper_after() { unsafe { libc::mprotect(p) } }\n";
-        assert!(!test_fn_relevant(spill, "wrong_test", "mprotect", &BTreeSet::new()));
+        let spill =
+            "fn wrong_test() { let x = 1; }\nfn helper_after() { unsafe { libc::mprotect(p) } }\n";
+        assert!(!test_fn_relevant(
+            spill,
+            "wrong_test",
+            "mprotect",
+            &BTreeSet::new()
+        ));
         // Round-2 shape two: the syscall name inside the test's own
         // name is not a whole-word mention.
         let named = "fn successful_time_store_probe() { assert!(true); }";
@@ -6341,16 +6460,27 @@ mod tests {
         let comp = "fn timex_query_test() { assert!(timex_mode_is_query(0)); }";
         let mut cited = BTreeSet::new();
         cited.insert("timex_mode_is_query".to_string());
-        assert!(test_fn_relevant(comp, "timex_query_test", "adjtimex", &cited));
+        assert!(test_fn_relevant(
+            comp,
+            "timex_query_test",
+            "adjtimex",
+            &cited
+        ));
         // One same-file helper level reaches the token (the fixed
         // mprotect citation's shape).
         let two = "fn real_test() { page_before_a_hole(0); }\nfn page_before_a_hole(p: i32) { unsafe { libc::mprotect(p) } }";
-        assert!(test_fn_relevant(two, "real_test", "mprotect", &BTreeSet::new()));
+        assert!(test_fn_relevant(
+            two,
+            "real_test",
+            "mprotect",
+            &BTreeSet::new()
+        ));
     }
 
     #[test]
     fn prose_helpers_negative_claims_and_words() {
-        let claims = negative_claims("It never blocks. It sometimes waits. There is no EINTR path.");
+        let claims =
+            negative_claims("It never blocks. It sometimes waits. There is no EINTR path.");
         assert_eq!(claims.len(), 2, "{claims:?}");
         // The markers a seat read found missing: each must be caught.
         let marked = negative_claims(
@@ -6372,7 +6502,10 @@ mod tests {
         assert!(json.contains("\"syscalls.json/v3\""), "{json}");
         assert!(json.contains("\"prose_status\": \"checked\""), "{json}");
         assert!(json.contains("\"prose_status\": \"none\""), "{json}");
-        assert!(index_md(&pages, sha).contains("| checked |"), "index prose column");
+        assert!(
+            index_md(&pages, sha).contains("| checked |"),
+            "index prose column"
+        );
         let html = site_page_html(&page);
         assert!(html.contains("<h2>Determinism strategy</h2>"), "{html}");
         assert!(html.contains("prose checked 2026-11-16"), "{html}");

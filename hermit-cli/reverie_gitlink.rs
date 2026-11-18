@@ -52,8 +52,7 @@ fn reverie_checkout_head(root: &std::path::Path) -> Option<String> {
     if !submodule.join(".git").exists() {
         return None;
     }
-    pin_git(&submodule, &["rev-parse", "HEAD"])
-        .and_then(|text| pin_full_sha(text.trim()))
+    pin_git(&submodule, &["rev-parse", "HEAD"]).and_then(|text| pin_full_sha(text.trim()))
 }
 
 /// The pin recorded by the Eden/Sapling marker, `reverie.submodule.txt`

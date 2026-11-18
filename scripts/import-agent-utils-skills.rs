@@ -46,10 +46,7 @@ fn resolve_commit(checkout: &Path, revision: &str) -> Result<String, String> {
         .map_err(|error| format!("cannot run git: {error}"))?;
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !output.status.success() || commit.len() != 40 {
-        return Err(format!(
-            "{} has no commit {revision}",
-            checkout.display()
-        ));
+        return Err(format!("{} has no commit {revision}", checkout.display()));
     }
     Ok(commit)
 }

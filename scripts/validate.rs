@@ -496,7 +496,9 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             || !unified.contains("--profile validate --workspace --all-targets")
             || !unified.contains(expected_feature_argument)
             || source.contains("--bin hermit")
-            || !source.contains("./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace")
+            || !source.contains(
+                "./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace",
+            )
             || source.contains("third-party-backends")
             || source.contains("run-with-reverie-dbt-budget.sh")
             || !source.contains("HERMIT_INSTALL_FORCE_RESTAGE=")
@@ -560,10 +562,8 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             // node (which now depends on the publisher) must still gate the
             // snapshot against the final staged tree before any prepared
             // consumer runs.
-            let compile_tag =
-                hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG;
-            let prepare_tag =
-                hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG;
+            let compile_tag = hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG;
+            let prepare_tag = hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG;
             let artifact_name = hermit_manifest_plan::validation_dag::HERMIT_BIN_ARTIFACT;
             let compile = step(compile_tag)?;
             let prepare = step(prepare_tag)?;
@@ -582,10 +582,7 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                     .deps
                     .iter()
                     .any(|dependency| dependency == prepare_tag)
-                || !prepare
-                    .deps
-                    .iter()
-                    .any(|dependency| dependency == tag)
+                || !prepare.deps.iter().any(|dependency| dependency == tag)
                 || !prepare_source.contains("./ci/verify-early-hermit-e2e-artifact.sh")
             {
                 return Err(
@@ -670,15 +667,14 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
         .cmd
         .contains("${HERMIT_VALIDATE_BUILD_MODE:-cargo}")
         || !reverie_buck.cmd.contains("cargo) : ;;")
-        || !reverie_buck.cmd.contains("buck) ./ci/harvest-reverie-buck.sh ;;")
+        || !reverie_buck
+            .cmd
+            .contains("buck) ./ci/harvest-reverie-buck.sh ;;")
         || !reverie_buck
             .cmd
             .contains("*) echo \"unknown Hermit build mode:")
         || reverie_buck.cmd.contains("not wired yet")
-        || !reverie_buck
-            .deps
-            .iter()
-            .any(|dep| dep == "gate.manifest")
+        || !reverie_buck.deps.iter().any(|dep| dep == "gate.manifest")
         || reverie_buck
             .deps
             .iter()
@@ -697,7 +693,11 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
 /// the portable frozen closure), so only a constructed Buck plan gets
 /// the step and the dependency.
 fn apply_buck_build_ordering(cfg: &mut DagConfig, committed: &DagConfig) -> Result<(), String> {
-    if !cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck") {
+    if !cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == "build.reverie_buck")
+    {
         let bracket = committed
             .steps
             .iter()
@@ -740,11 +740,12 @@ mod artifact_plan_tests {
             "committed pinned prepare must not depend on build.reverie_buck"
         );
         let mut cfg = committed.clone();
-        cfg.steps
-            .retain(|step| step.tag() != "build.reverie_buck");
+        cfg.steps.retain(|step| step.tag() != "build.reverie_buck");
         apply_buck_build_ordering(&mut cfg, &committed).unwrap();
         assert!(
-            cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck"),
+            cfg.steps
+                .iter()
+                .any(|step| step.tag() == "build.reverie_buck"),
             "constructed Buck plan must contain the host harvest"
         );
         let prepare = cfg
@@ -1648,8 +1649,7 @@ mod build_mode_environment_tests {
         assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
         assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         // An unknown build mode is refused by name too.
-        let error =
-            establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
+        let error = establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
         assert!(error.contains(BUILD_MODE_ENV), "{error}");
         assert!(
             error.contains("cargo and buck are the supported build modes"),
@@ -1659,8 +1659,7 @@ mod build_mode_environment_tests {
         let error =
             establish_build_mode_environment(None, Some(BUILD_MODE_BUCK.into())).unwrap_err();
         assert!(error.contains(RUN_MODE_ENV), "{error}");
-        let error =
-            establish_build_mode_environment(None, Some("banana".into())).unwrap_err();
+        let error = establish_build_mode_environment(None, Some("banana".into())).unwrap_err();
         assert!(error.contains(RUN_MODE_ENV), "{error}");
         // Restore the process environment: these variables are global, and
         // other tests in this process read them (prepare reads
@@ -1672,7 +1671,8 @@ mod build_mode_environment_tests {
         // focused profile refuses by name, and cargo is admitted in
         // every selection.
         for level in [Level::Quick, Level::PortableOnly, Level::Super] {
-            let error = check_build_mode_selection(BUILD_MODE_BUCK, level, None, false).unwrap_err();
+            let error =
+                check_build_mode_selection(BUILD_MODE_BUCK, level, None, false).unwrap_err();
             assert!(error.contains(level.name()), "{error}");
             assert!(error.contains("only at the full level"), "{error}");
             check_build_mode_selection(BUILD_MODE_CARGO, level, None, false).unwrap();
@@ -1691,8 +1691,7 @@ mod build_mode_environment_tests {
             // is admitted in either mode: run-split-validate's fetch phase
             // and check-shard-coverage probe the hosted plan this way from
             // inside a buck run's own nodes.
-            check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), true)
-                .unwrap();
+            check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), true).unwrap();
         }
         // Parser to policy: the focused flags parse with the default full
         // level, so the refusal must come from the focused selection, not
@@ -1733,24 +1732,24 @@ mod build_mode_environment_tests {
             hosted_probe.show_plan,
         )
         .unwrap();
-        assert!(check_build_mode_selection(
-            BUILD_MODE_BUCK,
-            hosted_probe.level,
-            hosted_probe.focused.as_ref(),
-            false,
-        )
-        .is_err());
+        assert!(
+            check_build_mode_selection(
+                BUILD_MODE_BUCK,
+                hosted_probe.level,
+                hosted_probe.focused.as_ref(),
+                false,
+            )
+            .is_err()
+        );
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             for name in [BUILD_MODE_ENV, RUN_MODE_ENV] {
-                let error = ambient_mode_value(
-                    name,
-                    Some(std::ffi::OsString::from_vec(vec![0xff])),
-                )
-                .unwrap_err();
+                let error =
+                    ambient_mode_value(name, Some(std::ffi::OsString::from_vec(vec![0xff])))
+                        .unwrap_err();
                 assert!(error.contains(name), "{error}");
                 if name == RUN_MODE_ENV {
                     assert!(
@@ -5191,7 +5190,9 @@ fn self_test() -> Result<(), String> {
     let mismatch_path = service_result_dir.path().join("mismatch.json");
     let mismatch_error = write_validation_service_result(&mismatch_path, &service_summary)
         .expect_err("a successful service result must reject a mismatched passed count");
-    if !mismatch_error.contains("passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests") {
+    if !mismatch_error
+        .contains("passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests")
+    {
         return Err(format!(
             "summary: service result did not refuse a mismatched passed count: {mismatch_error}"
         ));
@@ -6144,10 +6145,7 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .find(|s| {
-                s.tag()
-                    == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG
-            })
+            .find(|s| s.tag() == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG)
             .ok_or("full-plan bracket: workspace preparation disappeared")?;
         // The barrier is two-part since the early publisher: the publisher
         // snapshots the signalled binary, then preparation (which depends on
@@ -6162,17 +6160,12 @@ cleared-caps refusal names {} starved step(s)",
                 .any(|actual| actual == "build.buck_release_artifact")
             || artifact.artifact_deps
                 != [dagrun::model::ArtifactDep {
-                    step: hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG
-                        .into(),
+                    step: hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG.into(),
                     artifact: hermit_manifest_plan::validation_dag::HERMIT_BIN_ARTIFACT.into(),
                 }]
-            || artifact
-                .deps
-                .iter()
-                .any(|actual| {
-                    actual
-                        == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG
-                })
+            || artifact.deps.iter().any(|actual| {
+                actual == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG
+            })
             || !prepare_step
                 .deps
                 .iter()
@@ -7265,8 +7258,17 @@ fn default_mode_bracket() -> Result<(), String> {
     {
         return Err("default mode: a selective pass answered a full cache lookup".into());
     }
-    if validate_receipt::eligible(0, 0, true, true, false, "selective", RELEASE_BUILDER_CARGO, BUILD_MODE_CARGO)
-        .is_ok()
+    if validate_receipt::eligible(
+        0,
+        0,
+        true,
+        true,
+        false,
+        "selective",
+        RELEASE_BUILDER_CARGO,
+        BUILD_MODE_CARGO,
+    )
+    .is_ok()
     {
         return Err("default mode: a selective pass could mint a full receipt".into());
     }
@@ -8283,12 +8285,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     ])
     .map_err(|code| format!("only bracket: test.cli selection was refused with exit {code}"))?;
     let cli_plan = build_plan(root, &cli_args, &std::env::temp_dir())?;
-    let cli_tags: BTreeSet<String> = cli_plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| step.tag())
-        .collect();
+    let cli_tags: BTreeSet<String> = cli_plan.cfg.steps.iter().map(|step| step.tag()).collect();
     for required in [
         "test.cli",
         "build.e2e_artifact_in_pinned_root",
@@ -12562,9 +12559,8 @@ fn frozen_run_refusal(
     admission_canonical: Option<bool>,
     admission_frozen: Option<bool>,
 ) -> Option<String> {
-    frozen_run_label_refusal(frozen_run, label_pr, no_label_pr_explicit).or_else(|| {
-        frozen_run_admission_refusal(frozen_run, admission_canonical, admission_frozen)
-    })
+    frozen_run_label_refusal(frozen_run, label_pr, no_label_pr_explicit)
+        .or_else(|| frozen_run_admission_refusal(frozen_run, admission_canonical, admission_frozen))
 }
 
 /// The label half of [`frozen_run_refusal`], checked before the product front
@@ -14237,17 +14233,18 @@ fn expected_shared_integration_consumers(
     core_only: bool,
 ) -> Result<Vec<String>, String> {
     let declared: BTreeSet<String> = consumers.iter().map(|tag| (*tag).to_string()).collect();
-    let known = hermit_manifest_plan::dag_source_ownership::source_partition_tags(
-        &[], consumers, false,
-    );
+    let known =
+        hermit_manifest_plan::dag_source_ownership::source_partition_tags(&[], consumers, false);
     if declared.len() != consumers.len() || known != declared {
         return Err(format!(
             "shared integration-test consumers have unknown or duplicate source owners: declared={consumers:?}, known={known:?}"
         ));
     }
-    Ok(consumers.iter()
+    Ok(consumers
+        .iter()
         .filter(|tag| !core_only || hermit_manifest_plan::dag_source_ownership::is_core(tag))
-        .map(|tag| (*tag).to_string()).collect())
+        .map(|tag| (*tag).to_string())
+        .collect())
 }
 
 fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
@@ -14269,13 +14266,17 @@ fn assert_shared_integration_test_consumers_for_owners(
         consumers.iter().any(|tag| tag.starts_with("privileged-"))
             && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
     });
-    let expected = EXPECTED_SHARED_INTEGRATION_TESTS.iter()
+    let expected = EXPECTED_SHARED_INTEGRATION_TESTS
+        .iter()
         .map(|(binary, consumers)| {
             expected_shared_integration_consumers(consumers, core_only)
                 .map(|consumers| (*binary, consumers))
-        }).collect::<Result<Vec<_>, String>>()?;
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if by_binary.len() != EXPECTED_SHARED_INTEGRATION_TESTS.len()
-        || expected.iter().any(|(binary, consumers)| by_binary.get(binary) != Some(consumers))
+        || expected
+            .iter()
+            .any(|(binary, consumers)| by_binary.get(binary) != Some(consumers))
     {
         return Err(format!(
             "committed shared integration-test consumers changed: expected={expected:?}, actual={by_binary:?}"
@@ -14316,7 +14317,9 @@ fn assert_shared_integration_test_serialization_for_owners(
         let resource = format!("integration_test_binaries.{binary}");
         let mut expected: Vec<(String, i64)> =
             expected_shared_integration_consumers(consumers, core_only)?
-                .into_iter().map(|tag| (tag, 1)).collect();
+                .into_iter()
+                .map(|tag| (tag, 1))
+                .collect();
         expected.sort();
         let mut actual: Vec<(String, i64)> = steps
             .iter()
@@ -14649,20 +14652,24 @@ mod case_selection_tests {
 
     #[test]
     fn case_vector_keeps_terminal_attempt_per_node_and_case() {
-        let observation = |node: &str, attempt: usize, id: &str, passed: bool| {
-            TestAttemptObservation {
+        let observation =
+            |node: &str, attempt: usize, id: &str, passed: bool| TestAttemptObservation {
                 node: node.into(),
                 attempt,
                 id: id.into(),
                 passed,
                 inner_attempts: 1,
-            }
-        };
+            };
         let vector = test_case_vector(&[
             observation("test.cli", 1, "hermit-run::cli$flaky", false),
             observation("test.cli", 2, "hermit-run::cli$flaky", true),
             observation("test.cli", 1, "hermit-run::cli$red", false),
-            observation("e2e.manifest_compat", 1, "compat/java [ptrace/verify]", true),
+            observation(
+                "e2e.manifest_compat",
+                1,
+                "compat/java [ptrace/verify]",
+                true,
+            ),
         ]);
         assert_eq!(
             vector,
@@ -14727,7 +14734,10 @@ mod case_selection_tests {
             Err(error) => error,
         };
         assert!(error.contains("privileged-test.pmu_cli_cases"), "{error}");
-        assert!(error.contains("privileged-build.privileged_tests"), "{error}");
+        assert!(
+            error.contains("privileged-build.privileged_tests"),
+            "{error}"
+        );
         assert!(error.contains("setup.pinned_root_fetch"), "{error}");
         assert!(error.contains("tests-portable"), "{error}");
         assert!(error.contains("--selected"), "{error}");
@@ -14810,7 +14820,11 @@ mod case_selection_tests {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         let mut steps = cfg.steps.clone();
         let cases = parse_case_ids(
-            ["test.cli::hermit-run::cli$some_test", "e2e.manifest_compat::compat/java [ptrace/verify]"].into_iter(),
+            [
+                "test.cli::hermit-run::cli$some_test",
+                "e2e.manifest_compat::compat/java [ptrace/verify]",
+            ]
+            .into_iter(),
         )
         .unwrap();
         // The e2e node cannot be sliced yet: the error must name it.
@@ -14818,12 +14832,13 @@ mod case_selection_tests {
         assert!(error.contains("e2e.manifest_compat"), "{error}");
         assert!(error.contains("cannot select cases"), "{error}");
 
-        let cases =
-            parse_case_ids(["test.cli::hermit-run::cli$some_test"].into_iter()).unwrap();
+        let cases = parse_case_ids(["test.cli::hermit-run::cli$some_test"].into_iter()).unwrap();
         inject_case_filters(&mut steps, &cases).unwrap();
         let cli = steps.iter().find(|s| s.tag() == "test.cli").unwrap();
         assert_eq!(
-            cli.env.get("HERMIT_NEXTEST_FILTER_EXPR").map(String::as_str),
+            cli.env
+                .get("HERMIT_NEXTEST_FILTER_EXPR")
+                .map(String::as_str),
             Some("(binary(cli) & test(=some_test))")
         );
         assert_eq!(
@@ -14867,9 +14882,7 @@ fn parse_case_ids<'a>(
             .push(case.to_string());
     }
     if cases.is_empty() {
-        return Err(
-            "no test cases selected; --tests needs at least one node::case ID".to_string(),
-        );
+        return Err("no test cases selected; --tests needs at least one node::case ID".to_string());
     }
     Ok(cases)
 }
@@ -14925,10 +14938,8 @@ fn inject_case_filters(
             };
             exprs.push(expr);
         }
-        step.env.insert(
-            "HERMIT_NEXTEST_FILTER_EXPR".to_string(),
-            exprs.join(" | "),
-        );
+        step.env
+            .insert("HERMIT_NEXTEST_FILTER_EXPR".to_string(), exprs.join(" | "));
         // The counted wrapper refuses when the executed count differs from
         // the expectation, so a case that does not exist in this node fails
         // loudly instead of silently passing with zero tests run.
@@ -15247,11 +15258,8 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
         .filter(|step| tags.contains(&step.tag()))
         .any(|step| step.cmd.contains("HERMIT_PREPARED_NEXTEST_REQUIRED"));
     if consumes_prepared_nextest {
-        let by_tag: std::collections::BTreeMap<String, &Step> = cfg
-            .steps
-            .iter()
-            .map(|step| (step.tag(), step))
-            .collect();
+        let by_tag: std::collections::BTreeMap<String, &Step> =
+            cfg.steps.iter().map(|step| (step.tag(), step)).collect();
         let mut stack: Vec<String> = tags.iter().cloned().collect();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         while let Some(tag) = stack.pop() {
@@ -15390,11 +15398,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         };
         tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let mut cfg = select_focused_steps(
-            &lane_cfg,
-            &committed,
-            &tags.into_iter().collect::<Vec<_>>(),
-        )?;
+        let mut cfg =
+            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
         // A case node whose committed build/setup dependencies the
         // focused plan does not contain (a privileged-test node, whose
         // producers sit outside the portable lane subset) would fail
@@ -15436,11 +15441,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             if !missing.is_empty() {
                 return Err(format!(
                     "test selection names cases of {node}, whose dependencies {} are not in profile {}; select the node with --selected or choose a profile that has them",
-                    missing
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    missing.iter().cloned().collect::<Vec<_>>().join(", "),
                     args.focused
                         .as_ref()
                         .expect("matched focused mode")
@@ -15508,11 +15509,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             }
         }));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let cfg = select_focused_steps(
-            &lane_cfg,
-            &committed,
-            &tags.into_iter().collect::<Vec<_>>(),
-        )?;
+        let cfg =
+            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -18538,7 +18536,10 @@ fn manifest_node_vacuity_profile_bracket(
         .filter(|node| !node.runs())
         .map(|node| node.tag.as_str())
         .collect::<BTreeSet<_>>();
-    let expected_wholly = withheld_tags.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected_wholly = withheld_tags
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     if after != expected || wholly != expected_wholly {
         return Err(format!(
             "node vacuity: {label} withholding changed the wrong graph state: withheld \
@@ -21041,8 +21042,7 @@ fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
     let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::from_slice(
         include_bytes!("../ci/execution-owners.json"),
     )?;
-    selection.execution_backends =
-        Some(owners.backends_for_selection("core", &selection.labels)?);
+    selection.execution_backends = Some(owners.backends_for_selection("core", &selection.labels)?);
     Ok((selection, prebuilt))
 }
 
@@ -21302,10 +21302,21 @@ mod nextest_timeout_tests {
                 // preemption, added as bin-c/preempt-spin-flag and moved to
                 // c-programs the same day. Recounted by enumerating this
                 // selection at both trees: those three cells added, none removed.
-                assert_eq!(all.len(), 3001, "the original all-owner population is retained");
+                assert_eq!(
+                    all.len(),
+                    3001,
+                    "the original all-owner population is retained"
+                );
             }
-            let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
-            assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
+            let expected = all
+                .iter()
+                .map(|cell| cell.id.clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                expected.len(),
+                all.len(),
+                "duplicate all-owner cell identity"
+            );
             let mut union = BTreeSet::new();
             for owner in owners.names() {
                 let mut selection = baseline.clone();
@@ -21315,7 +21326,10 @@ mod nextest_timeout_tests {
                     assert!(union.insert(cell.id), "a cell has two execution owners");
                 }
             }
-            assert_eq!(union, expected, "an owned cell disappeared or changed identity");
+            assert_eq!(
+                union, expected,
+                "an owned cell disappeared or changed identity"
+            );
         }
         assert_eq!(
             manifests
@@ -21929,11 +21943,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
                     Some("1.5"),
                     Ok("RESOLVED_CPU=28 RESOLVED_WALL=336"),
                 ),
-                (
-                    Some("1.25"),
-                    Some("1.75"),
-                    Err("can consume 3940s"),
-                ),
+                (Some("1.25"), Some("1.75"), Err("can consume 3940s")),
                 (None, None, Ok("RESOLVED_CPU=22 RESOLVED_WALL=180")),
                 (
                     Some("malformed"),
@@ -25213,15 +25223,9 @@ fn product_front_door_bracket() -> Result<(), String> {
 
     let parent = PathBuf::from("/srv/dev-hermit");
     let checkout = parent.join("worktrees/slot07/hermit");
-    let refusal = product_front_door_refusal(
-        &parent,
-        &checkout,
-        commit,
-        "--rr-compat-only",
-        true,
-        false,
-    )
-    .ok_or_else(|| "product front door omitted the naked-run refusal".to_string())?;
+    let refusal =
+        product_front_door_refusal(&parent, &checkout, commit, "--rr-compat-only", true, false)
+            .ok_or_else(|| "product front door omitted the naked-run refusal".to_string())?;
     if !refusal.contains("Publishing because the code is ready requires ci-hub")
         || !refusal.contains(commit)
         || !refusal.contains("ci-hub/ci-hub validate-run")
@@ -25233,28 +25237,15 @@ fn product_front_door_bracket() -> Result<(), String> {
             "product front-door refusal lost remediation detail: {refusal}"
         ));
     }
-    if product_front_door_refusal(
-        &parent,
-        &checkout,
-        commit,
-        "--rr-compat-only",
-        true,
-        true,
-    )
-    .is_some()
+    if product_front_door_refusal(&parent, &checkout, commit, "--rr-compat-only", true, true)
+        .is_some()
     {
         return Err("product front door refused canonical admission".into());
     }
 
-    let unavailable = product_front_door_refusal(
-        &parent,
-        &checkout,
-        commit,
-        "--rr-compat-only",
-        false,
-        false,
-    )
-    .ok_or_else(|| "product front door omitted the missing-launcher refusal".to_string())?;
+    let unavailable =
+        product_front_door_refusal(&parent, &checkout, commit, "--rr-compat-only", false, false)
+            .ok_or_else(|| "product front door omitted the missing-launcher refusal".to_string())?;
     if !unavailable.contains("launcher is unavailable")
         || unavailable.contains("validate-run --checkout")
     {
@@ -25642,13 +25633,7 @@ fn exact_skipped_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
                 if u64::try_from(results.len()).ok()? != executed {
                     return None;
                 }
-                u64::try_from(
-                    results
-                        .iter()
-                        .filter(|result| result.is_skipped())
-                        .count(),
-                )
-                .ok()?
+                u64::try_from(results.iter().filter(|result| result.is_skipped()).count()).ok()?
             }
             None if executed == 0 || outcome.ok => 0,
             None => return None,
@@ -30883,12 +30868,7 @@ fn run(
             Ok(value) => value,
             Err(error) => {
                 eprintln!("validate: {error}");
-                return RunSummary::refused(
-                    2,
-                    "(arguments not parsed)",
-                    "build mode",
-                    vec![error],
-                );
+                return RunSummary::refused(2, "(arguments not parsed)", "build mode", vec![error]);
             }
         };
     let ambient_run_mode = match ambient_mode_value(RUN_MODE_ENV, std::env::var_os(RUN_MODE_ENV)) {
@@ -31025,14 +31005,12 @@ fn run(
             return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
         }
     };
-    if let Err(error) =
-check_build_mode_selection(
-            &build_mode,
-            args.level,
-            args.focused.as_ref(),
-            args.show_plan,
-        )
-    {
+    if let Err(error) = check_build_mode_selection(
+        &build_mode,
+        args.level,
+        args.focused.as_ref(),
+        args.show_plan,
+    ) {
         return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
 
@@ -34910,7 +34888,10 @@ mod committed_selection_preservation_tests {
                 expected
             );
             assert!(
-                plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                plan.cfg
+                    .steps
+                    .iter()
+                    .all(|step| step.fail_fast_family.is_none()),
                 "{argv:?}"
             );
             for actual in &plan.cfg.steps {
@@ -36973,10 +36954,12 @@ mod shared_consumer_tests {
             &BTreeSet::new(),
         )
         .unwrap();
-        assert!(!portable
-            .steps
-            .iter()
-            .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases"));
+        assert!(
+            !portable
+                .steps
+                .iter()
+                .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases")
+        );
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
         // Look each binary's table row up by name: main added the
@@ -36992,8 +36975,13 @@ mod shared_consumer_tests {
         };
         assert_eq!(
             consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "cli"),
-            ["privileged-cpuid.cpu_profile_v3", "privileged-test.cli_kvm",
-             "privileged-test.pmu_cli_cases", "test.cli"].map(str::to_string)
+            [
+                "privileged-cpuid.cpu_profile_v3",
+                "privileged-test.cli_kvm",
+                "privileged-test.pmu_cli_cases",
+                "test.cli"
+            ]
+            .map(str::to_string)
         );
         assert_eq!(
             consumers_of(&EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS, "cli"),
@@ -37001,9 +36989,15 @@ mod shared_consumer_tests {
         );
         assert_eq!(
             consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "deadline_slice_cap"),
-            ["privileged-test.deadline_slice_cap_kvm", "test.hermit_integration",
-             "test.hermit_integration_2", "test.hermit_integration_3",
-             "test.pmu_integration_cases", "test.pmu_integration_cases_2"].map(str::to_string)
+            [
+                "privileged-test.deadline_slice_cap_kvm",
+                "test.hermit_integration",
+                "test.hermit_integration_2",
+                "test.hermit_integration_3",
+                "test.pmu_integration_cases",
+                "test.pmu_integration_cases_2"
+            ]
+            .map(str::to_string)
         );
         assert_eq!(
             consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "hermit_modes"),
@@ -37013,16 +37007,26 @@ mod shared_consumer_tests {
             consumers_of(&EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS, "hermit_modes"),
             ["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"].map(str::to_string)
         );
-        assert!(expected_shared_integration_consumers(&["test.unknown_shared_consumer"], true).is_err());
+        assert!(
+            expected_shared_integration_consumers(&["test.unknown_shared_consumer"], true).is_err()
+        );
         assert!(expected_shared_integration_consumers(&["test.cli", "test.cli"], true).is_err());
         assert_eq!(
             hermit_manifest_plan::dag_source_ownership::source_partition_tags(
-                &[], &["test.isolated_dbt_workdir"], false,
+                &[],
+                &["test.isolated_dbt_workdir"],
+                false,
             ),
-            ["test.isolated_dbt_workdir".to_string()].into_iter().collect::<BTreeSet<_>>()
+            ["test.isolated_dbt_workdir".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
         );
-        assert!(!hermit_manifest_plan::dag_source_ownership::is_core("test.isolated_dbt_workdir"));
-        for tag in EXPECTED_SHARED_INTEGRATION_TESTS.iter().flat_map(|(_, tags)| *tags)
+        assert!(!hermit_manifest_plan::dag_source_ownership::is_core(
+            "test.isolated_dbt_workdir"
+        ));
+        for tag in EXPECTED_SHARED_INTEGRATION_TESTS
+            .iter()
+            .flat_map(|(_, tags)| *tags)
             .filter(|tag| hermit_manifest_plan::dag_source_ownership::is_core(tag))
         {
             let mut missing = full.steps.clone();
@@ -37031,20 +37035,35 @@ mod shared_consumer_tests {
         }
         // Plant external metadata explicitly; this row is never executed and
         // does not register a backend or stand in for a physical DBT workload.
-        let mut external = full.steps.iter().find(|step| step.tag() == "test.cli")
-            .unwrap().clone();
+        let mut external = full
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.cli")
+            .unwrap()
+            .clone();
         external.group = "test".into();
         external.job = "isolated_dbt_workdir".into();
         external.cmd = "false # metadata fixture; never executed".into();
         external.integration_test_binaries = Some(vec!["cli".into()]);
         external.hint.resources.clear();
-        external.hint.resources.insert("integration_test_binaries.cli".into(), 1);
+        external
+            .hint
+            .resources
+            .insert("integration_test_binaries.cli".into(), 1);
         full.steps.push(external);
-        assert!(assert_committed_shared_integration_test_serialization(
-            &full.steps, &full.resource_caps,
-        ).is_err());
-        assert_shared_integration_test_serialization_for_owners(&full.steps, &full.resource_caps, false)
-            .unwrap();
+        assert!(
+            assert_committed_shared_integration_test_serialization(
+                &full.steps,
+                &full.resource_caps,
+            )
+            .is_err()
+        );
+        assert_shared_integration_test_serialization_for_owners(
+            &full.steps,
+            &full.resource_caps,
+            false,
+        )
+        .unwrap();
         let isolated = full
             .steps
             .iter()
@@ -37157,11 +37176,13 @@ mod shared_consumer_tests {
             let mut caps = full.resource_caps.clone();
             caps.remove(resource);
             assert!(
-                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false).is_err()
+                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false)
+                    .is_err()
             );
             caps.insert(resource.into(), 2);
             assert!(
-                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false).is_err()
+                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false)
+                    .is_err()
             );
         }
     }
@@ -37895,7 +37916,10 @@ mod scorecard_cutover_tests {
             let plan = build_plan(&source, &args, temp.path()).unwrap();
             assert!(plan.suite_complete);
             assert!(
-                plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                plan.cfg
+                    .steps
+                    .iter()
+                    .all(|step| step.fail_fast_family.is_none()),
                 "{argv:?}"
             );
             assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
@@ -38097,7 +38121,17 @@ mod scorecard_cutover_tests {
                 "{builder} green against a Cargo cache key"
             );
             assert_eq!(
-                validate_receipt::eligible(0, 0, true, true, false, "full", builder, BUILD_MODE_CARGO).is_ok(),
+                validate_receipt::eligible(
+                    0,
+                    0,
+                    true,
+                    true,
+                    false,
+                    "full",
+                    builder,
+                    BUILD_MODE_CARGO
+                )
+                .is_ok(),
                 cargo_reusable,
                 "{builder} green as a full-suite receipt"
             );
@@ -39837,8 +39871,8 @@ mod fail_fast_tests {
 
     #[test]
     fn the_flag_parses_and_defaults_off() {
-        let on = parse_argv(&["full".into(), "--no-label-pr".into(), "--fail-fast".into()])
-            .unwrap();
+        let on =
+            parse_argv(&["full".into(), "--no-label-pr".into(), "--fail-fast".into()]).unwrap();
         assert!(on.fail_fast);
         let off = parse_argv(&["full".into(), "--no-label-pr".into()]).unwrap();
         assert!(!off.fail_fast);
@@ -39867,12 +39901,18 @@ mod fail_fast_tests {
         let before_second = plan.second.as_ref().map(|cfg| deps_of(cfg));
         apply_fail_fast(&mut plan);
         assert!(
-            plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
+            plan.cfg
+                .steps
+                .iter()
+                .all(|step| step.fail_fast_family.is_none()),
             "every step must share the global eager-exit scope"
         );
         if let Some(second) = &plan.second {
             assert!(
-                second.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                second
+                    .steps
+                    .iter()
+                    .all(|step| step.fail_fast_family.is_none()),
                 "every second-graph step must share the global eager-exit scope"
             );
         }

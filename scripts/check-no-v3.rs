@@ -1070,7 +1070,7 @@ fn encoding_above_v2(bytes: &[u8]) -> bool {
     let opcode = &bytes[at.min(bytes.len())..];
     match opcode.first() {
         Some(0xc4) | Some(0xc5) => true, // VEX
-        Some(0x62) => true,             // EVEX
+        Some(0x62) => true,              // EVEX
         Some(0x0f) => {
             // MOVBE 0F 38 F0/F1; CRC32 carries F2 and is v2.
             // LZCNT F3 0F BD; without F3 it is BSR, and F3 0F BC

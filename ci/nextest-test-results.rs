@@ -26,7 +26,8 @@ use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
-use nextest_cpu::{listed_count, listed_identities};
+use nextest_cpu::listed_count;
+use nextest_cpu::listed_identities;
 use nextest_cpu::read_attempt_records;
 use nextest_cpu::read_binary_map;
 use nextest_cpu::write_binary_map_atomic;
@@ -727,8 +728,7 @@ fn reconcile_cpu_attempts_with_cancelled(
         unexpected.into_iter().partition(|identity| {
             matches!(
                 actual[identity].completion,
-                AttemptCompletion::Signal { .. }
-                    | AttemptCompletion::SupervisorSignal { .. }
+                AttemptCompletion::Signal { .. } | AttemptCompletion::SupervisorSignal { .. }
             )
         });
     if !missing.is_empty() || !unexpected.is_empty() {
@@ -844,9 +844,8 @@ fn parse_marker_sidecar(bytes: &[u8], prefix: &str, kind: &str) -> Result<Vec<Sk
             "nextest-test-results: {kind} sidecar ends in a truncated line; refusing to guess"
         ));
     }
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        format!("nextest-test-results: {kind} sidecar is not UTF-8: {error}")
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("nextest-test-results: {kind} sidecar is not UTF-8: {error}"))?;
     let mut markers: Vec<SkipMarker> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
@@ -1078,7 +1077,10 @@ fn apply_skid_infra_markers(
             .iter()
             .enumerate()
             .filter(|(_, result)| {
-                let test = result.id.rsplit_once('$').map_or(result.id.as_str(), |(_, test)| test);
+                let test = result
+                    .id
+                    .rsplit_once('$')
+                    .map_or(result.id.as_str(), |(_, test)| test);
                 test == marker.name || test.ends_with(&format!("::{}", marker.name))
             })
             .map(|(index, _)| index)
@@ -1149,9 +1151,7 @@ fn apply_cancelled_attempts(
         let kind = binary_map
             .entries
             .iter()
-            .find(|entry| {
-                entry.package == identity.package && entry.binary == identity.binary
-            })
+            .find(|entry| entry.package == identity.package && entry.binary == identity.binary)
             .map(|entry| entry.kind.as_str())
             .ok_or_else(|| {
                 format!(
@@ -1173,16 +1173,14 @@ fn apply_cancelled_attempts(
                 "nextest-test-results: cancelled attempt {identity:?} does not follow the terminal attempt of {id:?}"
             ));
         }
-        let mut attempts = row.attempt_results.clone().ok_or_else(|| {
-            format!("nextest-test-results: row {id:?} lacks classified attempts")
-        })?;
+        let mut attempts = row
+            .attempt_results
+            .clone()
+            .ok_or_else(|| format!("nextest-test-results: row {id:?} lacks classified attempts"))?;
         attempts.push(TestAttemptResult::new(
             identity.attempt,
             TestAttemptOutcome::Cancelled,
-            Some(
-                "attempt was cancelled in flight by a fail-fast cancel (dh-825jy)"
-                    .into(),
-            ),
+            Some("attempt was cancelled in flight by a fail-fast cancel (dh-825jy)".into()),
         )?);
         *row = TestResult::with_attempt_results(row.id.clone(), false, attempts)?;
     }
@@ -1250,9 +1248,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
             .next()
             .ok_or_else(|| "nextest-test-results missing listed-ids OUTPUT".to_string())?;
         if args.next().is_some() {
-            return Err(
-                "nextest-test-results listed-ids mode received too many arguments".into(),
-            );
+            return Err("nextest-test-results listed-ids mode received too many arguments".into());
         }
         let bytes = fs::read(&inventory)
             .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
@@ -1342,7 +1338,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
                 .into(),
         );
     }
-    let (cpu_report, cancelled_attempts) = match (attempt_records, binary_map.as_ref(), cpu_report) {
+    let (cpu_report, cancelled_attempts) = match (attempt_records, binary_map.as_ref(), cpu_report)
+    {
         (Some(records), Some(binary_map), Some(output)) => {
             let (report, cancelled) =
                 reconcile_cpu_attempts_with_cancelled(&parsed, Path::new(&records), binary_map)?;
@@ -1579,10 +1576,15 @@ mod tests {
                             );
                         }
                         assert_eq!(
-                            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
-                                .unwrap()
-                                .0.attempts
-                                .len(),
+                            reconcile_cpu_attempts_with_cancelled(
+                                &parsed,
+                                &scratch.0,
+                                &inv.binary_map
+                            )
+                            .unwrap()
+                            .0
+                            .attempts
+                            .len(),
                             8
                         );
                     }
@@ -2065,7 +2067,8 @@ mod tests {
             assert_eq!(
                 reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
                     .unwrap()
-                    .0.attempts
+                    .0
+                    .attempts
                     .len(),
                 2
             );
@@ -2409,21 +2412,34 @@ mod tests {
         let classified = apply_skip_markers(rows.clone(), &[]).unwrap();
         let marker = SkipMarker {
             name: "spinner".into(),
-            reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA (not a test failure)"
-                .into(),
+            reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA (not a test failure)".into(),
         };
         let reclassified = apply_skid_infra_markers(classified, &[marker]).unwrap();
         // Still a non-pass, but its terminal cause is the infrastructure
         // verdict, not an ordinary failure; the unmarked failure beside
         // it stays an ordinary failure.
         assert!(!reclassified[0].passed && !reclassified[0].is_skipped());
-        let terminal = reclassified[0].attempt_results.as_ref().unwrap().last().unwrap();
+        let terminal = reclassified[0]
+            .attempt_results
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
         assert_eq!(terminal.outcome, TestAttemptOutcome::InfrastructureError);
         assert!(
-            terminal.detail.as_deref().unwrap().starts_with("SKID-INFRA: "),
+            terminal
+                .detail
+                .as_deref()
+                .unwrap()
+                .starts_with("SKID-INFRA: "),
             "{terminal:?}"
         );
-        let other = reclassified[2].attempt_results.as_ref().unwrap().last().unwrap();
+        let other = reclassified[2]
+            .attempt_results
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
         assert_eq!(other.outcome, TestAttemptOutcome::Failed);
         // The schema-5 report round-trips with the reclassified attempt.
         let report = TestResults::skipped(3, 0, reclassified).unwrap();
@@ -2452,9 +2468,11 @@ mod tests {
         }
         // A marker claiming a bound below the shared skid budget (a
         // single-attempt probe, a 3-attempt helper) is not an exhaustion.
-        for claimed in ["all 1 attempt(s) exited 122; verdict SKID-INFRA",
-                        "all 3 attempt(s) exited 122; verdict SKID-INFRA",
-                        "verdict SKID-INFRA"] {
+        for claimed in [
+            "all 1 attempt(s) exited 122; verdict SKID-INFRA",
+            "all 3 attempt(s) exited 122; verdict SKID-INFRA",
+            "verdict SKID-INFRA",
+        ] {
             let marker = SkipMarker {
                 name: "spinner".into(),
                 reason: claimed.into(),
@@ -2478,9 +2496,11 @@ mod tests {
             name: "runs".into(),
             reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA".into(),
         };
-        assert!(apply_skid_infra_markers(skipped, &[marker])
-            .unwrap_err()
-            .contains("did not fail"));
+        assert!(
+            apply_skid_infra_markers(skipped, &[marker])
+                .unwrap_err()
+                .contains("did not fail")
+        );
     }
 
     #[test]
@@ -2696,7 +2716,9 @@ mod tests {
         ] {
             write_record(&scratch.0, &record);
         }
-        let report = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &map).unwrap().0;
+        let report = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &map)
+            .unwrap()
+            .0;
         assert_eq!(report.attempts.len(), 3);
     }
 
@@ -2959,7 +2981,9 @@ mod tests {
                 .all(|row| row.id.contains("@stress-1"))
         );
         let scratch = Scratch::new();
-        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error =
+            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map())
+                .unwrap_err();
         assert!(
             error.contains("does not support stress_index identities"),
             "{error}"
@@ -2982,11 +3006,15 @@ mod tests {
         );
         assert_eq!(parsed.expected_attempts.len(), 2);
         let scratch = Scratch::new();
-        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error =
+            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map())
+                .unwrap_err();
         assert!(error.contains("retry population overflows"), "{error}");
         let parsed =
             parse_event_text(&sample_events().replace("recovers#2", "recovers#999999999")).unwrap();
-        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error =
+            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map())
+                .unwrap_err();
         assert!(
             error.contains("require 1000000000 attempt records, supplied 0"),
             "{error}"
@@ -3013,7 +3041,7 @@ mod tests {
             &scratch.0,
             &sample_binary_map(),
         )
-    .unwrap()
+        .unwrap()
         .0;
         assert_eq!(report.run_id.as_deref(), Some("sample-run"));
         assert_eq!(report.attempts.len(), 3);
@@ -3046,7 +3074,7 @@ mod tests {
             &scratch.0,
             &sample_binary_map(),
         )
-    .unwrap()
+        .unwrap()
         .0;
         assert_eq!(report.run_id.as_deref(), Some("sample-run"));
         assert_eq!(report.attempts.len(), 3);
@@ -3100,7 +3128,14 @@ mod tests {
         );
         let parsed = parse_event_text(events).unwrap();
         assert_eq!(parsed.results.len(), 2);
-        assert!(!parsed.results.iter().find(|row| row.id.ends_with("$fails")).unwrap().passed);
+        assert!(
+            !parsed
+                .results
+                .iter()
+                .find(|row| row.id.ends_with("$fails"))
+                .unwrap()
+                .passed
+        );
 
         let scratch = Scratch::new();
         for record in [
@@ -3108,8 +3143,16 @@ mod tests {
             attempt("fails", 1, AttemptCompletion::Exit { code: 23 }),
             // In flight at the cancel: the failed test's retry and a
             // test nextest never reported at all.
-            attempt("fails", 2, AttemptCompletion::SupervisorSignal { signal: 9 }),
-            attempt("never_reported", 1, AttemptCompletion::Signal { signal: 15 }),
+            attempt(
+                "fails",
+                2,
+                AttemptCompletion::SupervisorSignal { signal: 9 },
+            ),
+            attempt(
+                "never_reported",
+                1,
+                AttemptCompletion::Signal { signal: 15 },
+            ),
         ] {
             write_record(&scratch.0, &record);
         }
@@ -3148,12 +3191,8 @@ mod tests {
         ] {
             write_record(&exited.0, &record);
         }
-        let error = reconcile_cpu_attempts_with_cancelled(
-            &parsed,
-            &exited.0,
-            &sample_binary_map(),
-        )
-        .unwrap_err();
+        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &exited.0, &sample_binary_map())
+            .unwrap_err();
         assert!(error.contains("unexpected="), "{error}");
     }
 

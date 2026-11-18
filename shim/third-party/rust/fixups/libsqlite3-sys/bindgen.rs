@@ -929,7 +929,7 @@ extern "C" {
 }
 extern "C" {
     pub fn sqlite3_mprintf(arg1: *const ::std::os::raw::c_char, ...)
-        -> *mut ::std::os::raw::c_char;
+    -> *mut ::std::os::raw::c_char;
 }
 extern "C" {
     pub fn sqlite3_snprintf(

@@ -1229,9 +1229,11 @@ fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
                 // make also accepts the operator attached to the name, as in
                 // `define NAME+=`, so compare the name without it.
                 "define" | "undefine" => {
-                    return tail.split_whitespace().next().map(|word| {
-                        word.trim_end_matches(['=', ':', '+', '?', '!'])
-                    }) == Some(name);
+                    return tail
+                        .split_whitespace()
+                        .next()
+                        .map(|word| word.trim_end_matches(['=', ':', '+', '?', '!']))
+                        == Some(name);
                 }
                 _ => break,
             }
@@ -1258,7 +1260,10 @@ fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
     let Some(definition) = logical_line(lines, defines) else {
         panic!("lint-checks names $({name}), but the Makefile does not define {name}");
     };
-    let value = definition.split_once('=').map(|(_, v)| v).unwrap_or_default();
+    let value = definition
+        .split_once('=')
+        .map(|(_, v)| v)
+        .unwrap_or_default();
     value
         .split('#')
         .next()

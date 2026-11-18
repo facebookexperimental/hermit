@@ -183,7 +183,8 @@ fn run() -> Result<i32, String> {
     }
 }
 
-const PREPARE_USAGE: &str = "usage: ci/nextest-binaries.rs prepare PROFILE [--build-mode cargo|buck] [--cohort SLUG]
+const PREPARE_USAGE: &str =
+    "usage: ci/nextest-binaries.rs prepare PROFILE [--build-mode cargo|buck] [--cohort SLUG]
 
 Build PROFILE's committed Nextest selections in one prepared cohort and
 publish one record of them, replacing that cohort's previous record. The
@@ -196,7 +197,8 @@ recorded as dev. The record names PROFILE (prepared_for), that Cargo profile
 (cargo_profile), the build mode (build_mode), and the selections' canonical
 feature set (feature_set), which assert checks.";
 
-const ASSERT_USAGE: &str = "usage: ci/nextest-binaries.rs assert PROFILE [--prepared-by PRODUCER] [--cohort SLUG]
+const ASSERT_USAGE: &str =
+    "usage: ci/nextest-binaries.rs assert PROFILE [--prepared-by PRODUCER] [--cohort SLUG]
 
 Verify, without compiling, that the prepared record for the cohort (the
 default cohort's target/ci/nextest-binaries/current.json, or cohorts/SLUG.json

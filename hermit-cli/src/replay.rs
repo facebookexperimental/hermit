@@ -63,8 +63,7 @@ fn qualified_host_facts(
     metadata: &Metadata,
     gdbserver: bool,
 ) -> Result<Option<detcore_model::cpu_profile::HostXstate>, Error> {
-    if metadata.cpu_profile
-        == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
+    if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V2LegacyBroadwell
         && metadata.version >= crate::metadata::RECORD_VERSION
     {
         // Renaming a psABI-era recording to the legacy profile must
@@ -769,12 +768,10 @@ mod tests {
         // RCB-identity refusal this test asserts instead of the
         // table-digest one.
         let profile = detcore_model::cpu_profile::CpuProfile::X86_64V2;
-        let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(
-            &detcore::Config {
-                cpu_profile: profile,
-                ..Default::default()
-            },
-        ));
+        let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&detcore::Config {
+            cpu_profile: profile,
+            ..Default::default()
+        }));
         for (identity, cause) in [
             (None, "states no RCB coordinate identity"),
             (

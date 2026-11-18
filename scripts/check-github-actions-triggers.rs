@@ -717,10 +717,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
     let cleanup = format!("always() && ({gate}) && ({PORTABLE_FORK_GUARD})");
     for job in &jobs {
         if job.runs_on.is_empty() {
-            errors.push(format!(
-                "{AUTOMATIC} job `{}` has no `runs-on`",
-                job.name
-            ));
+            errors.push(format!("{AUTOMATIC} job `{}` has no `runs-on`", job.name));
         }
         for label in &job.runs_on {
             if !PORTABLE_HOSTED_RUNNERS.contains(&label.as_str()) {
@@ -794,10 +791,7 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
             } else if job.needs.iter().any(|need| gated.contains(need)) {
                 Ok(())
             } else {
-                Err(format!(
-                    "{AUTOMATIC} job `{}` needs no gated job",
-                    job.name
-                ))
+                Err(format!("{AUTOMATIC} job `{}` needs no gated job", job.name))
             };
             if result.is_ok() {
                 gated.insert(job.name.clone());
@@ -1544,7 +1538,11 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(AUTOMATIC), include_str!("../.github/workflows/ci.yml")).unwrap();
+        fs::write(
+            dir.join(AUTOMATIC),
+            include_str!("../.github/workflows/ci.yml"),
+        )
+        .unwrap();
         fs::write(dir.join("broken.yml"), UNQUOTED_COLON_STEP).unwrap();
         let result = run(&dir);
         fs::remove_dir_all(&dir).unwrap();

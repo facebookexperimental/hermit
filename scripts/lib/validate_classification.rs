@@ -1932,8 +1932,7 @@ mod timeout_tests {
             // finished, so the allowance is the budget at dispatch.
             let setup_started = super::super::monotonic_now_ns().unwrap();
             let _ = super::super::settled_log_len(&log);
-            let setup_elapsed_ns =
-                super::super::monotonic_now_ns().unwrap() - setup_started;
+            let setup_elapsed_ns = super::super::monotonic_now_ns().unwrap() - setup_started;
             let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
             if cold_log {
                 // This case exercises expiry during setup by construction:
@@ -1961,8 +1960,7 @@ mod timeout_tests {
                 // or below a step's own wall bound. If that ever holds at
                 // dispatch, the fixture is invalid: fail here, loudly,
                 // rather than let a refusal masquerade as a cutoff.
-                let remaining_s =
-                    super::super::remaining_budget_s(Some(deadline)).unwrap();
+                let remaining_s = super::super::remaining_budget_s(Some(deadline)).unwrap();
                 assert!(
                     remaining_s > 4,
                     "invalid cutoff fixture: remaining budget {remaining_s} s \

@@ -1382,8 +1382,16 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     #[test]
     fn every_deploy_must_write_the_custom_domain() {
         let (workflow, landing) = actual();
-        assert_rejected(&workflow.replacen(PAGES_CNAME, "", 1), &landing, PAGES_CNAME);
-        assert_rejected(&format!("{workflow}\n# {PAGES_CNAME}\n"), &landing, PAGES_CNAME);
+        assert_rejected(
+            &workflow.replacen(PAGES_CNAME, "", 1),
+            &landing,
+            PAGES_CNAME,
+        );
+        assert_rejected(
+            &format!("{workflow}\n# {PAGES_CNAME}\n"),
+            &landing,
+            PAGES_CNAME,
+        );
     }
 
     #[test]

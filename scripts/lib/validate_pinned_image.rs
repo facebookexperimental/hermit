@@ -365,8 +365,7 @@ exit 91
             .unwrap();
         assert_eq!(refused.status.code(), Some(2), "{refused:?}");
         assert!(
-            String::from_utf8_lossy(&refused.stderr)
-                .contains("is not a mode-1777 directory"),
+            String::from_utf8_lossy(&refused.stderr).contains("is not a mode-1777 directory"),
             "{refused:?}"
         );
         assert_eq!(

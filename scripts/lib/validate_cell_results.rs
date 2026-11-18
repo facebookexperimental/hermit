@@ -1202,9 +1202,7 @@ fn retain_v10_with_contract(
         }) {
             return Err("selected cell emitted the retired ptrace reference comparison".into());
         }
-        require_skid_qualified_history(
-            &rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>(),
-        )?;
+        require_skid_qualified_history(&rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>())?;
         let outcome = outcome_after_retries(
             rows.iter()
                 .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))

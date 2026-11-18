@@ -112,7 +112,9 @@ fn documented_roots(metadata: &serde_json::Value) -> Result<Vec<(PathBuf, Kind)>
         let mut entries = Vec::new();
         for target in targets {
             let name = target["name"].as_str().ok_or("target has no name")?;
-            let path = target["src_path"].as_str().ok_or("target has no src_path")?;
+            let path = target["src_path"]
+                .as_str()
+                .ok_or("target has no src_path")?;
             let documented = target["doc"].as_bool().unwrap_or(true);
             let kinds: Vec<&str> = target["kind"]
                 .as_array()
@@ -261,7 +263,8 @@ fn without_visibility(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("pub ") {
         rest.trim_start()
     } else if line.starts_with("pub(") {
-        line.split_once(')').map_or(line, |(_, rest)| rest.trim_start())
+        line.split_once(')')
+            .map_or(line, |(_, rest)| rest.trim_start())
     } else {
         line
     }
@@ -321,7 +324,10 @@ fn attribute_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 /// (ci/manifest-plan); the checker follows whichever candidate exists,
 /// since both name the same tracked source content.
 fn cfg_attr_path_value(line: &str) -> Option<&str> {
-    let inner = line.trim().strip_prefix("#[cfg_attr(")?.strip_suffix(")]")?;
+    let inner = line
+        .trim()
+        .strip_prefix("#[cfg_attr(")?
+        .strip_suffix(")]")?;
     let (_, value) = inner.split_once("path = \"")?;
     value.split_once('"')?.0.into()
 }
@@ -343,7 +349,10 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
         let text = fs::read_to_string(&file)
             .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
         let directory = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let stem = file.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+        let stem = file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
         let children_directory = if is_root || stem == "mod" {
             directory.clone()
         } else {
@@ -449,9 +458,7 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                         .find(|candidate| candidate.is_file())
                     {
                         Some(existing) => existing,
-                        None if !path_candidates.is_empty() => {
-                            directory.join(&path_candidates[0])
-                        }
+                        None if !path_candidates.is_empty() => directory.join(&path_candidates[0]),
                         _ => {
                             let flat = parent.join(format!("{name}.rs"));
                             if flat.is_file() {
@@ -911,10 +918,7 @@ fn scan(source: &str, kind: Kind) -> Result<Vec<Finding>, String> {
             test_attribute = false;
             hidden_attribute = false;
         }
-        if test_item
-            && without_visibility(trimmed).starts_with("mod ")
-            && trimmed.ends_with('{')
-        {
+        if test_item && without_visibility(trimmed).starts_with("mod ") && trimmed.ends_with('{') {
             skip_until = Some(format!("{}}}", &line[..indentation(line)]));
             index += 1;
             continue;
@@ -962,14 +966,16 @@ fn scan(source: &str, kind: Kind) -> Result<Vec<Finding>, String> {
             index += 1;
         }
         let enclosing: Vec<Block> = blocks.iter().map(|(_, block)| *block).collect();
-        let linted = if enclosing.contains(&Block::Function) || enclosing.contains(&Block::Hidden)
-        {
+        let linted = if enclosing.contains(&Block::Function) || enclosing.contains(&Block::Hidden) {
             false
         } else if marker == "//!" {
             true
         } else {
             let in_members = matches!(
-                enclosing.iter().rev().find(|block| **block != Block::Module),
+                enclosing
+                    .iter()
+                    .rev()
+                    .find(|block| **block != Block::Module),
                 Some(Block::Members(_))
             );
             match (attached_item(&lines, index)?, kind) {
@@ -1034,7 +1040,11 @@ fn scan_block(block: &[&str], first: usize) -> Vec<Finding> {
         paragraph.clear();
     };
     for (position, raw) in block.iter().enumerate() {
-        let text = if raw.len() >= common { &raw[common..] } else { raw.trim_start() };
+        let text = if raw.len() >= common {
+            &raw[common..]
+        } else {
+            raw.trim_start()
+        };
         let source_line = first + position;
         let leading = indentation(text);
         let body = text.trim_start();
@@ -1085,13 +1095,21 @@ fn repository_root() -> Result<PathBuf, String> {
     if !output.status.success() {
         return Err("not inside a git checkout".to_string());
     }
-    Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
 }
 
 fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
     let output = Command::new("cargo")
         .current_dir(root)
-        .args(["metadata", "--offline", "--no-deps", "--format-version", "1"])
+        .args([
+            "metadata",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
         .output()
         .map_err(|error| format!("cannot run cargo metadata: {error}"))?;
     if !output.status.success() {
@@ -1124,8 +1142,7 @@ fn check(root: &Path) -> Result<(usize, Vec<(PathBuf, Finding)>), String> {
     for (file, kind) in &files {
         let source = fs::read_to_string(file)
             .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        let found =
-            scan(&source, *kind).map_err(|error| format!("{}: {error}", file.display()))?;
+        let found = scan(&source, *kind).map_err(|error| format!("{}: {error}", file.display()))?;
         for finding in found {
             let relative = file.strip_prefix(root).unwrap_or(file).to_path_buf();
             findings.push((relative, finding));
@@ -1504,10 +1521,8 @@ pub fn g() {}
 
     #[test]
     fn module_paths_follow_declarations() {
-        let directory = std::env::temp_dir().join(format!(
-            "check-doc-bare-urls-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("check-doc-bare-urls-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("b")).unwrap();
         fs::write(
@@ -1561,7 +1576,11 @@ pub fn g() {}
         .unwrap();
         let tree: Vec<PathBuf> = module_tree(&directory.join("lib.rs")).unwrap();
         assert_eq!(tree, [directory.join("lib.rs"), directory.join("e.rs")]);
-        fs::write(directory.join("lib.rs"), "macro_rules! m {\n    () => {};\n").unwrap();
+        fs::write(
+            directory.join("lib.rs"),
+            "macro_rules! m {\n    () => {};\n",
+        )
+        .unwrap();
         let error = module_tree(&directory.join("lib.rs")).unwrap_err();
         assert!(error.contains("never closes"), "{error}");
         // A literal `mod name;` in a macro body declares a real file wherever
@@ -1577,7 +1596,10 @@ pub fn g() {}
         // The same holds when the name is a metavariable, alone or in a
         // repetition: rustdoc follows `decl!(e)` to e.rs (finding of the fifth
         // review).
-        for (pattern, body) in [("$m:ident", "pub mod $m;"), ("$($m:ident),*", "$(mod $m;)*")] {
+        for (pattern, body) in [
+            ("$m:ident", "pub mod $m;"),
+            ("$($m:ident),*", "$(mod $m;)*"),
+        ] {
             fs::write(
                 directory.join("lib.rs"),
                 format!("macro_rules! decl {{\n    ({pattern}) => {{\n        {body}\n    }};\n}}\ndecl!(e);\n"),

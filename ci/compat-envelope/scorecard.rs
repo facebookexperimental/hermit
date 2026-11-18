@@ -6570,11 +6570,9 @@ impl ParityCommitFacts {
                 }
             }
             if !shard_oids.is_empty() {
-                let names: Vec<String> =
-                    shard_oids.iter().map(|(_, _, oid)| oid.clone()).collect();
+                let names: Vec<String> = shard_oids.iter().map(|(_, _, oid)| oid.clone()).collect();
                 if let Ok(Some(blobs)) = git_cat_file_batch(root, &names) {
-                    let mut texts: BTreeMap<String, BTreeMap<String, String>> =
-                        BTreeMap::new();
+                    let mut texts: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
                     for ((sha, name, _), blob) in shard_oids.iter().zip(blobs.iter()) {
                         if let Some((_, bytes)) = blob {
                             if let Ok(text) = std::str::from_utf8(bytes) {
@@ -6601,17 +6599,14 @@ impl ParityCommitFacts {
                                     }
                                 }
                                 Err(e) => {
-                                    error = Some(format!(
-                                        "{sha}:{PARITY_CELLS_DIR}/{name}: {e}"
-                                    ));
+                                    error = Some(format!("{sha}:{PARITY_CELLS_DIR}/{name}: {e}"));
                                     break;
                                 }
                             }
                         }
-                        facts.committed.insert(
-                            sha.clone(),
-                            error.map(Err).unwrap_or(Ok(Some(selected))),
-                        );
+                        facts
+                            .committed
+                            .insert(sha.clone(), error.map(Err).unwrap_or(Ok(Some(selected))));
                     }
                 }
             }
@@ -18527,10 +18522,12 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
     read_series_rows_impl(
         &snapshot.source_commit,
-        snapshot
-            .shards
-            .iter()
-            .map(|shard| (shard.display_path.clone(), std::borrow::Cow::Borrowed(shard.bytes.as_slice()))),
+        snapshot.shards.iter().map(|shard| {
+            (
+                shard.display_path.clone(),
+                std::borrow::Cow::Borrowed(shard.bytes.as_slice()),
+            )
+        }),
     )
 }
 
@@ -18538,7 +18535,11 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
 /// are dropped as soon as its rows are parsed, so a render over the full
 /// corpus never holds every shard's bytes beside every parsed row.
 fn read_series_rows_owned(snapshot: SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
-    let SeriesSourceSnapshot { source_commit, shards, .. } = snapshot;
+    let SeriesSourceSnapshot {
+        source_commit,
+        shards,
+        ..
+    } = snapshot;
     read_series_rows_impl(
         &source_commit,
         shards
@@ -38986,9 +38987,12 @@ mod post_verdict_transaction_tests {
         replay["shell_command"] = shell_command.clone().into();
         replay["attempts"][0]["shell_command"] = shell_command.into();
         replay["effective_args"] = serde_json::json!(&argv[1..]);
-        let mut report: JsonValue =
-            serde_json::from_str(replay["attempts"][0]["verification_report"].as_str().unwrap())
-                .unwrap();
+        let mut report: JsonValue = serde_json::from_str(
+            replay["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         report["comparison"]["virtualize_time"] = false.into();
         let report = serde_json::to_string(&report).unwrap();
         replay["attempts"][0]["verification_report_sha256"] =
@@ -39003,7 +39007,10 @@ mod post_verdict_transaction_tests {
         let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
         match candidates[&id][0].evidence(&id, ResultInput::Current) {
             Ok(ValidateRowEvidence::ExpectedOutputFailed { reason, result, .. }) => {
-                assert!(reason.contains("failed its declared expected output"), "{reason}");
+                assert!(
+                    reason.contains("failed its declared expected output"),
+                    "{reason}"
+                );
                 assert_eq!(result, Some(ObservedResult::CrashError));
             }
             other => panic!("replay failed expectation was not retained: {other:?}"),

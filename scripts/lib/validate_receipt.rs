@@ -369,11 +369,29 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             "focused compat profile",
-            eligible(0, 0, true, true, false, "sabre-compat-only", "cargo", "cargo"),
+            eligible(
+                0,
+                0,
+                true,
+                true,
+                false,
+                "sabre-compat-only",
+                "cargo",
+                "cargo",
+            ),
         ),
         (
             "cell requalification profile",
-            eligible(0, 0, true, true, false, "cell-requalification", "cargo", "cargo"),
+            eligible(
+                0,
+                0,
+                true,
+                true,
+                false,
+                "cell-requalification",
+                "cargo",
+                "cargo",
+            ),
         ),
         (
             "Buck release payload",
@@ -401,9 +419,18 @@ pub fn self_test() -> Result<String, String> {
             ));
         }
     }
-    let focused_error = eligible(0, 0, true, true, false, "cell-requalification", "cargo", "cargo")
-        .err()
-        .ok_or("focused evidence must not authorize a full-suite receipt")?;
+    let focused_error = eligible(
+        0,
+        0,
+        true,
+        true,
+        false,
+        "cell-requalification",
+        "cargo",
+        "cargo",
+    )
+    .err()
+    .ok_or("focused evidence must not authorize a full-suite receipt")?;
     if focused_error != "profile is cell-requalification, not the full suite" {
         return Err(format!(
             "receipt: requalification must be refused BY THE PROFILE gate, got: {focused_error}"

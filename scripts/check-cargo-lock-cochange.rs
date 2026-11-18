@@ -2692,10 +2692,8 @@ name = \"not-a-package\"\n";
         use std::sync::atomic::Ordering;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, Ordering::Relaxed);
-        let repo = env::temp_dir().join(format!(
-            "cargo-lock-cochange-{}-{seq}",
-            std::process::id()
-        ));
+        let repo =
+            env::temp_dir().join(format!("cargo-lock-cochange-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&repo);
         fs::create_dir_all(repo.join("detcore")).expect("fixture dir");
         fs::create_dir_all(repo.join("liteinst-runtime-build")).expect("fixture dir");
@@ -2708,7 +2706,11 @@ name = \"not-a-package\"\n";
                 .args(args)
                 .output()
                 .expect("fixture git (git on PATH)");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.name", "cochange test"]);
@@ -2747,7 +2749,11 @@ name = \"not-a-package\"\n";
         // Clean tree vs HEAD: nothing changed (the old, vacuous wiring).
         assert_eq!(judge("HEAD"), 0, "HEAD base sees no change in a clean tree");
         // Vs the change's parent: the committed omission refuses.
-        assert_eq!(judge("HEAD^"), 1, "parent base must refuse manifest-only commit");
+        assert_eq!(
+            judge("HEAD^"),
+            1,
+            "parent base must refuse manifest-only commit"
+        );
         // Including the lock (even uncommitted) satisfies the same base.
         fs::write(repo.join("Cargo.lock"), "version = 4\n# regenerated\n").unwrap();
         assert_eq!(judge("HEAD^"), 0, "lock included must pass at parent base");

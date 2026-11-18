@@ -997,9 +997,11 @@ mod tests {
     fn rejects_a_manifest_length_that_is_not_the_reconstructed_length() {
         let mut wrong = record();
         *mutate(&mut wrong, "/runs/0/artifact/manifest_size_bytes") = Value::from(391);
-        assert!(validate_semantics(&wrong)
-            .unwrap_err()
-            .contains("does not equal the reconstructed manifest length"));
+        assert!(
+            validate_semantics(&wrong)
+                .unwrap_err()
+                .contains("does not equal the reconstructed manifest length")
+        );
     }
 
     #[test]

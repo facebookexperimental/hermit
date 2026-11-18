@@ -1342,8 +1342,18 @@ replay:
     );
     assert!(cell_guest_args(inherited_modes, "replay", "liteinst", "fixture").is_empty());
     assert!(
-        hermit_command("replay", "ptrace", "portable", None, &[], false, "info", &[], "g")
-            .contains("record start --base-env=minimal ")
+        hermit_command(
+            "replay",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            false,
+            "info",
+            &[],
+            "g"
+        )
+        .contains("record start --base-env=minimal ")
     );
     let nul_guest_args: Value = r#"
 backends_enabled: [ptrace]

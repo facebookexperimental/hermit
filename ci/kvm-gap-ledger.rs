@@ -1145,7 +1145,8 @@ fn counted_run(
         }
         command.env("HERMIT_CENSUS_ALLOW_NO_BASE", "1");
     }
-    command.args(nextest_args)
+    command
+        .args(nextest_args)
         .env("HERMIT_TEST_BACKEND", declaration.backend)
         .env(known_gaps::BACKEND_PROOF_ENV, &paths.proof)
         .env("NEXTEST_RETRIES", "0")
@@ -1768,7 +1769,9 @@ mod tests {
         rows.push(skipped_row("s"));
         // a, b and proof are required; g and t2 are run as gaps; s is not run.
         assert_eq!(
-            plan(&DECLARATION, &rows, &population(), Some(3)).unwrap().len(),
+            plan(&DECLARATION, &rows, &population(), Some(3))
+                .unwrap()
+                .len(),
             3
         );
         let error = plan(&DECLARATION, &rows, &population(), Some(4)).unwrap_err();
@@ -1849,7 +1852,9 @@ mod tests {
     #[test]
     fn the_plan_holds_the_required_count_to_its_pin() {
         assert_eq!(
-            plan(&DECLARATION, &rows(), &population(), Some(3)).unwrap().len(),
+            plan(&DECLARATION, &rows(), &population(), Some(3))
+                .unwrap()
+                .len(),
             3
         );
         let error = plan(&DECLARATION, &rows(), &population(), Some(4)).unwrap_err();

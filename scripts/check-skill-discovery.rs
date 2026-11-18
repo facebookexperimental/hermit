@@ -272,11 +272,18 @@ fn require_claude_policy(root: &Path) -> Result<(), String> {
         Err(error) => return Err(format!("inspect {}: {error}", path.display())),
     };
     if metadata.file_type().is_symlink() {
-        return Err(format!("{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively", path.display()));
+        return Err(format!(
+            "{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively",
+            path.display()
+        ));
     }
-    let text = fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
     if text.lines().next() != Some("@AGENTS.md") {
-        return Err(format!("{}: a regular CLAUDE.md must start with @AGENTS.md", path.display()));
+        return Err(format!(
+            "{}: a regular CLAUDE.md must start with @AGENTS.md",
+            path.display()
+        ));
     }
     Ok(())
 }
