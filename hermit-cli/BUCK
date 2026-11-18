@@ -608,7 +608,6 @@ rust_binary(
         "CARGO": "cargo",
         # Hermit isolates guest /tmp, so scratch space must not be under /tmp.
         "CARGO_TARGET_TMPDIR": "/var/tmp/hermit-v2-rootfs-test",
-        "HERMIT_REVERIE_PIN": HERMIT_REVERIE_PIN,
     },
     mapped_srcs = {
         src.removeprefix("hermit-cli/"): src
