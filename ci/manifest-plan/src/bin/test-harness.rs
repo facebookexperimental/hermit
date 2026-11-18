@@ -137,6 +137,10 @@ Source options:
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
+  --parity-plan-of-test            With an exact --test: name the parity golden's CPU
+                                   profile as a run of the whole test plans it, not from
+                                   this run's --mode/--backend filters (run only;
+                                   ci/buck-e2e/cell.sh runs every Buck cell alone)
   --diagnostic-results             Write dagrun structured-result schema 4, which
                                    reports a diagnostic cell's failure without
                                    failing the node (run only)
@@ -433,6 +437,8 @@ fn print_command_help(command: &str) -> bool {
                                               arguments (and --max-timeslice=disabled on liteinst and\n  \
                                               in-guest-trap), so parity can compare it\n  \
              --prebuilt                       Reuse prepared test programs\n  \
+             --parity-plan-of-test            With an exact --test: plan the parity golden's CPU profile\n  \
+                                              from every cell of the test, as a run of it would\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
              --junit <PATH>                   Write JUnit output to PATH\n  \
@@ -525,6 +531,9 @@ struct Args {
     retries: Retries,
     ci_only: bool,
     probe_disabled: bool,
+    /// `--parity-plan-of-test`: plan the parity golden's CPU profile from
+    /// every cell of the selected test ([`parity_plan`]).
+    parity_plan_of_test: bool,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
     tpx_json: Option<PathBuf>,
@@ -622,6 +631,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.selection.population = Some(Population::Disabled);
             }
             "--parity-inputs" => args.selection.parity_inputs = true,
+            PARITY_PLAN_OF_TEST_ARG => args.parity_plan_of_test = true,
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
@@ -1138,6 +1148,16 @@ fn validate_args(command: &str, args: &Args) {
         && (!args.probe_disabled || args.selection.mode.as_deref() != Some("verify"))
     {
         fail("--parity-inputs requires --probe-disabled on a verify cell");
+    }
+    if args.parity_plan_of_test {
+        if command != "run" {
+            fail(format!("{PARITY_PLAN_OF_TEST_ARG} is accepted by run only"));
+        }
+        if args.selection.test.is_none() || args.probe_disabled {
+            fail(format!(
+                "{PARITY_PLAN_OF_TEST_ARG} requires an exact --test and no --probe-disabled"
+            ));
+        }
     }
     if args.allow_empty {
         if !args.ci_only {
@@ -3600,7 +3620,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     ))
     // From the plan alone, not from the post-pass's scope: its switches
     // change what is reported, never how a cell runs.
-    .with_parity_compared(parity::planned_comparisons(&planned_verify));
+    .with_parity_compared(parity::planned_comparisons(&parity_plan(
+        manifests,
+        args,
+        &planned_verify,
+    )));
     // The v2 rootfs a loader-rejected verify or chaos cell retries inside
     // (issue 5476). An import launches nothing, so it reads none.
     let v2_oci_dir = if import_root.is_some() {
@@ -4738,6 +4762,40 @@ fn planned_verify(cells: &[SelectedCell]) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// `run`'s flag that plans the parity golden's CPU profile from every cell of
+/// the selected test.
+const PARITY_PLAN_OF_TEST_ARG: &str = "--parity-plan-of-test";
+
+/// The verify cells whose comparisons decide which ptrace verify runs name the
+/// parity golden's CPU profile (`runner::PARITY_GOLDEN_PROFILE_ARG`):
+/// `planned_verify`, this run's own verify cells, or with
+/// `--parity-plan-of-test` the verify cells of a run of the same filters
+/// without `--mode` and `--backend`, which is the plan of the whole test.
+///
+/// A category run plans a test's ptrace verify cell beside its candidates, so
+/// that cell names x86-64-v2. ci/buck-e2e/cell.sh runs every Buck cell alone
+/// (`--test --mode --backend`), so its own plan holds one cell, no comparison,
+/// and the same cell ran auto (x86-64-v3 on a qualifying host), another CPU
+/// than Cargo validation presents. With the flag a cell run alone names the
+/// profile a run of its test names.
+fn parity_plan(
+    manifests: &ManifestSet,
+    args: &Args,
+    own_plan: &BTreeSet<(String, String)>,
+) -> BTreeSet<(String, String)> {
+    if !args.parity_plan_of_test {
+        return own_plan.clone();
+    }
+    let whole_test = Selection {
+        mode: None,
+        backend: None,
+        ..run_selection(args)
+    };
+    let mut plan = planned_verify(&manifests.select(&whole_test).unwrap_or_else(|e| fail(e)));
+    plan.extend(own_plan.iter().cloned());
+    plan
+}
+
 /// The parity cells this run reports on: the parity population and
 /// `E2E_PARITY_SELECT`, resolved by [`parity::resolve_scope`], the same rule
 /// the pressure test uses: the cells with a verify side planned here, with
@@ -5354,6 +5412,7 @@ mod tests {
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::JsonValue;
+    use super::PARITY_PLAN_OF_TEST_ARG;
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
@@ -5375,6 +5434,7 @@ mod tests {
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
+    use super::parity_plan;
     use super::parse;
     use super::planned_verify;
     use super::print_best_effort;
@@ -9333,6 +9393,86 @@ sys.exit(1 if failed else 0)
         // (e2e.manifest_gvisor) and +2 direct (its _on_host and _buck
         // twins, https://github.com/rrnewton/hermit/pull/5194).
         assert_eq!((pinned, direct), (22, 39));
+    }
+
+    /// ci/buck-e2e/cell.sh runs every cell alone with `--parity-plan-of-test`.
+    /// For every cell a full-profile node plans, that one-cell run names the
+    /// parity golden's CPU profile exactly when the node does, so a Buck cell
+    /// presents the CPU Cargo validation presents; without the flag the
+    /// one-cell run names it for no cell.
+    #[test]
+    fn a_cell_run_alone_with_the_test_plan_names_the_parity_profile_its_node_names() {
+        use hermit_manifest_plan::parity;
+        let root = super::root(None);
+        let manifests = ManifestSet::load(&root).unwrap();
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("actual committed graph");
+        let full = dagrun::select_steps_by_labels(&committed, &["full".into()])
+            .expect("actual full selection");
+        let (mut golden, mut cells_checked) = (0, 0);
+        for step in &full.steps {
+            let Some(values) = harness_run_args(&step.cmd) else {
+                continue;
+            };
+            let node = parse(values.into_iter());
+            validate_args("run", &node);
+            let node_cells = run_cells(&manifests, &node).unwrap();
+            let node_planned = planned_verify(&node_cells);
+            let node_compared =
+                parity::planned_comparisons(&parity_plan(&manifests, &node, &node_planned));
+            assert_eq!(
+                node_compared,
+                parity::planned_comparisons(&node_planned),
+                "{}: a node without the flag keeps its own plan",
+                step.tag()
+            );
+            for cell in node_cells.iter().filter(|cell| {
+                cell.id.mode == parity::PARITY_MODE
+                    && cell.id.backend.as_deref() == Some(parity::PARITY_REFERENCE_BACKEND)
+            }) {
+                let mut argv = vec![
+                    "--test".to_string(),
+                    cell.id.test.clone(),
+                    "--mode".into(),
+                    cell.id.mode.clone(),
+                    "--backend".into(),
+                    parity::PARITY_REFERENCE_BACKEND.into(),
+                    "--prebuilt".into(),
+                ];
+                let alone = parse(argv.clone().into_iter());
+                validate_args("run", &alone);
+                let alone_planned = planned_verify(&run_cells(&manifests, &alone).unwrap());
+                assert!(
+                    !parity::planned_comparisons(&parity_plan(&manifests, &alone, &alone_planned))
+                        .contains(&cell.id.test),
+                    "{}: a one-cell run without the flag plans no comparison",
+                    cell.id.test
+                );
+                argv.push(PARITY_PLAN_OF_TEST_ARG.into());
+                let with_flag = parse(argv.into_iter());
+                validate_args("run", &with_flag);
+                let planned = planned_verify(&run_cells(&manifests, &with_flag).unwrap());
+                let compared =
+                    parity::planned_comparisons(&parity_plan(&manifests, &with_flag, &planned));
+                assert_eq!(
+                    compared.contains(&cell.id.test),
+                    node_compared.contains(&cell.id.test),
+                    "{} under {}",
+                    cell.id.test,
+                    step.tag()
+                );
+                golden += usize::from(compared.contains(&cell.id.test));
+                cells_checked += 1;
+            }
+        }
+        // golden > 0 catches a flag that does nothing; golden < cells_checked
+        // proves some checked cell is one its node does not compare, so the
+        // per-cell equality above also catches a flag that names the profile
+        // for every cell.
+        assert!(
+            cells_checked > 0 && golden > 0 && golden < cells_checked,
+            "{golden} of {cells_checked}"
+        );
     }
 
     /// The full profile's harness nodes together report each cell of the

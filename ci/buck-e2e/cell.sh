@@ -297,6 +297,10 @@ case $container in
     # git is the telemetry wrapper of a Meta host, which runs four more git commands and a
     # logger per call, it asks the git behind the wrapper.
     [[ -x /usr/local/bin/git.meta.real ]] && bundle_env+=(HERMIT_E2E_SNAPSHOT_GIT=/usr/local/bin/git.meta.real)
+    # --parity-plan-of-test: this harness runs ONE cell, but its ptrace verify run names
+    # the parity golden's CPU profile (x86-64-v2) exactly when a run of the whole test,
+    # as each Cargo category node runs it, plans a candidate beside it. Without it the
+    # cell's own one-cell plan holds no comparison and it ran auto (x86-64-v3).
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
         -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
@@ -305,7 +309,7 @@ case $container in
         HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" "${bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --parity-plan-of-test \
         --results "$out/results.jsonl" --junit "$out/junit.xml" --tpx-json "$out/tpx.jsonl" \
         "${refusal_args[@]}" "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
@@ -489,7 +493,7 @@ exec "$@"'
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install "${inner_bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --parity-plan-of-test \
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
         "${inner_refusal_args[@]}" "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
