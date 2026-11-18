@@ -63,6 +63,95 @@ fn reverie_repository() -> m1_artifact::private_static::CargoGitRepository<'stat
     m1_artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
 }
+
+/// Whether the Reverie root carries its own Git metadata: a `.git`
+/// directory or file at the Reverie root itself, the same test the
+/// content factory's pin proof uses for its canonical root. No
+/// parent-directory discovery (see liteinst-runtime-build).
+fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
+    reverie_root.join(".git").exists()
+}
+
+/// Whether a manifest spells its Reverie dependencies by path
+/// (`true`) or by git revision (`false`); both/neither refuses.
+fn reverie_is_path_sourced(manifest: &Path) -> Result<bool> {
+    let text = fs::read_to_string(manifest).map_err(|e| e.to_string())?;
+    let mut path_sourced: Option<bool> = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') || !line.contains("reverie") {
+            continue;
+        }
+        let vote = if line.contains("git =") {
+            Some(false)
+        } else if line.contains("path =") && line.contains("reverie/") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(vote) = vote {
+            match path_sourced {
+                Some(seen) if seen != vote => {
+                    return Err("manifest mixes git and path Reverie dependencies".into());
+                }
+                Some(_) => {}
+                None => path_sourced = Some(vote),
+            }
+        }
+    }
+    path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
+}
+
+/// The compiled-source layout for this workspace (see the same route
+/// in liteinst-runtime-build): `HermitPath` only for a gitless
+/// path-sourced Reverie root; a root with its own Git metadata takes
+/// `HermitGit`, so the pin proof runs for a real checkout.
+fn reverie_layout(manifest: &Path, reverie_root: &Path) -> Result<CompiledSourceLayout> {
+    Ok(
+        if reverie_is_path_sourced(manifest)? && !reverie_root_has_git_metadata(reverie_root) {
+            CompiledSourceLayout::HermitPath
+        } else {
+            CompiledSourceLayout::HermitGit
+        },
+    )
+}
+
+/// The Reverie pin label: the Eden marker file when it holds a valid
+/// pin, else the submodule checkout's HEAD, else the recorded gitlink
+/// (`HEAD:reverie`). This priority differs from `reverie_pin_at`
+/// (submodule HEAD first, then marker, gitlink and manifest), which
+/// this does not mirror. The order cannot mislabel compiled sources:
+/// the label never binds content (the compiled-source factory does),
+/// and both callers refuse when an initialized checkout's HEAD differs
+/// from this label, so a marker/checkout disagreement is a refusal,
+/// not a silent wrong pin. With no checkout (the gitless tree) the
+/// checkout source is unavailable to either order and the marker is
+/// the first source both can read.
+fn reverie_pin_label(root: &Path, runner: &mut Runner) -> Result<String> {
+    if let Ok(text) = fs::read_to_string(root.join("reverie.submodule.txt")) {
+        let line = text.strip_suffix('\n').unwrap_or(&text);
+        let marker_pin = if line.contains('\n') {
+            None
+        } else {
+            line.strip_prefix("Subproject commit ")
+                .filter(|pin| pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()))
+        };
+        if let Some(pin) = marker_pin {
+            return Ok(pin.to_owned());
+        }
+    }
+    if reverie_root_has_git_metadata(&root.join("reverie")) {
+        let head = runner
+            .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
+            .trim()
+            .to_owned();
+        return Ok(head);
+    }
+    Ok(runner
+        .text("git", &["rev-parse", "HEAD:reverie"], root)?
+        .trim()
+        .to_owned())
+}
 use m1_bundle::Bundle;
 use m1_bundle::Leaf;
 use serde_json::Value;
@@ -270,38 +359,55 @@ fn build_leaf(
         root.join("Cargo.lock")
     };
     let before = source(root, &lock, oracles, &mut runner)?;
-    let pin = runner
-        .text("git", &["rev-parse", "HEAD:reverie"], root)?
-        .trim()
-        .to_owned();
-    let initialized_pin = runner
-        .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
-        .trim()
-        .to_owned();
-    require(
-        initialized_pin == pin,
-        "initialized Reverie differs from the clean Hermit gitlink",
-    )?;
+    let pin = reverie_pin_label(root, &mut runner)?;
+    // When a submodule checkout is initialized, the sources Cargo
+    // compiles are its HEAD; the label must name that checkout.
+    if reverie_root_has_git_metadata(&root.join("reverie")) {
+        let initialized_pin = runner
+            .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
+            .trim()
+            .to_owned();
+        require(
+            initialized_pin == pin,
+            "initialized Reverie differs from the Hermit pin label",
+        )?;
+    }
     let source_manifest = if standalone {
         root.join("liteinst-runtime-build/Cargo.toml")
     } else {
         manifest.clone()
     };
-    let compiled_sources = VerifiedCompiledSources::resolve_with_repository(
-        &CompiledSourceExpectation {
-            layout: CompiledSourceLayout::HermitGit,
-            image_kind: if standalone {
-                FixedImageKind::Standalone
-            } else {
-                FixedImageKind::Detcore
-            },
-            workspace_root: root,
-            manifest: &source_manifest,
-            reverie_pin: &pin,
+    let layout = reverie_layout(&source_manifest, &root.join("reverie"))?;
+    let path_sourced = reverie_is_path_sourced(&source_manifest)?;
+    let expectation = CompiledSourceExpectation {
+        layout,
+        image_kind: if standalone {
+            FixedImageKind::Standalone
+        } else {
+            FixedImageKind::Detcore
         },
-        reverie_repository(),
-        &mut runner,
-    )?;
+        workspace_root: root,
+        manifest: &source_manifest,
+        reverie_pin: &pin,
+    };
+    // Git-sourced manifests keep the Git factory; path-sourced ones bind
+    // by declared content (plus the pin proof when the routed layout
+    // is the Git one). The factory follows the manifest spelling
+    // because the Git factory refuses path-form packages. Neither arm
+    // falls back to the other.
+    let compiled_sources = if path_sourced {
+        VerifiedCompiledSources::resolve_content_with_repository(
+            &expectation,
+            reverie_repository(),
+            &mut runner,
+        )?
+    } else {
+        VerifiedCompiledSources::resolve_with_repository(
+            &expectation,
+            reverie_repository(),
+            &mut runner,
+        )?
+    };
     let (package_name, target_name, initializer, filename) = if standalone {
         (
             "reverie-liteinst-preload",
@@ -322,7 +428,8 @@ fn build_leaf(
     require(
         package.name == package_name
             && package.target == target_name
-            && package.source.as_deref() == standalone.then_some(expected_source.as_str())
+            && package.source.as_deref()
+                == (standalone && !path_sourced).then_some(expected_source.as_str())
             && package.kind == ["cdylib"]
             && package.crate_types == ["cdylib"],
         "fresh metadata did not select the exact runtime package/source/target",
@@ -693,13 +800,10 @@ fn produce(root: &Path) -> Result<()> {
         .text("git", &["rev-parse", "HEAD^{tree}"], &root.join("reverie"))?
         .trim()
         .to_owned();
-    let gitlink = runner
-        .text("git", &["rev-parse", "HEAD:reverie"], root)?
-        .trim()
-        .to_owned();
+    let pin_label = reverie_pin_label(root, &mut runner)?;
     require(
-        gitlink == rv_head,
-        "initialized Reverie differs from committed gitlink",
+        pin_label == rv_head,
+        "initialized Reverie differs from the Hermit pin label",
     )?;
     let pin = runner
         .text(

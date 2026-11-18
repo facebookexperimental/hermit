@@ -44,6 +44,111 @@ fn reverie_repository() -> artifact::private_static::CargoGitRepository<'static>
     artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
 }
+
+/// Whether the Reverie root carries its own Git metadata: a `.git`
+/// directory or file at the Reverie root itself, the same test the
+/// content factory's pin proof uses for its canonical root. No
+/// parent-directory discovery (see liteinst-runtime-build).
+fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
+    reverie_root.join(".git").exists()
+}
+
+/// Whether a manifest spells its Reverie dependencies by path
+/// (`true`) or by git revision (`false`); both/neither refuses.
+fn reverie_is_path_sourced(manifest: &Path) -> Result<bool> {
+    let text = fs::read_to_string(manifest).map_err(|e| e.to_string())?;
+    let mut path_sourced: Option<bool> = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') || !line.contains("reverie") {
+            continue;
+        }
+        let vote = if line.contains("git =") {
+            Some(false)
+        } else if line.contains("path =") && line.contains("reverie/") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(vote) = vote {
+            match path_sourced {
+                Some(seen) if seen != vote => {
+                    return Err("manifest mixes git and path Reverie dependencies".into());
+                }
+                Some(_) => {}
+                None => path_sourced = Some(vote),
+            }
+        }
+    }
+    path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
+}
+
+/// The compiled-source layout for this workspace (see the same route
+/// in liteinst-runtime-build): `HermitPath` only for a gitless
+/// path-sourced Reverie root; a root with its own Git metadata takes
+/// `HermitGit`, so the pin proof runs for a real checkout.
+fn reverie_layout(manifest: &Path, reverie_root: &Path) -> Result<CompiledSourceLayout> {
+    Ok(
+        if reverie_is_path_sourced(manifest)? && !reverie_root_has_git_metadata(reverie_root) {
+            CompiledSourceLayout::HermitPath
+        } else {
+            CompiledSourceLayout::HermitGit
+        },
+    )
+}
+
+/// Run `body` inside a resolved compiled-source transaction: the Git
+/// factory's transaction for git-sourced Reverie, the declared-content
+/// factory plus its mandatory closing scan for path-sourced Reverie
+/// (in whichever layout the route selected: content-only when
+/// gitless, content plus pin proof for a Git checkout). The factory
+/// follows the manifest spelling, not the layout alone, because the
+/// Git factory refuses path-form packages. Both result paths close
+/// before returning, like `with_resolved`.
+fn with_compiled_sources<T>(
+    layout: CompiledSourceLayout,
+    root: &Path,
+    source_manifest: &Path,
+    standalone: bool,
+    pin: &str,
+    runner: &mut Runner,
+    body: impl FnOnce(&VerifiedCompiledSources) -> Result<T>,
+) -> Result<(T, artifact::CompiledSources)> {
+    let expectation = CompiledSourceExpectation {
+        layout,
+        image_kind: if standalone {
+            FixedImageKind::Standalone
+        } else {
+            FixedImageKind::Detcore
+        },
+        workspace_root: root,
+        manifest: source_manifest,
+        reverie_pin: pin,
+    };
+    if !reverie_is_path_sourced(source_manifest)? {
+        return VerifiedCompiledSources::with_resolved_with_repository(
+            &expectation,
+            reverie_repository(),
+            runner,
+            body,
+        );
+    }
+    let context = VerifiedCompiledSources::resolve_content_with_repository(
+        &expectation,
+        reverie_repository(),
+        runner,
+    )?;
+    let result = body(&context);
+    let closed = context.verify_unchanged(runner);
+    let record = context.record().clone();
+    match (result, closed) {
+        (Ok(value), Ok(())) => Ok((value, record)),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(close)) => Err(format!(
+            "{error}; compiled source transaction close failed: {close}"
+        )),
+    }
+}
 use contract::CapturedRun;
 use contract::HeldInputs;
 use m1_bundle::Leaf;
@@ -171,19 +276,14 @@ fn qualify(
         Duration::from_secs(60),
         64 * 1024 * 1024,
     )?;
-    let (receipt, compiled_sources) = VerifiedCompiledSources::with_resolved_with_repository(
-        &CompiledSourceExpectation {
-            layout: CompiledSourceLayout::HermitGit,
-            image_kind: if standalone {
-                FixedImageKind::Standalone
-            } else {
-                FixedImageKind::Detcore
-            },
-            workspace_root: root,
-            manifest: &source_manifest,
-            reverie_pin: pin,
-        },
-        reverie_repository(),
+    let layout = reverie_layout(&source_manifest, &root.join("reverie"))?;
+    let path_sourced = reverie_is_path_sourced(&source_manifest)?;
+    let (receipt, compiled_sources) = with_compiled_sources(
+        layout,
+        root,
+        &source_manifest,
+        standalone,
+        pin,
         &mut runner,
         |compiled_sources| {
             let receipt: RuntimeReceipt = serde_json::from_slice(
@@ -200,9 +300,14 @@ fn qualify(
                         == pin,
                     "standalone revision sidecar differs",
                 )?;
+                // Leaf source identity follows the manifest spelling:
+                // the exact Git source string, or source-null bound by
+                // content (plus the pin proof when the routed layout
+                // is the Git one).
                 require(
-                    receipt.cargo_artifact.package.source.as_deref() == Some(source.as_str()),
-                    "standalone exact Git source differs",
+                    receipt.cargo_artifact.package.source.as_deref()
+                        == (!path_sourced).then_some(source.as_str()),
+                    "standalone exact leaf source differs",
                 )?;
                 let manifest = artifact::real_file(&compiled_sources.package().manifest)?;
                 require(
@@ -213,14 +318,26 @@ fn qualify(
                             .is_some_and(|n| n == "reverie-liteinst-preload"),
                     "standalone selected package is not the real preload leaf",
                 )?;
+                let (package_source, id) = if path_sourced {
+                    let compiler_manifest = compiled_sources.compiler_manifest_path()?;
+                    let directory = compiler_manifest
+                        .parent()
+                        .ok_or("preload leaf directory absent")?;
+                    (None, format!("path+file://{}#0.5.7", directory.display()))
+                } else {
+                    (
+                        Some(source.clone()),
+                        format!(
+                            "git+https://github.com/facebookexperimental/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.7"
+                        ),
+                    )
+                };
                 (
                     "reverie-liteinst-preload",
                     "reverie_liteinst_preload",
                     manifest,
-                    Some(source.clone()),
-                    format!(
-                        "git+https://github.com/facebookexperimental/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.7"
-                    ),
+                    package_source,
+                    id,
                     artifact::STANDALONE_ROOT,
                 )
             } else {

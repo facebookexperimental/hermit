@@ -28,37 +28,30 @@ if [[ -n ${HERMIT_LITEINST_REVERIE_PIN:-} ]]; then
         exit 2
     fi
 fi
-# Derive the marker from the actual nested build inputs, never the containing
-# worktree. Require both manifests and the lock to name the same full revision;
-# Cargo and the content qualifier independently check the resolved package graph.
-manifest_revisions=
-for manifest in "$root_dir/liteinst-runtime-build/Cargo.toml" \
-    "$root_dir/liteinst-runtime-build/runtime/Cargo.toml"; do
-    revisions=$(
-        {
-            grep 'facebookexperimental/reverie' "$manifest" |
-                grep -oE 'rev = "[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}' || true
-        } | sort -u
-    )
-    if [[ ! $revisions =~ ^[0-9a-f]{40}$ ||
-        ( -n $manifest_revisions && $revisions != "$manifest_revisions" ) ]]; then
-        echo "liteinst-runtime-build manifests must name one identical full Reverie revision" >&2
-        exit 2
+# Name the marker pin the way the build itself identifies its Reverie
+# sources, mirroring reverie_pin_at in hermit-cli/reverie_gitlink.rs: the
+# submodule checkout's HEAD when one is initialized, else the Eden marker
+# file, else the recorded gitlink. Manifests may spell Reverie by path
+# (no revision to grep), and Cargo plus the content qualifier
+# independently bind the resolved package graph either way; repository-
+# wide pin uniformity stays with ci/run-reverie-pin-check.sh.
+reverie_pin=
+if [[ -e $root_dir/reverie/.git ]]; then
+    reverie_pin=$(git -C "$root_dir/reverie" rev-parse HEAD 2>/dev/null || true)
+fi
+if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ && -f $root_dir/reverie.submodule.txt ]]; then
+    marker_line=$(cat -- "$root_dir/reverie.submodule.txt")
+    if [[ $marker_line =~ ^Subproject\ commit\ ([0-9a-f]{40})$ ]]; then
+        reverie_pin=${BASH_REMATCH[1]}
     fi
-    manifest_revisions=$revisions
-done
-lock_revisions=$(
-    {
-        grep -h '^source = "git+https://github.com/facebookexperimental/reverie' \
-            "$root_dir/liteinst-runtime-build/Cargo.lock" |
-            grep -oE '[0-9a-f]{40}' || true
-    } | sort -u
-)
-if [[ ! $manifest_revisions =~ ^[0-9a-f]{40}$ || $lock_revisions != "$manifest_revisions" ]]; then
-    echo "liteinst-runtime-build manifests and lock must name one identical full Reverie revision" >&2
+fi
+if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ ]]; then
+    reverie_pin=$(git -C "$root_dir" rev-parse HEAD:reverie 2>/dev/null || true)
+fi
+if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ ]]; then
+    echo "cannot name the Reverie pin: no initialized reverie submodule checkout, reverie.submodule.txt marker, or gitlink at $root_dir" >&2
     exit 2
 fi
-reverie_pin=$manifest_revisions
 if [[ -n ${HERMIT_LITEINST_REVERIE_PIN:-} && $reverie_pin != "$HERMIT_LITEINST_REVERIE_PIN" ]]; then
     echo "HERMIT_LITEINST_REVERIE_PIN=$HERMIT_LITEINST_REVERIE_PIN, but liteinst-runtime-build builds Reverie at: $reverie_pin" >&2
     exit 2

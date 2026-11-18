@@ -53,6 +53,66 @@ fn reverie_repository() -> proof::private_static::CargoGitRepository<'static> {
         .expect("the named Reverie repository is a valid https URL")
 }
 
+/// Whether the Reverie root carries its own Git metadata: a `.git`
+/// directory or file at the Reverie root itself, the same test the
+/// content factory's pin proof uses for its canonical root. No
+/// parent-directory discovery: a gitless copy nested in an unrelated
+/// checkout must not inherit that checkout's metadata.
+fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
+    reverie_root.join(".git").exists()
+}
+
+/// Whether the root manifest spells its Reverie dependencies by path
+/// (`true`) or by git revision (`false`); both or neither refuses.
+fn reverie_is_path_sourced(manifest_text: &str) -> proof::Result<bool> {
+    let mut path_sourced: Option<bool> = None;
+    for line in manifest_text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') || !line.contains("reverie") {
+            continue;
+        }
+        let vote = if line.contains("git =") {
+            Some(false)
+        } else if line.contains("path =") && line.contains("reverie/") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(vote) = vote {
+            match path_sourced {
+                Some(seen) if seen != vote => {
+                    return Err("manifest mixes git and path Reverie dependencies".into());
+                }
+                Some(_) => {}
+                None => path_sourced = Some(vote),
+            }
+        }
+    }
+    path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
+}
+
+/// The compiled-source layout for this workspace: the content-only
+/// `HermitPath` layout only for a gitless path-sourced Reverie root;
+/// a root carrying its own Git metadata takes `HermitGit` even when
+/// the manifests spell path dependencies, so the content factory's
+/// pin proof (HEAD and gitlink equal to the pin) always runs for a
+/// real checkout. This only selects the factory arm; the arm binds
+/// its own shape exactly.
+fn reverie_layout(
+    manifest_text: &str,
+    reverie_root: &Path,
+) -> proof::Result<proof::CompiledSourceLayout> {
+    Ok(
+        if reverie_is_path_sourced(manifest_text)?
+            && !reverie_root_has_git_metadata(reverie_root)
+        {
+            proof::CompiledSourceLayout::HermitPath
+        } else {
+            proof::CompiledSourceLayout::HermitGit
+        },
+    )
+}
+
 fn require(ok: bool, message: &str) -> proof::Result<()> {
     if ok { Ok(()) } else { Err(message.into()) }
 }
@@ -913,10 +973,23 @@ fn run() -> proof::Result<()> {
     fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
     let mut runner = proof::Runner::new(evidence.join("logs"), Duration::from_secs(900), 64 << 20)?;
     let manifest = root.join("Cargo.toml");
-    let pin = reverie_pin_at(&root)
-        .ok_or("the reverie submodule gitlink must name one full Reverie pin")?;
+    // The pin is a provenance label: submodule checkout HEAD, the Eden
+    // marker, or the recorded gitlink (see reverie_pin_at). Content
+    // identity rides in the resolved compiled-source record.
+    let pin = reverie_pin_at(&root).ok_or(
+        "no Reverie pin label: no submodule checkout, reverie.submodule.txt marker, or gitlink names one full revision",
+    )?;
+    let manifest_text = fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
+    // `--git` is judged on the manifest spelling: the Git factory
+    // binds the exact Git source string and refuses path-form
+    // packages, whatever layout the content route below selects.
+    require(
+        authority != "--git" || !reverie_is_path_sourced(&manifest_text)?,
+        "--git requires git-sourced Reverie manifests; this workspace is path-sourced, use --source-copy",
+    )?;
+    let layout = reverie_layout(&manifest_text, &root.join("reverie"))?;
     let expectation = proof::CompiledSourceExpectation {
-        layout: proof::CompiledSourceLayout::HermitGit,
+        layout,
         image_kind: proof::FixedImageKind::Detcore,
         workspace_root: &root,
         manifest: &manifest,
@@ -1142,6 +1215,50 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn layout_selection_requires_one_agreeing_reverie_shape() {
+        // A Reverie root that does not exist carries no Git metadata:
+        // the gitless route. The checkout case uses a real root below.
+        let gitless = Path::new("/nonexistent-reverie-root");
+        assert_eq!(
+            reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", gitless).unwrap(),
+            proof::CompiledSourceLayout::HermitPath,
+        );
+        assert_eq!(
+            reverie_layout(
+                "reverie-core = { git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"0123456789012345678901234567890123456789\" }\n",
+                gitless,
+            )
+            .unwrap(),
+            proof::CompiledSourceLayout::HermitGit,
+        );
+        // A path-spelled root with its own .git takes the Git layout,
+        // so the pin proof runs; content alone never certifies it.
+        let serial = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let checkout = std::env::temp_dir().join(format!(
+            "stage-detcore-liteinst-layout-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        assert_eq!(
+            reverie_layout("reverie-core = { path = \"reverie/reverie\" }\n", &checkout)
+                .unwrap(),
+            proof::CompiledSourceLayout::HermitGit,
+        );
+        fs::remove_dir_all(&checkout).unwrap();
+        assert!(
+            reverie_layout(
+                "reverie-core = { path = \"reverie/reverie\" }\nreverie-ptrace = { git = \"https://github.com/facebookexperimental/reverie.git\" }\n",
+                gitless,
+            )
+            .is_err()
+        );
+        assert!(reverie_layout("[workspace]\n", gitless).is_err());
     }
 
     #[test]

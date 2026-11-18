@@ -21,6 +21,52 @@ pub(crate) fn reverie_repository() -> qualifier::private_static::CargoGitReposit
         .expect("the named Reverie repository is a valid https URL")
 }
 
+/// Whether the Reverie root carries its own Git metadata: a `.git`
+/// directory or file at the Reverie root itself, the same test the
+/// content factory's pin proof uses for its canonical root.
+/// Parent-directory Git discovery is deliberately not used: a gitless
+/// copy nested inside an unrelated checkout must not inherit that
+/// checkout's metadata, and a checkout must not lose its own.
+pub(crate) fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
+    reverie_root.join(".git").exists()
+}
+
+/// Whether a manifest spells its Reverie dependencies by path (`true`),
+/// by git revision (`false`), or neither/both (refused). Only non-comment
+/// lines naming a Reverie package vote, every vote must agree, and the
+/// selected shape is then bound exactly by the content factory: this
+/// selects which factory arm runs, it never downgrades a refusal.
+/// The gitless content-only layout is selected only when this vote is
+/// path AND [`reverie_root_has_git_metadata`] is false for the Reverie
+/// root; a path-spelled Git checkout takes the Git layout so its HEAD
+/// and the Hermit gitlink are checked against the pin.
+pub(crate) fn reverie_is_path_sourced(manifest_text: &str) -> Result<bool, String> {
+    let mut path_sourced: Option<bool> = None;
+    for line in manifest_text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') || !line.contains("reverie") {
+            continue;
+        }
+        let vote = if line.contains("git =") && line.contains("reverie") {
+            Some(false)
+        } else if line.contains("path =") && line.contains("reverie/") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(vote) = vote {
+            match path_sourced {
+                Some(seen) if seen != vote => {
+                    return Err("manifest mixes git and path Reverie dependencies".into());
+                }
+                Some(_) => {}
+                None => path_sourced = Some(vote),
+            }
+        }
+    }
+    path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
+}
+
 /// Bind the host proof implementation to the same Cargo-resolved checkout as
 /// the preload. No populated Hermit gitlink or installed helper is consulted.
 pub(crate) fn constructor_qualifier_source(
@@ -42,11 +88,17 @@ pub(crate) fn constructor_qualifier_source(
     let version = helper["version"]
         .as_str()
         .ok_or("constructor qualifier has no version")?;
-    // Two forms name the same checkout, and no third: the git form
-    // carries the revision; the path form (since the path-dependency
-    // migration) is bound by the verified constructor sources above,
-    // which required this checkout's clean HEAD and the Hermit
-    // gitlink to equal the pin before this metadata was read.
+    // Three spellings name the same checkout, and no fourth: the git
+    // form carries the revision; the path form (since the
+    // path-dependency migration) is bound by the verified constructor
+    // sources above — to the pin (clean HEAD and Hermit gitlink equal
+    // to it) only when the build routed this checkout through the Git
+    // layout, which is every Reverie root carrying Git metadata; a
+    // gitless root takes the path layout and is bound by declared
+    // content alone, with the pin staying a label. The path-sourced
+    // form carries a path+file package id at this version naming its
+    // own manifest directory and is bound by the canonical checkout
+    // checks below.
     let git_form = helper["source"]
         == format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#{revision}")
         && helper["id"]
@@ -65,7 +117,22 @@ pub(crate) fn constructor_qualifier_source(
                     .display(),
                 version
             );
-    if !git_form && !path_form {
+    let path_sourced = helper["source"].is_null()
+        && helper["id"].as_str().is_some_and(|id| {
+            let helper_manifest = helper["manifest_path"].as_str();
+            id.strip_prefix("path+file://").is_some_and(|rest| {
+                let directory = rest
+                    .strip_suffix(&format!("#{version}"))
+                    .or_else(|| {
+                        rest.strip_suffix(&format!("#reverie-liteinst-artifact@{version}"))
+                    });
+                directory.is_some_and(|dir| {
+                    dir.ends_with("/reverie-liteinst-artifact")
+                        && helper_manifest == Some(format!("{dir}/Cargo.toml").as_str())
+                })
+            })
+        });
+    if !git_form && !path_form && !path_sourced {
         return Err("constructor qualifier differs from the exact preload Git source".into());
     }
     let preload_manifest = fs::canonicalize(preload_manifest)
@@ -281,6 +348,60 @@ mod tests {
         )
     });
     const MANIFEST: &str = "/git/reverie/reverie-liteinst-preload/Cargo.toml";
+
+    #[test]
+    fn reverie_layout_selection_requires_one_agreeing_shape() {
+        assert_eq!(
+            reverie_is_path_sourced(
+                "reverie-inguest = { path = \"../reverie/reverie-inguest\", version = \"0.5.7\" }\n"
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            reverie_is_path_sourced(
+                "reverie-inguest = { git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"0123456789012345678901234567890123456789\" }\n"
+            ),
+            Ok(false)
+        );
+        // A commented-out opposite spelling does not vote.
+        assert_eq!(
+            reverie_is_path_sourced(
+                "# reverie-inguest = { git = \"https://github.com/facebookexperimental/reverie.git\" }\nreverie-inguest = { path = \"reverie/reverie-inguest\" }\n"
+            ),
+            Ok(true)
+        );
+        assert!(reverie_is_path_sourced(
+            "reverie-inguest = { path = \"../reverie/reverie-inguest\" }\nreverie-liteinst = { git = \"https://github.com/facebookexperimental/reverie.git\" }\n"
+        )
+        .is_err());
+        assert!(reverie_is_path_sourced("[workspace]\n").is_err());
+    }
+
+    #[test]
+    fn git_metadata_predicate_sees_only_the_reverie_root_itself() {
+        let serial = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hermit-gitless-predicate-{}-{serial}",
+            std::process::id()
+        ));
+        let reverie = root.join("reverie");
+        fs::create_dir_all(&reverie).unwrap();
+        assert!(!reverie_root_has_git_metadata(&reverie));
+        // A parent checkout's metadata does not count: no discovery.
+        fs::create_dir(root.join(".git")).unwrap();
+        assert!(!reverie_root_has_git_metadata(&reverie));
+        // The submodule spelling (a .git file) counts.
+        fs::write(reverie.join(".git"), "gitdir: ../.git/modules/reverie\n").unwrap();
+        assert!(reverie_root_has_git_metadata(&reverie));
+        fs::remove_file(reverie.join(".git")).unwrap();
+        // So does a plain checkout's .git directory.
+        fs::create_dir(reverie.join(".git")).unwrap();
+        assert!(reverie_root_has_git_metadata(&reverie));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     struct QualifierMetadataFixture {
         root: PathBuf,
@@ -512,6 +633,21 @@ mod tests {
             )
         };
         assert_eq!(bind(vec![helper.clone()]).unwrap(), source);
+        // Path-sourced shape: source null with the exact path+file id of
+        // this checkout's helper directory binds to the same proof source.
+        let mut path_helper = helper.clone();
+        path_helper["source"] = serde_json::json!(null);
+        path_helper["id"] = serde_json::json!(format!(
+            "path+file://{}#0.4.1",
+            root.join("reverie-liteinst-artifact").display()
+        ));
+        assert_eq!(bind(vec![path_helper.clone()]).unwrap(), source);
+        let mut wrong_path_id = path_helper.clone();
+        wrong_path_id["id"] = serde_json::json!(format!(
+            "path+file://{}#0.4.1",
+            root.join("other-checkout/reverie-liteinst-artifact").display()
+        ));
+        assert!(bind(vec![wrong_path_id]).is_err());
         let mut alias = helper.clone();
         alias["targets"][0]["src_path"] =
             serde_json::json!(root.join("reverie-liteinst-artifact/src/../src/lib.rs"));
@@ -1107,9 +1243,22 @@ pub(crate) mod native {
         // lock, then independently selects this exact runtime leaf. The
         // standalone producer has its own manifest/lock and qualifier source.
         let qualification_manifest = root.join("Cargo.toml");
+        let path_sourced = reverie_is_path_sourced(
+            &fs::read_to_string(&qualification_manifest)
+                .expect("failed to read the root workspace manifest"),
+        )
+        .unwrap_or_else(|e| panic!("native Reverie layout refused: {e}"));
+        // Same route as the standalone build: the content-only layout
+        // is for gitless Reverie roots alone; a root with its own Git
+        // metadata takes the Git layout so the pin proof runs.
+        let layout = if path_sourced && !reverie_root_has_git_metadata(&root.join("reverie")) {
+            qualifier::CompiledSourceLayout::HermitPath
+        } else {
+            qualifier::CompiledSourceLayout::HermitGit
+        };
         let sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
             &qualifier::CompiledSourceExpectation {
-                layout: qualifier::CompiledSourceLayout::HermitGit,
+                layout,
                 image_kind: qualifier::FixedImageKind::Detcore,
                 workspace_root: root,
                 manifest: &qualification_manifest,
@@ -1153,8 +1302,12 @@ pub(crate) mod native {
             .collect();
         assert_eq!(rv_packages.len(), 1);
         let rv_package = rv_packages[0];
-        let expected_source = format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}");
-        assert_eq!(rv_package["source"], expected_source);
+        // Leaf identity follows the resolved layout: the exact git source
+        // string for git-sourced manifests, source-null (bound by the
+        // content factory above) for path-sourced ones.
+        let expected_source = (!path_sourced)
+            .then(|| format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}"));
+        assert_eq!(rv_package["source"].as_str(), expected_source.as_deref());
         let rv_manifest = fs::canonicalize(rv_package["manifest_path"].as_str().unwrap()).unwrap();
         let rv = rv_manifest.parent().unwrap().parent().unwrap();
         assert_eq!(rv_manifest, rv.join("reverie-inguest/Cargo.toml"));
@@ -1176,7 +1329,7 @@ pub(crate) mod native {
         // compile-time source SHA and actual resolved RV path establish that join.
         if !helper.is_empty() {
             assert_eq!(helper.len(), 1);
-            assert_eq!(helper[0]["source"], expected_source);
+            assert_eq!(helper[0]["source"].as_str(), expected_source.as_deref());
             assert_eq!(
                 fs::canonicalize(helper[0]["manifest_path"].as_str().unwrap()).unwrap(),
                 qualifier_manifest

@@ -31,7 +31,10 @@ const CHILD_ROOT: &str = "HERMIT_SOURCE_COPY_TEST_CHILD";
 const TEST_NAME: &str = "source_copy::gitless_standalone_compiler_sources";
 const TRANSACTION_TEST_NAME: &str =
     "source_copy::compiled_source_transaction_closes_both_result_paths";
-const SOURCE_FILES: [&str; 9] = [
+const SOURCE_FILES: [&str; 10] = [
+    // detcore-model inherits its Reverie dependencies from the root
+    // workspace manifest, so Cargo metadata needs that root in the copy.
+    "Cargo.toml",
     "liteinst-runtime-build/Cargo.toml",
     "liteinst-runtime-build/Cargo.lock",
     "liteinst-runtime-build/runtime/Cargo.toml",
@@ -63,10 +66,77 @@ fn reverie_repository() -> reverie_liteinst_artifact::private_static::CargoGitRe
     reverie_liteinst_artifact::private_static::CargoGitRepository::new(REVERIE_GIT_REPOSITORY)
         .expect("the named Reverie repository is a valid https URL")
 }
+
+/// Whether the Reverie root carries its own Git metadata: a `.git`
+/// directory or file at the Reverie root itself, the same test the
+/// content factory's pin proof uses for its canonical root (via the
+/// logical link here, which names the same entry). No
+/// parent-directory discovery (see liteinst-runtime-build).
+fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
+    reverie_root.join(".git").exists()
+}
+
+/// Whether the workspace's nested manifest spells its Reverie
+/// dependencies by path (`true`) or by git revision (`false`): every
+/// non-comment Reverie dependency line must agree.
+fn manifest_is_path_sourced(root: &Path) -> Result<bool> {
+    let text = io(fs::read_to_string(
+        root.join("liteinst-runtime-build/Cargo.toml"),
+    ))?;
+    let mut path_sourced: Option<bool> = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') || !line.contains("reverie") {
+            continue;
+        }
+        let vote = if line.contains("git =") {
+            Some(false)
+        } else if line.contains("path =") && line.contains("reverie/") {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(vote) = vote {
+            match path_sourced {
+                Some(seen) if seen != vote => {
+                    return Err("manifest mixes git and path Reverie dependencies".into());
+                }
+                Some(_) => {}
+                None => path_sourced = Some(vote),
+            }
+        }
+    }
+    path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
+}
+
+/// The routed layout for this workspace (see the same route in
+/// liteinst-runtime-build): `HermitPath` only for a gitless
+/// path-sourced Reverie root; a root with its own Git metadata takes
+/// `HermitGit`, so the pin proof runs for a real checkout.
+fn source_layout(root: &Path) -> Result<CompiledSourceLayout> {
+    Ok(
+        if manifest_is_path_sourced(root)?
+            && !reverie_root_has_git_metadata(&root.join("reverie"))
+        {
+            CompiledSourceLayout::HermitPath
+        } else {
+            CompiledSourceLayout::HermitGit
+        },
+    )
+}
+
 fn resolve(root: &Path, runner: &mut Runner) -> Result<VerifiedCompiledSources> {
+    resolve_as(root, source_layout(root)?, runner)
+}
+
+fn resolve_as(
+    root: &Path,
+    layout: CompiledSourceLayout,
+    runner: &mut Runner,
+) -> Result<VerifiedCompiledSources> {
     VerifiedCompiledSources::resolve_content_with_repository(
         &CompiledSourceExpectation {
-            layout: CompiledSourceLayout::HermitGit,
+            layout,
             image_kind: FixedImageKind::Standalone,
             workspace_root: root,
             manifest: &root.join("liteinst-runtime-build/Cargo.toml"),
@@ -147,7 +217,176 @@ fn private_cargo_home(
     Ok(())
 }
 
+/// Path-sourced counterpart of the git checks below: the copied
+/// workspace carries its own private `reverie` tree behind the logical
+/// `<workspace>/reverie` link, with no Cargo git checkout anywhere.
+/// The gitless copy always routes to the content-only layout. The
+/// original routes by its own Reverie root: content-only when that
+/// root is gitless too (the fbsource sibling link), in which case the
+/// two content authorities hash identically over byte-identical
+/// trees; the Git layout (reviewed catalog plus pin proof) when it
+/// is a real checkout. Each layout's record is pinned exactly below.
+/// A changed runtime source must refuse both an existing binding and
+/// a fresh factory, and retargeting the logical link must break it.
+fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Result<()> {
+    let copied = case.join("source");
+    assert!(!copied.join(".git").exists());
+    let private_reverie = case.join("reverie-private");
+    assert!(!private_reverie.join(".git").exists());
+    assert_eq!(
+        source_layout(&copied)?,
+        CompiledSourceLayout::HermitPath,
+        "gitless copy must route to the content-only layout",
+    );
+    let original_context = resolve(original, runner)?;
+    // The original's own resolution may run the Git pin proof; the
+    // gitless copy's must not run git at all (asserted at the end).
+    let before_copied = runner.commands().len();
+    let context = resolve(&copied, runner)?;
+    let expected = record(&original_context)?;
+    let observed = record(&context)?;
+    assert_eq!(observed["layout"], "HermitPath");
+    assert_eq!(observed["authority"]["kind"], "declared_content");
+    assert_eq!(expected["authority"]["kind"], "declared_content");
+    // The workspace authority is layout-independent: the same six
+    // declared files with the same bytes.
+    assert_eq!(
+        expected["authority"]["workspace_sha256"],
+        observed["authority"]["workspace_sha256"],
+    );
+    for key in ["workspace_sha256", "reverie_sha256"] {
+        assert_eq!(observed["authority"][key].as_str().unwrap().len(), 64);
+        assert_eq!(expected["authority"][key].as_str().unwrap().len(), 64);
+    }
+    assert_eq!(
+        observed["authority"]["workspace_inventory"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        expected["authority"]["workspace_inventory"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    match source_layout(original)? {
+        CompiledSourceLayout::HermitPath => {
+            assert_eq!(expected["layout"], "HermitPath");
+            assert_eq!(
+                expected["authority"]["reverie_sha256"],
+                observed["authority"]["reverie_sha256"],
+                "gitless original and gitless copy must bind identical content",
+            );
+            assert_eq!(
+                expected["authority"]["reverie_inventory"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                507,
+            );
+        }
+        CompiledSourceLayout::HermitGit => {
+            assert_eq!(expected["layout"], "HermitGit");
+            // The Git layout binds the reviewed catalog (the 89-entry
+            // set the git family's checks pin for the same arm: the
+            // 88-row CONTENT_REVERIE_CATALOG plus the qualifier
+            // lib.rs) and the pin proof that ran above; the gitless
+            // copy binds the full compiled closure instead.
+            assert_eq!(
+                expected["authority"]["reverie_inventory"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                89,
+            );
+        }
+        other => panic!("path-sourced family routed the original to {other:?}"),
+    }
+    // The path inventory is the reviewed catalog plus every
+    // source-shaped file in the compiled closure, not the git arm's
+    // catalog alone: 507 entries on this tree (506 measured
+    // 2026-11-16, plus reverie-liteinst/tests/aarch64_trap_install.rs
+    // from the landed aarch64 trap-install change).
+    let reverie_inventory = observed["authority"]["reverie_inventory"]
+        .as_array()
+        .unwrap();
+    assert_eq!(reverie_inventory.len(), 507);
+    let mut inventory_paths: Vec<&str> = reverie_inventory
+        .iter()
+        .map(|entry| entry["relative"].as_str().unwrap())
+        .collect();
+    assert!(
+        inventory_paths.contains(&"reverie-liteinst/tests/aarch64_trap_install.rs"),
+        "path inventory lost the aarch64 trap-install test source",
+    );
+    inventory_paths.sort_unstable();
+    // Digest input format, exactly: the sorted inventory relative
+    // paths, one per line — joined with "\n" and terminated by one
+    // trailing "\n" — as UTF-8 bytes. Any inventory addition,
+    // removal, or rename changes this digest and must update the
+    // constant deliberately, like the count above.
+    assert_eq!(
+        crate::artifact::sha256(format!("{}\n", inventory_paths.join("\n")).as_bytes()),
+        "12925ab51846415091a7e663f27445afb0e53e3f7a60aac85d782051781399ba",
+    );
+    assert_eq!(
+        context.compiler_manifest_path()?.as_os_str(),
+        copied
+            .join("reverie/reverie-liteinst-preload/Cargo.toml")
+            .as_os_str(),
+    );
+
+    // The recorded package root is canonical (the private tree); the
+    // compiler spelling asserted above stays logical.
+    let physical_root = reverie_root(&context)?;
+    assert_eq!(physical_root, private_reverie);
+    let role = private_reverie.join("reverie-inguest/src/guest/tool_region.rs");
+    let bytes = io(fs::read(&role))?;
+    let mut changed = bytes.clone();
+    changed.extend_from_slice(b"\n// source-copy regression mutation\n");
+    io(fs::write(&role, changed))?;
+    let after = context.verify_unchanged(runner).unwrap_err();
+    assert!(after.contains("catalog"), "{after}");
+    let before = match resolve(&copied, runner) {
+        Ok(_) => panic!("a fresh factory accepted changed runtime source"),
+        Err(error) => error,
+    };
+    assert!(before.contains("catalog"), "{before}");
+    io(fs::write(&role, &bytes))?;
+    assert_eq!(io(fs::read(&role))?, bytes);
+    context.verify_unchanged(runner)?;
+    resolve(&copied, runner)?;
+
+    // Byte-identical sources at a new physical root must not reuse an
+    // already-resolved logical root binding.
+    let moved = case.join("reverie-moved");
+    io(fs::rename(&private_reverie, &moved))?;
+    io(fs::remove_file(copied.join("reverie")))?;
+    io(symlink(&moved, copied.join("reverie")))?;
+    let retarget = context.verify_unchanged(runner).unwrap_err();
+    assert!(retarget.contains("mapping changed"), "{retarget}");
+    io(fs::remove_file(copied.join("reverie")))?;
+    io(fs::rename(&moved, &private_reverie))?;
+    io(symlink(&private_reverie, copied.join("reverie")))?;
+    context.verify_unchanged(runner)?;
+    assert!(
+        runner.commands()[before_copied..]
+            .iter()
+            .all(|command| command.program() != "git"),
+        "gitless copy resolution ran git",
+    );
+    Ok(())
+}
+
 fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Result<()> {
+    // The check family follows the manifest spelling; the routed
+    // layout of each tree is asserted inside its own family.
+    if manifest_is_path_sourced(original)? {
+        return copied_path_source_checks(case, original, runner);
+    }
     let copied = case.join("source");
     assert!(!copied.join(".git").exists());
     let original_context = resolve(original, runner)?;
@@ -171,26 +410,16 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // The reviewed catalog binds 77 runtime/artifact inputs, including the
-        // pidfd-self modules and their lifecycle and Guest entry points, the
-        // signal-mask gate's runtime_mask module and its callers, the typed
-        // Tool configuration (reverie/src/tool_configuration.rs and
-        // reverie-inguest/src/guest/rpc.rs, added by Reverie 38c3e024), and
-        // the shared Tool process ownership, callback outcomes and reserved
-        // RPC protocol (seven rows added by the native caller-Tool join).
-        // Four package-role proof/fixture inputs are also bound.
-        // The separately bound qualifier source adds one input.
-        // Reverie 78e3cadac76b adds five more: the native-syscall modules
-        // (reverie/src/native_syscall.rs, reverie-ptrace/src/task/
-        // native_syscall.rs) and the reserved-input modules
-        // (reverie/src/reserved_input/{mod,registry}.rs,
-        // reverie-ptrace/src/task/reserved_input.rs): 78 + 5 = 83.
-        // Reverie a6dba68f7 binds the preparation identity proof
-        // (reverie-liteinst-artifact/src/preparation_identity.rs): 83 + 1 = 84.
-        // Reverie 1326 (the aarch64 Isa stack) binds the three ISA modules
-        // (reverie-inguest/src/guest/isa.rs, guest/isa/aarch64.rs,
-        // guest/isa/x86_64.rs): 84 + 3 = 87.
-        87
+        // Standalone DeclaredContent inventory, by its list
+        // definition in content_reverie_inventory_for_image
+        // (reverie-liteinst-artifact/src/lib.rs): every relative in
+        // the 88-row CONTENT_REVERIE_CATALOG plus the separately
+        // bound qualifier reverie-liteinst-artifact/src/lib.rs:
+        // 88 + 1 = 89. Detcore adds the fixed-gate row for 90; the
+        // library test pins both (89/90). Measured in the Git
+        // layout 2026-11-17: the HermitGit arm above failed
+        // left 89 vs the stale 87 pinned here and there.
+        89
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
@@ -258,6 +487,184 @@ fn gitless_standalone_compiler_sources() -> Result<()> {
     run_private_copy_test(original, TEST_NAME)
 }
 
+/// Routing control: path-form manifests over a Reverie root that IS a
+/// Git checkout must run the Git-layout pin proof, not the gitless
+/// content-only layout. The fixture is the gitless private copy above
+/// made into a fresh Git repository whose HEAD is a new commit, not
+/// the pin: resolution must refuse it by the pin check's own name.
+#[test]
+fn git_checkout_at_wrong_head_refused() -> Result<()> {
+    let original = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("Hermit source root missing")?;
+    // Premise gate: this control is about the path-form route. A
+    // git-form tree already selects the Git layout on every route,
+    // so a non-path-spelled fixture must fail loudly here rather
+    // than silently skip the pin-proof control.
+    let nested = io(fs::read_to_string(
+        original.join("liteinst-runtime-build/Cargo.toml"),
+    ))?;
+    assert!(
+        nested
+            .lines()
+            .any(|line| line.contains("path =") && line.contains("reverie/")),
+        "wrong-head control requires path-spelled Reverie manifests",
+    );
+    let directory = tempfile::Builder::new()
+        .prefix("liteinst-wrong-head-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .map_err(|e| e.to_string())?;
+    let case = io(fs::canonicalize(directory.path()))?;
+    let copied = case.join("source");
+    for relative in SOURCE_FILES {
+        let target = copied.join(relative);
+        io(fs::create_dir_all(target.parent().unwrap()))?;
+        io(fs::copy(original.join(relative), target))?;
+    }
+    let mut runner = Runner::new(case.join("logs"), WALL_BACKSTOP, 8 << 20)?;
+    let source_reverie = io(fs::canonicalize(original.join("reverie")))?;
+    // A real directory at the workspace spelling, not a link: the
+    // Git-layout binding admits only the canonical spelling (or the
+    // Cargo-home checkout alias), and this control must reach the
+    // pin proof, not stop at the alias gate.
+    let private_reverie = copied.join("reverie");
+    runner.run(
+        "cp",
+        &[
+            "-a".into(),
+            "--reflink=auto".into(),
+            "--".into(),
+            text(&source_reverie)?,
+            text(&private_reverie)?,
+        ],
+        &case,
+    )?;
+    // Start from the gitless copy, then make it a Git checkout at a
+    // fresh HEAD: exactly the tree the content-only route must not
+    // certify on location plus catalogued content.
+    let copied_git = private_reverie.join(".git");
+    if copied_git.is_dir() {
+        io(fs::remove_dir_all(&copied_git))?;
+    } else if copied_git.exists() {
+        io(fs::remove_file(&copied_git))?;
+    }
+    let git = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&private_reverie)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    };
+    git(&["init", "-q"])?;
+    git(&["add", "--", "Cargo.toml"])?;
+    git(&[
+        "-c",
+        "user.name=wrong-head-fixture",
+        "-c",
+        "user.email=wrong-head-fixture@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "wrong-head fixture",
+    ])?;
+    let head = git(&["rev-parse", "HEAD"])?.trim().to_owned();
+    assert_eq!(head.len(), 40, "{head}");
+    assert_ne!(head, env!("HERMIT_REVERIE_PIN"));
+    match resolve(&copied, &mut runner) {
+        Ok(_) => panic!(
+            "git checkout at wrong HEAD {head} was accepted; the route must \
+             run the Git-layout pin check for a Reverie root with .git"
+        ),
+        Err(error) => assert!(
+            error.contains("content Reverie checkout HEAD differs from independent full pin"),
+            "{error}",
+        ),
+    }
+    assert!(
+        runner
+            .commands()
+            .iter()
+            .any(|command| command.program() == "git"),
+        "pin proof never ran git",
+    );
+    Ok(())
+}
+
+/// Path-sourced setup: own a private copy of the whole Reverie tree
+/// (the compiled closure, not a Cargo checkout), link it at the copied
+/// workspace's logical `reverie`, and re-execute only this source check
+/// in the child. No CARGO_HOME surgery: path dependencies never consult
+/// a git checkout, and negative mutations stay inside the private copy.
+fn run_private_path_copy_child(
+    directory: tempfile::TempDir,
+    case: &Path,
+    copied: &Path,
+    original: &Path,
+    original_context: &VerifiedCompiledSources,
+    test_name: &str,
+    runner: &mut Runner,
+) -> Result<()> {
+    let source_reverie = io(fs::canonicalize(original.join("reverie")))?;
+    let private_reverie = case.join("reverie-private");
+    runner.run(
+        "cp",
+        &[
+            "-a".into(),
+            "--reflink=auto".into(),
+            "--".into(),
+            text(&source_reverie)?,
+            text(&private_reverie)?,
+        ],
+        case,
+    )?;
+    // The copy is gitless even when the source tree was a submodule.
+    let copied_git = private_reverie.join(".git");
+    if copied_git.is_dir() {
+        io(fs::remove_dir_all(&copied_git))?;
+    } else if copied_git.exists() {
+        io(fs::remove_file(&copied_git))?;
+    }
+    io(symlink(&private_reverie, copied.join("reverie")))?;
+    let child = vec![
+        format!("{CHILD_ROOT}={}", text(case)?),
+        "CARGO_NET_OFFLINE=true".into(),
+        text(&io(std::env::current_exe())?)?,
+        "--exact".into(),
+        test_name.into(),
+        "--nocapture".into(),
+        "--test-threads=1".into(),
+    ];
+    let child_run = runner
+        .run_cpu_bounded("env", &child, copied, CHILD_CPU_BUDGET)
+        .or_else(|error| {
+            if error.contains("producer CPU accounting unavailable") {
+                eprintln!(
+                    "source-copy child: CPU accounting unavailable ({error}); \
+                     running under the wall backstop only"
+                );
+                runner.run("env", &child, copied)
+            } else {
+                Err(error)
+            }
+        });
+    if let Err(error) = child_run {
+        let retained = directory.keep();
+        return Err(format!("{error}; retained fixture {}", retained.display()));
+    }
+    original_context.verify_unchanged(runner)?;
+    Ok(())
+}
+
 fn run_private_copy_test(original: &Path, test_name: &str) -> Result<()> {
     let directory = tempfile::Builder::new()
         .prefix("liteinst-source-copy-")
@@ -272,6 +679,17 @@ fn run_private_copy_test(original: &Path, test_name: &str) -> Result<()> {
     }
     let mut runner = Runner::new(case.join("parent-logs"), WALL_BACKSTOP, 8 << 20)?;
     let original_context = resolve(original, &mut runner)?;
+    if manifest_is_path_sourced(original)? {
+        return run_private_path_copy_child(
+            directory,
+            &case,
+            &copied,
+            original,
+            &original_context,
+            test_name,
+            &mut runner,
+        );
+    }
     let cargo_home = match std::env::var_os("CARGO_HOME") {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(std::env::var_os("HOME").ok_or("Cargo home missing")?).join(".cargo"),
@@ -343,7 +761,87 @@ fn run_private_copy_test(original: &Path, test_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Path-sourced closing checks: the Git factory's `with_resolved`
+/// transaction refuses the path layout by name, so the content
+/// factory's own closing scan (`verify_unchanged`, the same scan the
+/// Git transaction closes with) must catch a mutation made while a
+/// resolved context is in use, on both a succeeding and a failing
+/// body, with both errors retained on the failure path.
+fn path_transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
+    let copied = case.join("source");
+    assert_eq!(
+        source_layout(&copied)?,
+        CompiledSourceLayout::HermitPath,
+        "gitless copy must route to the content-only layout",
+    );
+    let private_reverie = case.join("reverie-private");
+    let expected = CompiledSourceExpectation {
+        layout: CompiledSourceLayout::HermitPath,
+        image_kind: FixedImageKind::Standalone,
+        workspace_root: &copied,
+        manifest: &copied.join("liteinst-runtime-build/Cargo.toml"),
+        reverie_pin: env!("HERMIT_REVERIE_PIN"),
+    };
+    let refused = VerifiedCompiledSources::with_resolved_with_repository(
+        &expected,
+        reverie_repository(),
+        runner,
+        |_| Ok(()),
+    );
+    let error = match refused {
+        Ok(_) => panic!("the Git transaction accepted the path layout"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("path-sourced layout requires the declared-content factory"),
+        "{error}",
+    );
+
+    let role = private_reverie.join("reverie-inguest/src/guest/tool_region.rs");
+    let bytes = io(fs::read(&role))?;
+    let mut changed = bytes.clone();
+    changed.extend_from_slice(b"\n// transaction closing-scan regression mutation\n");
+
+    // Success path: a mutation during use fails the mandatory close.
+    let context = resolve(&copied, runner)?;
+    io(fs::write(&role, &changed))?;
+    let close = context.verify_unchanged(runner);
+    io(fs::write(&role, &bytes))?;
+    assert_eq!(io(fs::read(&role))?, bytes);
+    let error = close.unwrap_err();
+    assert!(error.contains("catalog"), "{error}");
+
+    // Failure path: the body error and the closing error both surface.
+    let context = resolve(&copied, runner)?;
+    io(fs::write(&role, &changed))?;
+    let body: Result<()> = Err("deliberate receipt-only body failure".into());
+    let close = context.verify_unchanged(runner);
+    io(fs::write(&role, &bytes))?;
+    assert_eq!(io(fs::read(&role))?, bytes);
+    let combined = format!(
+        "{}; compiled source transaction close failed: {}",
+        body.unwrap_err(),
+        close.unwrap_err(),
+    );
+    assert!(
+        combined.contains("deliberate receipt-only body failure")
+            && combined.contains("catalog"),
+        "{combined}",
+    );
+    resolve(&copied, runner)?;
+    assert!(
+        runner
+            .commands()
+            .iter()
+            .all(|command| command.program() != "git")
+    );
+    Ok(())
+}
+
 fn transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
+    if case.join("reverie-private").exists() {
+        return path_transaction_checks(case, runner);
+    }
     // Use the existing content factory only to locate our owned physical Cargo
     // checkout. The transaction itself must exercise the real Git workspace
     // factory and fresh locked/offline metadata, not a synthesized binding.

@@ -63,6 +63,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALLOCATOR_FIXTURE");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=artifact.rs");
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=runtime/src/lib.rs");
@@ -118,9 +119,25 @@ fn main() {
         64 * 1024 * 1024,
     )
     .expect("failed to create bounded compiled-source runner");
+    let path_sourced = artifact::reverie_is_path_sourced(
+        &fs::read_to_string(&source_manifest).expect("failed to read the nested manifest"),
+    )
+    .unwrap_or_else(|error| panic!("standalone Reverie layout refused: {error}"));
+    // The content-only layout is for gitless copies alone: a Reverie
+    // root carrying its own Git metadata takes the Git layout even
+    // when the manifests spell path dependencies, so the factory's
+    // pin proof (checkout HEAD and Hermit gitlink equal to the pin)
+    // always runs for a real checkout.
+    let layout = if path_sourced
+        && !artifact::reverie_root_has_git_metadata(&source_root.join("reverie"))
+    {
+        qualifier::CompiledSourceLayout::HermitPath
+    } else {
+        qualifier::CompiledSourceLayout::HermitGit
+    };
     let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
         &qualifier::CompiledSourceExpectation {
-            layout: qualifier::CompiledSourceLayout::HermitGit,
+            layout,
             image_kind: qualifier::FixedImageKind::Standalone,
             workspace_root: source_root,
             manifest: &source_manifest,
@@ -164,16 +181,29 @@ fn main() {
     let version = package["version"]
         .as_str()
         .expect("preload leaf has no version");
-    // Two leaf forms name the same pin, and no third: the git form
-    // carries the revision itself; the path form (since the
-    // path-dependency migration) is bound by resolve_content above,
-    // which required the Hermit gitlink and the Reverie checkout HEAD
-    // to equal HERMIT_LITEINST_REVERIE_PIN before this metadata was
-    // read, and by the package-identity equality with the verified
-    // constructor package below. The revision reported downstream is
-    // that checked pin in both forms.
+    // Leaf identity follows the manifest spelling, and each form is
+    // bound exactly. A path-sourced leaf has no source string to
+    // parse: its identity is the content-bound package the factory
+    // verified above (id and manifest compared next). The revision
+    // is the independently supplied pin: a label for a gitless root
+    // (path layout, content-bound), and a checked value — Hermit
+    // gitlink and Reverie checkout HEAD equal to
+    // HERMIT_LITEINST_REVERIE_PIN, required by resolve_content above
+    // before this metadata was read — whenever the root carries Git
+    // metadata (Git layout). Otherwise the git form carries the
+    // revision itself. The package-identity equality with the
+    // verified constructor package below binds every form.
     let revision = requested_pin.as_str();
-    if let Some(source) = package["source"].as_str() {
+    if path_sourced {
+        assert!(
+            package["source"].is_null(),
+            "path-sourced preload leaf must have no Cargo source"
+        );
+        assert!(
+            package_id.starts_with("path+file://"),
+            "path-sourced preload leaf must have a path+file package ID: {package_id}"
+        );
+    } else if let Some(source) = package["source"].as_str() {
         let revision = source
             .strip_prefix(&format!("git+{REVERIE_GIT_REPOSITORY}?rev="))
             .and_then(|suffix| suffix.split_once('#'))
