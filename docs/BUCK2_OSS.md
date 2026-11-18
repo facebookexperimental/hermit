@@ -658,7 +658,8 @@ The wrappers use immutable versions rather than live branch tips:
   a BLAKE3 digest and size for each supported platform. The descriptor's size
   and digest describe the compressed `.zst` artifact, not the decompressed
   binary in the cache — those two numbers differing is expected.
-- Reindeer `e3d72748131d3a70378055f091e0647c1edad85e`
+- Reindeer `e3d72748131d3a70378055f091e0647c1edad85e`, with the local patches in
+  `bootstrap/patches/reindeer` (below)
 - Reindeer's own Rust toolchain `nightly-2026-05-22`
 - The build compiler, `1.97.1` in `rust-toolchain.toml`
 
@@ -687,6 +688,23 @@ such as one per validation host, and takes precedence over
 shared cache trusts every checkout that writes to it: a hit runs the cached
 binary without checking it. Nothing is evicted; each build takes about 1 GB.
 
+`bootstrap/run-pinned-tool` applies every `bootstrap/patches/<tool>/*.patch` to
+the pinned revision, in name order, before it builds, and the patches' names and
+contents are part of the build's name, so a patched Reindeer never shares a cache
+entry with another patch set or with the unpatched build. A patch that no longer
+applies stops the build and names the patch. Each patch file says why it exists
+and when to drop it. Today there is one,
+`0001-path-crates-outside-the-workspace-are-first-party.patch`. Hermit
+path-depends on the crates of its `reverie` submodule and keeps them out of its
+workspace. Pinned Reindeer treats such a crate as third-party and fails ("crate
+sources would be inaccessible from the generated BUCK file") because its sources
+are outside `shim/third-party/rust`. The `reverie` cell's own BUCK files build
+those crates, so the patch makes Reindeer walk them for their dependencies and
+emit no rules for them, as it does for workspace members. A per-crate
+`omit_targets` fixup is not a substitute: it stops the walk, so crates only
+Reverie uses (`derive_more`, `tokio-stream`, `tokio-util` among them) lose their
+rules. The patch goes away when Reindeer can be told this by configuration.
+
 DotSlash downloads and verifies the platform-specific Buck2 release
 binary; `DOTSLASH_CACHE` relocates its cache.
 
@@ -710,7 +728,8 @@ version, the compiler Reindeer queries (`RUSTC`, else `rustc`) with its
 `reindeer.toml`, every file under `shim/third-party/rust` whether Git ignores it
 or not and following links (apart from the generated `vendor`, `BUCK` and
 `.cargo` and Cargo's `registry`, `git`, `target` and `.package-cache`), the
-ignore files on the way to them, and the Reindeer pin and scripts. It reads
+ignore files on the way to them, and the Reindeer pin, scripts and local
+patches. It reads
 `reindeer.toml` and the `cargo metadata` output with TOML and JSON parsers, so
 quoting and escapes do not hide a setting or a path from it. A `reindeer.toml`
 that makes Reindeer read something the key does not cover (`fixups_dir`,

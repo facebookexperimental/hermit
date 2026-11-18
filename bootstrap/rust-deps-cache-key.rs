@@ -18,7 +18,9 @@
 //!   decoded JSON, so a member Git ignores is still read;
 //! - the toolchain file, the root Cargo.toml and Cargo configuration (.cargo),
 //!   the ignore files on the way to the third-party directory, the Reindeer pin
-//!   and launcher, the build recipe, this program and its caller;
+//!   and launcher, every local patch run-pinned-tool applies to the pinned
+//!   Reindeer (every file Git lists under bootstrap/patches, tracked or not),
+//!   the build recipe, this program and its caller;
 //! - the Buck package Reindeer names its targets under, and the `.gitignore`
 //!   files it applies: it walks up from the third-party directory to the nearest
 //!   directory holding `.buckconfig` or `.buckroot`, whether or not that is
@@ -92,7 +94,7 @@ const NAME: &str = "rust-deps-cache-key.rs";
 const USAGE: &str = "usage: rust-deps-cache-key.rs REPO_ROOT";
 /// Changes whenever what an entry holds, or how the key is formed, changes, so
 /// an entry stored under an earlier recipe is never restored.
-const RECIPE: &str = "4";
+const RECIPE: &str = "5";
 /// Reindeer's third-party directory, which regenerate-rust-deps passes as
 /// `--third-party-dir`; reindeer.toml and the default fixups directory are in it.
 const THIRD_PARTY_DIR: &str = "shim/third-party/rust";
@@ -264,6 +266,7 @@ fn run(root: &Path) -> Result<Outcome, String> {
             "--exclude-standard",
             "--",
             ":(glob)**/Cargo.toml",
+            ":(glob)bootstrap/patches/**",
         ]),
         "git ls-files",
     )?;

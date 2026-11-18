@@ -40,12 +40,30 @@ else
   cache_root=$HOME/.cache/hermit-buck2-tools
 fi
 
-# Everything a build depends on names it: the tool revision, the toolchain, and
-# this script's build recipe. Bump build_recipe when the cargo command or the
-# environment the miss gives it changes, so a cache that outlives one checkout
-# never hands a binary built one way to a checkout that builds it another way.
+# Local patches this tree carries for the tool, bootstrap/patches/<tool>/*.patch:
+# applied to the pinned revision in name order before the build (each patch file
+# says why it exists and when to drop it).
+patches=()
+if [[ -d $script_dir/patches/$tool ]]; then
+  shopt -s nullglob
+  patches=("$script_dir/patches/$tool"/*.patch)
+  shopt -u nullglob
+fi
+
+# Everything a build depends on names it: the tool revision, the toolchain, this
+# script's build recipe, and the local patches (their names and contents). Bump
+# build_recipe when the cargo command or the environment the miss gives it
+# changes, so a cache that outlives one checkout never hands a binary built one
+# way to a checkout that builds it another way.
 build_recipe=1
 build_key=$tool-$revision-$toolchain-r$build_recipe
+if ((${#patches[@]})); then
+  patch_digest=$(for patch in "${patches[@]}"; do
+    printf '%s\n' "${patch##*/}"
+    sha256sum <"$patch"
+  done | sha256sum)
+  build_key=$build_key-p${patch_digest:0:16}
+fi
 source_dir=$cache_root/source/$build_key
 target_dir=$cache_root/target/$build_key
 binary=$target_dir/release/$tool
@@ -102,6 +120,12 @@ if [[ ! -x $binary ]]; then
       echo "expected $tool revision $revision, got $actual_revision" >&2
       exit 1
     fi
+    for patch in "${patches[@]}"; do
+      if ! git -C "$source_dir" apply "$patch" 9>&-; then
+        echo "$patch does not apply to $tool revision $revision (above)" >&2
+        exit 1
+      fi
+    done
 
     if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1 9>&-; then
       rustup toolchain install "$toolchain" --profile minimal 9>&-

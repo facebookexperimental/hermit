@@ -1,0 +1,38 @@
+Hermit: a path crate outside the workspace is first-party.
+
+bootstrap/run-pinned-tool applies this to the pinned Reindeer revision
+(bootstrap/tool-pins.sh) before it builds it; the patch's content is part of
+the build key. Hermit path-depends on the crates of its reverie submodule and
+keeps them out of its workspace. Pinned Reindeer treats such a crate as
+third-party and fails ("crate sources would be inaccessible from the generated
+BUCK file") because its sources are outside shim/third-party/rust. The reverie
+Buck cell builds those crates, so Reindeer must walk them for their
+dependencies (crates only Reverie uses need rules too) and emit no rules for
+them: what it already does for workspace members. A per-crate omit_targets
+fixup is not enough: it stops the walk, and the crates only Reverie uses lose
+their rules. Drop this patch once Reindeer offers a way to say so.
+
+The match is wider than its title: Source::Local is every path crate, so a path
+crate under shim/third-party/rust would get no rules either. Today every path
+crate that is not a workspace member is one of the reverie submodule's 16
+crates (Cargo.lock: 38 path packages, 22 workspace members). Vendor a new
+third-party crate from a registry or git source, or narrow this match first.
+
+diff --git a/src/buckify.rs b/src/buckify.rs
+index 8386185..cd676dc 100644
+--- a/src/buckify.rs
++++ b/src/buckify.rs
+@@ -298,8 +298,12 @@ fn generate_rules<'scope, 'env>(
+         let will_use_rules = {
+             let is_private_root_pkg =
+                 context.index.is_root_package(pkg) && !context.index.is_public_package(pkg);
++            // Hermit (bootstrap/patches/reindeer): a path dependency outside the
++            // workspace (Source::Local) is first-party too; the Buck cell that
++            // holds it builds it. Walk it for its dependencies, emit nothing.
+             let is_ignored_workspace_package = !context.config.include_workspace_members
+-                && context.index.is_workspace_package(pkg);
++                && (context.index.is_workspace_package(pkg)
++                    || matches!(pkg.source, Source::Local));
+             !is_private_root_pkg && !is_ignored_workspace_package
+         };
+ 

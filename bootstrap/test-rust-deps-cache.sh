@@ -25,7 +25,8 @@
 # nearer the third-party directory, a .gitignore outside the checkout that the
 # nearest marker brings into force, two checkouts whose paths below the marker
 # (so Reindeer's package) differ, a local package under a third-party
-# directory named target, git, registry or .package-cache, and the compiler's
+# directory named target, git, registry or .package-cache, a local Reindeer
+# patch under bootstrap/patches (added, then changed), and the compiler's
 # target cfg and version each change the key, and RUSTC names the compiler
 # queried; a
 # platform target written as a multi-line or escaped string, or under an escaped
@@ -478,6 +479,21 @@ echo 'edition = "2021"' >>"$repo/$escaped_member/Cargo.toml"
 regen member_escaped_edit
 expect_vendored member_escaped_edit
 rm -rf -- "${repo:?}/${escaped_member:?}"
+
+# A local Reindeer patch (bootstrap/patches, which run-pinned-tool applies to the
+# pinned Reindeer) is keyed: adding one vendors anew, the same one restores, and a
+# changed one vendors anew. The fixture Reindeer does not read it, so only the
+# key is under test here.
+mkdir -p "$repo/bootstrap/patches/reindeer"
+echo 'patch 1' >"$repo/bootstrap/patches/reindeer/0001-fixture.patch"
+regen patch_new
+expect_vendored patch_new
+regen patch_again
+expect_restored patch_again
+echo 'patch 2' >"$repo/bootstrap/patches/reindeer/0001-fixture.patch"
+regen patch_edit
+expect_vendored patch_edit
+rm -rf -- "${repo:?}/bootstrap/patches"
 
 # expect_input_keyed WARM AGAIN EDIT: WARM vendored a new input and AGAIN
 # restored it; EDIT, after the input changed, must vendor (not restore WARM's

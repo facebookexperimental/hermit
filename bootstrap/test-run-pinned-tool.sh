@@ -348,6 +348,57 @@ elif ! grep -qx 'flock is required' <<<"$output"; then
   failures=$((failures + 1))
 fi
 
+# Local patches (bootstrap/patches/reindeer/*.patch) are applied to the pinned
+# revision before the build, and name the build: a patched binary is never served
+# for another patch set or for none, and a patch that does not apply builds nothing.
+patched=$tmp/patched
+mkdir -p "$patched/bootstrap/patches/reindeer"
+cp "$tmp/bootstrap/run-pinned-tool" "$tmp/bootstrap/tool-pins.sh" "$patched/bootstrap/"
+make_patch() { # $1: the line the patch appends to the upstream Cargo.toml
+  printf 'A fixture patch: it says why it exists.\n\n'
+  printf 'diff --git a/Cargo.toml b/Cargo.toml\n--- a/Cargo.toml\n+++ b/Cargo.toml\n'
+  printf '@@ -1,2 +1,3 @@\n [package]\n name = "reindeer"\n+%s\n' "$1"
+}
+patched_source() { # the one patched source checkout in cache $1, or a failure
+  local dirs
+  dirs=("$1"/source/"$build_key"-p*)
+  [[ ${#dirs[@]} -eq 1 && -d ${dirs[0]} ]] || return 1
+  printf '%s\n' "${dirs[0]}"
+}
+make_patch 'version = "1.0.0"' >"$patched/bootstrap/patches/reindeer/0001-fixture.patch"
+cache=$tmp/cache-patched log=$tmp/rustup-patched.log
+output=$(script=$patched/bootstrap/run-pinned-tool run_tool "$cache" "$log" 2>&1) || true
+expect_tool_output "local patch" "$output"
+expect_builds "local patch" "$log" 1
+if ! first=$(patched_source "$cache") || ! grep -qx 'version = "1.0.0"' "$first/Cargo.toml"; then
+  echo "FAIL [local patch]: no patched source checkout under $cache/source/$build_key-p*" >&2
+  failures=$((failures + 1))
+fi
+if [[ -e $cache/source/$build_key ]]; then
+  echo "FAIL [local patch]: the patched build used the unpatched build key" >&2
+  failures=$((failures + 1))
+fi
+make_patch 'version = "2.0.0"' >"$patched/bootstrap/patches/reindeer/0001-fixture.patch"
+output=$(script=$patched/bootstrap/run-pinned-tool run_tool "$cache" "$log" 2>&1) || true
+expect_tool_output "changed local patch" "$output"
+expect_builds "changed local patch" "$log" 2
+second=$(compgen -G "$cache/source/$build_key-p*" | grep -vxF "${first:-}" || true)
+if [[ $(compgen -G "$cache/source/$build_key-p*" | wc -l) -ne 2 || -z $second ]] ||
+    ! grep -qx 'version = "2.0.0"' "$second/Cargo.toml"; then
+  echo "FAIL [changed local patch]: a changed patch did not build under a new key" >&2
+  failures=$((failures + 1))
+fi
+printf 'not a patch\n\ndiff --git a/missing b/missing\n--- a/missing\n+++ b/missing\n@@ -1 +1 @@\n-a\n+b\n' \
+  >"$patched/bootstrap/patches/reindeer/0001-fixture.patch"
+if output=$(script=$patched/bootstrap/run-pinned-tool run_tool "$tmp/cache-bad-patch" "$tmp/rustup-bad.log" 2>&1); then
+  echo "FAIL [bad local patch]: a patch that does not apply still ran the tool" >&2
+  failures=$((failures + 1))
+elif ! grep -q '0001-fixture.patch does not apply to reindeer revision' <<<"$output" ||
+    [[ $(builds "$tmp/rustup-bad.log") -ne 0 ]]; then
+  echo "FAIL [bad local patch]: unexpected outcome: $output" >&2
+  failures=$((failures + 1))
+fi
+
 # The whole test again under an inherited HERMIT_BUCK2_SHARED_TOOL_CACHE, as a
 # validation step runs it; nothing may reach that cache.
 if [[ -z ${TEST_RUN_PINNED_TOOL_NESTED:-} ]]; then
@@ -366,4 +417,4 @@ if [[ $failures -ne 0 ]]; then
   echo "test-run-pinned-tool: $failures failure(s)" >&2
   exit 1
 fi
-echo "test-run-pinned-tool: OK - $case_number inherited-location cache misses left the caller untouched; the shared-cache cases passed"
+echo "test-run-pinned-tool: OK - $case_number inherited-location cache misses left the caller untouched; the shared-cache and local-patch cases passed"
