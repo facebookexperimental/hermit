@@ -2383,7 +2383,8 @@ fn buck_gate_job(name: &str) -> String {
 const BUCK_S0_DAEMON_MEMORY_MAX_ENV: &str = "HERMIT_VALIDATE_BUCK_DAEMON_MEMORY_MAX";
 const BUCK_S0_DAEMON_CPU_SECONDS_ENV: &str = "HERMIT_VALIDATE_BUCK_DAEMON_CPU_SECONDS";
 /// 32 GiB: 1.5 times the highest daemon-scope memory.peak measured in a cold
-/// `--buck-s0` run of s0 (21.3 GiB, devbig014, 2026-11-17; the range was
+/// `--buck-s0` run of s0 (21.3 GiB on 2026-11-17, on the host named in
+/// docs/TESTING_ENVIRONMENTS.md, Named measurement hosts; the range was
 /// 12.4-21.3 GiB). Also the node's admission estimate, since dagrun cannot see
 /// the daemon's memory to correct it.
 const BUCK_S0_DAEMON_MEMORY_MAX_BYTES: i64 = 32 << 30;
