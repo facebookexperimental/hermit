@@ -67,6 +67,7 @@ LIBHERMIT_DEPS = [
     "//hermetic_infra/hermit/hermit-run-kvm:hermit-run-kvm",
     "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
     "//hermetic_infra/reverie:reverie-kvm",
+    "//hermetic_infra/reverie:reverie-linuxemu-ext-procfs",
     "//hermetic_infra/reverie:reverie-liteinst",
     "//hermetic_infra/reverie:reverie-ptrace",
     "//hermetic_infra/reverie:reverie-rpc-transport",

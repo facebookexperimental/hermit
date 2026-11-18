@@ -11,12 +11,15 @@
 # resolved graph (cargo metadata + TOML-parsed lockfiles), so manifest
 # formatting games cannot slip it.
 #
-#   1. today's graph passes, reverie-procfs FLAGGED as expiring debt
+#   1. today's graph passes with exactly the two named debts flagged:
+#      the KVM maps extension in the Buck closure (Sapling scope only;
+#      git scope never judges it), and reverie-procfs only on the
+#      Cargo surfaces until the pin advance (S2-R4)
 #   2. a planted reverie-linuxemu-ext-* path dependency refuses
 #   3. features on their own line (spread table) refuses [seat bypass a]
 #   4. a multiline renamed key (package = "...") refuses [seat bypass b]
-#   5. the real graph judged after the allow-until date refuses,
-#      naming reverie-procfs EXPIRED
+#   5. an expired allow-until refuses: on a planted reverie-procfs
+#      fixture, and on today's real graph judged after 2026-12-31
 #   6. the same planted extension under a Sapling (sl) scope refuses
 #   7. a directory under no VCS errors closed (rc 2), never guesses
 #   8. an Eden-shaped Sapling checkout nested in an outer git repo is
@@ -30,7 +33,7 @@
 #      reverie-proc-grammar) passes; the excluded harness root
 #      re-joins loudly once its closure evaluates
 #  11. buck2 missing / failing / empty closure each fail closed (rc 2)
-#  11. a default `dep:<name>` activation does not hide a distinct
+#  12. a default `dep:<name>` activation does not hide a distinct
 #      same-named non-default feature
 # Sapling twins are skipped only when sl is absent; every skip is
 # named and counted in the final summary, never silent.
@@ -67,11 +70,27 @@ if prepared=$("$RUST_SCRIPT_BIN" --resolve-optional "$CHECKER" 2>/dev/null) \
     CHECKER_CMD=("$prepared")
 fi
 
-echo "twin 1: today's graph passes; reverie-procfs flagged, not hidden"
-OUT=$(rust-script "$CHECKER" --repo-root "$REPO_ROOT" 2>&1); RC=$?
+echo "twin 1: today's graph passes with only the two named debts flagged (extension in Buck where judged, procfs on Cargo surfaces until the pin advance)"
+OUT=$("${CHECKER_CMD[@]}" --repo-root "$REPO_ROOT" 2>&1); RC=$?
+# The Buck closure is judged only in Sapling scope; in git scope the
+# checker witnesses it by the Cargo legs and the extension (a Buck-only
+# dependency) cannot appear. Scope is read from the checker's own
+# output: Sapling runs print flagged "buck2 deps closure" lines and/or
+# the PASS line's "Buck closure via buck2 uquery" note.
 if ((RC != 0)); then fail "real graph rc=$RC (want 0): $OUT";
-elif grep -q "FLAGGED.*reverie-procfs" <<<"$OUT"; then note "ok (rc=0, procfs flagged)";
-else fail "real graph passed without flagging reverie-procfs: $OUT"; fi
+elif grep -q ": reverie-procfs at buck2" <<<"$OUT"; then fail "reverie-procfs back in the Buck graph: $OUT";
+elif grep "^FLAGGED" <<<"$OUT" | grep -v "reverie-linuxemu-ext-procfs" \
+    | grep -qv ": reverie-procfs at Cargo"; then
+    fail "a flagged debt other than the KVM maps extension or Cargo-surface procfs: $OUT";
+elif ! grep -q ": reverie-procfs at Cargo" <<<"$OUT"; then
+    fail "real graph passed without Cargo-surface reverie-procfs flagged: $OUT";
+elif { grep -q "buck2 deps closure" <<<"$OUT" \
+    || grep -q "Buck closure via buck2 uquery" <<<"$OUT"; } \
+    && ! grep -q "^FLAGGED.*reverie-linuxemu-ext-procfs" <<<"$OUT"; then
+    fail "Buck closure judged without flagging the KVM maps extension: $OUT";
+elif grep -q "flagged allow-until debt" <<<"$OUT"; then
+    note "ok (rc=0, only the named debts flagged for this scope)";
+else fail "real graph passed without the flagged-debt line: $OUT"; fi
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
@@ -126,12 +145,25 @@ make_ws 'renamed = {
 }' reverie-linuxemu-ext-demo ''
 expect_refuse "renamed multiline"
 
-echo "twin 5: expired allow-until refuses on the real graph, naming reverie-procfs"
-OUT=$(rust-script "$CHECKER" --repo-root "$REPO_ROOT" --today 2027-06-01 \
-    --skip-negative-control 2>&1); RC=$?
+echo "twin 5: expired allow-until refuses a planted reverie-procfs, naming it EXPIRED"
+make_ws 'reverie-procfs = { path = "../stub" }' reverie-procfs ''
+OUT=$(rust-script "$CHECKER" --repo-root "$scratch/repo" \
+    --deny-file "$scratch/scripts/linuxemu-graph-deny.txt" \
+    --today 2027-06-01 --skip-negative-control 2>&1); RC=$?
 if ((RC == 1)) && grep -q "reverie-procfs" <<<"$OUT" && grep -q "EXPIRED" <<<"$OUT";
 then note "ok (expired allow refuses)";
 else fail "expiry twin: rc=$RC (want 1, naming reverie-procfs EXPIRED): $OUT"; fi
+
+echo "twin 5b: today's real graph refuses after the allow-until deadline"
+OUT=$("${CHECKER_CMD[@]}" --repo-root "$REPO_ROOT" \
+    --today 2027-06-01 --skip-negative-control 2>&1); RC=$?
+if ((RC != 1)); then fail "real-graph expiry: rc=$RC (want 1): $OUT";
+elif ! grep -q "EXPIRED" <<<"$OUT" || ! grep -q ": reverie-procfs at Cargo" <<<"$OUT"; then
+    fail "real-graph expiry does not name Cargo-surface reverie-procfs EXPIRED: $OUT";
+elif grep -q "buck2 deps closure" <<<"$OUT" \
+    && ! grep -q "reverie-linuxemu-ext-procfs .*EXPIRED" <<<"$OUT"; then
+    fail "real-graph expiry judged the Buck closure without expiring the extension: $OUT";
+else note "ok (real graph refuses past 2026-12-31)"; fi
 
 echo "twin 6: planted extension under Sapling scope refuses"
 make_ws 'reverie-linuxemu-ext-demo = { path = "../stub" }' reverie-linuxemu-ext-demo ''

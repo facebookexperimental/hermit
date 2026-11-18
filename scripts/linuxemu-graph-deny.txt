@@ -23,8 +23,28 @@ deny reverie-linuxemu-full
 
 # reverie-procfs is denied from day one (owner 6463: "keeping the extra
 # things like minimal proc optional and turned off for hermit use").
-# It is in the graph today only because reverie-linuxemu depends on it
-# unconditionally; Slice 2 of the modularity restart moves it behind
-# the extension seam and DELETES this allow-until line.
+# Slice 2 S2-R4 renamed it to reverie-linuxemu-ext-procfs behind the
+# extension seam, so the in-tree Buck graph no longer contains it. It
+# remains on the Cargo surfaces until the Reverie pin advance that
+# exports the rename: the exported build resolves Reverie at its pin,
+# whose LinuxEmu core still depends on and serves from reverie-procfs.
+# The pin advance deletes this allow-until line.
 deny reverie-procfs
-allow-until reverie-procfs 2026-12-31 owner 6463 not ratified as core; removed by Slice 2 (extension seam)
+allow-until reverie-procfs 2026-12-31 owner 6463 not ratified as core; Cargo surfaces only until the Reverie pin advance exports the S2-R4 rename
+
+# reverie-linuxemu-ext-procfs is in the Buck graph from Slice 2 S2-R4
+# on, by coordinator ruling (option (a)): on the KVM backend a guest's
+# open of /proc/self/maps still reaches the executor's synthetic proc
+# file (Detcore renders maps from its memory map only where that
+# rendering applies and reads the executor's file elsewhere), so
+# Hermit's KVM composition registers the extension's maps claim to
+# keep the guest-visible file byte-identical. The deadline is the
+# original reverie-procfs one; a rename does not extend it. The exit
+# is Detcore rendering maps on every KVM path and deleting the
+# executor's synthetic file; these allow-until lines and the
+# registration are deleted then, in the same change.
+allow-until reverie-linuxemu-ext-procfs 2026-12-31 coordinator option (a): KVM maps open reaches executor synthetic file until Detcore renders maps on every KVM path
+# The extension target's sanitizer-config subtargets ride the same
+# buck closure under derived names; they are the same debt.
+allow-until reverie-linuxemu-ext-procfs-san-conf_san-conf.c 2026-12-31 same debt as reverie-linuxemu-ext-procfs (sanitizer-config subtarget)
+allow-until reverie-linuxemu-ext-procfs-san-conf-__generated-lib__ 2026-12-31 same debt as reverie-linuxemu-ext-procfs (sanitizer-config subtarget)

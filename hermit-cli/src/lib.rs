@@ -3589,6 +3589,32 @@ async fn run_kvm(
             &cwd,
         )
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
+    // On KVM a guest's open of `/proc/self/maps` still reaches the
+    // executor's synthetic proc path (Detcore renders the file from
+    // its memory map only where that rendering applies, and reads
+    // the executor's file elsewhere; see `maps_from_memory_map` in
+    // detcore's syscalls/files.rs). The synthetic maps snapshot is
+    // served by the procfs extension, so register it here to keep
+    // the guest-visible file byte-identical until Detcore renders
+    // maps on every KVM path and the executor file can go away.
+    // This is the flagged allow-until debt in
+    // scripts/linuxemu-graph-deny.txt.
+    //
+    // The registration is fbcode-only for now, gated on
+    // `fbcode_build` (supplied by the internal Buck build, and
+    // declared to check-cfg in build.rs; a Cargo feature would
+    // be switched on by --all-features): the exported Cargo
+    // build resolves Reverie at its pin, whose LinuxEmu core
+    // still serves maps itself and has neither the extension
+    // crate nor the backend setter, so it needs no registration.
+    // Every fbcode Buck target that compiles this file links
+    // the extension through LIBHERMIT_DEPS, the release targets
+    // included. At the pin advance that exports the extension,
+    // Cargo gains the dependency and this cfg goes away.
+    #[cfg(fbcode_build)]
+    backend
+        .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
+        .map_err(|error| anyhow!("failed to install the KVM procfs extension: {error}"))?;
     // The placeholder directory Detcore serves `/proc` and the descriptor
     // directories on (`DetConfig::directory_placeholder`, a container's
     // empty read-only tmpfs at `/proc/fs/nfsd`): the executor reaches it only
