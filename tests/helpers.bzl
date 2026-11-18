@@ -329,6 +329,22 @@ def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations)
         guest = "$(location " + bin_target + ")",
         guest_args = [],
         args = ["chaos-stress", "--max-iterations-count=" + str(max_iterations)],
-        hermit_args = ["--chaos", "--base-env=minimal", "--max-timeslice=" + str(preempt_interval)],
+        # The CPU profile is pinned because these tests test scheduling,
+        # not CPU profiles, and chaos-stress starts one Hermit process
+        # per iteration: with no profile named, every process would
+        # qualify the host for x86-64-v3 (the XINUSE probe), and a
+        # probe refusal under CI load is paid again by every iteration
+        # (only passes were cached). Today's x86-64-v2 is the psABI
+        # table: a smaller feature set than the Broadwell-era table
+        # these guests ran before the auto default (f2be519cb0ad),
+        # which is now named x86-64-v2-legacy. The pin restores the
+        # no-probe per-iteration economics, not that exact pre-split
+        # CPU table; these first-party guests run at psABI v2.
+        hermit_args = [
+            "--chaos",
+            "--base-env=minimal",
+            "--cpu-profile=x86-64-v2",
+            "--max-timeslice=" + str(preempt_interval),
+        ],
         env = {},
     )
