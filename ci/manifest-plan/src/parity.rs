@@ -6563,7 +6563,10 @@ mod tests {
         // cases measured in the pinned image 2026-11-07) add one row per
         // candidate backend each (129 x 5 for PR A's first suites; the
         // remaining batch-2 cases follow the parity-cells shard): 4685.
-        assert_eq!(parsed.cells.len(), 4685);
+        // c-programs/preempt-spin-flag (the pure-userspace spin cell that
+        // requires preemption, D132130650, moved from bin-c in D132264917)
+        // adds one row per candidate backend: 4690.
+        assert_eq!(parsed.cells.len(), 4690);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // Per-shard size bound: the original single file asserted it must
         // stay well under 2 MiB (1,536 KiB in the assert; the 2 MiB figure
