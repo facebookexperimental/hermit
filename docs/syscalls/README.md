@@ -6,7 +6,7 @@ These pages track Detcore strategy only. Which backends can run a syscall is tra
 
 Facts on every page were exported or derived at the revision in its `code_facts.as_of`; source citations in generated strategy text are line numbers in that source tree, not permanent addresses.
 
-Code facts as of source revision `7ac736d54e14d3eb8e190ae1849481e5ff41ea1a`.
+Code facts as of source revision `403e350e9e82ee540529f097daccae6a60832d07`.
 
 | strategy | count |
 |---|---:|

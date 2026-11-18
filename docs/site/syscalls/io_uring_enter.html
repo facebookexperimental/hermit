@@ -4,7 +4,7 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>io_uring_enter</code> (426)</h1>
 <p>Strategy: <strong>determinized-refused</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_uring_enter&amp;body=Discussion+for+the+%60io_uring_enter%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_uring_enter.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_uring_enter%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<p>Facts as of <code>403e350e9e82</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
 <h2>In short</h2>
 <p>Natively, io_uring completes work asynchronously in shared ring memory, outside syscall order. Hermit refuses it with ENOSYS, so nothing is ever submitted or waited on. Known gaps: 2.</p>
 <h2>Determinism strategy</h2>
@@ -24,17 +24,18 @@
 <p>Detcore classifies <code>io_uring_enter</code> (426) as determinized-refused via typed dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1746</code></li>
-<li>Dispatch: <code>detcore/src/lib.rs:8090</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8342</code></li>
 </ul>
 <h3>Tests</h3>
 <p>Refusal precedes guest injection: <code>detcore/src/io_buffers.rs</code> (<code>io_uring_refusal_never_reaches_guest_injection</code>) — what Hermit does, and interface fidelity. Guest-level fallback is tracked by manifest custom cell <code>c-programs/io-uring-fallback</code> — known gaps.</p>
 <h3>Citations</h3>
-<p><sup>[linux]</sup>: Linux <code>io_uring_enter(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/io_uring/io_uring.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1746 sha256:1c1981b8b744f325 <sup>[c2]</sup>: detcore/src/syscall_classification.rs:1555-1564 sha256:d6fb9993d44cbe48 <sup>[c3]</sup>: detcore/src/lib.rs:464-465 sha256:dfe85e842e0e8a89 <sup>[c4]</sup>: detcore/src/lib.rs:8089-8092 sha256:5508f1a66cc8ff30 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8089-L8092 <sup>[c5]</sup>: detcore/src/io_buffers.rs:1626-1631 sha256:bbd8dc0663f6afd6 <sup>[c6]</sup>: detcore/src/io_buffers.rs:1817-1835 sha256:89e8c68d0a1a09e2</p>
+<p><sup>[linux]</sup>: Linux <code>io_uring_enter(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/io_uring/io_uring.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1746 sha256:1c1981b8b744f325 <sup>[c2]</sup>: detcore/src/syscall_classification.rs:1555-1564 sha256:d6fb9993d44cbe48 <sup>[c3]</sup>: detcore/src/lib.rs:678-679 sha256:dfe85e842e0e8a89 <sup>[c4]</sup>: detcore/src/lib.rs:8341-8344 sha256:5508f1a66cc8ff30 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8341-L8344 <sup>[c5]</sup>: detcore/src/io_buffers.rs:1626-1631 sha256:bbd8dc0663f6afd6 <sup>[c6]</sup>: detcore/src/io_buffers.rs:1817-1835 sha256:89e8c68d0a1a09e2</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
 <li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
+<li>2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.</li>
 </ul>
 </body></html>

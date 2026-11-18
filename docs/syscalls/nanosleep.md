@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+nanosleep&body=Discussion+for+the+%60nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fnanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60nanosleep%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -52,7 +52,7 @@ Natively, wake timing and interruption depend on the host clock and scheduler. I
 Detcore classifies `nanosleep` (35) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1805`
-- Dispatch: `detcore/src/lib.rs:8156`
+- Dispatch: `detcore/src/lib.rs:8408`
 
 ### Tests
 
@@ -63,7 +63,7 @@ Interruption remainder and zero-length sleeps: `detcore/src/syscalls/time.rs` (`
 [^linux]: Linux `nanosleep(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/hrtimer.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1805 sha256:bdb80887873e8a3d
-[^c2]: detcore/src/lib.rs:8156 sha256:ed87abad08b828c8
+[^c2]: detcore/src/lib.rs:8408 sha256:ed87abad08b828c8
 [^c4]: detcore/src/syscalls/time.rs:1020-1040 sha256:780522b8b85931be
 [^c5]: detcore/src/syscalls/time.rs:926-972 sha256:ccfb2f3a9f96e469
 [^c6]: detcore/src/syscalls/time.rs:1105-1125 sha256:da2305f33c564d21
@@ -75,3 +75,4 @@ Interruption remainder and zero-length sleeps: `detcore/src/syscalls/time.rs` (`
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

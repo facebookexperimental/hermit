@@ -4,7 +4,7 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>clock_nanosleep</code> (230)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_nanosleep&amp;body=Discussion+for+the+%60clock_nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_nanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_nanosleep%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<p>Facts as of <code>403e350e9e82</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
 <h2>In short</h2>
 <p>Natively, wake timing rides on host time and host CPU accounting, for whichever clock is named. In the sequentialized deterministic configuration, Hermit determinizes ordinary-clock sleeps on logical deadlines and refuses CPU-clock sleeps that would have to wait. Known gaps: 3.</p>
 <h2>Determinism strategy</h2>
@@ -25,17 +25,18 @@
 <p>Detcore classifies <code>clock_nanosleep</code> (230) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1635</code></li>
-<li>Dispatch: <code>detcore/src/lib.rs:8157</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8409</code></li>
 </ul>
 <h3>Tests</h3>
 <p>Absolute CPU deadlines and refused CPU waits: <code>detcore/src/syscalls/time.rs</code> (<code>an_absolute_cpu_deadline_waits_for_the_rest</code>) and <code>detcore/src/cpu_clock/handler_tests.rs</code> (<code>a_cpu_clock_sleep_that_would_wait_is_refused</code>) — interface fidelity, and known gaps. Interruption remainder: <code>detcore/src/syscalls/time.rs</code> (<code>interrupted_sleep_remaining_time_floors_at_zero</code>) — interface fidelity.</p>
 <h3>Citations</h3>
-<p><sup>[linux]</sup>: Linux <code>clock_nanosleep(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1635 sha256:4a4c9cd61f298909 <sup>[c2]</sup>: detcore/src/lib.rs:8157-8159 sha256:a8cc88fc6dd9178b <sup>[c3]</sup>: detcore/src/syscalls/time.rs:988-1003 sha256:e136235491938171 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:1020-1040 sha256:780522b8b85931be <sup>[c5]</sup>: detcore/src/syscalls/time.rs:1005-1018 sha256:a227c07e2df918b8 <sup>[c6]</sup>: detcore/src/syscalls/time.rs:1182-1192 sha256:e48dfcc7f1dd0ef2 <sup>[c7]</sup>: detcore/src/syscalls/time.rs:1057-1102 sha256:d54f7113d8299803 <sup>[c8]</sup>: detcore/src/cpu_clock.rs:419-434 sha256:8aa80945903cb0be <sup>[c9]</sup>: detcore/src/syscalls/time.rs:1194-1222 sha256:64b20d04fefb079b <sup>[c10]</sup>: detcore/src/syscalls/time.rs:926-972 sha256:ccfb2f3a9f96e469 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L926-L972 <sup>[c11]</sup>: detcore/src/syscalls/time.rs:641-645 sha256:9f7ee2f871c456b8 <sup>[c12]</sup>: detcore/src/syscalls/time.rs:1149-1192 sha256:97e3cab71e4960c1</p>
+<p><sup>[linux]</sup>: Linux <code>clock_nanosleep(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1635 sha256:4a4c9cd61f298909 <sup>[c2]</sup>: detcore/src/lib.rs:8409-8411 sha256:a8cc88fc6dd9178b <sup>[c3]</sup>: detcore/src/syscalls/time.rs:988-1003 sha256:e136235491938171 <sup>[c4]</sup>: detcore/src/syscalls/time.rs:1020-1040 sha256:780522b8b85931be <sup>[c5]</sup>: detcore/src/syscalls/time.rs:1005-1018 sha256:a227c07e2df918b8 <sup>[c6]</sup>: detcore/src/syscalls/time.rs:1182-1192 sha256:e48dfcc7f1dd0ef2 <sup>[c7]</sup>: detcore/src/syscalls/time.rs:1057-1102 sha256:d54f7113d8299803 <sup>[c8]</sup>: detcore/src/cpu_clock.rs:419-434 sha256:8aa80945903cb0be <sup>[c9]</sup>: detcore/src/syscalls/time.rs:1194-1222 sha256:64b20d04fefb079b <sup>[c10]</sup>: detcore/src/syscalls/time.rs:926-972 sha256:ccfb2f3a9f96e469 https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L926-L972 <sup>[c11]</sup>: detcore/src/syscalls/time.rs:641-645 sha256:9f7ee2f871c456b8 <sup>[c12]</sup>: detcore/src/syscalls/time.rs:1149-1192 sha256:97e3cab71e4960c1</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
 <li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
+<li>2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.</li>
 </ul>
 </body></html>

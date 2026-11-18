@@ -10,7 +10,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+times&body=Discussion+for+the+%60times%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ftimes.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60times%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -54,7 +54,7 @@ Natively, both the elapsed-tick return and the CPU times come from the host. Her
 Detcore classifies `times` (100) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1966`
-- Dispatch: `detcore/src/lib.rs:8436`
+- Dispatch: `detcore/src/lib.rs:8688`
 
 ### Tests
 
@@ -65,7 +65,7 @@ Tick projection: `detcore/src/syscalls/sysinfo.rs` (`logical_clock_ticks_include
 [^linux]: Linux `times(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/sys.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1966 sha256:d27b643c185ed892
-[^c2]: detcore/src/lib.rs:8435-8436 sha256:e0b415f6635d038d
+[^c2]: detcore/src/lib.rs:8687-8688 sha256:e0b415f6635d038d
 [^c3]: detcore/src/syscalls/sysinfo.rs:463-493 sha256:5dfe35d3a967053d
   https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/sysinfo.rs#L463-L493
 [^c4]: detcore/src/syscalls/sysinfo.rs:22-31 sha256:806ff51e57634dc0
@@ -79,3 +79,4 @@ Tick projection: `detcore/src/syscalls/sysinfo.rs` (`logical_clock_ticks_include
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

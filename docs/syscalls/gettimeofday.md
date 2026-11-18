@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+gettimeofday&body=Discussion+for+the+%60gettimeofday%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgettimeofday.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60gettimeofday%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -52,7 +52,7 @@ Natively, this returns the host wall clock. By default (time virtualization on),
 Detcore classifies `gettimeofday` (96) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1730`
-- Dispatch: `detcore/src/lib.rs:7981`
+- Dispatch: `detcore/src/lib.rs:8233`
 
 ### Tests
 
@@ -63,11 +63,11 @@ Fault-repair proof obligations: `detcore/src/syscalls/time.rs` (`without_a_store
 [^linux]: Linux `gettimeofday(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/time.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1730 sha256:310a3124777d80e5
-[^c2]: detcore/src/lib.rs:7981-7987 sha256:c164fb54a01b22d1
+[^c2]: detcore/src/lib.rs:8233-8239 sha256:c164fb54a01b22d1
 [^c4]: detcore/src/syscalls/time.rs:685-722 sha256:a10e250f8324a803
   https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L685-L722
 [^c5]: detcore/src/syscalls/time.rs:185-192 sha256:2bfaae47fe5e3eed
-[^c6]: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258
+[^c6]: detcore/src/lib.rs:8230-8232 sha256:2018927e6bf82258
 [^c11]: detcore/src/syscalls/time.rs:292-345 sha256:bc3909d75a332b56
 
 ## Status
@@ -76,3 +76,4 @@ Fault-repair proof obligations: `detcore/src/syscalls/time.rs` (`without_a_store
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

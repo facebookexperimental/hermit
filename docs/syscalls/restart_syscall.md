@@ -9,7 +9,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+restart_syscall&body=Discussion+for+the+%60restart_syscall%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Frestart_syscall.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60restart_syscall%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: unsupported
   dispatch: "unsupported"
   refused: false
@@ -55,7 +55,7 @@ Natively, the kernel resumes an interrupted wait through this call, and a bare c
 Detcore classifies `restart_syscall` (219) as unsupported via unsupported dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:2094`
-- Dispatch: `detcore/src/lib.rs:8544`
+- Dispatch: `detcore/src/lib.rs:8796`
 
 ### Tests
 
@@ -68,14 +68,14 @@ Restart-errno policy per wait: `detcore/src/syscalls/helpers.rs` (`signal_interr
   and the register rewrite:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/kernel/signal.c?h=v7.1.3#n346
 [^c1]: detcore/src/syscall_classification.rs:2094 sha256:141bc2be34332b90
-[^c2]: detcore/src/lib.rs:8540-8553 sha256:60fa791b3b39c5f3
-[^c4]: detcore/src/lib.rs:1970-1987 sha256:a52a49e793018d72
-[^c5]: detcore/src/lib.rs:1909-1916 sha256:9019875916d9fecc
-[^c6]: detcore/src/lib.rs:1992-2029 sha256:11ce7bfdd0a59cb2
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L1992-L2029
-[^c7]: detcore/src/lib.rs:1880-1906 sha256:a956e173f03ed24f
+[^c2]: detcore/src/lib.rs:8792-8805 sha256:60fa791b3b39c5f3
+[^c4]: detcore/src/lib.rs:2184-2201 sha256:a52a49e793018d72
+[^c5]: detcore/src/lib.rs:2123-2130 sha256:9019875916d9fecc
+[^c6]: detcore/src/lib.rs:2206-2243 sha256:11ce7bfdd0a59cb2
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L2206-L2243
+[^c7]: detcore/src/lib.rs:2094-2120 sha256:a956e173f03ed24f
 [^c8]: detcore/src/syscalls/helpers.rs:3016-3045 sha256:4f7604dfddef1d52
-[^c9]: detcore/src/lib.rs:6955-6963 sha256:9ae2050e058435fa
+[^c9]: detcore/src/lib.rs:7207-7215 sha256:9ae2050e058435fa
 [^c10]: detcore/src/syscalls/helpers.rs:2260-2290 sha256:c25880d1866152ac
 
 ## Status
@@ -84,3 +84,4 @@ Restart-errno policy per wait: `detcore/src/syscalls/helpers.rs` (`signal_interr
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

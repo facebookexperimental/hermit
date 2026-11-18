@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_getres&body=Discussion+for+the+%60clock_getres%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_getres.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_getres%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -51,7 +51,7 @@ Natively, the reported resolution is a property of the host clocksource. By defa
 Detcore classifies `clock_getres` (229) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1629`
-- Dispatch: `detcore/src/lib.rs:8003`
+- Dispatch: `detcore/src/lib.rs:8255`
 
 ### Tests
 
@@ -62,10 +62,10 @@ CPU-clock task validation through this call: `detcore/src/cpu_clock/handler_test
 [^linux]: Linux `clock_getres(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1629 sha256:00b8308a0ee86a95
-[^c2]: detcore/src/lib.rs:8003-8009 sha256:47575a8e7cdfd456
+[^c2]: detcore/src/lib.rs:8255-8261 sha256:47575a8e7cdfd456
 [^c3]: detcore/src/syscalls/time.rs:55-66 sha256:ea09775213d38639
 [^c4]: detcore/src/syscalls/time.rs:775-815 sha256:f229250e93cd7931
-[^c5]: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258
+[^c5]: detcore/src/lib.rs:8230-8232 sha256:2018927e6bf82258
 [^c6]: detcore/src/cpu_clock.rs:106-150 sha256:72ee848aa6b82421
 
 ## Status
@@ -74,3 +74,4 @@ CPU-clock task validation through this call: `detcore/src/cpu_clock/handler_test
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

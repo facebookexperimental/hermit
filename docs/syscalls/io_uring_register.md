@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+io_uring_register&body=Discussion+for+the+%60io_uring_register%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fio_uring_register.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60io_uring_register%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: true
@@ -52,7 +52,7 @@ Natively, io_uring completes work asynchronously in shared ring memory, outside 
 Detcore classifies `io_uring_register` (427) as determinized-refused via typed dispatch; deterministic refusal: true; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1747`
-- Dispatch: `detcore/src/lib.rs:8090`
+- Dispatch: `detcore/src/lib.rs:8342`
 
 ### Tests
 
@@ -64,9 +64,9 @@ Refusal precedes guest injection: `detcore/src/io_buffers.rs` (`io_uring_refusal
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/io_uring/io_uring.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1747 sha256:2cf1d4de8ca1559d
 [^c2]: detcore/src/syscall_classification.rs:1555-1564 sha256:d6fb9993d44cbe48
-[^c3]: detcore/src/lib.rs:464-465 sha256:dfe85e842e0e8a89
-[^c4]: detcore/src/lib.rs:8089-8092 sha256:5508f1a66cc8ff30
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8089-L8092
+[^c3]: detcore/src/lib.rs:678-679 sha256:dfe85e842e0e8a89
+[^c4]: detcore/src/lib.rs:8341-8344 sha256:5508f1a66cc8ff30
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8341-L8344
 [^c5]: detcore/src/io_buffers.rs:1626-1631 sha256:bbd8dc0663f6afd6
 [^c6]: detcore/src/io_buffers.rs:1817-1835 sha256:89e8c68d0a1a09e2
 
@@ -76,3 +76,4 @@ Refusal precedes guest injection: `detcore/src/io_buffers.rs` (`io_uring_refusal
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

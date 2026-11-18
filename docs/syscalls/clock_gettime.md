@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_gettime&body=Discussion+for+the+%60clock_gettime%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_gettime.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_gettime%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -52,7 +52,7 @@ Natively, every clock reads host time or host CPU accounting. By default (time v
 Detcore classifies `clock_gettime` (228) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1632`
-- Dispatch: `detcore/src/lib.rs:7996`
+- Dispatch: `detcore/src/lib.rs:8248`
 
 ### Tests
 
@@ -63,13 +63,13 @@ CPU-clock readings and dead-task ids: `detcore/src/cpu_clock/handler_tests.rs` (
 [^linux]: Linux `clock_gettime(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1632 sha256:8ab0a9216ecb32b8
-[^c2]: detcore/src/lib.rs:7996-8002 sha256:6a297e311e55e02e
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L7996-L8002
+[^c2]: detcore/src/lib.rs:8248-8254 sha256:6a297e311e55e02e
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8248-L8254
 [^c3]: detcore/src/syscalls/time.rs:55-66 sha256:ea09775213d38639
 [^c4]: detcore/src/syscalls/time.rs:742-773 sha256:0af0a455c8cc2b74
 [^c5]: detcore/src/syscalls/time.rs:185-192 sha256:2bfaae47fe5e3eed
 [^c6]: detcore/src/tool_local.rs:5845-5850 sha256:fec2796a0addaa95
-[^c7]: detcore/src/lib.rs:7978-7980 sha256:2018927e6bf82258
+[^c7]: detcore/src/lib.rs:8230-8232 sha256:2018927e6bf82258
 [^c8]: detcore/src/cpu_clock.rs:106-150 sha256:72ee848aa6b82421
 
 ## Status
@@ -78,3 +78,4 @@ CPU-clock readings and dead-task ids: `detcore/src/cpu_clock/handler_tests.rs` (
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

@@ -9,7 +9,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+access&body=Discussion+for+the+%60access%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Faccess.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60access%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: passthrough
   dispatch: "passthrough"
   refused: false
@@ -64,9 +64,9 @@ Delivery to the tool under the passthrough optimization: `detcore/src/lib.rs` (`
 [^linux]: Linux `access(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/open.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:2000 sha256:338d98bf9b74cc53
-[^c2]: detcore/src/lib.rs:8539 sha256:46fdc2c10422fe4b
-[^c3]: detcore/src/lib.rs:5142-5149 sha256:b70894cae0b286e2
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L5142-L5149
+[^c2]: detcore/src/lib.rs:8791 sha256:46fdc2c10422fe4b
+[^c3]: detcore/src/lib.rs:5394-5401 sha256:b70894cae0b286e2
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L5394-L5401
 [^c4]: detcore/src/syscalls/files/rendered_procfs.rs:8372-8406 sha256:0623ae321077732f
 [^c5]: detcore/src/syscalls/files/prefilter_tests.rs:290-306 sha256:501d2754f4fd2903
 [^c6]: detcore/src/syscalls/files/rendered_procfs.rs:7765-7780 sha256:3b4d70911051ee26
@@ -78,3 +78,4 @@ Delivery to the tool under the passthrough optimization: `detcore/src/lib.rs` (`
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

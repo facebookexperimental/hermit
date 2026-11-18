@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+getrandom&body=Discussion+for+the+%60getrandom%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fgetrandom.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60getrandom%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -53,7 +53,7 @@ Natively, getrandom returns fresh kernel entropy, different on every call. Hermi
 Detcore classifies `getrandom` (318) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1721`
-- Dispatch: `detcore/src/lib.rs:8076`
+- Dispatch: `detcore/src/lib.rs:8328`
 
 ### Tests
 
@@ -65,8 +65,8 @@ Flag acceptance and rejection plus the length clamp: `detcore/src/syscalls/misc.
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/char/random.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1721 sha256:c54a525905843c1d
   https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscall_classification.rs#L1721
-[^c2]: detcore/src/lib.rs:8076 sha256:93780f6568a9ccb6
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8076
+[^c2]: detcore/src/lib.rs:8328 sha256:93780f6568a9ccb6
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8328
 [^c3]: detcore/src/syscalls/misc.rs:995-1006 sha256:da781258bb76f39c
   https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/misc.rs#L995-L1006
 [^c4]: detcore/src/random.rs:85-89 sha256:80070102c8955726; detcore/src/tool_local.rs:8064 sha256:77f5b8fa2750c93f
@@ -83,3 +83,4 @@ Flag acceptance and rejection plus the length clamp: `detcore/src/syscalls/misc.
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

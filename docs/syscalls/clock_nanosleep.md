@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+clock_nanosleep&body=Discussion+for+the+%60clock_nanosleep%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fclock_nanosleep.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60clock_nanosleep%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -53,7 +53,7 @@ Natively, wake timing rides on host time and host CPU accounting, for whichever 
 Detcore classifies `clock_nanosleep` (230) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1635`
-- Dispatch: `detcore/src/lib.rs:8157`
+- Dispatch: `detcore/src/lib.rs:8409`
 
 ### Tests
 
@@ -64,7 +64,7 @@ Absolute CPU deadlines and refused CPU waits: `detcore/src/syscalls/time.rs` (`a
 [^linux]: Linux `clock_nanosleep(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1635 sha256:4a4c9cd61f298909
-[^c2]: detcore/src/lib.rs:8157-8159 sha256:a8cc88fc6dd9178b
+[^c2]: detcore/src/lib.rs:8409-8411 sha256:a8cc88fc6dd9178b
 [^c3]: detcore/src/syscalls/time.rs:988-1003 sha256:e136235491938171
 [^c4]: detcore/src/syscalls/time.rs:1020-1040 sha256:780522b8b85931be
 [^c5]: detcore/src/syscalls/time.rs:1005-1018 sha256:a227c07e2df918b8
@@ -83,3 +83,4 @@ Absolute CPU deadlines and refused CPU waits: `detcore/src/syscalls/time.rs` (`a
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

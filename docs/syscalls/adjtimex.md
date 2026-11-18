@@ -9,7 +9,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+adjtimex&body=Discussion+for+the+%60adjtimex%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fadjtimex.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60adjtimex%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: determinized
   dispatch: "typed"
   refused: false
@@ -53,7 +53,7 @@ Natively, this reads and steers the host NTP discipline. By default (time virtua
 Detcore classifies `adjtimex` (159) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1614`
-- Dispatch: `detcore/src/lib.rs:8021`
+- Dispatch: `detcore/src/lib.rs:8273`
 
 ### Tests
 
@@ -64,11 +64,11 @@ Query/mutation boundary and snapshot: `detcore/src/syscalls/time.rs` (`timex_pol
 [^linux]: Linux `adjtimex(2)`:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/ntp.c?h=v7.1.3
 [^c1]: detcore/src/syscall_classification.rs:1614 sha256:83559dce6281bf2d
-[^c2]: detcore/src/lib.rs:8021-8032 sha256:92c9c3b78daa6c6d
+[^c2]: detcore/src/lib.rs:8273-8284 sha256:92c9c3b78daa6c6d
 [^c3]: detcore/src/syscalls/time.rs:162-181 sha256:9d53c5f9c9cd0cdf
 [^c4]: detcore/src/syscalls/time.rs:817-858 sha256:fbcdb3caabb0543b
   https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L817-L858
-[^c5]: detcore/src/lib.rs:1898-1907 sha256:72acd2655164229d
+[^c5]: detcore/src/lib.rs:2112-2121 sha256:72acd2655164229d
 
 ## Status
 
@@ -76,3 +76,4 @@ Query/mutation boundary and snapshot: `detcore/src/syscalls/time.rs` (`timex_pol
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.

@@ -4,7 +4,7 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>adjtimex</code> (159)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+adjtimex&amp;body=Discussion+for+the+%60adjtimex%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fadjtimex.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60adjtimex%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<p>Facts as of <code>403e350e9e82</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
 <h2>In short</h2>
 <p>Natively, this reads and steers the host NTP discipline. By default (time virtualization on), Hermit answers queries with a fixed unsynchronized snapshot on virtual time and refuses steering. Known gaps: 2.</p>
 <h2>Determinism strategy</h2>
@@ -24,17 +24,18 @@
 <p>Detcore classifies <code>adjtimex</code> (159) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1614</code></li>
-<li>Dispatch: <code>detcore/src/lib.rs:8021</code></li>
+<li>Dispatch: <code>detcore/src/lib.rs:8273</code></li>
 </ul>
 <h3>Tests</h3>
 <p>Query/mutation boundary and snapshot: <code>detcore/src/syscalls/time.rs</code> (<code>timex_policy_distinguishes_queries_from_mutations</code>, <code>timex_snapshot_is_unsynchronized_and_uses_virtual_time</code>) — interface fidelity, and what Hermit does.</p>
 <h3>Citations</h3>
-<p><sup>[linux]</sup>: Linux <code>adjtimex(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/ntp.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1614 sha256:83559dce6281bf2d <sup>[c2]</sup>: detcore/src/lib.rs:8021-8032 sha256:92c9c3b78daa6c6d <sup>[c3]</sup>: detcore/src/syscalls/time.rs:162-181 sha256:9d53c5f9c9cd0cdf <sup>[c4]</sup>: detcore/src/syscalls/time.rs:817-858 sha256:fbcdb3caabb0543b https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L817-L858 <sup>[c5]</sup>: detcore/src/lib.rs:1898-1907 sha256:72acd2655164229d</p>
+<p><sup>[linux]</sup>: Linux <code>adjtimex(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/ntp.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1614 sha256:83559dce6281bf2d <sup>[c2]</sup>: detcore/src/lib.rs:8273-8284 sha256:92c9c3b78daa6c6d <sup>[c3]</sup>: detcore/src/syscalls/time.rs:162-181 sha256:9d53c5f9c9cd0cdf <sup>[c4]</sup>: detcore/src/syscalls/time.rs:817-858 sha256:fbcdb3caabb0543b https://github.com/facebookexperimental/hermit/blob/main/detcore/src/syscalls/time.rs#L817-L858 <sup>[c5]</sup>: detcore/src/lib.rs:2112-2121 sha256:72acd2655164229d</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
 <li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
+<li>2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.</li>
 </ul>
 </body></html>

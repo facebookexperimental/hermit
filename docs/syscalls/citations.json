@@ -12,17 +12,17 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8539,
+          "first": 8791,
           "hash": "46fdc2c10422fe4b",
           "id": "c2",
-          "last": 8539,
+          "last": 8791,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 5142,
+          "first": 5394,
           "hash": "b70894cae0b286e2",
           "id": "c3",
-          "last": 5149,
+          "last": 5401,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -83,10 +83,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8021,
+          "first": 8273,
           "hash": "92c9c3b78daa6c6d",
           "id": "c2",
-          "last": 8032,
+          "last": 8284,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -104,10 +104,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 1898,
+          "first": 2112,
           "hash": "72acd2655164229d",
           "id": "c5",
-          "last": 1907,
+          "last": 2121,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -138,10 +138,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8003,
+          "first": 8255,
           "hash": "47575a8e7cdfd456",
           "id": "c2",
-          "last": 8009,
+          "last": 8261,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -159,10 +159,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 7978,
+          "first": 8230,
           "hash": "2018927e6bf82258",
           "id": "c5",
-          "last": 7980,
+          "last": 8232,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -203,10 +203,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 7996,
+          "first": 8248,
           "hash": "6a297e311e55e02e",
           "id": "c2",
-          "last": 8002,
+          "last": 8254,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -238,10 +238,10 @@
           "path": "detcore/src/tool_local.rs"
         },
         {
-          "first": 7978,
+          "first": 8230,
           "hash": "2018927e6bf82258",
           "id": "c7",
-          "last": 7980,
+          "last": 8232,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -304,10 +304,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 8157,
+          "first": 8409,
           "hash": "a8cc88fc6dd9178b",
           "id": "c2",
-          "last": 8159,
+          "last": 8411,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -408,17 +408,17 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8012,
+          "first": 8264,
           "hash": "ce80d6b93fe56ba9",
           "id": "c3",
-          "last": 8014,
+          "last": 8266,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 464,
+          "first": 678,
           "hash": "dfe85e842e0e8a89",
           "id": "c4",
-          "last": 465,
+          "last": 679,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -452,10 +452,10 @@
           "path": "detcore/src/random.rs"
         },
         {
-          "first": 8076,
+          "first": 8328,
           "hash": "93780f6568a9ccb6",
           "id": "c2",
-          "last": 8076,
+          "last": 8328,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -555,10 +555,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 7981,
+          "first": 8233,
           "hash": "c164fb54a01b22d1",
           "id": "c2",
-          "last": 7987,
+          "last": 8239,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -576,10 +576,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 7978,
+          "first": 8230,
           "hash": "2018927e6bf82258",
           "id": "c6",
-          "last": 7980,
+          "last": 8232,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -615,17 +615,17 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 464,
+          "first": 678,
           "hash": "dfe85e842e0e8a89",
           "id": "c3",
-          "last": 465,
+          "last": 679,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 8089,
+          "first": 8341,
           "hash": "5508f1a66cc8ff30",
           "id": "c4",
-          "last": 8092,
+          "last": 8344,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -673,17 +673,17 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 464,
+          "first": 678,
           "hash": "dfe85e842e0e8a89",
           "id": "c3",
-          "last": 465,
+          "last": 679,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 8089,
+          "first": 8341,
           "hash": "5508f1a66cc8ff30",
           "id": "c4",
-          "last": 8092,
+          "last": 8344,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -731,17 +731,17 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 464,
+          "first": 678,
           "hash": "dfe85e842e0e8a89",
           "id": "c3",
-          "last": 465,
+          "last": 679,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 8089,
+          "first": 8341,
           "hash": "5508f1a66cc8ff30",
           "id": "c4",
-          "last": 8092,
+          "last": 8344,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -782,10 +782,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8539,
+          "first": 8791,
           "hash": "46fdc2c10422fe4b",
           "id": "c2",
-          "last": 8539,
+          "last": 8791,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -811,10 +811,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8156,
+          "first": 8408,
           "hash": "ed87abad08b828c8",
           "id": "c2",
-          "last": 8156,
+          "last": 8408,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -874,38 +874,38 @@
           "path": "detcore/src/syscalls/helpers.rs"
         },
         {
-          "first": 8540,
+          "first": 8792,
           "hash": "60fa791b3b39c5f3",
           "id": "c2",
-          "last": 8553,
+          "last": 8805,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 1970,
+          "first": 2184,
           "hash": "a52a49e793018d72",
           "id": "c4",
-          "last": 1987,
+          "last": 2201,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 1909,
+          "first": 2123,
           "hash": "9019875916d9fecc",
           "id": "c5",
-          "last": 1916,
+          "last": 2130,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 1992,
+          "first": 2206,
           "hash": "11ce7bfdd0a59cb2",
           "id": "c6",
-          "last": 2029,
+          "last": 2243,
           "path": "detcore/src/lib.rs"
         },
         {
-          "first": 1880,
+          "first": 2094,
           "hash": "a956e173f03ed24f",
           "id": "c7",
-          "last": 1906,
+          "last": 2120,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -916,10 +916,10 @@
           "path": "detcore/src/syscalls/helpers.rs"
         },
         {
-          "first": 6955,
+          "first": 7207,
           "hash": "9ae2050e058435fa",
           "id": "c9",
-          "last": 6963,
+          "last": 7215,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -950,10 +950,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 7988,
+          "first": 8240,
           "hash": "f319953eedd3775f",
           "id": "c2",
-          "last": 7995,
+          "last": 8247,
           "path": "detcore/src/lib.rs"
         },
         {
@@ -971,10 +971,10 @@
           "path": "detcore/src/syscalls/time.rs"
         },
         {
-          "first": 7978,
+          "first": 8230,
           "hash": "2018927e6bf82258",
           "id": "c5",
-          "last": 7980,
+          "last": 8232,
           "path": "detcore/src/lib.rs"
         }
       ],
@@ -992,10 +992,10 @@
           "path": "detcore/src/syscall_classification.rs"
         },
         {
-          "first": 8435,
+          "first": 8687,
           "hash": "e0b415f6635d038d",
           "id": "c2",
-          "last": 8436,
+          "last": 8688,
           "path": "detcore/src/lib.rs"
         },
         {

@@ -4,7 +4,7 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>mprotect</code> (10)</h1>
 <p>Strategy: <strong>passthrough</strong> &middot; dispatch: <code>passthrough</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mprotect&amp;body=Discussion+for+the+%60mprotect%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmprotect.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mprotect%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<p>Facts as of <code>7ac736d54e14</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
+<p>Facts as of <code>403e350e9e82</code> &middot; prose checked 2026-11-16 at <code>7ac736d54e14</code></p>
 <h2>In short</h2>
 <p>Natively, success depends partly on host policy (mount flags, LSM, deny-write-execute). Hermit passes the call through unchanged, so its answer is only as repeatable as that host configuration. Known gaps: 2.</p>
 <h2>Determinism strategy</h2>
@@ -28,12 +28,13 @@
 <h3>Tests</h3>
 <p>The passthrough exercised against a real mapping (a helper re-protects a page so a later read faults): <code>detcore/tests/misc/mod.rs</code> (<code>random_read_before_an_unmapped_page</code>, via its helper <code>page_before_a_hole</code>) — what Hermit does. No dedicated <code>mprotect</code> policy test exists; that absence is the subject of G2.</p>
 <h3>Citations</h3>
-<p><sup>[linux]</sup>: Linux <code>mprotect(2)</code> permission checks: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/mm/mprotect.c?h=v7.1.3#n937 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:2048 sha256:7467309d5c39fe53 <sup>[c2]</sup>: detcore/src/lib.rs:8539 sha256:46fdc2c10422fe4b https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8539</p>
+<p><sup>[linux]</sup>: Linux <code>mprotect(2)</code> permission checks: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/mm/mprotect.c?h=v7.1.3#n937 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:2048 sha256:7467309d5c39fe53 <sup>[c2]</sup>: detcore/src/lib.rs:8791 sha256:46fdc2c10422fe4b https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8791</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3, passthrough host-state); citations verified at this revision.</li>
 <li>2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.</li>
+<li>2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.</li>
 </ul>
 </body></html>

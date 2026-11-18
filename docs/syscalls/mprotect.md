@@ -8,7 +8,7 @@ discussion:
   url: https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+mprotect&body=Discussion+for+the+%60mprotect%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fmprotect.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60mprotect%60%2C+or+in+what+the+page+says%3F%0A
 # code facts: tool-owned (syscall-pages.rs facts --apply); never hand-edit
 code_facts:
-  as_of: 7ac736d54e14d3eb8e190ae1849481e5ff41ea1a
+  as_of: 403e350e9e82ee540529f097daccae6a60832d07
   detcore_class: passthrough
   dispatch: "passthrough"
   refused: false
@@ -63,8 +63,8 @@ The passthrough exercised against a real mapping (a helper re-protects a page so
 [^linux]: Linux `mprotect(2)` permission checks:
   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/mm/mprotect.c?h=v7.1.3#n937
 [^c1]: detcore/src/syscall_classification.rs:2048 sha256:7467309d5c39fe53
-[^c2]: detcore/src/lib.rs:8539 sha256:46fdc2c10422fe4b
-  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8539
+[^c2]: detcore/src/lib.rs:8791 sha256:46fdc2c10422fe4b
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8791
 
 ## Status
 
@@ -72,3 +72,4 @@ The passthrough exercised against a real mapping (a helper re-protects a page so
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3, passthrough host-state); citations verified at this revision.
 - 2026-11-16 · rev 8e48c1c6605b · summary-first layout (In short, Known gaps, Appendix); claims unchanged.
+- 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.
