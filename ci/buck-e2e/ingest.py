@@ -564,6 +564,8 @@ def listed_local(local_root):
         except (OSError, ValueError) as error:
             sys.exit(
                 f"ingest: local artifacts directory {dirpath} has no readable result.json: {error}")
+        if not isinstance(result, dict):
+            sys.exit(f"ingest: local result.json in {dirpath} is not a JSON object")
         cell = result.get("cell")
         head, at, backend = cell.rpartition("@") if isinstance(cell, str) else ("", "", "")
         test, slash, mode = head.rpartition("/")

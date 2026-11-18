@@ -741,6 +741,14 @@ class IngestTest(unittest.TestCase):
             local_listing=True,
         )
 
+    def test_local_listing_refuses_a_result_json_that_is_not_an_object(self):
+        self.refused(
+            {},
+            "is not a JSON object",
+            local=[execution(X, 300, "PASS", "rx1", result=["not", "an", "object"])],
+            local_listing=True,
+        )
+
     def test_local_listing_refuses_when_nothing_is_marked(self):
         self.refused(
             {},

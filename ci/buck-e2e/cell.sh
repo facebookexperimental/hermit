@@ -66,7 +66,9 @@
 #                                  session census through (default
 #                                  /tmp/hermit-e2e-session-census-UID; host cells only)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
-#         into a failure if its evidence is incomplete, then all_done. Always exits 0.
+#         into a failure if its evidence is incomplete, then all_done. The verdict is
+#         the JSON record; the exit status is 0 for every reported outcome except when
+#         the artifact dirs are unset, which exits 1 (no runner reads the claim).
 #         The record's details start with a short human summary (backend and mode, each
 #         run's exit status, wall time and INFO-message count, the log-comparison verdict,
 #         the guest's stdout tail and the report's name), so `buck2 test ... --
@@ -92,11 +94,13 @@ t0=$(date +%s%N)
 
 emit_fatal() {
     python3 -c 'import json,sys; print(json.dumps({"op":"test_done","test":sys.argv[1],"status":"failed","details":json.dumps({"outcome":"ERROR","reason":sys.argv[2]})})); print(json.dumps({"op":"all_done"}))' "$CELL" "$1"
-    exit 0
+    exit "${2:-0}"
 }
 
+# Exit nonzero for this one: without the artifact protocol there is no runner
+# reading the JSON claim, so exit 0 would be recorded as a pass.
 [[ -n ${TEST_RESULT_ARTIFACTS_DIR:-} && -n ${TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR:-} ]] ||
-    emit_fatal "Tpx artifact dirs are not set; the target needs the tpx-enable-artifact-reporting label"
+    emit_fatal "Tpx artifact dirs are not set; the target needs the tpx-enable-artifact-reporting label" 1
 mkdir -p "$TEST_RESULT_ARTIFACTS_DIR" "$TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR"
 # On RE these are relative to /re_cwd; absolutize before anything changes directory.
 A=$(realpath "$TEST_RESULT_ARTIFACTS_DIR")

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Scenario tests for ci/buck-e2e/cell.sh and the container choice in ci/buck-e2e/defs.bzl.
 
 CellTest runs cell.sh against a scratch bundle whose test-harness and
@@ -495,6 +501,19 @@ class CellTest(unittest.TestCase):
         result = artifacts / "result.json"
         return lines[0], (json.loads(result.read_text()) if result.exists() else None)
 
+    def run_cell_without_artifact_dirs(self) -> subprocess.CompletedProcess:
+        """cell.sh with neither artifact directory set, as the stock public
+        runner invokes the raw cell targets."""
+        env = {
+            "PATH": f"{self.tmp / 'image-bin'}:{os.environ['PATH']}",
+            "HOME": str(self.tmp),
+            "HERMIT_E2E_BUNDLE": str(self.bundle),
+            "HERMIT_E2E_ROUTE": "local",
+            "FAKE_CALLS": str(self.calls),
+        }
+        return subprocess.run(["bash", str(CELL_SH), TEST, MODE, BACKEND], env=env,
+                              capture_output=True, text=True, timeout=120)
+
     def calls_by(self, who: str) -> list[dict]:
         return [c for c in map(json.loads, self.calls.read_text().splitlines()) if c["who"] == who]
 
@@ -505,6 +524,13 @@ class CellTest(unittest.TestCase):
         for needle in needles:
             self.assertIn(needle, details["reason"])
         self.assertEqual(self.calls_by("harness"), [], "the harness must not run")
+
+    def test_unset_artifact_dirs_exit_nonzero_not_a_false_pass(self) -> None:
+        proc = self.run_cell_without_artifact_dirs()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(lines[-1], {"op": "all_done"}, proc.stdout)
+        self.assert_error(lines[0], "artifact dirs are not set")
 
     def test_pinned_root_runs_the_harness_only_through_the_wrapper(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
@@ -1926,6 +1952,14 @@ class _Anything:
         return self
 
 
+def _defs_load(module: str, *symbols: str, **aliases: str) -> None:
+    """Stand-in for defs.bzl's one load. Any other load is a defs.bzl change
+    these evaluators have not been taught, so fail here rather than exec past it."""
+    requested = set(symbols) | set(aliases.values())
+    if module != "@fbcode_macros//build_defs:native_rules.bzl" or not requested <= {"buck_sh_test"}:
+        raise AssertionError(f"unexpected load in defs.bzl: {module!r} {sorted(requested)}")
+
+
 def defs_skip_reason(defs: Path, repository: str | None) -> str | None:
     """The SKIPPED line for the GitHub export, or None to run the tests that exec defs.bzl.
 
@@ -2016,6 +2050,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
     namespace = {
         "rule": rule,
         "attrs": _Anything(),
+        "load": _defs_load,
+        "buck_sh_test": lambda **kwargs: targets.__setitem__(kwargs["name"], kwargs),
         "read_root_config": lambda section, key, default=None: config.get((section, key), default),
         "native": _Anything(),
         "fail": _starlark_fail,
@@ -2039,6 +2075,8 @@ def load_defs() -> tuple[dict, list[str]]:
     namespace = {
         "rule": rule,
         "attrs": _Anything(),
+        "load": _defs_load,
+        "buck_sh_test": _Anything(),
         "read_root_config": lambda section, key, default=None: default,
         "native": _Anything(),
     }

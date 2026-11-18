@@ -453,11 +453,12 @@ proxy refuses GitHub to Reindeer.
 
 The cell targets above speak the artifact protocol of Meta's internal test
 runner: each expects per-test artifact directories and reports its outcome as
-one JSON `test_done` record, exiting 0 for every harness outcome. The stock
-`buck2 test` runner in a public Buck2 release provides none of that protocol,
-so running the cell targets directly under it is never evidence: every cell
-reports `test_done status="failed"` ("Tpx artifact dirs are not set"), exits
-0, and Buck records a pass. Passing `-c hermit_e2e.stock_runner=true`
+one JSON `test_done` record, exiting 0 for every harness outcome when those
+directories are set. The stock `buck2 test` runner in a public Buck2 release
+sets neither directory, so a raw cell target there never runs its cell: it
+reports `test_done status="failed"` ("Tpx artifact dirs are not set") and
+exits 1, and Buck records a failure. That failure is still never evidence
+about the cell itself; use the twins below. Passing `-c hermit_e2e.stock_runner=true`
 generates a shell-test twin of every cell, `:<slug>-stock` (and a
 `:stock-local` suite), which runs `ci/buck-e2e/cell-stock.py` around the
 unchanged `cell.sh`: the wrapper supplies a unique `artifacts_directory`,
