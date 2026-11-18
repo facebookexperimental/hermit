@@ -985,6 +985,37 @@ impl AuthenticatedValidationAdmission {
                 self.verify_queue_base(root)?;
             }
             ("frozen-validate", "frozen-target") if self.floor.sha == self.authority.target => {}
+            // A pre-land export candidate (`fbexp-candidate`): ONE commit
+            // whose only parent is the export main M the authority observed.
+            // M is the floor and every pin base, as for a current-main run;
+            // the target is never M. This re-proves from Git that M is the
+            // target's one and only parent, so a candidate built on an older
+            // main, an unsquashed stack or a merge can never select it.
+            ("fbexp-candidate", "first-parent-main")
+                if self.floor.sha == self.floor.observed_main_sha
+                    && self.floor.sha != self.authority.target =>
+            {
+                let parents = git(
+                    root,
+                    &[
+                        "rev-list",
+                        "--parents",
+                        "-n",
+                        "1",
+                        &self.authority.target,
+                        "--",
+                    ],
+                )?;
+                let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+                if parents != [self.floor.sha.as_str()] {
+                    return Err(format!(
+                        "export candidate {} has parents [{}], not exactly the floor {}",
+                        self.authority.target,
+                        parents.join(" "),
+                        self.floor.sha
+                    ));
+                }
+            }
             _ => {
                 return Err(
                     "selected floor does not match its authenticated authority kind".into(),
@@ -2286,6 +2317,165 @@ for entry in Path('/proc/self/fd').iterdir():
         assert_eq!(baseline(&current_row).as_deref(), Some(target.as_str()));
         assert!(hit(&queue_row).is_none());
         assert_eq!(baseline(&queue_row), None);
+    }
+
+    /// The lock's status for a pre-land export candidate: lock-admitted,
+    /// never canonical, on a first-parent-main floor at `floor`.
+    fn export_candidate_status(f: &Fixture, target: &str, floor: &str) -> Value {
+        let mut status = f.authority(target, floor);
+        status["holder"]["kind"] = "fbexp-candidate".into();
+        status["admissible"] = false.into();
+        status["reason_code"] = "canonical-holder-kind-export-candidate".into();
+        status["admission_floor"]["kind"] = "first-parent-main".into();
+        status
+    }
+
+    /// A pre-land export candidate is admitted only as ONE commit whose only
+    /// parent is the observed export main, and `verify_source` proves that
+    /// parent from Git: an unsquashed stack, a merge whose first parent is
+    /// main, and main itself are refused. It is never canonical and never
+    /// frozen, and no other authority takes its floor.
+    #[test]
+    fn export_candidate_floor_admits_only_one_commit_on_the_observed_main() {
+        let f = Fixture::new();
+        let main = f.commit("export main");
+        let candidate = f.commit("the squashed candidate");
+        let stacked = f.commit("a second commit on the candidate");
+        f.command(&["checkout", "--quiet", "--detach", &candidate]);
+        let admitted = f
+            .admit(&export_candidate_status(&f, &candidate, &main), &candidate)
+            .unwrap();
+        assert_eq!(admitted.floor().kind, "first-parent-main");
+        assert_eq!(admitted.floor().sha, main);
+        assert!(!admitted.canonical());
+        assert!(!admitted.frozen());
+        admitted.verify_source(&f.0).unwrap();
+
+        // An unsquashed stack: the top commit's parent is not main.
+        f.command(&["checkout", "--quiet", "--detach", &stacked]);
+        let e = f
+            .admit(&export_candidate_status(&f, &stacked, &main), &stacked)
+            .unwrap_err();
+        assert!(e.contains("not exactly the floor"), "{e}");
+        // A merge whose first parent is main has a second parent.
+        f.command(&["checkout", "--quiet", "--detach", &main]);
+        f.command(&[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "merge the candidate",
+            &candidate,
+        ]);
+        let merged = f.command(&["rev-parse", "HEAD"]);
+        let e = f
+            .admit(&export_candidate_status(&f, &merged, &main), &merged)
+            .unwrap_err();
+        assert!(e.contains("not exactly the floor"), "{e}");
+        // Export main itself is not a candidate.
+        f.command(&["checkout", "--quiet", "--detach", &main]);
+        let e = f
+            .admit(&export_candidate_status(&f, &main, &main), &main)
+            .unwrap_err();
+        assert!(e.contains("not an export main below its target"), "{e}");
+
+        f.command(&["checkout", "--quiet", "--detach", &candidate]);
+        let refused = |status: Value| f.admit(&status, &candidate).unwrap_err();
+        let mut canonical = export_candidate_status(&f, &candidate, &main);
+        canonical["admissible"] = true.into();
+        let e = refused(canonical);
+        assert!(e.contains("noncanonical"), "{e}");
+        let mut frozen_reason = export_candidate_status(&f, &candidate, &main);
+        frozen_reason["reason_code"] = "canonical-holder-kind-not-validate".into();
+        let e = refused(frozen_reason);
+        assert!(e.contains("reason_code"), "{e}");
+        let mut current = export_candidate_status(&f, &candidate, &main);
+        current["admission_floor"]["kind"] = "current-main".into();
+        let e = refused(current);
+        assert!(e.contains("admission floor kind"), "{e}");
+        // The export post-land authority never takes the candidate floor.
+        let mut fbexp = f.authority(&candidate, &main);
+        fbexp["holder"]["kind"] = "fbexp-validate".into();
+        fbexp["admission_floor"]["kind"] = "first-parent-main".into();
+        let e = refused(fbexp);
+        assert!(e.contains("admission floor kind"), "{e}");
+    }
+
+    /// A passing export-candidate row is never reused by tree: its pass is
+    /// about a head on no main, and a by-tree hit would let it stand in for a
+    /// main run of the same tree. The same row on a current-main floor is a
+    /// hit.
+    #[test]
+    fn export_candidate_rows_are_never_reused_by_tree() {
+        let f = Fixture::new();
+        std::fs::write(f.0.join(".gitignore"), "ignored/\n").unwrap();
+        f.command(&["add", ".gitignore"]);
+        let main = f.commit_files("export main", &["README"]);
+        let target = f.commit_files("the squashed candidate", &["src/lib.rs"]);
+        let candidate = export_candidate_status(&f, &target, &main);
+        let current = f.authority(&target, &main);
+        let canonical = crate::validate_plan::validation_config(&source_root()).unwrap();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let key_tree = f.command(&["rev-parse", &format!("{target}^{{tree}}")]);
+        let key = crate::validate_history::CacheKey {
+            tree: &key_tree,
+            profile: "full",
+            host: "fixture-host",
+            toolchain: "rustc fixture",
+            release_builder: crate::RELEASE_BUILDER_CARGO,
+        };
+        let row_for = |status: &Value, name: &str| {
+            let proof = f.admit(status, &target).unwrap();
+            let view = BoundExecutionPlan::bind(&canonical, None, Some(&proof)).unwrap();
+            let log_path = f.0.join(format!("ignored/validate/{name}.log"));
+            let log = state.create(&state.locator(&log_path).unwrap()).unwrap();
+            log.write_exact(b"driver log\n").unwrap();
+            let retained = view
+                .retain(&proof, &f.0, &state, name, "2026-10-12T15:00:00Z", &log)
+                .unwrap();
+            // The driver's own cache check binds only canonical authority, so
+            // it never matches a candidate either; the history reader below is
+            // the layer this test refuses at.
+            assert_eq!(
+                view.cache_matches(&proof, &retained.evidence),
+                proof.canonical(),
+                "{name}"
+            );
+            let AdmissionEvidence::V2(v2) = &retained.evidence else {
+                panic!("new emission must be v2")
+            };
+            let row = serde_json::json!({"result":"pass","commit":target,"tree":key_tree,
+                "host":"fixture-host","profile":"full","toolchain":"rustc fixture",
+                "selection_mode":"full","commit_anchored":true,"tree_dirty":false,
+                "failures":0,"finished_at":"2026-10-12T15:20:00Z","schema_version":10,
+                "producer":"hermit-validate-rs","executed_nodes":76,"executed_tests":2129,
+                "passed_tests":2129,"gates_expected":76,"gates_run":76,
+                "coverage":{"planned_test_nodes":20,"executed_test_nodes":20,"absent_nodes":[]},
+                "release_builder":crate::RELEASE_BUILDER_CARGO,
+                "e2e_payload":crate::e2e_payload_identity(crate::RELEASE_BUILDER_CARGO),
+                "run_id":v2.context.run_id,"started_at":v2.context.started_at,
+                "log_file":log_path,"log_identity":log.locator,
+                "admission_floor_evidence":retained.evidence,
+                "cell_results":{"run_id":v2.context.run_id}});
+            crate::validate_history::admission_cache_row(&row.to_string()).unwrap()
+        };
+        let current_row = row_for(&current, "current-run");
+        let candidate_row = row_for(&candidate, "candidate-run");
+        let hit = |row: &Value| {
+            crate::validate_history::cache_lookup(std::slice::from_ref(row), "pass", &key)
+        };
+        let baseline = |row: &Value| {
+            crate::validate_history::selective_baseline(
+                std::slice::from_ref(row),
+                None,
+                "",
+                &|_| true,
+            )
+        };
+        assert_eq!(hit(&current_row).unwrap().commit, target);
+        assert_eq!(baseline(&current_row).as_deref(), Some(target.as_str()));
+        assert!(hit(&candidate_row).is_none());
+        assert_eq!(baseline(&candidate_row), None);
     }
 
     /// Every file a floor-based check (pre.reverie_pin, pre.reverie_pin_on_host,

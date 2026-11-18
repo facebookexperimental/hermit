@@ -24932,10 +24932,67 @@ fn validate_lock_status_reason(
                 ));
             }
         }
+        Some("fbexp-candidate") => {
+            // A pre-land export candidate: ONE commit whose only parent is
+            // the export main the lock observed. Like frozen, the lock
+            // admits the run but never as canonical authority (its answer is
+            // about the candidate head, not about export main), under its own
+            // reason code. Only the first-parent-main floor pairs with it,
+            // with M as floor and observed main and a target that is not M;
+            // `verify_source` then re-proves from Git that M is the target's
+            // only parent.
+            if value
+                .get("lock_admissible")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err("the candidate authority itself reports lock_admissible=false".into());
+            }
+            if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(false) {
+                return Err(
+                    "the candidate authority must remain noncanonical (admissible=false)".into(),
+                );
+            }
+            if value.get("reason_code").and_then(serde_json::Value::as_str)
+                != Some("canonical-holder-kind-export-candidate")
+            {
+                return Err(format!(
+                    "the candidate authority attached reason_code {}, not \
+                     \"canonical-holder-kind-export-candidate\"",
+                    shown(value.get("reason_code").and_then(serde_json::Value::as_str))
+                ));
+            }
+            let floor_text = |key: &str| {
+                value
+                    .get("admission_floor")
+                    .and_then(|floor| floor.get(key))
+                    .and_then(serde_json::Value::as_str)
+            };
+            if floor_text("kind") != Some("first-parent-main") {
+                return Err(format!(
+                    "the candidate authority carries admission floor kind {}, not \
+                     \"first-parent-main\"",
+                    shown(floor_text("kind"))
+                ));
+            }
+            let target = object_string(holder, "target");
+            if floor_text("sha").is_none()
+                || floor_text("sha") != floor_text("observed_main_sha")
+                || floor_text("sha") == target
+            {
+                return Err(format!(
+                    "the candidate authority's first-parent-main floor {} (observed main {}) \
+                     is not an export main below its target {}",
+                    shown(floor_text("sha")),
+                    shown(floor_text("observed_main_sha")),
+                    shown(target)
+                ));
+            }
+        }
         _ => {
             return Err(format!(
-                "the held lock is kind {}, not \"validate\", \"fbexp-validate\" or \
-                 \"frozen-validate\"",
+                "the held lock is kind {}, not \"validate\", \"fbexp-validate\", \
+                 \"fbexp-candidate\" or \"frozen-validate\"",
                 shown(holder_kind)
             ));
         }
@@ -25227,6 +25284,68 @@ fn product_front_door_bracket() -> Result<(), String> {
         ) {
             return Err(format!(
                 "product front door accepted invalid fbexp authority: {label}"
+            ));
+        }
+    }
+
+    // A pre-land export candidate is lock-admitted but never canonical,
+    // under its own reason code, and only with a first-parent-main floor
+    // whose sha is the observed export main and not the target.
+    let main = "fedcba9876543210fedcba9876543210fedcba98";
+    let mut candidate_authority = authority.clone();
+    candidate_authority["lock_admissible"] = serde_json::json!(true);
+    candidate_authority["admissible"] = serde_json::json!(false);
+    candidate_authority["reason_code"] =
+        serde_json::json!("canonical-holder-kind-export-candidate");
+    candidate_authority["holder"]["kind"] = serde_json::json!("fbexp-candidate");
+    candidate_authority["admission_floor"] = serde_json::json!({
+        "kind": "first-parent-main", "sha": main, "tree": main, "observed_main_sha": main
+    });
+    if !validate_lock_status_admits(
+        &encode(&candidate_authority),
+        commit,
+        host,
+        Some(boot_id),
+        &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+    ) {
+        return Err("product front door refused exact export-candidate authority".into());
+    }
+    let mut candidate_weakened = Vec::new();
+    let mut value = candidate_authority.clone();
+    value["lock_admissible"] = serde_json::json!(false);
+    candidate_weakened.push(("not lock-admissible", value));
+    let mut value = candidate_authority.clone();
+    value["admissible"] = serde_json::json!(true);
+    candidate_weakened.push(("claims canonical authority", value));
+    let mut value = candidate_authority.clone();
+    value["reason_code"] = serde_json::json!("canonical-holder-kind-not-validate");
+    candidate_weakened.push(("frozen reason code", value));
+    let mut value = candidate_authority.clone();
+    value["admission_floor"]["kind"] = serde_json::json!("current-main");
+    candidate_weakened.push(("current-main floor", value));
+    let mut value = candidate_authority.clone();
+    value["admission_floor"]["observed_main_sha"] = serde_json::json!(commit);
+    candidate_weakened.push(("floor is not the observed main", value));
+    let mut value = candidate_authority.clone();
+    value["admission_floor"]["sha"] = serde_json::json!(commit);
+    value["admission_floor"]["observed_main_sha"] = serde_json::json!(commit);
+    candidate_weakened.push(("floor is the target", value));
+    let mut value = candidate_authority.clone();
+    value.as_object_mut().unwrap().remove("admission_floor");
+    candidate_weakened.push(("no admission floor", value));
+    let mut value = fbexp_authority.clone();
+    value["admission_floor"] = candidate_authority["admission_floor"].clone();
+    candidate_weakened.push(("fbexp-validate with a first-parent-main floor", value));
+    for (label, value) in candidate_weakened {
+        if validate_lock_status_admits(
+            &encode(&value),
+            commit,
+            host,
+            Some(boot_id),
+            &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+        ) {
+            return Err(format!(
+                "product front door accepted invalid export-candidate authority: {label}"
             ));
         }
     }

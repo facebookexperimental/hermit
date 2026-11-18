@@ -678,6 +678,10 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// A `queue-base` row is refused for the same reason: its claim (the floor
 /// is merge-base(target, M)) is a Git fact this reader decodes but does not
 /// recompute, so a by-tree reuse would carry an unproven floor.
+///
+/// A `first-parent-main` row (a pre-land export candidate) is refused too:
+/// its pass is about a head that is not on any main, and reusing it by tree
+/// would let a candidate's answer stand in for a main run of the same tree.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
@@ -686,7 +690,7 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
                     e.is_some_and(|evidence| {
                         !matches!(
                             evidence.floor().kind.as_str(),
-                            "disjoint-main" | "queue-base"
+                            "disjoint-main" | "queue-base" | "first-parent-main"
                         )
                     })
                 })

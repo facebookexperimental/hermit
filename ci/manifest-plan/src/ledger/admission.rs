@@ -820,6 +820,11 @@ impl AdmissionIdentity<'_> {
         if f.kind == "queue-base" && !self.v2_contract {
             return Err("a queue-base floor requires the v2 admission context contract".into());
         }
+        if f.kind == "first-parent-main" && !self.v2_contract {
+            return Err(
+                "a first-parent-main floor requires the v2 admission context contract".into(),
+            );
+        }
         if (f.kind == "disjoint-main") != f.main_delta_commits.is_some() {
             return Err(
                 "admission floor carries main_delta_commits if and only if it is disjoint-main"
@@ -892,6 +897,15 @@ impl AdmissionIdentity<'_> {
                     && f.observed_main_sha != self.target_sha => {}
             ("frozen-validate", "frozen-target")
                 if f.sha == self.target_sha && f.tree == self.target_tree => {}
+            // A pre-land export candidate: one commit whose only parent is
+            // the export main M the authority observed. M is the floor and
+            // the observed main; the target is the commit on top of it, never
+            // M. That M is the target's only parent needs Git, so the driver
+            // (`verify_source`) and the parent's admission prove it; this
+            // reader keeps the shape honest. [`AdmissionEvidence::is_canonical`]
+            // stays false: the record is about the candidate head, not a main.
+            ("fbexp-candidate", "first-parent-main")
+                if f.sha == f.observed_main_sha && f.sha != self.target_sha => {}
             _ => return Err("admission floor disagrees with its authority kind/identity".into()),
         }
         let mut nodes = BTreeSet::new();
@@ -2060,6 +2074,75 @@ mod tests {
         assert!(admission_context_bytes(&v1).is_err());
         // The other kinds are unchanged under v1.
         context().validate().unwrap();
+    }
+
+    /// A pre-land export candidate (`fbexp-candidate`): M is the floor and
+    /// the observed main, and the target is the one commit on top of it.
+    fn first_parent_main_context() -> AdmissionContextV2 {
+        let mut c = context_v2();
+        c.authority.kind = "fbexp-candidate".into();
+        c.floor.kind = "first-parent-main".into();
+        c
+    }
+
+    /// An export candidate's record is well formed with M as floor and
+    /// observed main and a target that is not M, and it is never canonical:
+    /// it is about the candidate head, not about any main. Every other
+    /// pairing of the kind or the floor is refused.
+    #[test]
+    fn first_parent_main_floor_is_well_formed_only_for_an_export_candidate() {
+        let candidate = first_parent_main_context();
+        candidate.validate().unwrap();
+        admission_context_v2_bytes(&candidate).unwrap();
+        let evidence = AdmissionEvidence::V2(evidence_v2(candidate.clone()));
+        assert_eq!(evidence.floor().kind, "first-parent-main");
+        assert!(!evidence.is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // The floor is the observed main, never another commit.
+        let mut moved = candidate.clone();
+        moved.floor.observed_main_sha = "a".repeat(40);
+        assert!(refused(moved).contains("floor disagrees"));
+        // The target is never M itself.
+        let mut own = candidate.clone();
+        own.floor.sha = own.target_sha.clone();
+        own.floor.tree = own.target_tree.clone();
+        own.floor.observed_main_sha = own.target_sha.clone();
+        own.pin_bindings[0].base_sha = own.target_sha.clone();
+        assert!(refused(own).contains("floor disagrees"));
+        // Only the candidate authority selects this floor...
+        for kind in ["validate", "fbexp-validate", "frozen-validate"] {
+            let mut other = candidate.clone();
+            other.authority.kind = kind.into();
+            assert!(refused(other).contains("floor disagrees"), "{kind}");
+        }
+        // ...and the candidate authority selects no other floor.
+        let mut current = candidate.clone();
+        current.floor.kind = "current-main".into();
+        assert!(refused(current).contains("floor disagrees"));
+        // CONTROL: the same identities as an ordinary current-main record
+        // are admitted and canonical, so the verdicts above are the kind's.
+        let mut ordinary = candidate;
+        ordinary.authority.kind = "validate".into();
+        ordinary.floor.kind = "current-main".into();
+        ordinary.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(ordinary)).is_canonical());
+    }
+
+    /// The v1 contract predates the candidate floor as well.
+    #[test]
+    fn first_parent_main_floor_is_refused_under_the_v1_contract() {
+        let v2 = first_parent_main_context();
+        v2.validate().unwrap();
+        let mut v1 = context();
+        v1.authority.kind = "fbexp-candidate".into();
+        v1.floor = v2.floor.clone();
+        let e = v1.validate().unwrap_err();
+        assert!(
+            e.contains("requires the v2 admission context contract"),
+            "{e}"
+        );
+        assert!(admission_context_bytes(&v1).is_err());
     }
 
     #[test]
