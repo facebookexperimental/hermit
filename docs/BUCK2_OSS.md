@@ -508,6 +508,9 @@ flag.
 
 `scripts/validate.rs --buck-s0` drives this runner over the subset in
 `ci/buck-e2e/subsets/s0.json`, in one DAG node (`ci/buck-e2e/validate-node`).
+`--buck-s1` does the same for `ci/buck-e2e/subsets/s1.json`, which is s0 plus
+the applications category. Its guests run the host's `git`, `ar`, `cc` and
+`python3`, so the host needs them.
 The buck2 daemon, and every cell it runs, lives in the daemon's own systemd
 scope, outside the node's cgroup, and buck2 clears each test's environment, so
 dagrun's reap of the node does not reach the cells. The node therefore bounds
@@ -520,7 +523,8 @@ the killed daemon fails a running buck2 client), so no later buck2 command in
 the node starts an unbounded daemon. At every end (exit,
 signal, or a breach) the node kills the scope with `cgroup.kill` after
 `buck2 kill`. A host whose buck2 daemon has no
-systemd scope cannot run `--buck-s0`: the node exits 2 before any cell runs.
+systemd scope cannot run `--buck-s0` or `--buck-s1`: the node exits 2 before any
+cell runs.
 
 ## Host prerequisites for Buck validation
 

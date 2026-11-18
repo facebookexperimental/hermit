@@ -1042,14 +1042,14 @@ enum Focused {
     Envelope {
         baseline: Option<PathBuf>,
     },
-    /// `--buck-s0 --buck2 PATH`: a Buck-only validation of the subset in
-    /// ci/buck-e2e/subsets/s0.json with ZERO cargo nodes
-    /// (validation_dag::buck_s0_selection), in a checkout that needs no Cargo
+    /// `--buck-s0 --buck2 PATH` (or `--buck-s1`): a Buck-only validation of the
+    /// subset ci/buck-e2e/subsets/<name>.json, here "s0" or "s1", with ZERO
+    /// cargo nodes (validation_dag::buck_subset_selection), in a checkout that needs no Cargo
     /// target directory: its run state goes to ignored/validation. Off the
     /// record until the open-source tree has the root .buckconfig and the
     /// fb-only stand-in shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl: GitHub
     /// main has carried the BUCK and .bzl files since 0afaf382, but not those two.
-    BuckS0,
+    Buck(&'static str),
 }
 
 impl Focused {
@@ -1071,7 +1071,7 @@ impl Focused {
             // envelope history stays continuous whether or not a baseline was
             // supplied.
             Focused::Envelope { .. } => "envelope-only".into(),
-            Focused::BuckS0 => "buck-s0".into(),
+            Focused::Buck(name) => format!("buck-{name}"),
         }
     }
     /// `--all/--full-run` refuses to combine with any focused mode; this is the
@@ -1101,7 +1101,9 @@ impl Focused {
                     "envelope-only"
                 }
             }
-            Focused::BuckS0 => "buck-s0",
+            Focused::Buck("s0") => "buck-s0",
+            Focused::Buck("s1") => "buck-s1",
+            Focused::Buck(other) => unreachable!("no Buck-only subset {other}"),
         }
     }
 }
@@ -1196,9 +1198,9 @@ const E2E_RUNNER_ENV: &str = "HERMIT_VALIDATE_E2E_RUNNER";
 const E2E_BUCK2_ENV: &str = "HERMIT_VALIDATE_BUCK2";
 const E2E_RUNNER_CARGO: &str = "cargo";
 const E2E_RUNNERS: [&str; 3] = [E2E_RUNNER_CARGO, "buck-local", "buck-hybrid"];
-/// The runner `--buck-s0` passes to ci/buck-e2e/validate-node: the public
-/// buck2's stock test runner over one subset, no cargo. Not a `--e2e-runner`
-/// value: only `--buck-s0` selects it.
+/// The runner `--buck-s0` and `--buck-s1` pass to ci/buck-e2e/validate-node:
+/// the public buck2's stock test runner over one subset, no cargo. Not a
+/// `--e2e-runner` value: only those two select it.
 const E2E_RUNNER_BUCK_STOCK: &str = "buck-stock";
 /// The absolute path of the subset file a buck-stock run stages and runs.
 const E2E_SUBSET_ENV: &str = "HERMIT_VALIDATE_E2E_SUBSET";
@@ -1817,14 +1819,15 @@ fn establish_e2e_runner_environment(args: &Args) -> Result<(), String> {
     std::env::set_var(E2E_RUNNER_ENV, args.e2e_runner);
     std::env::set_var(E2E_BUCK2_ENV, buck2);
     if args.e2e_runner == E2E_RUNNER_BUCK_STOCK {
+        let Some(focused @ Focused::Buck(name)) = &args.focused else {
+            return Err("the buck-stock runner runs only under --buck-s0 or --buck-s1".into());
+        };
+        let flag = format!("--{}", focused.cli_name());
         let subset = std::env::current_dir()
-            .map_err(|error| format!("--buck-s0 cannot read the working directory: {error}"))?
-            .join(hermit_manifest_plan::validation_dag::BUCK_S0_SUBSET);
+            .map_err(|error| format!("{flag} cannot read the working directory: {error}"))?
+            .join(hermit_manifest_plan::validation_dag::buck_subset_path(name));
         if !subset.is_file() {
-            return Err(format!(
-                "--buck-s0 needs the subset file {}",
-                subset.display()
-            ));
+            return Err(format!("{flag} needs the subset file {}", subset.display()));
         }
         std::env::set_var(E2E_SUBSET_ENV, subset);
     }
@@ -1946,6 +1949,8 @@ fn usage() -> &'static str {
      \x20                  Run state goes to ignored/validation; the checkout needs no\n\
      \x20                  target/ directory, and shim/third-party/rust/BUCK must already\n\
      \x20                  be generated.\n\
+     \x20 --buck-s1        The same for ci/buck-e2e/subsets/s1.json: s0 plus the applications\n\
+     \x20                  category, whose guests run the host's git, ar, cc and python3.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
      \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
@@ -2143,7 +2148,8 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 return Err(2);
             }
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
-            "--buck-s0" => focused.push(Focused::BuckS0),
+            "--buck-s0" => focused.push(Focused::Buck("s0")),
+            "--buck-s1" => focused.push(Focused::Buck("s1")),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
             "--hosted-portable-only" => focused.push(Focused::HostedPortable),
             "--hosted-privileged-only" => focused.push(Focused::HostedPrivileged),
@@ -2496,7 +2502,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.show_plan = show_plan;
     args.show_plan_json = show_plan_json;
     args.focused = focused.pop();
-    if args.focused == Some(Focused::BuckS0) && !e2e_runner_explicit {
+    if matches!(args.focused, Some(Focused::Buck(_))) && !e2e_runner_explicit {
         args.e2e_runner = E2E_RUNNER_BUCK_STOCK;
     }
     if args.buck_release_dotslash.is_some()
@@ -2570,30 +2576,28 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
 /// A Buck E2E runner replaces only the full level's E2E buckets, so it refuses
 /// every other selection rather than running a plan nobody defined.
 fn e2e_runner_policy(args: &Args) -> Result<(), String> {
-    if args.focused == Some(Focused::BuckS0) {
+    if let Some(focused @ Focused::Buck(_)) = &args.focused {
+        let flag = format!("--{}", focused.cli_name());
         if args.e2e_runner != E2E_RUNNER_BUCK_STOCK {
-            return Err(
-                "--buck-s0 picks its own runner (the stock buck2 test runner); drop --e2e-runner"
-                    .into(),
-            );
+            return Err(format!(
+                "{flag} picks its own runner (the stock buck2 test runner); drop --e2e-runner"
+            ));
         }
         if args.buck2.is_none() {
-            return Err(
-                "--buck-s0 needs --buck2 PATH, the absolute path of a buck2 executable (the public \
+            return Err(format!(
+                "{flag} needs --buck2 PATH, the absolute path of a buck2 executable (the public \
                  buck2 the checkout's bootstrap/buck2 descriptor names; see docs/BUCK2_OSS.md)"
-                    .into(),
-            );
+            ));
         }
         if args.buck_release_dotslash.is_some() || args.selected.is_some() {
-            return Err("--buck-s0 runs its own plan; drop --buck-release and --selected".into());
+            return Err(format!("{flag} runs its own plan; drop --buck-release and --selected"));
         }
         if !args.allow_local_off_the_record_run && !args.show_plan && !args.show_plan_json {
-            return Err(
-                "--buck-s0 is off the record until the open-source tree has the root .buckconfig and \
+            return Err(format!(
+                "{flag} is off the record until the open-source tree has the root .buckconfig and \
                  shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl, which a checkout supplies as \
                  untracked files outside SOURCE_SHA: add --allow-local-off-the-record-run"
-                    .into(),
-            );
+            ));
         }
         return Ok(());
     }
@@ -15798,25 +15802,28 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
-    if args.focused == Some(Focused::BuckS0) {
-        let subset_path = root.join(hermit_manifest_plan::validation_dag::BUCK_S0_SUBSET);
+    if let Some(focused @ Focused::Buck(name)) = &args.focused {
+        let flag = format!("--{}", focused.cli_name());
+        let subset_path = root.join(hermit_manifest_plan::validation_dag::buck_subset_path(name));
         let subset = std::fs::read_to_string(&subset_path)
-            .map_err(|error| format!("--buck-s0: cannot read {}: {error}", subset_path.display()))
-            .and_then(|text| hermit_manifest_plan::validation_dag::BuckSubset::from_json(&text))?;
+            .map_err(|error| format!("{flag}: cannot read {}: {error}", subset_path.display()))
+            .and_then(|text| {
+                hermit_manifest_plan::validation_dag::BuckSubset::from_json(name, &text)
+            })?;
         let plan_path = root.join("ci/expected-e2e-plan.json");
         let plan_json: serde_json::Value = std::fs::read(&plan_path)
-            .map_err(|error| format!("--buck-s0: cannot read {}: {error}", plan_path.display()))
+            .map_err(|error| format!("{flag}: cannot read {}: {error}", plan_path.display()))
             .and_then(|bytes| {
                 serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("--buck-s0: {}: {error}", plan_path.display()))
+                    .map_err(|error| format!("{flag}: {}: {error}", plan_path.display()))
             })?;
         let plan_backends = plan_json["cells"]
             .as_array()
-            .ok_or_else(|| format!("--buck-s0: {} has no cells", plan_path.display()))?
+            .ok_or_else(|| format!("{flag}: {} has no cells", plan_path.display()))?
             .iter()
             .filter_map(|cell| cell["backend"].as_str().map(str::to_string))
             .collect::<BTreeSet<_>>();
-        let cfg = hermit_manifest_plan::validation_dag::buck_s0_selection(
+        let cfg = hermit_manifest_plan::validation_dag::buck_subset_selection(
             &committed,
             &subset,
             &plan_backends,
@@ -15824,8 +15831,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
-            profile: "buck-s0".into(),
-            selection_mode: "buck-s0",
+            profile: focused.profile(),
+            selection_mode: focused.cli_name(),
             cacheable: false,
             ..Default::default()
         };
@@ -30949,7 +30956,7 @@ fn install_fixture_first_hop(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A `--buck-s0` run's no-cargo shim records refused calls in the checkout's
+/// A Buck-only run's (`--buck-s0`, `--buck-s1`) no-cargo shim records refused calls in the checkout's
 /// ignored/validation (validation_dag::BUCK_S0_CARGO_REFUSED_LOG), where the
 /// record outlives its run. A run that holds the invocation lock is the only
 /// run in the checkout, so a record there when it starts is an earlier run's:
@@ -30981,7 +30988,7 @@ fn keep_earlier_buck_s0_refusals(
     ));
     std::fs::rename(&log, &kept).map_err(|error| {
         format!(
-            "cannot move an earlier --buck-s0 run's refused cargo calls from {} to {}: {error}",
+            "cannot move an earlier Buck-only run's refused cargo calls from {} to {}: {error}",
             log.display(),
             kept.display()
         )
@@ -31682,12 +31689,13 @@ fn run(
         );
     }
     std::env::set_var("VALIDATE_RUN_STATE", &tmp);
-    // An earlier --buck-s0 run's no-cargo record, renamed only by a run that
-    // holds the invocation lock (never by --show-plan or a nested payload).
-    if args.focused == Some(Focused::BuckS0) {
+    // An earlier Buck-only run's no-cargo record (--buck-s0, --buck-s1),
+    // renamed only by a run that holds the invocation lock (never by
+    // --show-plan or a nested payload).
+    if matches!(args.focused, Some(Focused::Buck(_))) {
         match keep_earlier_buck_s0_refusals(&root, &tmp, invocation_lock.is_some()) {
             Ok(Some(kept)) => eprintln!(
-                "validate: kept an earlier --buck-s0 run's refused cargo calls as {}, so this run's gates judge only this run's",
+                "validate: kept an earlier Buck-only run's refused cargo calls as {}, so this run's gates judge only this run's",
                 kept.display()
             ),
             Ok(None) => {}
@@ -38557,6 +38565,32 @@ mod scorecard_cutover_tests {
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), record);
         // No record, nothing to keep.
         assert_eq!(keep_earlier_buck_s0_refusals(root, &state, true), Ok(None));
+    }
+
+    // Each Buck-only flag selects its own subset: the profile, the flag its
+    // refusals name, and the stock runner, which no other flag selects.
+    #[test]
+    fn buck_s0_and_buck_s1_select_their_own_subset_profile_and_runner() {
+        for (flag, name) in [("--buck-s0", "s0"), ("--buck-s1", "s1")] {
+            let args = parse_argv(&[
+                flag.into(),
+                "--buck2".into(),
+                "/abs/buck2".into(),
+                "--show-plan".into(),
+            ])
+            .expect("a Buck-only argv parses");
+            assert_eq!(args.focused, Some(Focused::Buck(name)));
+            assert_eq!(args.e2e_runner, E2E_RUNNER_BUCK_STOCK);
+            let focused = args.focused.as_ref().unwrap();
+            assert_eq!(focused.profile(), format!("buck-{name}"));
+            assert_eq!(format!("--{}", focused.cli_name()), flag);
+            e2e_runner_policy(&args).expect("a Buck-only plan needs no off-the-record flag");
+            assert!(matches!(parse_argv(&[flag.into()]), Err(2)), "{flag} without --buck2 is a usage error");
+            let mut bare = args;
+            bare.buck2 = None;
+            let error = e2e_runner_policy(&bare).unwrap_err();
+            assert!(error.starts_with(&format!("{flag} needs --buck2 PATH")), "{error}");
+        }
     }
 
     #[test]

@@ -1,0 +1,18 @@
+{
+  "name": "s1",
+  "description": "The Buck-only E2E subset S1: S0 plus the applications category, the portable lane on the ptrace and kvm backends. Every input of these cells is Buck-built in the open-source tree: the harness and hermit by Buck, the fixtures by the Buck-built harness, no cargo. The applications guests run host tools that the manifest names in requires (git, ar, cc, python3), so the host that runs ci/buck-e2e/stage and the cells must have them; fbsource keeps applications out of its ci/buck-e2e for that reason (fb-only/e2e_cells.bzl EXCLUDED_CATEGORIES). scripts/validate.rs --buck-s1 runs exactly these cells and judges them with one import twin per category (validation_dag.rs buck_subset_selection).",
+  "lanes": ["portable"],
+  "backends": ["kvm", "ptrace"],
+  "categories": [
+    "applications",
+    "bin-c",
+    "c-programs",
+    "chaos-c",
+    "data-handling",
+    "debugger-c",
+    "determinism-stress",
+    "determinism-stress-c",
+    "shared-futex-c",
+    "util-c"
+  ]
+}
