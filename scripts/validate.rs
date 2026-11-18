@@ -4187,8 +4187,20 @@ impl SubmoduleServiceBracket {
                 )
             })
             .collect::<Vec<_>>();
+        // The clone has only the directories HEAD tracks. A source in the tree
+        // that HEAD does not track yet (a new file being developed, or a Buck
+        // stand-in the export does not carry yet) needs its directory made
+        // first, or the copy fails before the case runs.
         for relative in &sources {
-            exec_safe_fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
+            let destination = checkout.join(relative);
+            if let Some(directory) = destination.parent() {
+                std::fs::create_dir_all(directory).map_err(|error| {
+                    format!(
+                        "submodule service result: cannot create the directory of {relative} in fixture: {error}"
+                    )
+                })?;
+            }
+            exec_safe_fs::copy(root.join(relative), &destination).map_err(|error| {
                 format!("submodule service result: cannot copy {relative} into fixture: {error}")
             })?;
         }
