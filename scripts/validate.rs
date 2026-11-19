@@ -20094,6 +20094,92 @@ fn interrupted_by() -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+mod stop_handler_tests {
+    use super::*;
+
+    /// A validation started with SIGINT, SIGTERM and SIGHUP ignored (under
+    /// `nohup`, or with `&` from a non-interactive shell) still starts every
+    /// child, and so every DAG node's shell, with them at their defaults:
+    /// install_stop_handlers replaces the inherited SIG_IGN with a handler, and
+    /// exec resets a handled signal to its default, where an ignored one would
+    /// stay ignored. A node's traps (the validation_dag.rs recorder's, for
+    /// one) work only on signals its shell did not start ignoring.
+    #[test]
+    fn children_start_with_default_stop_signals_when_validate_inherited_them_ignored() {
+        const CHILD: &str = "HERMIT_VALIDATE_STOP_HANDLER_TEST_CHILD";
+        const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+        if std::env::var_os(CHILD).is_none() {
+            // Dispositions are process-wide, so change them only in a separate
+            // test process, which starts with the stop signals ignored.
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "stop_handler_tests::children_start_with_default_stop_signals_when_validate_inherited_them_ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            // SAFETY: between fork and exec this calls only signal(2), which is
+            // async-signal-safe, and allocates nothing.
+            unsafe {
+                command.pre_exec(|| {
+                    for signal in STOP_SIGNALS {
+                        libc::signal(signal, libc::SIG_IGN);
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "the child process ran no test: {stdout}"
+            );
+            return;
+        }
+
+        let ignored = |status: &str| -> u64 {
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .unwrap_or_else(|| panic!("no SigIgn line in {status:?}"));
+            u64::from_str_radix(mask.trim(), 16).unwrap()
+        };
+        let stop = STOP_SIGNALS
+            .iter()
+            .fold(0_u64, |mask, signal| mask | 1 << (signal - 1));
+        let inherited = ignored(&std::fs::read_to_string("/proc/self/status").unwrap());
+        assert_eq!(
+            inherited & stop,
+            stop,
+            "this process did not start with the stop signals ignored: SigIgn {inherited:#x}"
+        );
+        install_stop_handlers();
+        // The shell reads its own status through a redirection, without exec.
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                "while IFS= read -r line; do case $line in SigIgn:*) echo \"$line\";; esac; done < /proc/self/status",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let shell = ignored(&String::from_utf8_lossy(&output.stdout));
+        assert_eq!(
+            shell & stop,
+            0,
+            "a shell validate started has stop signals ignored: SigIgn {shell:#x}"
+        );
+    }
+}
+
 // --------------------------------------------------------------- lane execution
 
 /// One outer scheduler attempt for one DAG node.

@@ -2164,18 +2164,37 @@ fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize
     );
 }
 
-/// Run the determinism-stress library's comparison-evidence self-test, which
-/// prints its own pass line ("positive and refusal directions pass").
+/// The line the determinism-stress library's comparison-evidence self-test
+/// prints after both of its directions passed.
+const DETERMINISM_STRESS_EVIDENCE_PASS_LINE: &str =
+    "determinism-stress comparison evidence self-test: positive and refusal directions pass";
+
+/// Run the determinism-stress library's comparison-evidence self-test. It
+/// passes only if it exits 0 AND prints its own pass line
+/// ([`DETERMINISM_STRESS_EVIDENCE_PASS_LINE`]): a library that exits 0 before
+/// its checks ran has not passed them.
 fn audit_determinism_stress_evidence(root: &Path) -> Result<(), String> {
     let program = root.join("tests/e2e/lib/determinism-stress/common.sh");
-    let status = Command::new(&program)
+    let output = Command::new(&program)
         .env("DETERMINISM_STRESS_EVIDENCE_SELF_TEST", "1")
         .current_dir(root)
-        .status()
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .map_err(|error| format!("cannot execute {}: {error}", program.display()))?;
-    if !status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{stdout}");
+    if !output.status.success() {
         return Err(format!(
             "{} failed its comparison-evidence self-test",
+            program.display()
+        ));
+    }
+    if !stdout
+        .lines()
+        .any(|line| line == DETERMINISM_STRESS_EVIDENCE_PASS_LINE)
+    {
+        return Err(format!(
+            "{} exited 0 without its comparison-evidence pass line {DETERMINISM_STRESS_EVIDENCE_PASS_LINE:?}",
             program.display()
         ));
     }
@@ -2399,6 +2418,13 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if actual != expected {
             return Err(format!(
                 "{} manifest buckets differ: expected={expected:?} actual={actual:?}",
+                path.display()
+            ));
+        }
+        // A lane whose DAG and manifests both name no bucket agrees vacuously.
+        if actual.is_empty() {
+            return Err(format!(
+                "{} checked no {lane} manifest buckets: the {lane} lane's correspondence is vacuous",
                 path.display()
             ));
         }
@@ -2653,6 +2679,19 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         &fs::read(root.join("ci/portable-shards.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
+    let sharded = shards["debug_shards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(shards["release_shards"].as_array().into_iter().flatten())
+        .map(|shard| shard["nodes"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    if sharded == 0 {
+        return Err(
+            "the portable shard map lists no nodes: no sharded portable budget is checked"
+                .to_string(),
+        );
+    }
     audit_portable_preflight_budget(&portable_workflow, &portable, &shards)?;
     audit_portable_checks_budget(&portable_workflow, &portable, &shards)?;
     audit_portable_reducer_prepared_tools(&portable_workflow)?;
@@ -2745,15 +2784,8 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "budget ordering: {} baseline inversion(s), {} portable sharded + {} privileged nodes checked",
+        "budget ordering: {} baseline inversion(s), {sharded} portable sharded + {} privileged nodes checked",
         current.len(),
-        shards["debug_shards"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(shards["release_shards"].as_array().into_iter().flatten())
-            .map(|shard| shard["nodes"].as_array().map_or(0, Vec::len))
-            .sum::<usize>(),
         privileged.steps.len()
     );
     Ok(())
@@ -9479,7 +9511,6 @@ sys.exit(1 if failed else 0)
         assert_eq!((pinned, direct), (22, 39));
     }
 
-    /// ci/buck-e2e/cell.sh runs every cell alone with `--parity-plan-of-test`.
     /// Each audit `validate --without-footprint-check` runs (the Buck-only
     /// gate's mode) accepts the committed input and refuses a deliberately
     /// broken one. Each audit gets a tree holding only the files it reads, so
@@ -9538,6 +9569,25 @@ sys.exit(1 if failed else 0)
             "{error}"
         );
 
+        // DAG correspondence, vacuous: no node records a manifest identity and
+        // no manifest names a test, so each lane agrees on zero buckets.
+        let vacuous = copy("dag-vacuous", &dag);
+        let path = vacuous.join(dag[0]);
+        let mut json: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for step in json["steps"].as_array_mut().unwrap() {
+            step.as_object_mut().unwrap().remove("manifest");
+        }
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let mut no_manifests = manifests.clone();
+        no_manifests.documents.clear();
+        let error = super::audit_dag_correspondence(&vacuous, &no_manifests).unwrap_err();
+        eprintln!("refused as expected: {error}");
+        assert!(
+            error.contains("checked no portable manifest buckets"),
+            "{error}"
+        );
+
         // Budget ordering: a baseline inversion the DAG no longer has.
         let budget = [
             "ci/dag/validate.json",
@@ -9561,6 +9611,46 @@ sys.exit(1 if failed else 0)
             "{error}"
         );
 
+        // Budget ordering, vacuous: no step carries the hosted-privileged
+        // label, so no privileged wall budget would be checked. The selection
+        // already refuses a label no step carries, so a lane never selects no
+        // step; this pins that refusal...
+        let unlabelled = copy("budget-no-privileged", &budget);
+        let path = unlabelled.join(budget[0]);
+        let mut json: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for step in json["steps"].as_array_mut().unwrap() {
+            if let Some(labels) = step["labels"].as_array_mut() {
+                labels.retain(|label| label.as_str() != Some("hosted-privileged"));
+            }
+        }
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let error = super::audit_budget_ordering(&unlabelled).unwrap_err();
+        eprintln!("refused as expected: {error}");
+        assert!(
+            error.contains("cannot select privileged DAG steps")
+                && error.contains("unknown label(s): hosted-privileged"),
+            "{error}"
+        );
+        // ... and a shard map that lists no nodes, so no sharded portable
+        // budget would be.
+        let unsharded = copy("budget-no-shards", &budget);
+        let path = unsharded.join("ci/portable-shards.json");
+        let mut json: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for key in ["debug_shards", "release_shards"] {
+            for shard in json[key].as_array_mut().into_iter().flatten() {
+                shard["nodes"] = JsonValue::Array(Vec::new());
+            }
+        }
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let error = super::audit_budget_ordering(&unsharded).unwrap_err();
+        eprintln!("refused as expected: {error}");
+        assert!(
+            error.contains("the portable shard map lists no nodes"),
+            "{error}"
+        );
+
         // Determinism-stress evidence: a library that reports a comparison
         // policy when it observed none, which its self-test exists to refuse.
         let stress = ["tests/e2e/lib/determinism-stress/common.sh"];
@@ -9575,6 +9665,20 @@ sys.exit(1 if failed else 0)
         let error = super::audit_determinism_stress_evidence(&broken).unwrap_err();
         assert!(
             error.contains("failed its comparison-evidence self-test"),
+            "{error}"
+        );
+        // ... and one that exits 0 without printing its pass line: a library
+        // that stops before its checks ran has not passed them.
+        let silent = copy("stress-silent", &stress);
+        edit(
+            &silent.join(stress[0]),
+            "printf 'determinism-stress comparison evidence self-test: positive and refusal directions pass\\n'",
+            ":",
+        );
+        let error = super::audit_determinism_stress_evidence(&silent).unwrap_err();
+        eprintln!("refused as expected: {error}");
+        assert!(
+            error.contains("exited 0 without its comparison-evidence pass line"),
             "{error}"
         );
 
@@ -9613,6 +9717,7 @@ sys.exit(1 if failed else 0)
         fs::remove_dir_all(&fixture).unwrap();
     }
 
+    /// ci/buck-e2e/cell.sh runs every cell alone with `--parity-plan-of-test`.
     /// For every cell a full-profile node plans, that one-cell run names the
     /// parity golden's CPU profile exactly when the node does, so a Buck cell
     /// presents the CPU Cargo validation presents; without the flag the
