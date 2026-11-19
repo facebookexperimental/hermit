@@ -47,6 +47,52 @@ replaces the `--recursive` in the clone.
 target pattern is a diagnostic rather than a gate: it includes optional and
 non-host platform targets that the default Hermit binary does not use.
 
+## Shared BUCK files and the shim cell
+
+The `BUCK`, `PACKAGE` and `.bzl` files outside `shim/` are byte-identical to
+the ones Meta builds internally. The `shim` cell supplies open-source
+definitions for every cell those files load from: `.buckconfig` aliases
+`fbcode`, `fbcode_macros` and `fbsource` to it, so a load such as
+`@fbcode//hermetic_infra/hermit/fb-only:release.bzl` reads
+`shim/hermetic_infra/hermit/fb-only/release.bzl`. The shim's own build files
+are named `BUCK.v2`: Buck reads `BUCK.v2` before `BUCK`, and the internal
+build, which reads only `BUCK` and `TARGETS`, ignores them. Internally the root
+`.buckconfig` is kept as `.buckconfig.oss` and exported under its public name.
+
+The shim gives every `rust_library` and `rust_binary` without
+`unittests = False` the implicit `<name>-unittest` test target that Meta's
+build generates (29 targets), built from the same sources plus `test_srcs`.
+Those targets evaluate under `buck2 targets //...`; their open-source build and
+pass status are not yet established.
+
+### What the open-source Buck build does not run
+
+Where an internal macro wraps an internal-only test harness, the shim's
+stand-in defines no target, so these do not run under the open-source Buck
+build:
+
+| Stand-in | Call sites | Not run here |
+|---|---|---|
+| `gated_test` | 5 | The host-capability gate wrappers around `detcore:detcore-unittest`, `detcore:tests_misc`, `detcore:tests_parallelism`, `detcore:tests_time` and `hermit-cli:libhermit-unittest`; the wrapped tests themselves are defined here. |
+| `hermit_integration_tests` | 1 | hermit-cli's validation-node integration family; its 149 test crates (`hermit-cli/tests/*.rs`) run under Cargo. |
+| `lit_unittest` | 86 | Every lit test: 85 targets in `detcore/tests/lit` (the shell `.test` and scheduler-strategy scripts, the C, Rust and Go guests, and the per-directory `.lit` suites) and `hermit-cli:test_record_with_gdb_smoke`. The shim carries no lit runner. |
+| `record_c_workloads` | 2 | The 50 record-and-replay C workload targets. |
+| `wrap_test_suite` | 1 | The upstream rr test-suite wrapper (296 targets). |
+| `excluded_paths_test` | 1 | The internal import-exclusion check, which has no meaning in this tree. |
+| `go_binary` | 1 | `detcore/tests/lit:hello_world_go_main`, the Go lit guest. The open-source build configures no Go toolchain. |
+
+The table covers Hermit's packages. Reverie's stand-ins `gated_test`,
+`excluded_paths_test` and `downstream_source_exports`
+(`shim/hermetic_infra/reverie/fb-only/defs.bzl`) also define no target;
+Reverie's BUCK files do not evaluate in this tree yet.
+
+`flaky-tests:use_configurable_flaky_service` is marked `broken-in-oss` (the
+shim has no curl), as are the root package's `backend-abstraction-repository`,
+`cargo-lock-repository` and `oss-release-values-stand-in`, which feed internal
+contract checks. This tree runs the backend-abstraction check as
+`scripts/check-detcore-backend-abstraction.sh` and checks the stand-in
+`release.bzl` values with `scripts/check-reverie-pin.rs`.
+
 ## Shadow release parity
 
 The feature-complete release target is shadow-only: Cargo remains the

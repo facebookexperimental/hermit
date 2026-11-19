@@ -587,6 +587,17 @@ buck_filegroup(
     visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
 )
 
+# The open-source stand-in for fb-only/release.bzl, which the shim cell
+# supplies to the shared BUCK files on GitHub.
+# fb-only/contract_checks:release-values-oss-stand-in runs the same value
+# check on it as on the internal file, so the two cannot drift.
+buck_export_file(
+    name = "oss-release-values-stand-in",
+    src = "shim/hermetic_infra/hermit/fb-only/release.bzl",
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
+    visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
+)
+
 # The manifest/lock snapshot the Tier 2 co-change contract gate runs
 # --check-tree on, in export shape: Hermit root manifest and lock,
 # every workspace member manifest (MEMBER_MANIFESTS, maintained with
