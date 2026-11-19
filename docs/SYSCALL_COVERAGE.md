@@ -66,6 +66,65 @@ turns it off by default), its helper now runs, cannot attach to threads that
 are already traced, and LeakSanitizer reports that it does not work under
 ptrace, as under any tracer.
 
+### Post-Snapshot Timer And Accounting Policy
+
+The historical counts below also predate Detcore's interval/POSIX timer
+handlers. Timers do not use host time in a normal serialized run:
+
+- `alarm` and `ITIMER_REAL` register with the scheduler on logical time
+  (`handle_alarm` and `handle_setitimer` in `detcore/src/syscalls/signal.rs`,
+  through `register_alarm`), and `getitimer` reads that logical state back
+  (`handle_getitimer`, through `alarm_remaining`). With thread serialization
+  disabled these calls instead inject the host operation, as before.
+- `setitimer` for `ITIMER_VIRTUAL` or `ITIMER_PROF` returns `ENOSYS`;
+  `getitimer` for either returns a zero (disarmed) snapshot.
+- POSIX timers get a deterministic id from `timer_create`
+  (`handle_timer_create` in `detcore/src/syscalls/time.rs`) and are armed
+  against the virtual clock by `timer_settime` (`handle_timer_settime`, with
+  `timer_gettime` reporting the remaining virtual time). Expiry is a scheduler
+  event; on ptrace the scheduler makes the physical send itself at that
+  deterministic point, with a host `pidfd_send_signal`, `tgkill` or
+  `rt_(tg)sigqueueinfo` as transport only (`Scheduler::send_guest_signal` in
+  `detcore/src/scheduler.rs`). The cases still short of Linux: a timer on a
+  CPU clock counts its relative expirations — a periodic relative one is
+  accepted — on the shared virtual clock, not on the task's CPU time, while
+  an absolute arming is refused when its expiry is still ahead of the clock's
+  reading or it would reload (`refuse_cpu_clock` in `handle_timer_settime`);
+  `SIGEV_THREAD_ID` creation is refused in a nested PID namespace
+  (`handle_timer_create`). A `SIGEV_THREAD_ID` expiry whose signal is already
+  pending in the target thread is queued behind the pending copy on the
+  coalescing ptrace path when the signal is observable, as on Linux (and if
+  the pending copy is this timer's own earlier expiry it is only an
+  overrun); it refuses the run only off that model — a backend that does not
+  model signal targets, or the fallback when the signal does not coalesce or
+  is unobservable (`fire_thread_timer` in `detcore/src/scheduler.rs`,
+  reached from `detcore/src/scheduler/posix_timer_coalesce.rs`).
+- `timerfd` expirations likewise count on the virtual clock: Detcore keeps
+  each timerfd's setting and leaves the host timerfd disarmed, and before a
+  probe that can observe readiness it counts the expirations at or before the
+  guest clock and only then makes the host descriptor readable (module
+  comment and `enabled` in `detcore/src/syscalls/timerfd.rs`). Where no
+  shared model exists (a strict SaBRe run) the timerfd is refused by name
+  instead; under record/replay or without serialized threads it stays on the
+  host, as in the snapshot.
+- A POSIX timer that would notify with a real-time signal (32 to 64; glibc's
+  `SIGEV_THREAD` timers use one, delivered through its internal
+  `SIGEV_THREAD_ID`, so they all count as such a timer) still creates, arms,
+  reads and deletes as on Linux, but Detcore cannot deliver that signal from
+  a timer. A fail-closed run registers the expiry
+  (`posix_timer_expiry_is_registered`); one Linux would discard is dropped
+  and one every thread blocks stays pending, and the scheduler refuses the
+  run by name only when an expiry would become observable
+  (`real_time_expiration_fate` in `detcore/src/scheduler/parked.rs`,
+  `refuse_real_time_expiration`). A permissive
+  `--allow-unsupported-syscalls` run leaves it unregistered, so it never
+  fires.
+- `times` and the user/system times of `getrusage` come from one logical CPU
+  accounting, not host scheduler counters (`handle_times` and
+  `handle_getrusage` in `detcore/src/syscalls/sysinfo.rs`). `getrusage`'s
+  `ru_maxrss` is still a best-effort host procfs read, and its page-fault and
+  context-switch counts stay zero.
+
 ## Terminology And Scope
 
 - **Emulated** means Detcore returns a result without executing the guest's
@@ -111,7 +170,7 @@ The following rows exhaust the 87 optimized subscriptions.
 | Process/thread lifecycle (10) | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `exit`, `exit_group`, `wait4`, `setsid` | Detcore registers children, orders exit/wait, updates FD state across exec, and injects lifecycle calls. | Partial. PID/TID values are not virtualized. `vfork` is implemented as `fork`; `CLONE_VFORK` is unsupported. Executable/filesystem errors remain external. |
 | Synchronization and CPU policy (4) | `futex`, `sched_yield`, `sched_getaffinity`, `sched_setaffinity` | Supported futex WAIT/WAKE and BITSET operations are modeled; yield is a scheduler turn; affinity is virtualized to CPU 0. | Strong only for supported futex operations under the precise default mode. Other futex commands panic; scheduler-disabled and alternate debug modes inject or poll Linux. |
 | Signal API (5) | `rt_sigaction`, `rt_sigprocmask`, `rt_sigtimedwait`, `signalfd`, `signalfd4` | Protects Reverie's reserved signal, deterministically polls timed waits, and tracks signal FDs. | Partial. The kernel still owns masks/actions and signal-FD contents; signal sources and untrapped signal syscalls can remain external. |
-| Special FD creation/management (11) | `eventfd`, `eventfd2`, `timerfd_create`, `timerfd_settime`, `timerfd_gettime`, `inotify_init`, `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `memfd_create`, `userfaultfd` | Linux executes the call; Detcore records FD type/flags and delegates timer/inotify operations. | Mostly bookkeeping. Event counts, timer expiration, inotify events, userfault activity, and subsequent unmodeled FD operations can expose host timing or mutable state. |
+| Special FD creation/management (11) | `eventfd`, `eventfd2`, `timerfd_create`, `timerfd_settime`, `timerfd_gettime`, `inotify_init`, `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, `memfd_create`, `userfaultfd` | Linux executes the creation; Detcore records FD type/flags, answers `timerfd_settime`/`timerfd_gettime` from its virtual-clock model where enabled (see the post-snapshot timer policy above), and delegates inotify operations. | Mostly bookkeeping, except timerfd expiry, which follows the post-snapshot timer policy above. Event counts, inotify events, userfault activity, and subsequent unmodeled FD operations can expose host timing or mutable state. |
 | Polling and networking (13) | `socket`, `socketpair`, `bind`, `connect`, `accept`, `accept4`, `recvfrom`, `poll`, `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_pwait`, `epoll_wait` | Sockets are made physically nonblocking, local blocking operations are retried through scheduler turns, and port zero is assigned from a deterministic range. | Conditional for isolated, guest-internal communication. External endpoints are a record/replay boundary. Poll cannot currently distinguish internal from external FD sets, and `epoll_pwait` is injected as a blocking call. |
 | Key management (3) | `add_key`, `request_key`, `keyctl` | Trapped, then explicitly passed through. | Not deterministic. Kernel key serial numbers and keyring state are not virtualized. |
 | Intentional rejection (3) | `futimesat`, `epoll_ctl_old`, `epoll_wait_old` | `futimesat` returns `ENOSYS`; obsolete epoll ABIs panic. | Deterministic failure, not compatibility. |
@@ -220,7 +279,7 @@ restart_syscall rt_sigreturn
 | P0 | Modern FD creators/mutators are untracked: `openat2`, `close_range`, `pidfd_open`, `pidfd_getfd`, `memfd_secret`, `fanotify_init`, `io_uring_setup`, and mount-FD APIs. | Detcore's FD type/flags/resource map diverges; later trapped `read`, `write`, `close`, `fcntl`, or polling may fail or use the wrong model. | Trap and update FD bookkeeping, or return a documented deterministic error until modeled. |
 | P0 | `select`, `pselect6`, `ppoll`, `epoll_pwait2`, new futex calls, and `waitid` bypass blocking control. | A guest thread can block in Linux outside Detcore's timed-wait/run-queue model, causing hangs and timing-dependent wake order. | Add nonblocking retry/scheduler adapters matching `poll`, `epoll_wait`, futex, and `wait4`. |
 | P1 | Positioned/vectored and zero-copy I/O bypass deterministic I/O and resource ordering. | Common runtimes, databases, and file servers expose short-I/O, file-offset, pipe, and socket timing differences. | Cover `pread*`, `pwrite*`, `readv`, `sendfile`, `copy_file_range`, `splice`, `tee`, and `vmsplice`, classifying the FD type. |
-| P1 | POSIX/interval timers and accounting clocks use host time. | `getitimer`, `setitimer`, POSIX timers, `times`, and `getrusage` reveal wall/CPU timing and signal races. | Back timers with logical time and scheduler events; normalize CPU accounting or reject it. |
+| P1 | Timer and accounting residuals outside virtual time (see the post-snapshot policy above). | A POSIX timer notifying with a real-time signal cannot be delivered, `ITIMER_VIRTUAL`/`ITIMER_PROF` are unsupported, CPU-clock POSIX timers count relative expirations (periodic included) on the shared clock instead of task CPU time (an absolute arming is refused only while its expiry is still ahead or it would reload), `SIGEV_THREAD_ID` creation is refused in a nested PID namespace, off the coalescing ptrace path a `SIGEV_THREAD_ID` expiry is refused when another copy of its signal (not its own, which is only an overrun) is pending in the target thread, where Linux queues a second copy, and `getrusage`'s `ru_maxrss` still reads host procfs. | Deliver real-time-signal timer expiries or keep the named refusals; count CPU-clock timers on task CPU time and model the CPU-time interval timers and `ru_maxrss` only for demonstrated workloads. |
 | P1 | PID/TID and signal-target APIs are not virtualized. | IDs vary across namespace/host conditions and feed `kill`, pidfd, `/proc`, logs, and application protocols. | Define stable virtual IDs and translate syscall arguments/results consistently. |
 | P1 | `ioctl` and `prctl` are command-dependent catch-all holes. | Individual commands expose devices, terminals, CPU features, clocks, namespace state, or alter execution policy. | Inventory commands from representative workloads; explicitly model/allowlist deterministic commands and reject or record the rest. |
 | P2 | System V/POSIX IPC, AIO, and io_uring have no deterministic model. | Blocking, wake order, completion order, IDs, and shared kernel state are uncontrolled. | Start with deterministic rejection for unsupported async engines; add IPC models only for demonstrated workloads. |
@@ -247,9 +306,15 @@ tests plus optimized-build coverage checks.
 5. **Cover mainstream I/O families (1-2 weeks).** Generalize deterministic
    read/write logic to positioned, vectored, and zero-copy operations, with
    regular-file versus pipe/socket policy.
-6. **Virtualize remaining timer APIs (1-2 weeks).** Model interval/POSIX timers
-   and normalize process accounting. Add signal interruption and cancellation
-   tests.
+6. **Close the timer/accounting residuals.** Interval/POSIX timers and
+   process accounting already run on virtual time (see the post-snapshot
+   policy above); what remains includes real-time-signal timer delivery,
+   `ITIMER_VIRTUAL`/`ITIMER_PROF`, CPU-clock timers counted on task CPU
+   time, the nested-PID-namespace and off-coalescing-model
+   `SIGEV_THREAD_ID` refusals, the coalescing scheduler's named refusals
+   when a signal with pending timer entries stops being observable
+   (`detcore/src/scheduler/posix_timer_coalesce.rs`), and the
+   host-derived `ru_maxrss`.
 7. **Virtualize process identity (3-6 weeks).** Introduce PID/TID translation
    across getters, signal targets, wait/pidfd, `/proc` interactions, and logs.
    This is broad and should be designed before incremental syscall patches.
