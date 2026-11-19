@@ -19352,10 +19352,7 @@ impl RunOpts {
             }
         }
 
-        let mut mounts = identity_mounts
-            .into_iter()
-            .map(PlannedMount::hermit)
-            .collect::<Vec<_>>();
+        let mut mounts = identity_mounts;
         mounts.extend(user_mounts);
 
         for overlay in self

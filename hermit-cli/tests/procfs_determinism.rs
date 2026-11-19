@@ -1734,6 +1734,105 @@ fn proc_self_mountinfo_shows_a_user_bind_over_private_tmp_at_its_target() {
     );
 }
 
+/// #4799 end-to-end: a host rename replacing /etc/ld.so.cache while the
+/// guest runs (ldconfig's shape) must not change what the guest reads, and
+/// a host entry created mid-run must not appear. Hermit itself runs inside
+/// a private mount namespace whose /etc is a sandbox copy, so the rename
+/// the trigger performs is over the very dentries Hermit's setup froze
+/// from, without touching the host's real /etc.
+#[test]
+fn guest_etc_survives_a_host_rename_of_ld_so_cache() {
+    let _guard = hermit_run_lock();
+    // Outside /tmp: Hermit's private /tmp would cover the sandbox (and the
+    // guest script in it) exactly as mount_target_outside_tmp avoids.
+    let sandbox = tempfile::Builder::new()
+        .prefix("rename-sandbox-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create rename sandbox");
+    let etc = sandbox.path().join("etc");
+    fs::create_dir(&etc).unwrap();
+    let v1 = fs::read("/etc/ld.so.cache").expect("host loader cache");
+    fs::write(etc.join("ld.so.cache"), &v1).unwrap();
+    fs::copy("/etc/group", etc.join("group")).unwrap();
+    fs::copy("/etc/hosts", etc.join("hosts")).unwrap();
+    let mut v2 = v1.clone();
+    v2.push(b'X');
+    fs::write(sandbox.path().join("newcache"), &v2).unwrap();
+    fs::write(
+        sandbox.path().join("guest.sh"),
+        "#!/bin/sh\n\
+         cat /etc/ld.so.cache > \"$1/first.bin\"\n\
+         : > \"$1/guest-ready\"\n\
+         i=0; while [ ! -e \"$1/go\" ] && [ $i -lt 2000 ]; do sleep 0.05; i=$((i+1)); done\n\
+         if [ -e \"$1/go\" ]; then echo yes > \"$1/saw-go\"; else echo no > \"$1/saw-go\"; fi\n\
+         cat /etc/ld.so.cache > \"$1/second.bin\"\n\
+         ls /etc > \"$1/entries.txt\"\n",
+    )
+    .unwrap();
+    // A process, not a thread: the trigger must rename from this namespace
+    // while Hermit and its guest run in theirs.
+    let mut trigger = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "i=0; while [ ! -e \"$SB/guest-ready\" ] && [ $i -lt 600 ]; do \
+             sleep 0.05; i=$((i+1)); done; \
+             mv \"$SB/newcache\" \"$SB/etc/ld.so.cache\"; \
+             echo NEW > \"$SB/etc/hermit-midrun-new\"; touch \"$SB/go\"",
+        )
+        .env("SB", sandbox.path())
+        .spawn()
+        .unwrap();
+    let mut command = Command::new("unshare");
+    command
+        .args(["-rm", "/bin/sh", "-c"])
+        .arg(
+            "mount --bind \"$SB/etc\" /etc || exit 9; \
+             exec \"$HERMIT\" --log=error run --base-env=minimal \
+             --no-virtualize-cpuid --cpu-profile=x86-64-v2 \
+             --max-timeslice=disabled --strict -- /bin/sh \"$SB/guest.sh\" \"$SB\"",
+        )
+        .env("SB", sandbox.path())
+        .env("HERMIT", hermit_test::hermit_binary());
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output_attempts(&rendered, 1, &mut command);
+    trigger.wait().unwrap();
+    assert!(
+        output.status.success(),
+        "rename-survival run failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        fs::read(sandbox.path().join("first.bin")).unwrap(),
+        v1,
+        "first guest read is the frozen cache"
+    );
+    assert_eq!(
+        fs::read(sandbox.path().join("second.bin")).unwrap(),
+        v1,
+        "guest still reads the frozen cache after the host rename"
+    );
+    assert_eq!(
+        fs::read(etc.join("ld.so.cache")).unwrap(),
+        v2,
+        "the trigger really renamed the host cache under the running guest"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.path().join("saw-go"))
+            .unwrap()
+            .trim(),
+        "yes",
+        "the guest waited for, and saw, the post-rename signal"
+    );
+    let entries = fs::read_to_string(sandbox.path().join("entries.txt")).unwrap();
+    assert!(
+        !entries.lines().any(|line| line == "hermit-midrun-new"),
+        "a host entry created mid-run must not appear in the guest /etc:\n{entries}"
+    );
+}
+
 /// A directory the test makes outside /tmp for a `--mount` target: Hermit
 /// creates a missing target only under /tmp, and a host directory such as
 /// /mnt need not exist where the test runs (the validation's pinned root has

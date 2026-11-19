@@ -675,7 +675,7 @@ impl StartOpts {
         // `/dev/shm` follows every mount sourced from a host path, as in
         // `hermit run`, and precedes the mounts that go into it.
         let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
-        plan.extend(identity_mounts.into_iter().map(PlannedMount::hermit));
+        plan.extend(identity_mounts);
         plan.extend(user_mounts.into_iter().cloned().map(PlannedMount::hermit));
         plan.extend(backend_mounts.into_iter().map(PlannedMount::backend));
         plan.extend(dev_shm.map(PlannedMount::hermit));

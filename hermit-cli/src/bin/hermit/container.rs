@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::panic;
@@ -59,11 +60,17 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::RunError;
 
+const GUEST_ETC: &str = "/etc";
 const GROUP_FILE: &str = "/etc/group";
 const LD_SO_CACHE: &str = "/etc/ld.so.cache";
-const NSCD_DIR: &str = "/var/run/nscd";
 const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
 const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache";
+const NSCD_DIR: &str = "/var/run/nscd";
+/// The root the guest's mount table shows for Hermit's staged `/etc`
+/// cover bind, in place of the run's private staging directory. Like the
+/// other deterministic roots, it names no host path and is the same
+/// every run.
+const DETERMINISTIC_ETC_ROOT: &[u8] = b"/tmpvol/.hermit/etc";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
 
@@ -630,9 +637,30 @@ impl MountInfoRootSource {
 // applies the mounts in the forked child before exec. Hold this guard in the
 // caller until after `Container::run` returns so the backing temp files still
 // exist when the child binds them.
+/// Hermit's staged mirror of the host `/etc`: a private directory holding
+/// the frozen files as regular files, symbolic links recreated, and empty
+/// mountpoints the backend stage binds fill, bound recursively over the
+/// guest's `/etc`. The guard holds its temp directory until after
+/// container setup, like the bind sources it replaces.
+#[derive(Debug)]
+struct EtcStage {
+    _dir: tempfile::TempDir,
+    stage: PathBuf,
+    /// The staged frozen files (mirror bind targets share their names, so
+    /// existence alone cannot tell a frozen file from a mirrored one).
+    _frozen: Vec<PathBuf>,
+}
+
+impl EtcStage {
+    /// The staged file holding the frozen bytes for guest path
+    /// `guest_path` (named by its file name under `/etc`).
+    fn file(&self, guest_path: &Path) -> PathBuf {
+        self.stage.join(guest_path.file_name().unwrap_or_default())
+    }
+}
+
 pub(super) struct IdentityGuard {
-    _group_file: Option<tempfile::NamedTempFile>,
-    _ld_so_cache: Option<tempfile::NamedTempFile>,
+    _etc_stage: Option<EtcStage>,
     ld_so_cache_origin: Option<HostInputSnapshot>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
@@ -728,8 +756,7 @@ impl IdentityGuard {
     /// not use the frozen-identity bind mounts.
     pub(super) fn empty() -> Self {
         Self {
-            _group_file: None,
-            _ld_so_cache: None,
+            _etc_stage: None,
             ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
@@ -753,6 +780,15 @@ impl IdentityGuard {
     /// not match this still-owned file, even at `/etc/ld.so.cache`.
     pub(super) fn host_input_snapshots(&self) -> Vec<HostInputSnapshot> {
         self.ld_so_cache_origin.iter().cloned().collect()
+    }
+
+    /// The staged file holding the frozen bytes for a guest `/etc` path,
+    /// when identity hardening froze that path.
+    #[cfg(test)]
+    fn frozen_etc_path(&self, guest_path: &Path) -> Option<PathBuf> {
+        let stage = self._etc_stage.as_ref()?;
+        let path = stage.file(guest_path);
+        stage._frozen.contains(&path).then_some(path)
     }
 
     /// Record that the container's setup mounts the placeholder directory at
@@ -1080,7 +1116,7 @@ impl IdentityGuard {
     /// though no pathname could reopen that exact layer afterward.
     pub(super) fn discard_mounts_shadowed_by(
         &mut self,
-        mounts: &mut Vec<Mount>,
+        mounts: &mut Vec<PlannedMount>,
         overriding_target: &Path,
     ) {
         // Host canonicalization describes the namespace only until the first
@@ -1098,12 +1134,38 @@ impl IdentityGuard {
         } else {
             canonical_mount_target(overriding_target)
         };
-        mounts.retain(|mount| {
-            !canonical_mount_target(mount.get_target()).starts_with(&resolved_override)
+        mounts.retain(|planned| {
+            // The staged /etc mirror's backend binds name staging paths,
+            // not guest paths: a user mount at /tmp (or a staging parent)
+            // shadows no guest path they serve, and dropping them while
+            // the cover survives would leave the guest an /etc of empty
+            // placeholder files. They drop only with the cover, below.
+            if planned.backend
+                && self
+                    ._etc_stage
+                    .as_ref()
+                    .is_some_and(|stage| planned.mount.get_target().starts_with(&stage.stage))
+            {
+                return true;
+            }
+            !canonical_mount_target(planned.mount.get_target()).starts_with(&resolved_override)
         });
         self.mountinfo_roots.retain(|source| {
             !canonical_mount_target(&source.target).starts_with(&resolved_override)
         });
+        // The staged `/etc` cover and its frozen-file binds drop together
+        // above: an override at a frozen file drops that bind (the staged
+        // frozen file stays shadowed below the guest's own mount), an
+        // override at `/etc` or above drops cover and binds, and a mount
+        // below `/etc` stacks inside the staged directory, dropping
+        // neither. The mirror's backend binds serve only the cover: when
+        // the override drops it, drop them too.
+        if canonical_mount_target(Path::new(GUEST_ETC)).starts_with(&resolved_override)
+            && let Some(stage) = &self._etc_stage
+        {
+            let staged = stage.stage.clone();
+            mounts.retain(|planned| !planned.mount.get_target().starts_with(&staged));
+        }
         self.user_mount_targets
             .push(overriding_target.to_path_buf());
     }
@@ -1248,11 +1310,11 @@ fn overflow_gid() -> String {
         .to_string()
 }
 
-/// Snapshot the host group database into a private temp file, appending a
-/// synthetic overflow group (`nobody:x:<overflow gid>`) when the host lacks
-/// one. Binding this frozen copy read-only over `/etc/group` keeps guest
+/// The frozen guest group database: the host's contents, with a synthetic
+/// overflow group (`nobody:x:<overflow gid>`) appended when the host lacks
+/// one. Serving these bytes at `/etc/group` for the whole run keeps guest
 /// group-name resolution stable across otherwise-identical runs.
-fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
+fn frozen_group_contents() -> Result<Vec<u8>, Error> {
     let overflow_gid = overflow_gid();
     let mut contents = fs::read_to_string(GROUP_FILE)
         .context("Failed to read the host group database for the guest")?;
@@ -1270,59 +1332,283 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
         contents.push_str(":\n");
     }
 
-    let mut group_file = tempfile::NamedTempFile::new()
-        .context("Failed to create the frozen group database for the guest")?;
-    group_file
-        .write_all(contents.as_bytes())
-        .context("Failed to populate the frozen group database for the guest")?;
-    group_file
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))
-        .context("Failed to set permissions on the frozen guest group database")?;
-    Ok(group_file)
+    Ok(contents.into_bytes())
 }
 
-/// Snapshot the host's dynamic-linker cache into a private temp file, or
-/// `None` when the host has none. The host's package manager replaces
-/// `/etc/ld.so.cache` (ldconfig writes a new file and renames it over the old
-/// one) whenever it installs a package, which on a managed host is many times
-/// an hour. A guest's loader opens the cache at every exec and keeps it open
-/// while it maps it, so a replacement during a run gives that run a new inode
-/// at a later open (named as a host input change) or an `fstat` of the open
-/// descriptor with `nlink` 0 instead of 1, which no host-input check can name.
-/// On 2026-10-23 that failed compat/nm and compat/openssl verify/kvm in one
-/// full validation. A copy taken when the container is set up, bound
-/// read-only over the path, keeps the cache one unchanging file for the
-/// guest's whole run, as the frozen `/etc/group` keeps group resolution.
+/// Write one frozen file into the staged `/etc`, with the mode the frozen
+/// file binds used (0644: what the host files carry). Returns the staged
+/// file's path.
+fn write_frozen_etc_file(stage: &Path, guest_path: &Path, bytes: &[u8]) -> Result<PathBuf, Error> {
+    let path = stage.join(guest_path.file_name().unwrap_or_default());
+    let mut file = File::create(&path).with_context(|| {
+        format!(
+            "Failed to create the frozen guest file for {}",
+            guest_path.display()
+        )
+    })?;
+    file.write_all(bytes).with_context(|| {
+        format!(
+            "Failed to populate the frozen guest file for {}",
+            guest_path.display()
+        )
+    })?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .with_context(|| {
+            format!(
+                "Failed to set permissions on the frozen guest file for {}",
+                guest_path.display()
+            )
+        })?;
+    Ok(path)
+}
+
+/// Refuse, by name, a host on which the guest's `/etc` cannot be the staged
+/// mirror [`frozen_etc_stage`] builds. Falling back to binding frozen
+/// files over the host's own dentries would silently restore the
+/// host-rename detachment staging exists to remove
+/// (https://github.com/rrnewton/hermit/issues/4799), so there is no fallback.
+fn require_guest_etc_stage(etc: &Path) -> Result<(), Error> {
+    if !etc.is_dir() {
+        anyhow::bail!(Error::new(PolicyRefusal).context(
+            "refusing the staged guest /etc: this host has no /etc directory to freeze \
+             identity files into (https://github.com/rrnewton/hermit/issues/4799)"
+        ));
+    }
+    Ok(())
+}
+
+/// Stage a mirror of the host `etc` directory at `stage`, appending the
+/// backend bind mounts that fill it to `mounts`. Each entry is bound as
+/// one unit, except along paths that hold host submounts, which are
+/// mirrored entry by entry (a bind of a tree holding locked submounts
+/// fails `EINVAL` in a user namespace). Symbolic links are recreated as
+/// links. Entries named in `skip` (the frozen files, already staged as
+/// regular files) get no mirror entry. Entry order is sorted, so the
+/// staged entry set -- and the mount plan -- is a deterministic function
+/// of the host directory at setup: a host entry created mid-run does not
+/// appear, which is the setup snapshot the frozen files already are.
+/// Staging failures refuse by name: this mirror is the only `/etc` the
+/// guest may be given, and there is no fallback to host dentries.
+fn mirror_etc_stage(
+    etc: &Path,
+    stage: &Path,
+    skip: &[&std::ffi::OsStr],
+    mounts: &mut Vec<PlannedMount>,
+) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStringExt;
+    let mountpoints: std::collections::BTreeSet<PathBuf> = mount_rows()
+        .context("Failed to read the host mount table for the staged guest /etc")?
+        .into_iter()
+        .map(|row| {
+            detcore_model::container_mounts::unescape_mountinfo_path(&row.mountpoint)
+                .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+                .ok_or_else(|| {
+                    Error::new(PolicyRefusal).context(
+                        "refusing the staged guest /etc: a host mountpoint in mountinfo \
+                         is malformed, so the staged /etc mirror cannot be proven complete \
+                         (https://github.com/rrnewton/hermit/issues/4799)",
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    mirror_etc_dir(etc, stage, &mountpoints, skip, mounts)
+}
+
+/// Whether any host mountpoint lies strictly below `path`.
+fn etc_has_submount(path: &Path, mountpoints: &std::collections::BTreeSet<PathBuf>) -> bool {
+    mountpoints
+        .iter()
+        .any(|mountpoint| mountpoint != path && mountpoint.starts_with(path))
+}
+
+/// One directory of [`mirror_etc_stage`]: `stage` already exists with the
+/// host directory's mode. `skip` applies at every level (the frozen names
+/// occur only at the top, where the upper serves them).
+fn mirror_etc_dir(
+    host: &Path,
+    stage: &Path,
+    mountpoints: &std::collections::BTreeSet<PathBuf>,
+    skip: &[&std::ffi::OsStr],
+    mounts: &mut Vec<PlannedMount>,
+) -> Result<(), Error> {
+    let refuse = |path: &Path, what: &str| {
+        Error::new(PolicyRefusal).context(format!(
+            "refusing the staged guest /etc: cannot stage host /etc entry {} ({what}); \
+             the staged mirror is the only /etc the guest may be given \
+             (https://github.com/rrnewton/hermit/issues/4799)",
+            path.display()
+        ))
+    };
+    let mut entries: Vec<_> = fs::read_dir(host)
+        .map_err(|_| refuse(host, "the directory cannot be listed"))?
+        .collect::<Result<_, _>>()
+        .map_err(|_| refuse(host, "a directory entry cannot be read"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        if skip.contains(&name.as_os_str()) {
+            continue;
+        }
+        let source = entry.path();
+        let target = stage.join(&name);
+        // The link itself decides: a dangling symbolic link mirrors as one,
+        // so metadata (which follows links) is read only for directories.
+        let file_type = entry
+            .file_type()
+            .map_err(|_| refuse(&source, "its type cannot be read"))?;
+        if file_type.is_symlink() {
+            let link = fs::read_link(&source).map_err(|_| refuse(&source, "a symbolic link"))?;
+            std::os::unix::fs::symlink(&link, &target)
+                .map_err(|_| refuse(&source, "its symbolic link cannot be recreated"))?;
+        } else if file_type.is_dir() {
+            let metadata = entry
+                .metadata()
+                .map_err(|_| refuse(&source, "its metadata cannot be read"))?;
+            fs::create_dir(&target).map_err(|_| refuse(&source, "its mirror directory"))?;
+            if etc_has_submount(&source, mountpoints) {
+                // Fill before chmod: a read-only host mode (0555) must not
+                // refuse staging its own contents.
+                mirror_etc_dir(&source, &target, mountpoints, &[], mounts)?;
+                fs::set_permissions(
+                    &target,
+                    fs::Permissions::from_mode(metadata.mode() & 0o7777),
+                )
+                .map_err(|_| refuse(&source, "its mirror directory mode"))?;
+            } else {
+                // Writable, like the host view it mirrors: the guest's
+                // writes meet the host file's own permissions, as today.
+                // Optional: an entry that vanishes after this listing is
+                // simply absent from the setup snapshot.
+                mounts.push(PlannedMount::backend(
+                    Mount::bind(&source, &target).optional(),
+                ));
+            }
+        } else if file_type.is_file()
+            || file_type.is_fifo()
+            || file_type.is_char_device()
+            || file_type.is_block_device()
+            || file_type.is_socket()
+        {
+            File::create(&target).map_err(|_| refuse(&source, "its mirror file"))?;
+            mounts.push(PlannedMount::backend(
+                Mount::bind(&source, &target).optional(),
+            ));
+        } else {
+            return Err(refuse(
+                &source,
+                "it is not a regular file, directory or symbolic link",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The guest's `etc` as private mounts no host rename can detach: a staged
+/// mirror of the host directory (backend binds, hidden from the guest's
+/// mount table) bound recursively over `etc`, with Hermit's frozen
+/// identity files staged as regular files in the mirror and then each
+/// bind-mounted read-only over its guest path, as the frozen binds were
+/// read-only before. `None` when there is nothing to freeze. Returns the
+/// mounts in install order, the stage to keep alive, and the mountinfo
+/// provenance of the cover bind and each frozen bind. Each frozen input
+/// pairs its bytes with the deterministic mountinfo root its bind shows.
 ///
-/// Both runs of one verification must see the same bytes too, so a caller
-/// that runs both passes the one [`LdSoCacheSnapshot`] it took for them
-/// (https://github.com/rrnewton/hermit/issues/4693); without one the host's
-/// cache is read now.
-fn frozen_ld_so_cache(
-    snapshot: Option<&LdSoCacheSnapshot>,
-) -> Result<Option<tempfile::NamedTempFile>, Error> {
-    let snapshot = match snapshot {
-        Some(snapshot) => snapshot.clone(),
-        None => LdSoCacheSnapshot::of_host()?,
-    };
-    let Some(captured) = snapshot.0 else {
+/// Why not bind each frozen file over its host path directly, as before:
+/// the host's package manager replaces `/etc/ld.so.cache` many times an
+/// hour (ldconfig writes a new file and renames it over the old one), and
+/// Linux answers a rename over a mountpoint by detaching the mounts on
+/// that dentry in every namespace (`detach_mounts` from `vfs_rename`). A
+/// frozen file bound over the host's dentry therefore vanishes mid-run and
+/// later opens read the host's new file
+/// (https://github.com/rrnewton/hermit/issues/4799; a replacement during
+/// setup was already caught and retried, but no setup check can cover the
+/// run itself).
+///
+/// Why the staged mirror instead of serving the host directory itself:
+/// measured in a private namespace on this kernel class, a bind of a tree
+/// holding locked submounts fails `EINVAL`, an overlay will not clone such
+/// a lower ("failed to clone lowerpath"), and the locked mounts cannot be
+/// unmounted either -- and production hosts carry them inside `/etc` (a
+/// tmpfs cert bundle, configuration-injection binds). The mirror's binds
+/// are Hermit's own, never locked, so the recursive cover bind copies
+/// them cleanly while every guest-visible mountpoint dentry belongs to
+/// the private stage, never to the host filesystem: the cover's
+/// mountpoint is the `/etc` directory, which no package manager renames
+/// over, and the frozen binds sit inside it. The rebinds keep the frozen
+/// files read-only to the guest exactly as the direct binds did; the
+/// entry set is the setup snapshot, so a host entry created mid-run does
+/// not appear.
+/// What [`frozen_etc_stage`] builds: the mounts in install order, the
+/// stage to keep alive, and the mountinfo provenance of its binds.
+struct FrozenEtcStage {
+    mounts: Vec<PlannedMount>,
+    stage: EtcStage,
+    roots: Vec<MountInfoRootSource>,
+}
+
+fn frozen_etc_stage(
+    etc: &Path,
+    group: Option<(&[u8], &[u8])>,
+    cache: Option<(&CapturedLdSoCache, &[u8])>,
+) -> Result<Option<FrozenEtcStage>, Error> {
+    if group.is_none() && cache.is_none() {
         return Ok(None);
-    };
-    let mut cache = tempfile::NamedTempFile::new()
-        .context("Failed to create the frozen dynamic-linker cache for the guest")?;
-    cache
-        .write_all(&captured.bytes)
-        .context("Failed to populate the frozen dynamic-linker cache for the guest")?;
-    cache
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))
-        .context("Failed to set permissions on the frozen guest dynamic-linker cache")?;
-    Ok(Some(cache))
+    }
+    require_guest_etc_stage(etc)?;
+    let dir = tempfile::TempDir::new().context("Failed to create the private staged guest /etc")?;
+    let stage = dir.path().join("etc");
+    fs::create_dir(&stage).context("Failed to create the staged guest /etc")?;
+    // The staged root keeps the host `/etc` mode, so the guest's `/etc`
+    // directory stats as the host's does rather than as a temp directory.
+    // Applied only once the stage is filled, below: a read-only host mode
+    // must not refuse staging its own contents.
+    let etc_mode = fs::metadata(etc)
+        .context("Failed to inspect the host /etc directory for the staged guest /etc")?
+        .mode()
+        & 0o7777;
+    let mut frozen: Vec<(PathBuf, PathBuf, &[u8])> = Vec::new();
+    if let Some((group, root)) = group {
+        let guest = etc.join("group");
+        let file = write_frozen_etc_file(&stage, &guest, group)?;
+        frozen.push((file, guest, root));
+    }
+    if let Some((cache, root)) = cache {
+        let guest = etc.join("ld.so.cache");
+        let file = write_frozen_etc_file(&stage, &guest, &cache.bytes)?;
+        frozen.push((file, guest, root));
+    }
+    let mut mounts = Vec::new();
+    let skip: Vec<&std::ffi::OsStr> = frozen
+        .iter()
+        .filter_map(|(_, guest, _)| guest.file_name())
+        .collect();
+    mirror_etc_stage(etc, &stage, &skip, &mut mounts)?;
+    fs::set_permissions(&stage, fs::Permissions::from_mode(etc_mode))
+        .context("Failed to set permissions on the staged guest /etc")?;
+    mounts.push(PlannedMount::hermit(Mount::bind(&stage, etc).rprivate()));
+    let mut roots = Vec::with_capacity(frozen.len() + 1);
+    roots.push(MountInfoRootSource::new(
+        &stage,
+        etc,
+        DETERMINISTIC_ETC_ROOT,
+    )?);
+    for (file, guest, root) in &frozen {
+        roots.push(MountInfoRootSource::new(file, guest, root)?);
+        mounts.push(PlannedMount::hermit(Mount::bind(file, guest).readonly()));
+    }
+    Ok(Some(FrozenEtcStage {
+        mounts,
+        stage: EtcStage {
+            _dir: dir,
+            stage,
+            _frozen: frozen.iter().map(|(file, _, _)| file.clone()).collect(),
+        },
+        roots,
+    }))
 }
 
 /// The bytes of the host's `/etc/ld.so.cache` at one moment, or `None` when
-/// the host has none: what [`frozen_ld_so_cache`] gives the guest.
+/// the host has none: what the guest's staged `/etc` serves at that path.
 ///
 /// A package manager replaces the host's cache many times an hour. Two runs of
 /// one verification that each read it can see different caches -- the
@@ -1404,9 +1690,10 @@ impl LdSoCacheSnapshot {
 }
 
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
-/// `replay`: a frozen `/etc/group`, a frozen `/etc/ld.so.cache`
-/// ([`frozen_ld_so_cache`]) and an empty directory over the host nscd
-/// cache. These keep guest NSS lookups from reaching nondeterministic host
+/// `replay`: the guest's `/etc` as a staged mirror holding the frozen
+/// `/etc/group` and `/etc/ld.so.cache` ([`frozen_etc_stage`]), and an
+/// empty directory over the host nscd cache. These keep guest NSS lookups
+/// from reaching nondeterministic host
 /// state (the nscd cache and the systemd-userdb socket), so record/replay
 /// reproduce the same group/user resolution that `run` mode already enforces.
 /// Returns the mounts plus a guard that must outlive container setup.
@@ -1415,7 +1702,7 @@ impl LdSoCacheSnapshot {
 /// to take the host's cache now.
 pub(super) fn identity_hardening_mounts(
     ld_so_cache: Option<&LdSoCacheSnapshot>,
-) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+) -> Result<(Vec<PlannedMount>, IdentityGuard), Error> {
     identity_hardening_mounts_on(HostLayout::of_host(), ld_so_cache)
 }
 
@@ -1445,18 +1732,11 @@ impl HostLayout {
 pub(super) fn identity_hardening_mounts_on(
     layout: HostLayout,
     ld_so_cache: Option<&LdSoCacheSnapshot>,
-) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+) -> Result<(Vec<PlannedMount>, IdentityGuard), Error> {
     let mut mountinfo_roots = Vec::new();
     let mut mounts = Vec::new();
-    let group_file = if layout.group_file {
-        let group_file = frozen_group_file()?;
-        mountinfo_roots.push(MountInfoRootSource::new(
-            group_file.path(),
-            Path::new(GROUP_FILE),
-            DETERMINISTIC_GROUP_ROOT,
-        )?);
-        mounts.push(Mount::bind(group_file.path(), GROUP_FILE).readonly());
-        Some(group_file)
+    let group = if layout.group_file {
+        Some(frozen_group_contents()?)
     } else {
         tracing::info!(
             "[hermit] this host has no {GROUP_FILE}, so the guest has none either: there is no \
@@ -1468,23 +1748,38 @@ pub(super) fn identity_hardening_mounts_on(
         Some(snapshot) => snapshot.clone(),
         None => LdSoCacheSnapshot::of_host()?,
     };
-    let ld_so_cache = frozen_ld_so_cache(Some(&snapshot))?;
-    let ld_so_cache_origin = match (&ld_so_cache, snapshot.0.as_ref()) {
-        (Some(cache), Some(captured)) if captured.origin.is_some() => Some(HostInputSnapshot {
-            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(cache)?),
+    let etc_stage = match frozen_etc_stage(
+        Path::new(GUEST_ETC),
+        group
+            .as_deref()
+            .map(|bytes| (bytes, DETERMINISTIC_GROUP_ROOT)),
+        snapshot
+            .0
+            .as_deref()
+            .map(|captured| (captured, DETERMINISTIC_LD_SO_CACHE_ROOT)),
+    )? {
+        Some(FrozenEtcStage {
+            mounts: etc_mounts,
+            stage,
+            roots,
+        }) => {
+            mounts.extend(etc_mounts);
+            mountinfo_roots.extend(roots);
+            Some(stage)
+        }
+        None => None,
+    };
+    let ld_so_cache_origin = match (&etc_stage, snapshot.0.as_ref()) {
+        (Some(stage), Some(captured)) if captured.origin.is_some() => Some(HostInputSnapshot {
+            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(
+                &File::open(stage.file(Path::new(LD_SO_CACHE)))
+                    .context("Failed to open the frozen guest dynamic-linker cache")?,
+            )?),
             origin: captured.origin.unwrap(),
             content: detcore::Digest::new(&captured.bytes).to_string(),
         }),
         _ => None,
     };
-    if let Some(cache) = &ld_so_cache {
-        mountinfo_roots.push(MountInfoRootSource::new(
-            cache.path(),
-            Path::new(LD_SO_CACHE),
-            DETERMINISTIC_LD_SO_CACHE_ROOT,
-        )?);
-        mounts.push(Mount::bind(cache.path(), LD_SO_CACHE).readonly());
-    }
 
     // Host nscd cache readiness is external state and can differ between runs.
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
@@ -1500,7 +1795,9 @@ pub(super) fn identity_hardening_mounts_on(
             &target,
             DETERMINISTIC_NSCD_ROOT,
         )?);
-        mounts.push(Mount::bind(directory.path(), target).readonly());
+        mounts.push(PlannedMount::hermit(
+            Mount::bind(directory.path(), target).readonly(),
+        ));
         Some(directory)
     } else {
         None
@@ -1510,8 +1807,7 @@ pub(super) fn identity_hardening_mounts_on(
     Ok((
         mounts,
         IdentityGuard {
-            _group_file: group_file,
-            _ld_so_cache: ld_so_cache,
+            _etc_stage: etc_stage,
             ld_so_cache_origin,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
@@ -2153,9 +2449,8 @@ pub(super) mod declared_inputs {
             if self.common_group.is_some() {
                 bail!("common identity inputs already captured");
             }
-            let group = super::frozen_group_file()?;
             let sealed = super::super::native_exec_inputs::seal_bytes(
-                &std::fs::read(group.path())?,
+                &super::frozen_group_contents()?,
                 InputRole::Data,
             )?;
             self.common_group = Some(Arc::new(RuntimeFile::new(
@@ -4617,7 +4912,7 @@ pub(super) mod declared_inputs {
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
     let mut container = default_container(true)?;
     let (mounts, identity_guard) = identity_hardening_mounts(None)?;
-    container.mounts(mounts);
+    container.mounts(mounts.iter().map(|planned| planned.mount.clone()));
     Ok((container, identity_guard))
 }
 
@@ -7064,11 +7359,10 @@ mod tests {
             "expected at least the frozen /etc/group mount"
         );
         let group_file = guard
-            ._group_file
-            .as_ref()
+            .frozen_etc_path(Path::new(GROUP_FILE))
             .expect("identity hardening must produce a frozen group file");
-        let contents = fs::read_to_string(group_file.path())
-            .expect("frozen group database should be readable");
+        let contents =
+            fs::read_to_string(group_file).expect("frozen group database should be readable");
         let overflow_gid = overflow_gid();
         assert_eq!(overflow_gid, "65534");
         assert!(
@@ -7081,31 +7375,47 @@ mod tests {
 
     // A host package install replaces /etc/ld.so.cache by renaming a new
     // file over it, which gave a running guest a new inode or an fstat with
-    // nlink 0. The guest's cache is a frozen copy with the host's bytes, bound
-    // read-only at the literal path (a canonicalized file target would carry
-    // a trailing separator, which mount refuses with ENOTDIR).
+    // nlink 0, and detaches any mount stacked on the replaced dentry
+    // (#4799). The guest's cache is a frozen copy with the host's bytes,
+    // served from the staged /etc: no guest-visible identity mount may
+    // target a host file dentry under /etc.
     #[test]
     fn identity_hardening_freezes_the_dynamic_linker_cache() {
         let (mounts, guard) = identity_hardening_mounts(None)
             .expect("identity hardening mounts should be constructible");
         let Ok(host) = fs::read(LD_SO_CACHE) else {
-            assert!(guard._ld_so_cache.is_none());
+            assert!(guard.frozen_etc_path(Path::new(LD_SO_CACHE)).is_none());
             return;
         };
         let cache = guard
-            ._ld_so_cache
-            .as_ref()
+            .frozen_etc_path(Path::new(LD_SO_CACHE))
             .expect("a host with a dynamic-linker cache gets a frozen copy");
-        assert_eq!(fs::read(cache.path()).unwrap(), host);
-        let bound = mounts
+        assert_eq!(fs::read(&cache).unwrap(), host);
+        let stage = guard
+            ._etc_stage
+            .as_ref()
+            .expect("a host with a cache gets a staged /etc");
+        let covers = mounts
             .iter()
-            .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+            .filter(|planned| {
+                planned.mount.get_target() == Path::new(GUEST_ETC)
+                    && planned.mount.get_source() == Some(stage.stage.as_path())
+            })
             .collect::<Vec<_>>();
-        assert_eq!(bound.len(), 1, "{mounts:?}");
+        assert_eq!(covers.len(), 1, "{mounts:?}");
+        // The frozen files are bound over their staged paths (private
+        // dentries), never over the host files: the one mount at the cache
+        // path sources the staged file holding the frozen bytes.
+        let binds = mounts
+            .iter()
+            .filter(|planned| planned.mount.get_target() == Path::new(LD_SO_CACHE))
+            .collect::<Vec<_>>();
+        assert_eq!(binds.len(), 1, "{mounts:?}");
         assert_eq!(
-            bound[0].get_target().as_os_str().as_encoded_bytes(),
+            binds[0].mount.get_target().as_os_str().as_encoded_bytes(),
             LD_SO_CACHE.as_bytes()
         );
+        assert_eq!(binds[0].mount.get_source(), Some(cache.as_path()));
         assert!(guard.mountinfo_roots.iter().any(|root| {
             root.target == Path::new(LD_SO_CACHE)
                 && root.deterministic_root.as_deref() == Some(DETERMINISTIC_LD_SO_CACHE_ROOT)
@@ -7116,36 +7426,214 @@ mod tests {
     // snapshot their caller took, never from the host at each run's setup
     // (https://github.com/rrnewton/hermit/issues/4693).
     #[test]
-    fn identity_hardening_binds_the_given_dynamic_linker_cache_snapshot() {
+    fn identity_hardening_serves_the_given_dynamic_linker_cache_snapshot() {
         let snapshot = LdSoCacheSnapshot::from_bytes(b"not the host's cache".to_vec());
         let (mounts, guard) = identity_hardening_mounts(Some(&snapshot))
             .expect("identity hardening mounts should be constructible");
         let cache = guard
-            ._ld_so_cache
-            .as_ref()
+            .frozen_etc_path(Path::new(LD_SO_CACHE))
             .expect("a snapshot with bytes gets a frozen copy");
-        assert_eq!(fs::read(cache.path()).unwrap(), b"not the host's cache");
+        assert_eq!(fs::read(&cache).unwrap(), b"not the host's cache");
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|planned| planned.mount.get_target() == Path::new(LD_SO_CACHE))
+                .count(),
+            1,
+            "{mounts:?}"
+        );
         assert!(
             guard.host_input_snapshots().is_empty(),
             "unknown origin stays unknown"
         );
+        let stage = guard
+            ._etc_stage
+            .as_ref()
+            .expect("a snapshot with bytes gets a staged /etc");
         assert_eq!(
             mounts
                 .iter()
-                .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+                .filter(|planned| {
+                    planned.mount.get_target() == Path::new(GUEST_ETC)
+                        && planned.mount.get_source() == Some(stage.stage.as_path())
+                })
                 .count(),
             1,
             "{mounts:?}"
         );
         let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
             .expect("identity hardening mounts should be constructible");
-        assert!(guard._ld_so_cache.is_none());
+        assert!(guard.frozen_etc_path(Path::new(LD_SO_CACHE)).is_none());
         assert!(guard.host_input_snapshots().is_empty());
         assert!(
             mounts
                 .iter()
-                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
-            "a snapshot of a host without a cache binds none: {mounts:?}"
+                .all(|planned| planned.mount.get_target() != Path::new(LD_SO_CACHE)),
+            "a snapshot of a host without a cache serves none at the file: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn user_mounts_shadow_frozen_etc_files_by_cover() {
+        let (mut mounts, mut guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
+        if guard._etc_stage.is_none() {
+            return;
+        }
+        let mounted_at = |mounts: &[PlannedMount], target: &Path| {
+            mounts
+                .iter()
+                .any(|planned| planned.mount.get_target() == target)
+        };
+        let proven_at = |guard: &IdentityGuard, target: &Path| {
+            guard
+                .mountinfo_roots
+                .iter()
+                .any(|root| root.target == target)
+        };
+        let stage_root = guard._etc_stage.as_ref().unwrap().stage.clone();
+        let staged_binds = |mounts: &[PlannedMount]| {
+            mounts
+                .iter()
+                .filter(|planned| {
+                    planned.backend && planned.mount.get_target().starts_with(&stage_root)
+                })
+                .count()
+        };
+        let staged_before = staged_binds(&mounts);
+        assert!(staged_before > 0, "the mirror staged backend binds");
+        // A user mount at /tmp names the staging parent, not a guest path:
+        // the mirror binds and the cover they serve must all survive, or
+        // the guest's /etc becomes empty placeholder files.
+        guard.discard_mounts_shadowed_by(&mut mounts, &std::env::temp_dir());
+        assert_eq!(
+            staged_binds(&mounts),
+            staged_before,
+            "a /tmp mount must not drop the staged mirror binds"
+        );
+        assert!(mounted_at(&mounts, Path::new(GUEST_ETC)));
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/etc/hosts"));
+        assert!(
+            mounted_at(&mounts, Path::new(GUEST_ETC)),
+            "a mount below /etc stacks inside the staged directory: {mounts:?}"
+        );
+        assert!(mounted_at(&mounts, Path::new(LD_SO_CACHE)));
+        assert!(proven_at(&guard, Path::new(LD_SO_CACHE)));
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new(LD_SO_CACHE));
+        assert!(
+            !mounted_at(&mounts, Path::new(LD_SO_CACHE)),
+            "the user's mount at the cache path replaces Hermit's bind"
+        );
+        assert!(!proven_at(&guard, Path::new(LD_SO_CACHE)));
+        assert!(mounted_at(&mounts, Path::new(GUEST_ETC)));
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new(GUEST_ETC));
+        assert!(!mounted_at(&mounts, Path::new(GUEST_ETC)));
+        assert!(!proven_at(&guard, Path::new(GROUP_FILE)));
+        assert_eq!(
+            staged_binds(&mounts),
+            0,
+            "the mirror binds drop with the cover they serve"
+        );
+    }
+
+    // #4799 regression: a host rename over the lower cache file while the
+    // guest runs must not change what the guest reads, and the frozen file
+    // stays read-only. The sandbox `etc` stands in for the host's; the
+    // trigger process renames from this namespace while the guest waits,
+    // as ldconfig does from the host's.
+    #[test]
+    fn frozen_etc_stage_survives_a_host_rename() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let sandbox = tempfile::tempdir().unwrap();
+        let etc = sandbox.path().join("etc");
+        fs::create_dir(&etc).unwrap();
+        fs::write(etc.join("ld.so.cache"), b"HOST_V1").unwrap();
+        fs::write(etc.join("group"), b"GROUP_V1").unwrap();
+        fs::write(etc.join("other"), b"OTHER_V1").unwrap();
+        fs::write(sandbox.path().join("newcache"), b"HOST_V2").unwrap();
+        // A process, not a thread: the container clone below must happen
+        // while this process still has no other threads (test isolation).
+        let mut trigger = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "i=0; while [ ! -e \"$SB/guest-ready\" ] && [ $i -lt 600 ]; do \
+                 sleep 0.05; i=$((i+1)); done; \
+                 mv \"$SB/newcache\" \"$SB/etc/ld.so.cache\"; touch \"$SB/go\"",
+            )
+            .env("SB", sandbox.path())
+            .spawn()
+            .unwrap();
+        let guest_etc = etc.clone();
+        let guest_sandbox = sandbox.path().to_path_buf();
+        let facts = Container::new()
+            .checked_run(move || {
+                let snapshot = LdSoCacheSnapshot::from_bytes(b"FROZEN_CACHE".to_vec());
+                let captured = snapshot.0.as_deref().expect("snapshot has bytes");
+                let FrozenEtcStage {
+                    mounts,
+                    stage,
+                    roots: _roots,
+                } = frozen_etc_stage(
+                    &guest_etc,
+                    Some((b"FROZEN_GROUP".as_slice(), DETERMINISTIC_GROUP_ROOT)),
+                    Some((captured, DETERMINISTIC_LD_SO_CACHE_ROOT)),
+                )
+                .map_err(|error| format!("{error:#}"))?
+                .expect("frozen inputs build a staged /etc");
+                let mut container =
+                    namespace_container(false, None).map_err(|error| format!("{error:#}"))?;
+                container.mounts(mounts.iter().map(|planned| planned.mount.clone()));
+                let read_etc = guest_etc.clone();
+                let sync = guest_sandbox.clone();
+                let facts = container
+                    .checked_run(
+                        move || -> Result<(String, String, Option<i32>, bool), String> {
+                            let cache = read_etc.join("ld.so.cache");
+                            let first =
+                                fs::read_to_string(&cache).map_err(|error| error.to_string())?;
+                            fs::write(sync.join("guest-ready"), b"ready")
+                                .map_err(|error| error.to_string())?;
+                            let mut saw_go = false;
+                            for _ in 0..600 {
+                                if sync.join("go").exists() {
+                                    saw_go = true;
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            let second =
+                                fs::read_to_string(&cache).map_err(|error| error.to_string())?;
+                            let write_errno = fs::OpenOptions::new()
+                                .append(true)
+                                .open(&cache)
+                                .err()
+                                .and_then(|error| error.raw_os_error());
+                            Ok((first, second, write_errno, saw_go))
+                        },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                drop(stage);
+                facts
+            })
+            .unwrap()
+            .expect("the frozen staged /etc container should run");
+        trigger.wait().unwrap();
+        assert_eq!(
+            fs::read_to_string(etc.join("ld.so.cache")).unwrap(),
+            "HOST_V2",
+            "the trigger really renamed the host cache under the running guest"
+        );
+        assert_eq!(
+            facts,
+            (
+                "FROZEN_CACHE".to_string(),
+                "FROZEN_CACHE".to_string(),
+                Some(libc::EROFS),
+                true
+            ),
+            "(first read, read after the host rename, frozen write errno, saw the go signal)"
         );
     }
 
@@ -7173,7 +7661,7 @@ mod tests {
                 detcore::Digest::new(b"captured cache").to_string()
             );
             assert_eq!(
-                fs::read(guard._ld_so_cache.as_ref().unwrap().path()).unwrap(),
+                fs::read(guard.frozen_etc_path(Path::new(LD_SO_CACHE)).unwrap()).unwrap(),
                 b"captured cache"
             );
         }
@@ -7213,8 +7701,7 @@ mod tests {
         let matching =
             MountInfoRootSource::new(actual.path(), &target, b"/tmpvol/.hermit/matching").unwrap();
         let guard = IdentityGuard {
-            _group_file: Some(actual),
-            _ld_so_cache: None,
+            _etc_stage: None,
             ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
@@ -7315,8 +7802,7 @@ mod tests {
             MountInfoRootSource::new(lookalike.path(), &target, b"/tmpvol/.hermit/lookalike")
                 .unwrap();
         let guard = IdentityGuard {
-            _group_file: Some(actual),
-            _ld_so_cache: None,
+            _etc_stage: None,
             ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
@@ -7360,7 +7846,7 @@ mod tests {
             raw_mountpoint_prefix: None,
             deterministic_mountpoint_prefix: None,
         });
-        let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
+        let mut mounts = vec![PlannedMount::hermit(Mount::bind("/tmp", "/run/nscd"))];
 
         guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/var"));
         guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/var/run/nscd"));
@@ -7378,7 +7864,7 @@ mod tests {
                 raw_mountpoint_prefix: None,
                 deterministic_mountpoint_prefix: None,
             });
-            let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
+            let mut mounts = vec![PlannedMount::hermit(Mount::bind("/tmp", "/run/nscd"))];
             guard.discard_mounts_shadowed_by(&mut mounts, Path::new(direct_target));
             assert!(mounts.is_empty(), "{direct_target} must shadow /run/nscd");
             assert!(guard.mountinfo_roots.is_empty());
