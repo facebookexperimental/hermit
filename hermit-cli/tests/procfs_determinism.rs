@@ -715,8 +715,8 @@ fn proc_pid_statm_accounting_is_deterministic() {
 fn proc_pid_status_accounting_is_deterministic() {
     assert_deterministic("/proc/1/status", |contents| {
         let text = std::str::from_utf8(contents).expect("process status should be UTF-8");
-        assert!(text.contains("VmSize:\t0 kB\n"));
-        assert!(text.contains("VmRSS:\t0 kB\n"));
+        assert!(text.contains("VmSize:\t       0 kB\n"));
+        assert!(text.contains("VmRSS:\t       0 kB\n"));
     });
 }
 
