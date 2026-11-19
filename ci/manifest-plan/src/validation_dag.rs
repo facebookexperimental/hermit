@@ -6488,6 +6488,32 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// `bash -c cmd` with SIGTERM, SIGINT and SIGHUP at their default
+    /// dispositions. Bash cannot trap a signal that was ignored when it
+    /// started, and a test process started under `nohup`, or with `&` from a
+    /// non-interactive shell, hands SIGHUP or SIGINT down ignored. The recorder
+    /// tests deliver those signals, so their shells start without that
+    /// inheritance, as a dagrun node's shell does when dagrun's own signals
+    /// are at their defaults.
+    fn bash_with_default_signals(cmd: &str) -> Command {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(cmd);
+        // SAFETY: between fork and exec this calls only signal(2), which is
+        // async-signal-safe, and allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                    if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
     /// Run `cmd` under `bash -c` in its own process group, wait for it to
     /// create `started`, then send `signal` to the group, as dagrun's reap
     /// does to a node it kills; return the node's exit code. A node still
@@ -6502,9 +6528,7 @@ mod tests {
     ) -> Option<i32> {
         use std::os::unix::process::CommandExt;
         let _ = std::fs::remove_file(started);
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
+        let mut child = bash_with_default_signals(cmd)
             .envs(envs.iter().copied())
             .current_dir(cwd)
             .process_group(0)
@@ -9290,9 +9314,7 @@ sys.exit(37)
                     &recorded[..boundary],
                     &recorded[boundary..]
                 );
-                let output = Command::new("bash")
-                    .arg("-c")
-                    .arg(&spliced)
+                let output = bash_with_default_signals(&spliced)
                     .output()
                     .expect("run bash");
                 assert_ne!(output.status.code(), Some(0), "{signal} at {at}: {spliced}");
