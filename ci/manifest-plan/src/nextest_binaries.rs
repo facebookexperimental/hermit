@@ -2476,7 +2476,7 @@ fn verify_record_workloads(
         return Err("record workload C compiler or recipe changed".into());
     }
     check_identity(&workloads.compiler, true)?;
-    let mut paths = BTreeMap::new();
+    let mut prepared = BTreeMap::new();
     for workload in &workloads.workloads {
         let source =
             record_workloads::source(&workload.name).ok_or("unknown record workload alias")?;
@@ -2505,14 +2505,19 @@ fn verify_record_workloads(
             (None, None) => {}
             _ => return Err("record workload Cargo origin differs from compiler metadata".into()),
         }
-        if paths
-            .insert(workload.name.clone(), workload.executable.path.clone())
+        // The SHA256 `check_identity` has just compared with the bytes.
+        let workload_prepared = record_workloads::Prepared {
+            path: workload.executable.path.clone(),
+            sha256: workload.executable.sha256.clone(),
+        };
+        if prepared
+            .insert(workload.name.clone(), workload_prepared)
             .is_some()
         {
             return Err("duplicate prepared record workload alias".into());
         }
     }
-    record_workloads::prepared_envelope(&paths).map(Some)
+    record_workloads::prepared_envelope(&prepared).map(Some)
 }
 
 /// The Cargo profile that compiles a graph profile's prepared test executables.

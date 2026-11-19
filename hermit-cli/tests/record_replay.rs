@@ -15,6 +15,7 @@ use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::io::Seek as _;
 use std::io::Write as _;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -1036,11 +1037,266 @@ fn workloads() -> &'static [Workload] {
     })
 }
 
+/// Names the alias a fresh child process of
+/// `a_case_runs_only_the_workload_bytes_its_producer_hashed` takes through
+/// `workload()` and runs.
+const WORKLOAD_CHILD_ENV: &str = "HERMIT_TEST_RECORD_WORKLOAD_CHILD";
+
+/// A fresh test process, given an envelope over harmless shell-script
+/// workloads, takes one through `workload()` as every case does: it runs the
+/// workload unchanged and after another link was made to it, and refuses it,
+/// by name and without running it, once other bytes of the same size were
+/// written in place with the times put back.
+#[test]
+fn a_case_runs_only_the_workload_bytes_its_producer_hashed() {
+    if let Some(alias) = std::env::var_os(WORKLOAD_CHILD_ENV) {
+        let alias = alias.into_string().expect("an alias is ASCII");
+        let output = Command::new(&workload(&alias).path)
+            .output()
+            .expect("run the workload");
+        assert!(output.status.success(), "{output:?}");
+        // On a line of its own, after libtest's `test <name> ... `.
+        print!("\nran: {}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
+    let directory = tempfile::tempdir().expect("create a workload directory");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("canonicalize the workload directory");
+    let prepared = record_workloads::names()
+        .map(|name| {
+            let path = root.join(name);
+            fs::write(&path, format!("#!/bin/sh\necho {name}\n")).expect("write a workload");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make a workload executable");
+            let sha256 = record_workloads::sha256(&path).expect("hash a workload");
+            (name.to_owned(), record_workloads::Prepared { path, sha256 })
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let envelope = record_workloads::prepared_envelope(&prepared).expect("write the envelope");
+    let take = |alias: &str| {
+        let output = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "a_case_runs_only_the_workload_bytes_its_producer_hashed",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(record_workloads::PREPARED_ENV, &envelope)
+            .env(record_workloads::REQUIRED_ENV, "1")
+            .env(WORKLOAD_CHILD_ENV, alias)
+            .output()
+            .expect("start a fresh test process");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.success(), stdout, stderr)
+    };
+    let ran = |stdout: &str, printed: &str| {
+        stdout
+            .lines()
+            .any(|line| line.strip_prefix("ran: ") == Some(printed))
+    };
+    let path = &prepared["c_getpid"].path;
+
+    let (passed, stdout, stderr) = take("c_getpid");
+    assert!(
+        passed && ran(&stdout, "c_getpid"),
+        "unchanged:\n{stdout}\n{stderr}"
+    );
+
+    fs::hard_link(path, root.join("another-actions-link")).expect("link the workload");
+    let (passed, stdout, stderr) = take("c_getpid");
+    assert!(
+        passed && ran(&stdout, "c_getpid"),
+        "hard-linked:\n{stdout}\n{stderr}"
+    );
+
+    let before = fs::metadata(path).expect("inspect the workload");
+    fs::write(path, "#!/bin/sh\necho C_GETPID\n").expect("rewrite the workload");
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| {
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_accessed(before.accessed()?)
+                    .set_modified(before.modified()?),
+            )
+        })
+        .expect("put the workload's times back");
+    let after = fs::metadata(path).expect("inspect the rewritten workload");
+    assert_eq!(
+        (after.len(), after.modified().ok()),
+        (before.len(), before.modified().ok()),
+        "the rewrite keeps the size and the modification time"
+    );
+    let (passed, stdout, stderr) = take("c_getpid");
+    assert!(
+        !passed
+            && !ran(&stdout, "C_GETPID")
+            && stderr.contains(
+                "prepared record workload changed: c_getpid: content changed: prepared sha256 "
+            ),
+        "rewritten:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Names the alias a fresh child process of
+/// `a_case_in_its_own_user_namespace_runs_only_the_workloads_its_producer_witnessed`
+/// takes through `workload()` and runs, as root in a user namespace of its own.
+const WORKLOAD_NAMESPACE_CHILD_ENV: &str = "HERMIT_TEST_RECORD_WORKLOAD_NAMESPACE_CHILD";
+
+/// As the public record/replay cases do, a fresh test process re-run as root
+/// in a user namespace of its own takes a workload through `workload()`, given
+/// an envelope written outside it. It sees the workload's owner and group as 0,
+/// where the producer saw its own ids, and runs the workload. It still
+/// refuses, by name and without running it, a workload whose mode changed, one
+/// replaced by another file with its bytes, mode and times, and one whose bytes
+/// changed in place with its size and times kept.
+#[test]
+fn a_case_in_its_own_user_namespace_runs_only_the_workloads_its_producer_witnessed() {
+    const NAME: &str =
+        "a_case_in_its_own_user_namespace_runs_only_the_workloads_its_producer_witnessed";
+    if let Some(alias) = std::env::var_os(WORKLOAD_NAMESPACE_CHILD_ENV) {
+        let alias = alias.into_string().expect("an alias is ASCII");
+        let path = &workload(&alias).path;
+        let owner = fs::metadata(path).expect("inspect the workload");
+        let output = Command::new(path).output().expect("run the workload");
+        assert!(output.status.success(), "{output:?}");
+        // On lines of their own, after libtest's `test <name> ... `.
+        print!(
+            "\nowner: {} {}\nran: {}",
+            owner.uid(),
+            owner.gid(),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let prepare = || {
+        let directory = tempfile::tempdir().expect("create a workload directory");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonicalize the workload directory");
+        let prepared = record_workloads::names()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(&path, format!("#!/bin/sh\necho {name}\n")).expect("write a workload");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("make a workload executable");
+                let sha256 = record_workloads::sha256(&path).expect("hash a workload");
+                (name.to_owned(), record_workloads::Prepared { path, sha256 })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let envelope = record_workloads::prepared_envelope(&prepared).expect("write the envelope");
+        (directory, root, prepared, envelope)
+    };
+    let take = |envelope: &str| {
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(record_workloads::PREPARED_ENV, envelope)
+            .env(record_workloads::REQUIRED_ENV, "1")
+            .env(WORKLOAD_NAMESPACE_CHILD_ENV, "c_getpid")
+            .map_root();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a runtime")
+            .block_on(command.output())
+            .expect("start a fresh test process in its own user namespace");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (
+            output.status == reverie::process::ExitStatus::Exited(0),
+            stdout,
+            stderr,
+        )
+    };
+    let ran = |stdout: &str, printed: &str| {
+        stdout
+            .lines()
+            .any(|line| line.strip_prefix("ran: ") == Some(printed))
+    };
+    let put_times_back = |path: &Path, before: &fs::Metadata| {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                file.set_times(
+                    fs::FileTimes::new()
+                        .set_accessed(before.accessed()?)
+                        .set_modified(before.modified()?),
+                )
+            })
+            .expect("put the workload's times back");
+    };
+
+    let (_directory, _, prepared, envelope) = prepare();
+    let producer = fs::metadata(&prepared["c_getpid"].path).expect("inspect the workload");
+    let (passed, stdout, stderr) = take(&envelope);
+    assert!(
+        passed && ran(&stdout, "c_getpid") && stdout.lines().any(|line| line == "owner: 0 0"),
+        "unchanged (the producer saw owner {} {}):\n{stdout}\n{stderr}",
+        producer.uid(),
+        producer.gid()
+    );
+
+    let (_directory, _, prepared, envelope) = prepare();
+    fs::set_permissions(
+        &prepared["c_getpid"].path,
+        fs::Permissions::from_mode(0o750),
+    )
+    .expect("change the workload's mode");
+    let (passed, stdout, stderr) = take(&envelope);
+    assert!(
+        !passed
+            && !ran(&stdout, "c_getpid")
+            && stderr.contains("prepared record workload changed: c_getpid: prepared "),
+        "mode changed:\n{stdout}\n{stderr}"
+    );
+
+    let (_directory, root, prepared, envelope) = prepare();
+    let path = &prepared["c_getpid"].path;
+    let before = fs::metadata(path).expect("inspect the workload");
+    let replacement = root.join("replacement");
+    fs::copy(path, &replacement).expect("copy the workload");
+    put_times_back(&replacement, &before);
+    fs::rename(&replacement, path).expect("replace the workload");
+    let (passed, stdout, stderr) = take(&envelope);
+    assert!(
+        !passed
+            && !ran(&stdout, "c_getpid")
+            && stderr.contains("prepared record workload changed: c_getpid: prepared "),
+        "replaced:\n{stdout}\n{stderr}"
+    );
+
+    let (_directory, _, prepared, envelope) = prepare();
+    let path = &prepared["c_getpid"].path;
+    let before = fs::metadata(path).expect("inspect the workload");
+    fs::write(path, "#!/bin/sh\necho C_GETPID\n").expect("rewrite the workload");
+    put_times_back(path, &before);
+    let (passed, stdout, stderr) = take(&envelope);
+    assert!(
+        !passed
+            && !ran(&stdout, "C_GETPID")
+            && stderr.contains(
+                "prepared record workload changed: c_getpid: content changed: prepared sha256 "
+            ),
+        "rewritten:\n{stdout}\n{stderr}"
+    );
+}
+
 fn workload(name: &str) -> &Workload {
-    workloads()
+    let workload = workloads()
         .iter()
         .find(|workload| workload.name == name)
-        .unwrap_or_else(|| panic!("unknown record/replay workload: {name}"))
+        .unwrap_or_else(|| panic!("unknown record/replay workload: {name}"));
+    workload
+        .check_content()
+        .expect("record/replay prepared workload verification failed");
+    workload
 }
 
 fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {

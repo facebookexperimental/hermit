@@ -1,8 +1,10 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// All rights reserved.
-//
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 //! The complete record/replay WORKLOADS preparation contract.
 //! Included by both the official producer and its test-harness consumer.
@@ -15,6 +17,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -302,6 +305,28 @@ pub const RUST_SOURCES: [(&str, &str, &str); 26] = [
 pub struct Workload {
     pub name: &'static str,
     pub path: PathBuf,
+    sha256: String,
+    content: OnceLock<Result<(), String>>,
+}
+
+impl Workload {
+    /// Whether the workload's bytes are the ones its producer hashed. The first
+    /// call in a process hashes them; later calls give its answer. A case calls
+    /// it for each workload it takes, so a process hashes only those.
+    pub fn check_content(&self) -> Result<(), String> {
+        self.content
+            .get_or_init(|| {
+                let now = sha256(&self.path)?;
+                if now != self.sha256 {
+                    return Err(format!(
+                        "prepared record workload changed: {}: content changed: prepared sha256 {}, now {now}",
+                        self.name, self.sha256
+                    ));
+                }
+                Ok(())
+            })
+            .clone()
+    }
 }
 
 pub fn names() -> impl Iterator<Item = &'static str> {
@@ -345,21 +370,32 @@ pub fn executable(path: &Path, directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A generation witness supplements the official producer's SHA256 checks.
-/// Checked once when WORKLOADS initializes. The official caller holds its shared
-/// preparation lock through child exit, excluding cooperative producers. This
-/// does not provide a per-guest check or exclude uncoordinated path mutations.
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// A generation witness, checked for every workload once when WORKLOADS
+/// initializes; each workload's bytes are compared with its SHA256 when a case
+/// first takes it (`Workload::check_content`). The official caller holds its
+/// shared preparation lock through child exit, excluding cooperative producers.
+/// This does not provide a per-guest check or exclude uncoordinated path
+/// mutations.
+/// It leaves out the change time: a link made to the file or removed from it
+/// changes that with the link count, and a build executor that gives several
+/// concurrent actions one input as hard links of one file does both while a
+/// workload runs, whose bytes, inode, size and modification time stay. A
+/// rewrite that puts the times back changes none of it either, which the
+/// SHA256 sees.
+/// The owner and group are the ids the reading process's user namespace maps
+/// them to, so they are compared only where the consumer reads them in the
+/// producer's user namespace ([`Generation::agrees`]).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Generation {
     dev: u64,
     ino: u64,
     size: u64,
     mode: u32,
+    uid: u32,
+    gid: u32,
     mtime: i64,
     mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
 }
 
 impl Generation {
@@ -371,10 +407,47 @@ impl Generation {
             ino: m.ino(),
             size: m.len(),
             mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
             mtime: m.mtime(),
             mtime_nsec: m.mtime_nsec(),
-            ctime: m.ctime(),
-            ctime_nsec: m.ctime_nsec(),
+        })
+    }
+
+    /// Whether `now`, the witness read again, is the generation the producer
+    /// witnessed (`self`). Every field counts where `same_user_namespace`;
+    /// elsewhere all but the owner and group, which stat reports as the ids
+    /// the reader's user namespace maps them to: a case that re-runs itself as
+    /// root in a user namespace of its own sees its owner's files owned by 0.
+    fn agrees(&self, now: &Self, same_user_namespace: bool) -> bool {
+        if same_user_namespace {
+            return self == now;
+        }
+        Self {
+            uid: now.uid,
+            gid: now.gid,
+            ..*self
+        } == *now
+    }
+}
+
+/// A user namespace, by the device and inode of its nsfs file.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserNamespace {
+    dev: u64,
+    ino: u64,
+}
+
+impl UserNamespace {
+    /// The user namespace this process is in.
+    fn of_this_process() -> Result<Self, String> {
+        let m = fs::metadata("/proc/self/ns/user").map_err(|e| {
+            format!("cannot identify this process's user namespace: /proc/self/ns/user: {e}")
+        })?;
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
         })
     }
 }
@@ -384,40 +457,66 @@ impl Generation {
 struct PreparedWorkload {
     name: String,
     path: PathBuf,
+    sha256: String,
     generation: Generation,
 }
+
+/// The envelope schema this module writes and reads. Schema 1 had no SHA256,
+/// so a consumer cannot check its bytes and refuses it.
+const SCHEMA: u32 = 2;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
     schema: u32,
+    /// The user namespace the producer read the generation witnesses in.
+    user_namespace: UserNamespace,
     // A sequence deliberately preserves duplicate names for rejection.
     workloads: Vec<PreparedWorkload>,
 }
 
-pub fn prepared_envelope(paths: &BTreeMap<String, PathBuf>) -> Result<String, String> {
-    if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
+/// A workload as its producer hands it over: where it is and the SHA256, in
+/// lowercase hex, of the bytes the producer prepared there.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+pub fn prepared_envelope(workloads: &BTreeMap<String, Prepared>) -> Result<String, String> {
+    if workloads
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != names().collect()
+    {
         return Err(
             "prepared record workload population must contain exactly all 52 aliases".into(),
         );
     }
-    let workloads = paths
+    let workloads = workloads
         .iter()
-        .map(|(name, path)| {
+        .map(|(name, prepared)| {
+            check_sha256(name, &prepared.sha256)?;
             Ok(PreparedWorkload {
                 name: name.clone(),
-                path: path.clone(),
-                generation: Generation::read(path)?,
+                path: prepared.path.clone(),
+                sha256: prepared.sha256.clone(),
+                generation: Generation::read(&prepared.path)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     serde_json::to_string(&Envelope {
-        schema: 1,
+        schema: SCHEMA,
+        user_namespace: UserNamespace::of_this_process()?,
         workloads,
     })
     .map_err(|e| e.to_string())
 }
 
+/// The workloads of a prepared envelope, each still at its witnessed
+/// generation, with the SHA256 `Workload::check_content` compares its bytes
+/// with.
 pub fn consume_prepared(
     required: bool,
     raw: Option<&str>,
@@ -431,17 +530,38 @@ pub fn consume_prepared(
             Ok(None)
         };
     };
-    let envelope: Envelope =
-        serde_json::from_str(raw).map_err(|e| format!("invalid {PREPARED_ENV}: {e}"))?;
-    if envelope.schema != 1 {
-        return Err("unsupported prepared record workload schema".into());
+    let invalid = |e: serde_json::Error| format!("invalid {PREPARED_ENV}: {e}");
+    let probe: Value = serde_json::from_str(raw).map_err(invalid)?;
+    if probe["schema"] != SCHEMA {
+        return Err(format!(
+            "unsupported prepared record workload schema {}: this consumer reads schema {SCHEMA}, whose workloads carry their SHA256",
+            probe["schema"]
+        ));
     }
+    // From the text, not `probe`: a `Value` keeps the last of a member given
+    // twice, which the typed read refuses.
+    let envelope: Envelope = serde_json::from_str(raw).map_err(invalid)?;
+    let same_user_namespace = UserNamespace::of_this_process()? == envelope.user_namespace;
     let mut paths = BTreeMap::new();
     for entry in envelope.workloads {
-        if entry.generation != Generation::read(&entry.path)? {
-            return Err(format!("prepared record workload changed: {}", entry.name));
+        check_sha256(&entry.name, &entry.sha256)?;
+        let now = Generation::read(&entry.path)?;
+        if !entry.generation.agrees(&now, same_user_namespace) {
+            return Err(format!(
+                "prepared record workload changed: {}: prepared {:?}, now {now:?}{}",
+                entry.name,
+                entry.generation,
+                if same_user_namespace {
+                    ""
+                } else {
+                    " (owner and group not compared: read in another user namespace than the producer's)"
+                }
+            ));
         }
-        if paths.insert(entry.name, entry.path).is_some() {
+        if paths
+            .insert(entry.name, (entry.path, entry.sha256))
+            .is_some()
+        {
             return Err("duplicate prepared record workload alias".into());
         }
     }
@@ -452,9 +572,14 @@ pub fn consume_prepared(
     }
     Ok(Some(
         names()
-            .map(|name| Workload {
-                name,
-                path: paths.remove(name).expect("checked population"),
+            .map(|name| {
+                let (path, sha256) = paths.remove(name).expect("checked population");
+                Workload {
+                    name,
+                    path,
+                    sha256,
+                    content: OnceLock::new(),
+                }
             })
             .collect(),
     ))
@@ -763,10 +888,19 @@ fn prepare_population(
     // cleanup at scope end can only find a path that no longer exists:
     // let it drop normally (and free its path allocation) instead of
     // forgetting it, which leaked the allocation on every build.
-    let paths = names()
-        .map(|name| (name.to_owned(), population.join(name)))
-        .collect::<BTreeMap<_, _>>();
-    let raw = prepared_envelope(&paths)?;
+    let workloads = names()
+        .map(|name| {
+            let path = population.join(name);
+            Ok((
+                name.to_owned(),
+                Prepared {
+                    sha256: sha256(&path)?,
+                    path,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let raw = prepared_envelope(&workloads)?;
     let partial = population.join(format!("{ENVELOPE}.partial"));
     fs::write(&partial, &raw).map_err(|e| e.to_string())?;
     fs::rename(&partial, &envelope).map_err(|e| e.to_string())?;
@@ -827,11 +961,34 @@ fn population_key(
             fs::read(path).map_err(|e| format!("cannot read Cargo record workload {name}: {e}"))?;
         field(name, &bytes);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(hex(&hasher.finalize()))
+}
+
+/// The SHA-256, in hex, of the bytes of the file at `path`.
+pub fn sha256(path: &Path) -> Result<String, String> {
+    use sha2::Digest as _;
+    let bytes = fs::read(path)
+        .map_err(|e| format!("cannot read record workload {}: {e}", path.display()))?;
+    Ok(hex(&sha2::Sha256::digest(bytes)))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Refuses a workload's SHA256 unless it is 64 lowercase hex digits, as
+/// `sha256` writes it.
+fn check_sha256(name: &str, sha256: &str) -> Result<(), String> {
+    if sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "prepared record workload {name} has no SHA256: {sha256:?}"
+    ))
 }
 
 /// Marks a population as used now.
@@ -953,6 +1110,22 @@ mod tests {
         events.iter().map(|event| format!("{event}\n")).collect()
     }
 
+    /// The envelope of `paths`, each with the SHA256 of its bytes now.
+    fn envelope(paths: &BTreeMap<String, PathBuf>) -> String {
+        prepared_envelope(&prepared(paths)).unwrap()
+    }
+
+    fn prepared(paths: &BTreeMap<String, PathBuf>) -> BTreeMap<String, Prepared> {
+        paths
+            .iter()
+            .map(|(name, path)| {
+                let sha256 = sha256(path).unwrap();
+                let path = path.clone();
+                (name.clone(), Prepared { path, sha256 })
+            })
+            .collect()
+    }
+
     #[test]
     fn cargo_metadata_drives_exported_paths_and_preserves_clock_alias() {
         let fixture = Fixture::new();
@@ -1061,7 +1234,7 @@ mod tests {
     fn prepared_consumer_requires_every_alias_and_never_falls_back_on_invalid_data() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
-        let raw = prepared_envelope(&paths).unwrap();
+        let raw = envelope(&paths);
         let workloads = consume_prepared(true, Some(&raw)).unwrap().unwrap();
         assert_eq!(
             workloads.iter().map(|w| w.name).collect::<Vec<_>>(),
@@ -1080,7 +1253,7 @@ mod tests {
         let mut extra = envelope.clone();
         extra["workloads"][0]["name"] = serde_json::json!("unknown");
         let mut schema = envelope.clone();
-        schema["schema"] = serde_json::json!(2);
+        schema["schema"] = serde_json::json!(SCHEMA + 1);
         for input in [
             missing.to_string(),
             duplicate.to_string(),
@@ -1099,13 +1272,287 @@ mod tests {
     fn prepared_consumer_refuses_replaced_or_modified_bytes_at_the_same_path() {
         let fixture = Fixture::new();
         let paths = fixture.paths();
-        let raw = prepared_envelope(&paths).unwrap();
+        let raw = envelope(&paths);
         fs::write(&paths["c_getpid"], "#!/bin/sh\nexit 1\n").unwrap();
         assert!(consume_prepared(true, Some(&raw)).is_err());
-        let raw = prepared_envelope(&paths).unwrap();
+        let raw = envelope(&paths);
         let replacement = fixture.executable("replacement");
         fs::rename(replacement, &paths["c_getpid"]).unwrap();
         assert!(consume_prepared(true, Some(&raw)).is_err());
+    }
+
+    /// A link made to a prepared workload, or removed from it, changes its
+    /// change time and link count, not the workload, as another action's hard
+    /// link of a shared input does; a write still changes its witness.
+    #[test]
+    fn prepared_consumer_keeps_a_workload_another_link_was_made_to() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let raw = envelope(&paths);
+        let link = fixture.0.join("another-actions-link");
+        let taken = |raw: &str| {
+            let workloads = consume_prepared(true, Some(raw))?.unwrap();
+            workloads
+                .iter()
+                .find(|w| w.name == "c_getpid")
+                .unwrap()
+                .check_content()
+        };
+        fs::hard_link(&paths["c_getpid"], &link).unwrap();
+        assert_eq!(taken(&raw), Ok(()));
+        fs::remove_file(link).unwrap();
+        assert_eq!(taken(&raw), Ok(()));
+        fs::File::options()
+            .write(true)
+            .open(&paths["c_getpid"])
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let refusal = consume_prepared(true, Some(&raw)).unwrap_err();
+        assert!(
+            refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+            "{refusal}"
+        );
+    }
+
+    /// A file renamed over a prepared workload changes its witness by the
+    /// inode alone when it has the workload's bytes, mode and times.
+    #[test]
+    fn prepared_consumer_refuses_a_replacement_with_the_workloads_times() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let raw = envelope(&paths);
+        let original = &paths["c_getpid"];
+        let replacement = fixture.executable("replacement");
+        let times = fs::metadata(original).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(times.accessed().unwrap())
+                    .set_modified(times.modified().unwrap()),
+            )
+            .unwrap();
+        fs::rename(replacement, original).unwrap();
+        let refusal = consume_prepared(true, Some(&raw)).unwrap_err();
+        assert!(
+            refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+            "{refusal}"
+        );
+    }
+
+    /// Other bytes of the same size written in place, with the access and
+    /// modification times put back, leave the whole generation witness as it
+    /// was: only the SHA256 tells them apart, when a case takes the workload.
+    #[test]
+    fn prepared_consumer_refuses_other_bytes_of_the_same_size_and_times() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let raw = envelope(&paths);
+        let path = &paths["c_getpid"];
+        let witnessed = Generation::read(path).unwrap();
+        let times = fs::metadata(path).unwrap();
+        fs::write(path, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(times.accessed().unwrap())
+                    .set_modified(times.modified().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(Generation::read(path).unwrap(), witnessed);
+        let workloads = consume_prepared(true, Some(&raw)).unwrap().unwrap();
+        let [changed, unchanged] = ["c_getpid", "c_getsockopt_null"]
+            .map(|name| workloads.iter().find(|w| w.name == name).unwrap());
+        let refusal = changed.check_content().unwrap_err();
+        assert!(
+            refusal.starts_with(
+                "prepared record workload changed: c_getpid: content changed: prepared sha256 "
+            ),
+            "{refusal}"
+        );
+        assert_eq!(unchanged.check_content(), Ok(()));
+    }
+
+    /// An envelope without a workload's SHA256 cannot have its bytes checked:
+    /// the consumer refuses schema 1, which had none, and a schema 2 envelope
+    /// that leaves one out, and the producer writes neither.
+    #[test]
+    fn prepared_consumer_refuses_an_envelope_without_a_workloads_sha256() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let envelope: Value = serde_json::from_str(&envelope(&paths)).unwrap();
+        let mut schema_1 = envelope.clone();
+        schema_1["schema"] = serde_json::json!(1);
+        for workload in schema_1["workloads"].as_array_mut().unwrap() {
+            workload.as_object_mut().unwrap().remove("sha256");
+        }
+        let refusal = consume_prepared(true, Some(&schema_1.to_string())).unwrap_err();
+        assert!(
+            refusal.starts_with("unsupported prepared record workload schema 1: "),
+            "{refusal}"
+        );
+        let mut unhashed = envelope.clone();
+        unhashed["workloads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256");
+        let refusal = consume_prepared(true, Some(&unhashed.to_string())).unwrap_err();
+        assert!(refusal.contains("missing field `sha256`"), "{refusal}");
+        let mut workloads = prepared(&paths);
+        let name = envelope["workloads"][0]["name"].as_str().unwrap();
+        for sha256 in ["", "C0FFEE", "A".repeat(64).as_str()] {
+            workloads.get_mut("c_getpid").unwrap().sha256 = sha256.into();
+            assert_eq!(
+                prepared_envelope(&workloads).unwrap_err(),
+                format!("prepared record workload c_getpid has no SHA256: {sha256:?}")
+            );
+            let mut malformed = envelope.clone();
+            malformed["workloads"][0]["sha256"] = serde_json::json!(sha256);
+            for required in [true, false] {
+                assert_eq!(
+                    consume_prepared(required, Some(&malformed.to_string())).unwrap_err(),
+                    format!("prepared record workload {name} has no SHA256: {sha256:?}")
+                );
+            }
+        }
+    }
+
+    /// A member given twice is refused wherever it is, in either mode, not read
+    /// as its last value: at the root (the producer's user namespace included),
+    /// in a workload and in its generation witness.
+    #[test]
+    fn prepared_consumer_refuses_a_member_given_twice() {
+        let fixture = Fixture::new();
+        let raw = envelope(&fixture.paths());
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let first = &parsed["workloads"][0];
+        let member = |key: &str| format!("\"{key}\":{}", first[key]);
+        let generation = {
+            let start = raw.find("\"generation\":").unwrap();
+            let end = start + raw[start..].find('}').unwrap() + 1;
+            raw[start..end].to_owned()
+        };
+        let ino = format!("\"ino\":{},", first["generation"]["ino"]);
+        let user_namespace = format!("\"user_namespace\":{}", parsed["user_namespace"]);
+        for (field, once, twice) in [
+            (
+                "schema",
+                "{\"schema\":2,".to_owned(),
+                "{\"schema\":1,\"schema\":2,".to_owned(),
+            ),
+            (
+                "user_namespace",
+                user_namespace.clone(),
+                format!("{user_namespace},{user_namespace}"),
+            ),
+            (
+                "workloads",
+                "\"workloads\":[".to_owned(),
+                "\"workloads\":[],\"workloads\":[".to_owned(),
+            ),
+            (
+                "name",
+                member("name"),
+                format!("\"name\":\"c_getpid\",{}", member("name")),
+            ),
+            (
+                "path",
+                member("path"),
+                format!("\"path\":\"/elsewhere\",{}", member("path")),
+            ),
+            (
+                "sha256",
+                member("sha256"),
+                format!("{},{}", member("sha256"), member("sha256")),
+            ),
+            (
+                "generation",
+                generation.clone(),
+                format!("{generation},{generation}"),
+            ),
+            ("ino", ino.clone(), format!("\"ino\":0,{ino}")),
+        ] {
+            let duplicate = raw.replacen(&once, &twice, 1);
+            assert_ne!(duplicate, raw, "{field} was not given twice");
+            for required in [true, false] {
+                let refusal = consume_prepared(required, Some(&duplicate)).unwrap_err();
+                assert!(
+                    refusal.starts_with(&format!(
+                        "invalid {PREPARED_ENV}: duplicate field `{field}`"
+                    )),
+                    "{field}: {refusal}"
+                );
+            }
+        }
+    }
+
+    /// The owner and group count only where the consumer reads them in the
+    /// producer's user namespace; every other field counts in any. Here the
+    /// envelope's namespace or witness is edited, so this process stands for
+    /// a consumer elsewhere; a real case in its own user namespace is
+    /// record_replay's
+    /// `a_case_in_its_own_user_namespace_runs_only_the_workloads_its_producer_witnessed`.
+    #[test]
+    fn prepared_consumer_compares_the_owner_and_group_only_in_the_producers_user_namespace() {
+        let fixture = Fixture::new();
+        let raw = envelope(&fixture.paths());
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let index = parsed["workloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|w| w["name"] == "c_getpid")
+            .unwrap();
+        let edited = |elsewhere: bool, field: &str| {
+            let mut edited = parsed.clone();
+            if elsewhere {
+                let ino = edited["user_namespace"]["ino"].as_u64().unwrap();
+                edited["user_namespace"]["ino"] = serde_json::json!(ino + 1);
+            }
+            if !field.is_empty() {
+                let value = edited["workloads"][index]["generation"][field]
+                    .as_u64()
+                    .unwrap();
+                edited["workloads"][index]["generation"][field] = serde_json::json!(value + 1);
+            }
+            edited.to_string()
+        };
+        for elsewhere in [false, true] {
+            assert!(
+                consume_prepared(true, Some(&edited(elsewhere, "")))
+                    .unwrap()
+                    .is_some(),
+                "unchanged, elsewhere {elsewhere}"
+            );
+        }
+        for field in ["uid", "gid"] {
+            let refusal = consume_prepared(true, Some(&edited(false, field))).unwrap_err();
+            assert!(
+                refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+                "{field} in the producer's user namespace: {refusal}"
+            );
+            assert!(
+                consume_prepared(true, Some(&edited(true, field)))
+                    .unwrap()
+                    .is_some(),
+                "{field} in another user namespace"
+            );
+        }
+        for field in ["dev", "ino", "size", "mode", "mtime", "mtime_nsec"] {
+            for elsewhere in [false, true] {
+                let refusal = consume_prepared(true, Some(&edited(elsewhere, field))).unwrap_err();
+                assert!(
+                    refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+                    "{field}, elsewhere {elsewhere}: {refusal}"
+                );
+            }
+        }
     }
 
     /// The directories in `build_root`, sorted.
@@ -1179,6 +1626,21 @@ mod tests {
         assert_eq!(populations.len(), 1, "{:?}", directories(&build_root));
         assert_eq!(both[0], both[1], "the population was built twice");
         assert_eq!(prepare(), both[0], "the population was not reused");
+        // A population whose envelope predates the SHA256 is built again.
+        let envelope = build_root.join(&populations[0]).join(ENVELOPE);
+        let mut schema_1: Value =
+            serde_json::from_str(&fs::read_to_string(&envelope).unwrap()).unwrap();
+        schema_1["schema"] = serde_json::json!(1);
+        for workload in schema_1["workloads"].as_array_mut().unwrap() {
+            workload.as_object_mut().unwrap().remove("sha256");
+        }
+        fs::write(&envelope, schema_1.to_string()).unwrap();
+        prepare();
+        let rebuilt: Value = serde_json::from_str(&fs::read_to_string(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            rebuilt["schema"], SCHEMA,
+            "a schema 1 population was reused"
+        );
         assert_eq!(
             directories(&build_root),
             [format!("{LEGACY_PREFIX}2-2"), populations[0].clone()],
