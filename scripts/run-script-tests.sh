@@ -64,6 +64,33 @@ declare -A shards=(
 declare -A deferred_cases=()
 declare -A deferred_reasons=()
 
+# Tests a harness compiles in from another crate's sources but that belong to
+# that crate, keyed by script: the libtest name prefix of the included module,
+# the exact number of listed tests under it, and where they run instead. They
+# are taken out by exact name after listing, never by a substring filter, and
+# every other listed test must still run. The count is pinned, so a change in
+# the included crate's test set (a Reverie pin bump, for one) stops this script
+# by name until the count is updated, and the update is where to confirm that
+# the moved tests still run in their home.
+#
+# ci/build-liteinst-allocator-fixtures.rs includes Reverie's
+# reverie-liteinst-artifact/src/lib.rs as its module `m1_artifact`, so its test
+# list carries that crate's own unit tests under m1_artifact::. They read their
+# crate's directory from the run-time CARGO_MANIFEST_DIR and re-run themselves
+# by their in-crate test names, so they hold only in that crate's own test
+# binary, which runs them: `cargo test -p reverie-liteinst-artifact` in
+# Reverie, and the crate's Buck unit-test target. The script keeps its own
+# tests here.
+declare -A relocated_prefixes=(
+    [ci/build-liteinst-allocator-fixtures.rs]='m1_artifact::'
+)
+declare -A relocated_counts=(
+    [ci/build-liteinst-allocator-fixtures.rs]=309
+)
+declare -A relocated_homes=(
+    [ci/build-liteinst-allocator-fixtures.rs]="reverie-liteinst-artifact's own test binary"
+)
+
 files=()
 for f in $(git ls-files '*.rs' ':!:third-party/**' ':!:scripts/lib/**'); do
     # Only standalone entrypoints: a rust-script shebang makes the file runnable
@@ -98,6 +125,24 @@ for sharded in "${!shards[@]}"; do
     fi
 done
 
+for relocating in "${!relocated_prefixes[@]}"; do
+    found=false
+    for f in "${files[@]}"; do
+        [ "$f" = "$relocating" ] && found=true
+    done
+    if ! "$found"; then
+        echo "run-script-tests: note: relocated_prefixes names ${relocating}, which is not a discovered test-carrying rust-script; ignored" >&2
+        unset 'relocated_prefixes[$relocating]'
+        continue
+    fi
+    if ! [[ ${relocated_prefixes[$relocating]} =~ ^[A-Za-z_][A-Za-z0-9_]*::$ ]] ||
+        ! [[ ${relocated_counts[$relocating]:-} =~ ^[1-9][0-9]*$ ]] ||
+        [ -z "${relocated_homes[$relocating]:-}" ]; then
+        echo "error: run-script-tests relocation for ${relocating} needs a module:: prefix, a positive count and a home" >&2
+        exit 2
+    fi
+done
+
 # Arguments meant for the test harness itself. The prepared runner in
 # ci/rust-script-bin hands everything after the source to the harness. The
 # ordinary rust-script runs `cargo test` with them, and cargo keeps for itself
@@ -119,7 +164,8 @@ unit_listed=()
 failed_listing=()
 for f in "${files[@]}"; do
     n=${shards[$f]:-1}
-    if [ "$n" -eq 1 ] && [[ -z ${deferred_cases[$f]+present} ]]; then
+    if [ "$n" -eq 1 ] && [[ -z ${deferred_cases[$f]+present} ]] &&
+        [[ -z ${relocated_prefixes[$f]+present} ]]; then
         unit_file+=("$f")
         unit_label+=("$f")
         unit_names+=('')
@@ -182,6 +228,29 @@ for f in "${files[@]}"; do
             status=list
         fi
     fi
+    relocated_prefix=${relocated_prefixes[$f]:-}
+    relocated_count=0
+    if [ "$status" = 0 ] && [ -n "$relocated_prefix" ]; then
+        # Count before partitioning, by prefix at the start of the name only,
+        # and keep at least one test of the script's own.
+        own_count=0
+        for name in "${names[@]}"; do
+            if [[ $name == "$relocated_prefix"* ]]; then
+                relocated_count=$((relocated_count + 1))
+            elif [ "$name" != "$deferred_case" ]; then
+                own_count=$((own_count + 1))
+            fi
+        done
+        if [ "$relocated_count" -ne "${relocated_counts[$f]}" ]; then
+            printf 'run-script-tests: %s lists %s tests under %s, but %s are pinned; they run in %s, so confirm they still run there, then update the pinned count\n' \
+                "$f" "$relocated_count" "$relocated_prefix" "${relocated_counts[$f]}" "${relocated_homes[$f]}" >"$list.why"
+            status=list
+        elif [ "$own_count" -eq 0 ]; then
+            printf 'run-script-tests: %s has no tests of its own left after the %s under %s\n' \
+                "$f" "$relocated_count" "$relocated_prefix" >"$list.why"
+            status=list
+        fi
+    fi
     if [ "$status" != 0 ]; then
         printf 'run-script-tests: %s (listing tests)\n' "$f"
         cat -- "$list.stdout"
@@ -200,14 +269,20 @@ for f in "${files[@]}"; do
             if [ -n "$deferred_case" ] && [ "${names[$i]}" = "$deferred_case" ]; then
                 continue
             fi
+            if [ -n "$relocated_prefix" ] && [[ ${names[$i]} == "$relocated_prefix"* ]]; then
+                continue
+            fi
             printf '%s\n' "${names[$i]}" >>"$names_file"
         done
         unit_file+=("$f")
+        label="$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests"
         if [ -n "$deferred_case" ]; then
-            unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests; ${deferred_reasons[$f]})")
-        else
-            unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests)")
+            label+="; ${deferred_reasons[$f]}"
         fi
+        if [ -n "$relocated_prefix" ]; then
+            label+="; the ${relocated_count} under ${relocated_prefix} run in ${relocated_homes[$f]}"
+        fi
+        unit_label+=("$label)")
         unit_names+=("$names_file")
         unit_listed+=("$count")
     done

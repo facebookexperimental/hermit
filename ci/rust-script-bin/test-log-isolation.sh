@@ -12,6 +12,7 @@ python3 - "$SOURCE_DIR" <<'PY'
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -228,14 +229,38 @@ exit 17
     (root / sharded).write_text("#!/usr/bin/env -S rust-script --force\n#[cfg(test)]\n")
     subprocess.run(["git", "-C", str(root), "add", "--", sharded], check=True)
     listed = ["m::a", "m::a_b", "m::ab", "n::c", "n::d", "n::e", "z::ignored"]
+    # The relocation stand-in below lists exactly the count run-script-tests.sh
+    # pins, read from the copy under test, around two tests of its own.
+    pinned = int(re.search(r"\[ci/build-liteinst-allocator-fixtures\.rs\]=([0-9]+)",
+                           (scripts / "run-script-tests.sh").read_text()).group(1))
+    own = ["tests::m1_artifact::nested", "tests::standalone"]
+    relocated_listed = ([own[0]] + [f"m1_artifact::t{i}" for i in range(pinned)] + [own[1]])
     libtest = scratch / "libtest"
     libtest.mkdir()
     (libtest / "rust-script").write_text(f'''#!/usr/bin/env python3
 import os, sys
 listed = {listed!r}
+relocated_listed = {relocated_listed!r}
 argv = sys.argv[1:]
 assert argv[0] == "--test", argv
 source, rest = argv[1], argv[2:]
+if source.endswith("build-liteinst-allocator-fixtures.rs"):
+    assert rest[0] == "--", rest
+    rest, mode = rest[1:], os.environ.get("FIXTURE_RELOCATE_MODE", "")
+    if rest == ["--list", "--format", "terse"]:
+        extra = ["m1_artifact::one_more"] if mode == "extra" else []
+        for name in relocated_listed + extra:
+            print(name + ": test")
+        sys.exit(0)
+    assert rest[0] == "--exact", rest
+    chosen = rest[1:]
+    with open(os.environ["FIXTURE_RELOCATE_LOG"], "a") as log:
+        log.write("".join(name + "\\n" for name in chosen))
+    ran = relocated_listed if mode == "drop" else chosen
+    passed = len(ran) - (mode == "short")
+    print(f"test result: ok. {{passed}} passed; 0 failed; 0 ignored; 0 measured; "
+          f"{{len(relocated_listed) - len(ran)}} filtered out; finished in 0.00s")
+    sys.exit(0)
 if not source.endswith("scorecard.rs"):
     print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
     sys.exit(0)
@@ -282,5 +307,40 @@ print(f"test result: ok. {{passed}} passed; 0 failed; {{ignored}} ignored; 0 mea
     assert b"cannot list its tests for sharding" in output.stderr, output
     assert b"1 of 3 script test suites failed" in output.stderr, output
 
-print("rust-script log isolation: prepared/ordinary/nested/concurrent harnesses retain private logs; outer bytes, argv, failure and signals preserved")
+    # A relocated module's tests come out by exact name, with a pinned count,
+    # and every test of the script's own still runs, including one whose name
+    # only contains the prefix. The stand-in reports what it was asked to run,
+    # unless told to list one relocated test more, to drop the --exact filter,
+    # or to report one test short.
+    relocating = "ci/build-liteinst-allocator-fixtures.rs"
+    (root / relocating).write_text("#!/usr/bin/env -S rust-script --force\n#[cfg(test)]\n")
+    subprocess.run(["git", "-C", str(root), "add", "--", relocating], check=True)
+
+    def relocate_run(mode):
+        log = scratch / f"relocate-{mode or 'exact'}.log"
+        output = run([str(scripts / "run-script-tests.sh")],
+                     dict(env, PATH=str(libtest) + os.pathsep + env["PATH"],
+                          FIXTURE_SHARD_LOG=str(scratch / "relocate-shards.log"),
+                          FIXTURE_RELOCATE_MODE=mode, FIXTURE_RELOCATE_LOG=str(log)))
+        return output, (log.read_text().splitlines() if log.exists() else [])
+
+    output, chosen = relocate_run("")
+    assert output.returncode == 0, output
+    assert b"OK -- 4 script test suites passed" in output.stdout, output
+    assert chosen == own, chosen
+    assert (f"{relocating} (shard 1 of 1: {len(own)} of {pinned + len(own)} tests; the {pinned}"
+            " under m1_artifact:: run in reverie-liteinst-artifact's own test binary)"
+            ).encode() in output.stdout, output
+    output, chosen = relocate_run("extra")
+    assert output.returncode == 1 and chosen == [], output
+    assert (f"lists {pinned + 1} tests under m1_artifact::, but {pinned} are pinned"
+            ).encode() in output.stderr, output
+    assert b"1 of 4 script test suites failed" in output.stderr, output
+    for mode in ("drop", "short"):
+        output, _ = relocate_run(mode)
+        assert output.returncode == 1, (mode, output)
+        assert b"shard ran a different set than its" in output.stderr, (mode, output)
+        assert b"1 of 4 script test suites failed" in output.stderr, (mode, output)
+
+print("rust-script log isolation: prepared/ordinary/nested/concurrent harnesses retain private logs; outer bytes, argv, failure and signals preserved; shards and a relocated module run exactly their lists")
 PY

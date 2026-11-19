@@ -898,6 +898,7 @@ class ValidateNodeTest(unittest.TestCase):
         shutil.copy2(BUCK_E2E / "validate-node", self.node)
         self.checkout = checkout
         shutil.copy2(BUCK_E2E / "stages.py", checkout / "ci" / "buck-e2e" / "stages.py")
+        shutil.copy2(BUCK_E2E / "daemon-bound.sh", checkout / "ci" / "buck-e2e" / "daemon-bound.sh")
         for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage"):
             write_executable(checkout / step, FAKE_STEP)
         write_executable(checkout / "ci" / "buck-e2e" / "run", FAKE_RUN)
@@ -1085,7 +1086,7 @@ class ValidateNodeTest(unittest.TestCase):
     def assert_retention_deadline_trace(self, trace):
         """Check the real Bash decisions and expanded timeout argv, not observer wall time."""
         deadline = remaining = None
-        expired = False
+        expired = retention_over = False
         commands = []
         checked_commands = []
         pending = {}
@@ -1101,6 +1102,14 @@ class ValidateNodeTest(unittest.TestCase):
                 continue
             _, pid, timestamp, function, now, observed_deadline, _left, command = line.split("\t", 7)
             clock = Decimal(timestamp) * 1_000_000
+            if deadline is not None and function == "on_exit":
+                # on_exit is back from keep_invocations and goes on to stop the buck2
+                # daemon (record_daemon, `buck2 kill`, kill_daemon_scope): retention is over.
+                retention_over = True
+            if retention_over:
+                self.assertFalse(function == "on_exit" and command.startswith("keep_invocations "),
+                                 "retention received a second deadline")
+                continue
             if deadline is not None:
                 self.assertIn(function, {"on_exit", "timeout", *builtins}, "unexpected retention helper")
             if function == "on_exit" and command.startswith("keep_invocations "):

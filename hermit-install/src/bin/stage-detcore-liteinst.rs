@@ -1296,7 +1296,9 @@ mod tests {
         );
         assert_eq!(
             reverie_layout(
-                "reverie-core = { git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"0123456789012345678901234567890123456789\" }\n",
+                &format!(
+                    "reverie-core = {{ git = \"{REVERIE_GIT_REPOSITORY}\", rev = \"0123456789012345678901234567890123456789\" }}\n"
+                ),
                 gitless,
             )
             .unwrap(),
@@ -1320,7 +1322,9 @@ mod tests {
         fs::remove_dir_all(&checkout).unwrap();
         assert!(
             reverie_layout(
-                "reverie-core = { path = \"reverie/reverie\" }\nreverie-ptrace = { git = \"https://github.com/facebookexperimental/reverie.git\" }\n",
+                &format!(
+                    "reverie-core = {{ path = \"reverie/reverie\" }}\nreverie-ptrace = {{ git = \"{REVERIE_GIT_REPOSITORY}\" }}\n"
+                ),
                 gitless,
             )
             .is_err()

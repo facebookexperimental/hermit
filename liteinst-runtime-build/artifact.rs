@@ -414,21 +414,21 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            reverie_is_path_sourced(
-                "reverie-inguest = { git = \"https://github.com/facebookexperimental/reverie.git\", rev = \"0123456789012345678901234567890123456789\" }\n"
-            ),
+            reverie_is_path_sourced(&format!(
+                "reverie-inguest = {{ git = \"{REVERIE_GIT_REPOSITORY}\", rev = \"0123456789012345678901234567890123456789\" }}\n"
+            )),
             Ok(false)
         );
         // A commented-out opposite spelling does not vote.
         assert_eq!(
-            reverie_is_path_sourced(
-                "# reverie-inguest = { git = \"https://github.com/facebookexperimental/reverie.git\" }\nreverie-inguest = { path = \"reverie/reverie-inguest\" }\n"
-            ),
+            reverie_is_path_sourced(&format!(
+                "# reverie-inguest = {{ git = \"{REVERIE_GIT_REPOSITORY}\" }}\nreverie-inguest = {{ path = \"reverie/reverie-inguest\" }}\n"
+            )),
             Ok(true)
         );
-        assert!(reverie_is_path_sourced(
-            "reverie-inguest = { path = \"../reverie/reverie-inguest\" }\nreverie-liteinst = { git = \"https://github.com/facebookexperimental/reverie.git\" }\n"
-        )
+        assert!(reverie_is_path_sourced(&format!(
+            "reverie-inguest = {{ path = \"../reverie/reverie-inguest\" }}\nreverie-liteinst = {{ git = \"{REVERIE_GIT_REPOSITORY}\" }}\n"
+        ))
         .is_err());
         assert!(reverie_is_path_sourced("[workspace]\n").is_err());
     }

@@ -2364,7 +2364,7 @@ const BUCK_S0_NO_CARGO_SHIM: &str = "ci/buck-e2e/no-cargo/cargo";
 /// does not: the stage's fixture builds set their own, and buck2 clears a test's
 /// environment but for PATH and five others. When a `--buck-s0` run starts,
 /// scripts/validate.rs, holding the invocation lock, renames an earlier run's
-/// record beside it (cargo-refused.before-<run>.log).
+/// record beside it (`cargo-refused.before-<run>.log`).
 pub const BUCK_S0_CARGO_REFUSED_LOG: &str = "ignored/validation/cargo-refused.log";
 /// The job of the last `--buck-<name>` node (`no_cargo_s0`): after every import
 /// twin, it refuses on any refused cargo call, the twins' included.
@@ -2491,7 +2491,7 @@ fn buck_s0_cargo_refusal_check(tag: &str) -> String {
 /// harness and the plan's other backends excluded, so each twin selects exactly
 /// the subset's cells of its bucket and writes that bucket's result files.
 /// Every other node is left out. Every node runs with the refusing cargo shim
-/// first on its PATH ([`BUCK_S0_NO_CARGO_PATH`]).
+/// first on its PATH (`BUCK_S0_NO_CARGO_PATH`).
 ///
 /// `plan_backends` is every backend of ci/expected-e2e-plan.json. Refuses a
 /// subset that names a backend outside them, a category or lane without a
