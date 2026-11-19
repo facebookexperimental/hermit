@@ -2316,12 +2316,16 @@ const BUCK_S0_PREFLIGHT: [&str; 2] = ["pre.submodules", "pre.reverie_pin"];
 /// Where each `--buck-s0` preflight node writes `<tag>.rc`, its exit status;
 /// ci/buck-e2e/validate-node reads `$VALIDATE_RUN_STATE/preflight/$tag.rc`.
 const BUCK_S0_PREFLIGHT_STATUS_DIR: &str = "$VALIDATE_RUN_STATE/preflight";
+/// Where each `--buck-s0` import twin writes `<tag>.rc`, its exit status, for
+/// the last node ([`buck_no_cargo_job`]), which waits for every twin's record
+/// instead of depending on the twins, so a failed twin does not skip it.
+const BUCK_TWIN_STATUS_DIR: &str = "$VALIDATE_RUN_STATE/twin-status";
 /// The job of the first `--buck-s0` node, which removes an earlier execution's
-/// preflight records before the preflight writes them or validate-node waits
-/// for them. A run state is reused by a plan export's scheduler
-/// (`<export dir>/run-state`) and by a nested payload, and a `0` left there by
-/// an earlier execution would otherwise pass validate-node's wait before this
-/// execution's preflight finished (`buck_s0_records`).
+/// preflight and twin records before the preflight and the twins write them or
+/// validate-node and the last node wait for them. A run state is reused by a
+/// plan export's scheduler (`<export dir>/run-state`) and by a nested payload,
+/// and a record left there by an earlier execution would otherwise pass a wait
+/// before this execution's node finished (`buck_s0_records`).
 fn buck_records_job(name: &str) -> String {
     format!("buck_{name}_records")
 }
@@ -2330,7 +2334,7 @@ fn buck_records_job(name: &str) -> String {
 /// deleted) unless VALIDATE_RUN_STATE is an absolute path to an existing
 /// directory, not a symbolic link, whose last component is named like a run
 /// state (`run-<profile>-<pid>-<nonce>`, or a plan export's `run-state`); then
-/// it removes only that directory's `preflight` child.
+/// it removes only that directory's `preflight` and `twin-status` children.
 fn clear_preflight_records(tag: &str) -> String {
     let refuse = format!(r#"refuse() {{ echo "{tag}: $1; nothing was deleted" >&2; exit 2; }}"#);
     let script = [
@@ -2341,7 +2345,7 @@ fn clear_preflight_records(tag: &str) -> String {
         r#"name=${d##*/}"#,
         r#"[[ $name =~ ^run-[A-Za-z0-9-]+-[0-9]+-[0-9]+$ || $name == run-state ]] || refuse "VALIDATE_RUN_STATE=$d is not named like a run state (run-<profile>-<pid>-<nonce>, or a plan export's run-state)""#,
         r#"[[ -d $d && ! -L $d ]] || refuse "VALIDATE_RUN_STATE=$d is not an existing directory""#,
-        r#"rm -rf -- "$d/preflight""#,
+        r#"rm -rf -- "$d/preflight" "$d/twin-status""#,
     ]
     .join("; ");
     format!("bash -c {}", shell_quote(&script))
@@ -2389,18 +2393,113 @@ const BUCK_S0_DAEMON_CPU_SECONDS_ENV: &str = "HERMIT_VALIDATE_BUCK_DAEMON_CPU_SE
 /// the daemon's memory to correct it.
 const BUCK_S0_DAEMON_MEMORY_MAX_BYTES: i64 = 32 << 30;
 
-/// `cmd`, then its exit status written to
-/// `$VALIDATE_RUN_STATE/preflight/<tag>.rc` (by rename, so a reader never
-/// sees half a file) and returned as the node's own. `cmd` runs in a child
-/// `bash -c`, so an `exit` inside it cannot skip the record, and a `set -e`
-/// inside it still holds (a subshell on the left of `&&` would run it with
-/// errexit off). A record that cannot be written leaves the reader to refuse
-/// when its wait runs out.
-fn recording_preflight_status(cmd: &str, tag: &str) -> String {
-    let file = format!("{BUCK_S0_PREFLIGHT_STATUS_DIR}/{tag}.rc");
+/// `cmd` with its exit status written to `<dir>/<tag>.rc` (by rename, so a
+/// reader never sees half a file) and kept as the node's own. An EXIT trap set
+/// before `cmd` writes the record, so `cmd` stays the END of the command
+/// string: dagrun appends a step's inner-parallelism arguments there
+/// (`dagrun::model::command_with_inner_jobs`, for example the c-programs
+/// twin's `--jobs 8`), and they must reach `cmd`'s last program, not land
+/// after a trailing `exit`. The trap runs on every exit of the node's shell,
+/// an `exit` inside `cmd` and a `set -e` failure included, and its own `exit`
+/// keeps the status.
+///
+/// dagrun ends a node it kills (at its wall or CPU budget, or on a
+/// cancellation) with SIGTERM to the node's process group, then SIGKILL after
+/// a grace. Bash runs the EXIT trap on that SIGTERM too, but `$?` there is the
+/// status of the last command that completed, typically an earlier `export`,
+/// so the record would read 0 for a killed node. The TERM, INT and HUP traps
+/// therefore exit with the shell's own statuses for those signals (143, 130 and
+/// 129), and the EXIT trap records that. A node killed by SIGKILL (for example
+/// one whose child ignores SIGTERM, so its shell is still waiting when the
+/// grace ends) writes no record, which leaves the reader to refuse when its
+/// wait runs out. `cmd` must not set a trap of its own or `exec`, either of
+/// which would drop or falsify the record ([`refuse_record_breakers`]).
+///
+/// The signal traps come BEFORE the EXIT trap. Once an EXIT trap is set, bash
+/// handles TERM, INT and HUP itself and runs that trap with `$?` from the last
+/// completed command (0 for the `trap` builtin), so a signal landing between an
+/// earlier EXIT trap and its signal trap would record 0. In this order a signal
+/// at any point leaves either no record (before the EXIT trap is set: the
+/// shell dies of it, or exits from its signal trap) or the signal's status.
+fn recording_status(cmd: &str, dir: &str, tag: &str) -> String {
+    assert!(
+        !dir.contains('\'') && !tag.contains('\''),
+        "a status record path is quoted in single quotes"
+    );
+    let file = format!("{dir}/{tag}.rc");
     format!(
-        "bash -c {} && rc=0 || rc=$?; mkdir -p \"{BUCK_S0_PREFLIGHT_STATUS_DIR}\" && echo \"$rc\" > \"{file}.tmp\" && mv \"{file}.tmp\" \"{file}\"; exit $rc",
-        shell_quote(cmd)
+        "trap 'exit {}' TERM; trap 'exit {}' INT; trap 'exit {}' HUP; trap 'rc=$?; mkdir -p \"{dir}\" && echo \"$rc\" > \"{file}.tmp\" && mv \"{file}.tmp\" \"{file}\"; exit $rc' EXIT; {cmd}",
+        RECORDED_SIGNAL_STATUSES[0], RECORDED_SIGNAL_STATUSES[1], RECORDED_SIGNAL_STATUSES[2]
+    )
+}
+
+/// The statuses [`recording_status`] records for a node killed by SIGTERM,
+/// SIGINT and SIGHUP: 128 plus the signal number, as the shell reports them.
+const RECORDED_SIGNAL_STATUSES: [u8; 3] = [143, 130, 129];
+
+/// Refuse a command [`recording_status`] cannot record: one that sets any trap
+/// of its own (replacing the recorder's EXIT trap, or the TERM, INT and HUP
+/// traps that keep a killed node's record non-zero) or `exec`s (leaving the
+/// shell before the trap runs), or that runs `eval` or `source`, which could do
+/// either out of sight. A word counts with its quotes and backslashes removed,
+/// and an assignment's value is a word (`x=exec`), so `\exec`, `"trap"` and
+/// `x=exec; $x` are refused too.
+///
+/// It is a cheap lint on the command's words, which cannot see inside a script
+/// the command runs, a `.` (it also names the current directory, as in
+/// `--src .`), a variable set outside the command, or a word the shell builds
+/// at run time (`$'\x65xec'`, `$(printf …)`, `${a}p`). A hidden `exec` or EXIT
+/// trap fails closed: no record, so the reader refuses. A hidden trap that
+/// restores a signal's default does not: bash still runs the EXIT trap on that
+/// signal, so a killed node would record its last completed command's status.
+/// No committed command it checks runs a trap, `exec`, `eval` or `source`: the
+/// selection tests build every subset through it.
+fn refuse_record_breakers(tag: &str, cmd: &str) -> Result<(), String> {
+    let words = cmd
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(c, ';' | '&' | '|' | '(' | ')' | '=' | '`' | '$' | '{' | '}')
+        })
+        .map(|word| word.replace(['"', '\'', '\\'], ""))
+        .collect::<Vec<_>>();
+    for breaker in ["trap", "exec", "eval", "source"] {
+        if words.iter().any(|word| word == breaker) {
+            return Err(format!(
+                "{tag}'s command runs `{breaker}`, which would drop its exit-status record"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`recording_status`] into `$VALIDATE_RUN_STATE/preflight`, where
+/// ci/buck-e2e/validate-node waits for a preflight node's record.
+fn recording_preflight_status(cmd: &str, tag: &str) -> String {
+    recording_status(cmd, BUCK_S0_PREFLIGHT_STATUS_DIR, tag)
+}
+
+/// The command of the last `--buck-<name>` node ([`buck_no_cargo_job`]),
+/// tagged `tag`: wait up to `bound` seconds for each import twin's exit status
+/// in [`BUCK_TWIN_STATUS_DIR`], so every twin has finished and no node can
+/// still call cargo, then refuse on any refused cargo call. It reports each
+/// twin's status but judges none: the twins own their verdicts, and this node's
+/// verdict is the no-cargo property alone. A twin killed at its wall or
+/// cancelled by an eager exit leaves no verdict, whichever way it shows: no
+/// status within the bound (killed by SIGKILL), or a recorded signal status
+/// ([`RECORDED_SIGNAL_STATUSES`]), written while dagrun's reap grace may still
+/// leave the twin's processes running. Either way the node names the twin and
+/// exits 1.
+fn buck_no_cargo_wait_then_check(tag: &str, twins: &[String], bound: i64) -> String {
+    let killed = RECORDED_SIGNAL_STATUSES
+        .map(|status| status.to_string())
+        .join("|");
+    let wait = format!(
+        "deadline=$((SECONDS + {bound})); statuses=; for twin in {}; do f=\"{BUCK_TWIN_STATUS_DIR}/$twin.rc\"; until [ -e \"$f\" ]; do if [ \"$SECONDS\" -ge \"$deadline\" ]; then echo \"{tag}: the import twin $twin wrote no exit status to $f within {bound} s, so it may not have finished; no verdict\" >&2; exit 1; fi; sleep 5; done; s=$(cat \"$f\"); case \"$s\" in {killed}) echo \"{tag}: the import twin $twin was killed by a signal (exit $s in $f), so its processes may still be running; no verdict\" >&2; exit 1;; esac; statuses=\"$statuses $twin=$s\"; done; echo \"{tag}: every import twin finished (exit statuses:$statuses; the twins own those verdicts)\"",
+        twins.join(" ")
+    );
+    format!(
+        "{wait}; {}; echo \"{tag}: the no-cargo shim refused no call\"",
+        buck_s0_cargo_refusal_check(tag)
     )
 }
 
@@ -2489,7 +2588,10 @@ fn buck_s0_cargo_refusal_check(tag: &str) -> String {
 /// gate.manifest; and one import twin per (lane, category) of the subset,
 /// cloned from the committed `<bucket>_buck` twin with the staged Buck-built
 /// harness and the plan's other backends excluded, so each twin selects exactly
-/// the subset's cells of its bucket and writes that bucket's result files.
+/// the subset's cells of its bucket and writes that bucket's result files,
+/// recording its exit status; and gate.no_cargo_s0, which waits for every
+/// twin's record and then refuses if any node ran cargo, so its verdict exists
+/// even when a twin fails ([`buck_no_cargo_wait_then_check`]).
 /// Every other node is left out. Every node runs with the refusing cargo shim
 /// first on its PATH (`BUCK_S0_NO_CARGO_PATH`).
 ///
@@ -2554,6 +2656,7 @@ pub fn buck_subset_selection(
     steps.push(records);
 
     let mut submodules = find(BUCK_S0_PREFLIGHT[0])?;
+    refuse_record_breakers(BUCK_S0_PREFLIGHT[0], &submodules.cmd)?;
     submodules.cmd = recording_preflight_status(&submodules.cmd, BUCK_S0_PREFLIGHT[0]);
     submodules.deps = vec![records_tag.clone()];
     relabel(&mut submodules);
@@ -2567,6 +2670,7 @@ pub fn buck_subset_selection(
     pin.cmd = pin
         .cmd
         .replace(pin_call, &format!("{BUCK_S0_PIN_CHECK_ROOT}{pin_call}"));
+    refuse_record_breakers(BUCK_S0_PREFLIGHT[1], &pin.cmd)?;
     pin.cmd = recording_preflight_status(&pin.cmd, BUCK_S0_PREFLIGHT[1]);
     relabel(&mut pin);
     let pin_wall = pin.timeout;
@@ -2650,6 +2754,7 @@ pub fn buck_subset_selection(
     let gate_tag = gate.tag();
     steps.push(gate);
     let mut twin_tags = Vec::new();
+    let mut longest_twin_wall = 0;
 
     for lane in &subset.lanes {
         let group = match lane.as_str() {
@@ -2683,13 +2788,16 @@ pub fn buck_subset_selection(
             twin.job.push_str(&format!("_{name}"));
             twin.desc = format!("{} (Buck-only subset)", twin.desc);
             twin.description = format!(
-                "The {flag} import twin of {tag}: the same bucket's result files from the rows {} wrote, judged by the staged Buck-built test-harness, with the plan's backends outside the subset excluded ({}), so it owns exactly the subset's cells of the bucket.",
+                "The {flag} import twin of {tag}: the same bucket's result files from the rows {} wrote, judged by the staged Buck-built test-harness, with the plan's backends outside the subset excluded ({}), so it owns exactly the subset's cells of the bucket. Its exit status also goes to {BUCK_TWIN_STATUS_DIR}/<tag>.rc, which the last node waits for.",
                 cells.tag(),
                 excluded.trim()
             );
             twin.deps = vec![cells.tag(), gate_tag.clone(), BUCK_S0_PREFLIGHT[1].into()];
             relabel(&mut twin);
             let owner = twin.tag();
+            refuse_record_breakers(&owner, &twin.cmd)?;
+            twin.cmd = recording_status(&twin.cmd, BUCK_TWIN_STATUS_DIR, &owner);
+            longest_twin_wall = longest_twin_wall.max(twin.timeout);
             twin_tags.push(owner.clone());
             for result in twin.result_manifests.iter_mut().flatten() {
                 if let ResultManifest::StructuredTestResults(result) = result {
@@ -2701,20 +2809,32 @@ pub fn buck_subset_selection(
     }
 
     // The twins run after gate.manifest_s0, so this last node checks the shim's
-    // record again once they are done: a run's PASS then also says that no
-    // node, the twins included, ran cargo.
+    // record again once they are done: its verdict says whether any node, the
+    // twins included, ran cargo. It waits for the twins' recorded exit statuses
+    // rather than depending on the twins, because dagrun skips every dependent
+    // of a failed node: a twin's FAIL would otherwise leave the no-cargo
+    // question without a verdict, as it did in every run before this.
     let mut last = gate_template;
     last.job = buck_no_cargo_job(name);
     let last_tag = last.tag();
-    last.cmd = format!(
-        "{}; echo \"{last_tag}: the no-cargo shim refused no call\"",
-        buck_s0_cargo_refusal_check(&last_tag)
-    );
+    // The longest twin wall plus a minute for the last record to land. The
+    // twins start when this node does (both wait on gate.manifest_s0) and run
+    // side by side; import-only twins took 2-7 s each in the 2026-11-18 s0 run
+    // against walls of 600 s. So one twin running to its own wall still fits,
+    // and twins that queue behind each other near their walls end in a "no
+    // verdict" refusal, never a pass. Summing the walls instead made this the
+    // plan's longest node (5520 s for s0, above the cells node), which refused
+    // --run-timeout values the plan accepted before and held this node's
+    // memory reservation for up to 91 minutes after a twin was killed.
+    let wait_bound = longest_twin_wall + 60;
+    last.cmd = buck_no_cargo_wait_then_check(&last_tag, &twin_tags, wait_bound);
     last.desc = "Buck-only gate: no node, the import twins included, ran cargo".into();
     last.description = format!(
-        "Selected only by scripts/validate.rs {flag}, after every import twin: it refuses if any {flag} node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to). {gate_tag} checks the same record before the twins run; this covers the twins too. dagrun skips it when a twin fails, and the run has then failed anyway."
+        "Selected only by scripts/validate.rs {flag}, after {gate_tag} and beside the import twins: it waits up to {wait_bound} s for every twin's exit status in {BUCK_TWIN_STATUS_DIR}/<tag>.rc ({}), prints them, then refuses if any {flag} node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to). {gate_tag} checks the same record before the twins run; this covers the twins too. Its verdict is the no-cargo property alone, whatever the twins' verdicts, which stay theirs: it waits for the twins instead of depending on them, because dagrun skips every dependent of a failed node. A twin killed at its wall or cancelled leaves no verdict, and the node says which: it wrote no status within the wait (SIGKILL), or its record holds a signal status (143, 130 or 129, from SIGTERM, SIGINT or SIGHUP), written while dagrun's reap grace may still leave its processes running. Under validate's default eager exit a failed twin also cancels this node; `-k` keeps every node in its own fail-fast family, so a run that needs this verdict whatever the twins say runs with -k (which also sets HERMIT_E2E_FAIL_FAST=0, so the twins judge every cell).",
+        twin_tags.join(", ")
     );
-    last.deps = twin_tags;
+    last.deps = vec![gate_tag.clone()];
+    last.timeout = wait_bound + 60;
     last.env.clear();
     relabel(&mut last);
     steps.push(last);
@@ -6361,6 +6481,60 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Run `cmd` under `bash -c` in its own process group, wait for it to
+    /// create `started`, then send `signal` to the group, as dagrun's reap
+    /// does to a node it kills; return the node's exit code. A node still
+    /// running 30 s later is SIGKILLed and fails the test, so a recorder that
+    /// ignored the signal cannot hang it.
+    fn signal_group_once_started(
+        cmd: &str,
+        envs: &[(&str, &std::ffi::OsStr)],
+        cwd: &std::path::Path,
+        started: &std::path::Path,
+        signal: i32,
+    ) -> Option<i32> {
+        use std::os::unix::process::CommandExt;
+        let _ = std::fs::remove_file(started);
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .envs(envs.iter().copied())
+            .current_dir(cwd)
+            .process_group(0)
+            .spawn()
+            .expect("run bash");
+        let group = -i32::try_from(child.id()).expect("a pid fits in i32");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !started.exists() {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: kill(2) on our own child's process group.
+                unsafe { libc::kill(group, libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("{cmd} never created {}", started.display());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: kill(2) on our own child's process group.
+        assert_eq!(
+            unsafe { libc::kill(group, signal) },
+            0,
+            "kill({group}, {signal})"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for bash") {
+                return status.code();
+            }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: kill(2) on our own child's process group.
+                unsafe { libc::kill(group, libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("signal {signal} did not end {cmd} within 30 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// The three pinned-root steps the native-exec cohort adds: its compile
     /// and prepare producers and its counted consumer. They belong in the
     /// pinned-root forwarding inventories below because all three execute
@@ -8856,6 +9030,290 @@ sys.exit(37)
         );
     }
 
+    // dagrun appends a step's inner-parallelism arguments to the END of its
+    // command (dagrun::model::command_with_inner_jobs), so a recorded command
+    // must keep its program last. Every s0 node is rendered as dagrun renders it
+    // with 8 inner jobs, and every twin's rendered command runs against a stub
+    // harness: the stub must see the appended arguments, the node must exit with
+    // the stub's status, and the twin's record must hold that status.
+    #[test]
+    fn buck_s0_rendered_commands_keep_inner_jobs_on_the_program_and_record_its_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let subset =
+            BuckSubset::from_json("s0", include_str!("../../buck-e2e/subsets/s0.json")).unwrap();
+        let plan: serde_json::Value =
+            serde_json::from_str(include_str!("../../expected-e2e-plan.json")).unwrap();
+        let backends = plan["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell["backend"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        let selected = buck_subset_selection(&committed, &subset, &backends).unwrap();
+        for step in &selected.steps {
+            let rendered =
+                dagrun::model::command_with_inner_jobs(step, &selected.default_jobs_flag, Some(8));
+            assert!(
+                rendered.starts_with(step.cmd.as_str()),
+                "{}: dagrun no longer appends: {rendered}",
+                step.tag()
+            );
+            // Nothing may end a command before the arguments dagrun appends.
+            assert!(
+                !step.cmd.trim_end().ends_with("exit $rc"),
+                "{}: {}",
+                step.tag(),
+                step.cmd
+            );
+        }
+        let twins = selected
+            .steps
+            .iter()
+            .filter(|step| step.job.ends_with("_buck_s0"))
+            .collect::<Vec<_>>();
+        // The case the seat found: the c-programs twin declares --jobs 8, and
+        // dagrun renders it with that count, unforced.
+        let c_programs = twins
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_c_programs_buck_s0")
+            .unwrap();
+        assert_eq!(c_programs.jobs_flag.as_deref(), Some("--jobs"));
+        assert_eq!(c_programs.hint.preferred_inner_jobs, Some(8));
+        let real = dagrun::model::command_with_inner_jobs(
+            c_programs,
+            &selected.default_jobs_flag,
+            c_programs.hint.preferred_inner_jobs,
+        );
+        assert!(real.ends_with(" --jobs 8"), "{real}");
+
+        let fixture = std::env::temp_dir().join(format!("buck-s0-rendered-{}", std::process::id()));
+        let bin = fixture.join("ci/buck-e2e/staged/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            fixture.join("ci/buck-e2e/staged/SOURCE_SHA"),
+            format!("{}\n", "0".repeat(40)),
+        )
+        .unwrap();
+        let harness = bin.join("test-harness");
+        std::fs::write(
+            &harness,
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$STUB_ARGV\"\n[ -z \"${STUB_SLEEP:-}\" ] || sleep \"$STUB_SLEEP\"\nexit \"$STUB_EXIT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = fixture.join("run-buck-s0-1-2");
+        std::fs::create_dir_all(&state).unwrap();
+        let argv = fixture.join("argv");
+        for twin in &twins {
+            let tag = twin.tag();
+            let rendered =
+                dagrun::model::command_with_inner_jobs(twin, &selected.default_jobs_flag, Some(8));
+            let appended = shell_words::split(&rendered[twin.cmd.len()..]).unwrap();
+            assert!(
+                !appended.is_empty(),
+                "{tag}: nothing appended to {rendered}"
+            );
+            let record = state.join(format!("twin-status/{tag}.rc"));
+            for status in [0, 3] {
+                let _ = std::fs::remove_file(&argv);
+                let _ = std::fs::remove_file(&record);
+                let output = Command::new("bash")
+                    .arg("-c")
+                    .arg(&rendered)
+                    .env("VALIDATE_RUN_STATE", &state)
+                    .env("E2E_RESULT_ROOT", fixture.join("results"))
+                    .env("STUB_ARGV", &argv)
+                    .env("STUB_EXIT", status.to_string())
+                    .current_dir(&fixture)
+                    .output()
+                    .expect("run bash");
+                assert_eq!(
+                    output.status.code(),
+                    Some(status),
+                    "{tag}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&record).unwrap(),
+                    format!("{status}\n"),
+                    "{tag}"
+                );
+                let seen = std::fs::read_to_string(&argv).unwrap();
+                let seen = seen.lines().collect::<Vec<_>>();
+                let tail = appended.iter().map(String::as_str).collect::<Vec<_>>();
+                assert!(
+                    seen.ends_with(&tail),
+                    "{tag}: the harness saw {seen:?}, which does not end in {tail:?}"
+                );
+            }
+            // Killed by dagrun: SIGTERM to the node's process group at a wall
+            // or CPU breach or a cancellation, and SIGINT and SIGHUP alike.
+            // The record holds the signal's status, never the 0 of the
+            // command's earlier `export`.
+            let results = fixture.join("results");
+            for (signal, status) in [
+                (libc::SIGTERM, 143),
+                (libc::SIGINT, 130),
+                (libc::SIGHUP, 129),
+            ] {
+                let _ = std::fs::remove_file(&record);
+                let code = signal_group_once_started(
+                    &rendered,
+                    &[
+                        ("VALIDATE_RUN_STATE", state.as_os_str()),
+                        ("E2E_RESULT_ROOT", results.as_os_str()),
+                        ("STUB_ARGV", argv.as_os_str()),
+                        ("STUB_EXIT", std::ffi::OsStr::new("0")),
+                        ("STUB_SLEEP", std::ffi::OsStr::new("60")),
+                    ],
+                    &fixture,
+                    &argv,
+                    signal,
+                );
+                assert_eq!(code, Some(status), "{tag}: signal {signal}");
+                assert_eq!(
+                    std::fs::read_to_string(&record).unwrap(),
+                    format!("{status}\n"),
+                    "{tag}: signal {signal}"
+                );
+            }
+        }
+        // The last node's wait refuses a killed twin's record: no verdict.
+        let c_tag = c_programs.tag();
+        let killed = signal_group_once_started(
+            &real,
+            &[
+                ("VALIDATE_RUN_STATE", state.as_os_str()),
+                ("E2E_RESULT_ROOT", fixture.join("results").as_os_str()),
+                ("STUB_ARGV", argv.as_os_str()),
+                ("STUB_EXIT", std::ffi::OsStr::new("0")),
+                ("STUB_SLEEP", std::ffi::OsStr::new("60")),
+            ],
+            &fixture,
+            &argv,
+            libc::SIGTERM,
+        );
+        assert_eq!(killed, Some(143));
+        let gate = Command::new("bash")
+            .arg("-c")
+            .arg(buck_no_cargo_wait_then_check(
+                "gate.no_cargo_t",
+                std::slice::from_ref(&c_tag),
+                0,
+            ))
+            .env("VALIDATE_RUN_STATE", &state)
+            .current_dir(&fixture)
+            .output()
+            .expect("run bash");
+        let stderr = String::from_utf8_lossy(&gate.stderr);
+        assert_eq!(gate.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "the import twin {c_tag} was killed by a signal (exit 143"
+            )) && stderr.contains("no verdict"),
+            "{stderr}"
+        );
+        std::fs::remove_dir_all(&fixture).expect("remove the rendered-command fixture");
+        // A command that would drop or falsify its record is refused: any trap
+        // of its own, the signal traps included, or an exec.
+        for cmd in [
+            "trap 'x' EXIT; y",
+            "trap 'exit 0' TERM; y",
+            "trap '' INT; y",
+            "y; trap - HUP",
+            "a; exec b",
+        ] {
+            assert!(refuse_record_breakers("t", cmd).is_err(), "{cmd}");
+        }
+        for cmd in [
+            "a; \\exec b",
+            "a; \"exec\" b",
+            "eval 'exec b'",
+            "x=exec; $x b",
+            "source ./lib.sh; y",
+        ] {
+            assert!(refuse_record_breakers("t", cmd).is_err(), "{cmd}");
+        }
+        assert!(refuse_record_breakers("t", "harness run --exec-mode x").is_ok());
+        // A trap planted in a committed twin's command is refused when the
+        // selection is built, before the run could lose or falsify a record.
+        let mut planted = committed.clone();
+        let source = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_c_programs_buck")
+            .expect("the committed c-programs import twin");
+        source.cmd = format!("trap '' TERM; {}", source.cmd);
+        let refused = buck_subset_selection(&planted, &subset, &backends).unwrap_err();
+        assert!(
+            refused.contains("e2e.manifest_c_programs_buck_s0's command runs `trap`"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn buck_recorder_sets_its_signal_traps_before_its_exit_trap_so_no_signal_records_zero() {
+        let state = std::env::temp_dir().join(format!(
+            "buck-recorder-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let dir = state
+            .to_str()
+            .expect("a UTF-8 temporary directory")
+            .to_string();
+        let record = state.join("t.rc");
+        let recorded = recording_status("true", &dir, "t");
+        let exit_trap_end = recorded.find("' EXIT; ").expect("an EXIT trap") + "' EXIT; ".len();
+        // A signal at each point of the prologue, delivered deterministically:
+        // the shell sends it to itself, and handles it before its next command.
+        // It leaves no record or the signal's status, never the 0 of the
+        // last completed command.
+        let mut boundaries = vec![0];
+        for marker in [" TERM; ", " INT; ", " HUP; "] {
+            boundaries.push(recorded.find(marker).unwrap() + marker.len());
+        }
+        boundaries.push(exit_trap_end);
+        for (signal, status) in [("TERM", 143), ("INT", 130), ("HUP", 129)] {
+            for (at, &boundary) in boundaries.iter().enumerate() {
+                let _ = std::fs::remove_file(&record);
+                let spliced = format!(
+                    "{}kill -s {signal} $$; {}",
+                    &recorded[..boundary],
+                    &recorded[boundary..]
+                );
+                let output = Command::new("bash")
+                    .arg("-c")
+                    .arg(&spliced)
+                    .output()
+                    .expect("run bash");
+                assert_ne!(output.status.code(), Some(0), "{signal} at {at}: {spliced}");
+                match std::fs::read_to_string(&record) {
+                    Ok(text) => assert_eq!(text, format!("{status}\n"), "{signal} at {at}"),
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        // Once the EXIT trap is set, a signal must be recorded.
+                        assert!(
+                            boundary < exit_trap_end,
+                            "{signal} after the EXIT trap left no record"
+                        );
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&state);
+        // The order itself: every signal trap, then the EXIT trap, then the
+        // command, last.
+        assert!(
+            recorded.starts_with(
+                "trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap 'rc=$?;"
+            ),
+            "{recorded}"
+        );
+        assert_eq!(&recorded[exit_trap_end..], "true");
+    }
+
     #[test]
     fn buck_s0_selection_runs_no_cargo_and_judges_exactly_the_subset() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
@@ -9027,17 +9485,102 @@ sys.exit(37)
         );
         assert!(!shim.contains("$VALIDATE_RUN_STATE"), "{shim}");
         assert!(BUCK_S0_NO_CARGO_PATH.contains(&format!("CARGO=\"$PWD/{BUCK_S0_NO_CARGO_SHIM}\"")));
-        // The last node checks the log again after every twin.
+        // The last node checks the log again after every twin. It waits for
+        // each twin's recorded exit status instead of depending on the twins,
+        // so a failed twin, whose dependents dagrun skips, does not leave the
+        // no-cargo question without a verdict.
         let last = selected.steps.last().unwrap();
-        let twins = selected
+        let twin_steps = selected
             .steps
             .iter()
             .filter(|step| step.job.ends_with("_buck_s0"))
-            .map(Step::tag)
             .collect::<Vec<_>>();
         assert_eq!(last.tag(), "gate.no_cargo_s0");
-        assert_eq!(last.deps, twins);
+        assert_eq!(last.deps, vec!["gate.manifest_s0".to_string()]);
         assert!(last.cmd.contains(BUCK_S0_CARGO_REFUSED_LOG), "{}", last.cmd);
+        // The longest twin wall plus a minute, not the sum, so the gate stays
+        // shorter than the cells node and inside gate.manifest's old wall.
+        let wait_bound = twin_steps.iter().map(|step| step.timeout).max().unwrap() + 60;
+        let cells_node = selected
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.buck_s0")
+            .unwrap();
+        assert!(
+            last.timeout < cells_node.timeout,
+            "{} >= {}",
+            last.timeout,
+            cells_node.timeout
+        );
+        assert!(
+            last.cmd
+                .contains(&format!("deadline=$((SECONDS + {wait_bound}))")),
+            "{}",
+            last.cmd
+        );
+        assert!(
+            last.timeout > wait_bound,
+            "{} <= {wait_bound}",
+            last.timeout
+        );
+        for twin in &twin_steps {
+            let tag = twin.tag();
+            assert!(last.cmd.contains(&format!(" {tag}")), "{tag}: {}", last.cmd);
+            assert!(
+                twin.cmd
+                    .contains(&format!("{BUCK_TWIN_STATUS_DIR}/{tag}.rc")),
+                "{tag} records no exit status: {}",
+                twin.cmd
+            );
+        }
+        // The wait-then-check itself: every record present reports each twin's
+        // status and passes on an empty refusal log, whatever the twins'
+        // statuses; a refused call fails it; a missing record leaves no verdict.
+        let fixture = std::env::temp_dir().join(format!("buck-s0-no-cargo-{}", std::process::id()));
+        let state = fixture.join("run-buck-s0-1-2");
+        std::fs::create_dir_all(state.join("twin-status")).unwrap();
+        std::fs::write(state.join("twin-status/e2e.a.rc"), "0\n").unwrap();
+        std::fs::write(state.join("twin-status/e2e.b.rc"), "1\n").unwrap();
+        let check = |twins: &[String], bound: i64| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(buck_no_cargo_wait_then_check(
+                    "gate.no_cargo_t",
+                    twins,
+                    bound,
+                ))
+                .env("VALIDATE_RUN_STATE", &state)
+                .current_dir(&fixture)
+                .output()
+                .expect("run bash")
+        };
+        let both = ["e2e.a".to_string(), "e2e.b".to_string()];
+        let passed = check(&both, 0);
+        let stdout = String::from_utf8_lossy(&passed.stdout);
+        assert_eq!(passed.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("e2e.a=0 e2e.b=1"), "{stdout}");
+        assert!(
+            stdout.contains("the no-cargo shim refused no call"),
+            "{stdout}"
+        );
+        let missing = check(&["e2e.a".to_string(), "e2e.c".to_string()], 0);
+        assert_eq!(missing.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&missing.stderr);
+        assert!(
+            stderr.contains("the import twin e2e.c wrote no exit status")
+                && stderr.contains("no verdict"),
+            "{stderr}"
+        );
+        std::fs::create_dir_all(fixture.join("ignored/validation")).unwrap();
+        std::fs::write(fixture.join(BUCK_S0_CARGO_REFUSED_LOG), "cargo build\n").unwrap();
+        let refused = check(&both, 0);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("cargo build"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        std::fs::remove_dir_all(&fixture).expect("remove the no-cargo fixture");
         // The record holds the command's own status, an `exit` inside it
         // included, and a `set -e` inside it holds; the node exits with that
         // status.
@@ -9087,6 +9630,8 @@ sys.exit(37)
             for tag in BUCK_S0_PREFLIGHT {
                 std::fs::write(dir.join(format!("preflight/{tag}.rc")), "0\n").unwrap();
             }
+            std::fs::create_dir_all(dir.join("twin-status")).unwrap();
+            std::fs::write(dir.join("twin-status/e2e.a.rc"), "0\n").unwrap();
         };
         let wait = |dir: &std::path::Path| {
             std::process::Command::new("bash")
@@ -9123,9 +9668,10 @@ sys.exit(37)
             String::from_utf8_lossy(&cleared.stderr)
         );
         assert!(!state.join("preflight").exists());
+        assert!(!state.join("twin-status").exists());
         assert!(
             state.join("kept").exists(),
-            "only the preflight child is removed"
+            "only the preflight and twin-status children are removed"
         );
         let waited = wait(&state);
         assert_eq!(waited.status.code(), Some(1));
@@ -9134,10 +9680,45 @@ sys.exit(37)
             "{}",
             String::from_utf8_lossy(&waited.stderr)
         );
+        // A preflight dagrun kills (SIGTERM to its process group, here after
+        // an `export` completed, whose 0 the record must not take) records
+        // 143, and the wait refuses it: no cell runs, even under -k.
+        plant(&state);
+        let started = fixture.join("preflight-started");
+        let killed = signal_group_once_started(
+            &recording_preflight_status(
+                "export HERMIT_FIXTURE=1; touch \"$STARTED\"; sleep 60",
+                BUCK_S0_PREFLIGHT[0],
+            ),
+            &[
+                ("VALIDATE_RUN_STATE", state.as_os_str()),
+                ("STARTED", started.as_os_str()),
+            ],
+            &fixture,
+            &started,
+            libc::SIGTERM,
+        );
+        assert_eq!(killed, Some(143));
+        assert_eq!(
+            std::fs::read_to_string(state.join(format!("preflight/{}.rc", BUCK_S0_PREFLIGHT[0])))
+                .unwrap(),
+            "143\n"
+        );
+        let refused = wait(&state);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(&format!(
+                "the preflight node {} failed (exit 143)",
+                BUCK_S0_PREFLIGHT[0]
+            )),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
         let export = fixture.join("export/run-state");
         plant(&export);
         assert_eq!(clear(export.to_str().unwrap()).status.code(), Some(0));
         assert!(!export.join("preflight").exists());
+        assert!(!export.join("twin-status").exists());
         let unnamed = fixture.join("not-a-run-state");
         plant(&unnamed);
         let relative = "run-buck-s0-56-78";
@@ -9166,6 +9747,11 @@ sys.exit(37)
                     dir.display()
                 );
             }
+            assert!(
+                dir.join("twin-status/e2e.a.rc").exists(),
+                "a refusal deleted {}'s twin-status",
+                dir.display()
+            );
         }
         std::fs::remove_dir_all(&fixture).expect("remove the records fixture");
         // A subset naming a backend the plan lacks is refused, never shrunk.

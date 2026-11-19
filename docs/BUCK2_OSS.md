@@ -559,6 +559,14 @@ flag.
 `--buck-s1` does the same for `ci/buck-e2e/subsets/s1.json`, which is s0 plus
 the applications category. Its guests run the host's `git`, `ar`, `cc` and
 `python3`, so the host needs them.
+The last node of each Buck-only run, `gate.no_cargo_<name>`, waits for every
+import twin's recorded exit status instead of depending on the twins, so a
+failed twin no longer skips it. Its verdict is whether any node, the twins
+included, ran cargo. A twin killed at its wall or cancelled leaves no verdict:
+it records the signal's exit status (143, 130 or 129) or, if killed by SIGKILL,
+nothing. Under the default eager exit, a failed twin still cancels
+it; run with `-k` when that verdict is needed whatever the twins say. `-k`
+also sets `HERMIT_E2E_FAIL_FAST=0`, so every cell is judged.
 The buck2 daemon, and every cell it runs, lives in the daemon's own systemd
 scope, outside the node's cgroup, and buck2 clears each test's environment, so
 dagrun's reap of the node does not reach the cells. The node therefore bounds
