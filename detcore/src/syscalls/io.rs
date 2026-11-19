@@ -5024,6 +5024,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into_iter()
             .collect();
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        if self.audit_send_outside_turn(guest, call.fd(), call) {
+            return Self::audit_send_refused(
+                guest,
+                Sysno::sendmsg,
+                "guest NETLINK_AUDIT send would execute outside the caller's turn, \
+                 where its bytes cannot be classified before delivery"
+                    .to_owned(),
+            );
+        }
+        if self.netlink_audit_fd(guest, call.fd()) {
+            let datagrams = Self::msg_iov_datagrams(guest, &headers)?;
+            if let Some(refusal) =
+                self.audit_write_refusal(guest, call.fd(), Sysno::sendmsg, &datagrams)
+            {
+                return refusal;
+            }
+        }
         // The placeholder descriptions it sends, counted in flight, and what
         // each attempt checks again, or its refusal by name
         // (`Detcore::inspect_placeholder_send`).
@@ -5793,6 +5810,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        if self.audit_send_outside_turn(guest, call.sockfd(), call) {
+            return Self::audit_send_refused(
+                guest,
+                Sysno::sendmmsg,
+                "guest NETLINK_AUDIT send would execute outside the caller's turn, \
+                 where its bytes cannot be classified before delivery"
+                    .to_owned(),
+            );
+        }
+        if self.netlink_audit_fd(guest, call.sockfd()) {
+            let datagrams = Self::msg_iov_datagrams(guest, &headers)?;
+            if let Some(refusal) =
+                self.audit_write_refusal(guest, call.sockfd(), Sysno::sendmmsg, &datagrams)
+            {
+                return refusal;
+            }
+        }
         // A placeholder sent in a batch is refused by name: which of its
         // messages the batch sent is not known (`descriptor_directory`). Each
         // attempt checks again that the batch passes none.
@@ -6130,7 +6164,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.cfg.virtualize_metadata
             && guest
                 .thread_state()
-                .with_detfd(fd, |detfd| detfd.is_sock_diag() || detfd.is_netlink_route())
+                .with_detfd(fd, |detfd| {
+                    detfd.is_sock_diag() || detfd.is_netlink_route() || detfd.is_netlink_audit()
+                })
                 .unwrap_or(false)
     }
 
@@ -6143,9 +6179,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             .unwrap_or(false)
     }
 
+    /// Whether this descriptor is a `NETLINK_AUDIT` socket. Unlike the reply
+    /// predicate above this is not gated on `virtualize_metadata`: the flag
+    /// also drives write containment (audit writes address the *host* audit
+    /// subsystem), which must hold whether or not replies are virtualized.
+    pub(crate) fn netlink_audit_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.is_netlink_audit())
+            .unwrap_or(false)
+    }
+
     /// Read an `iovec` array out of guest memory as plain `(address, capacity)`
     /// scalars, so no non-`Send` raw pointer is held across an await.
-    fn read_iov_segments<G: Guest<Self>>(
+    pub(crate) fn read_iov_segments<G: Guest<Self>>(
         guest: &mut G,
         iov: usize,
         iovlen: usize,
@@ -6164,6 +6211,160 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .map(|iov| (iov.iov_base as usize, iov.iov_len))
             .collect())
+    }
+
+    /// The `msg_iov` segments of every message header in `headers`, one
+    /// segment list per datagram (`sendmsg`'s one header, or each
+    /// `mmsghdr` of a `sendmmsg` batch, whose first field is the
+    /// `msghdr`). Boundaries are preserved: the kernel parses each
+    /// datagram independently, so classification must too.
+    fn msg_iov_datagrams<G: Guest<Self>>(
+        guest: &mut G,
+        headers: &[usize],
+    ) -> Result<Vec<Vec<(usize, usize)>>, Error> {
+        let mut datagrams = Vec::with_capacity(headers.len());
+        for &header in headers {
+            let address: AddrMut<'_, Msghdr> = AddrMut::from_raw(header).ok_or(Errno::EFAULT)?;
+            let message: Msghdr = guest.memory().read_value(address)?;
+            datagrams.push(Self::read_iov_segments(
+                guest,
+                message.msg_iov as usize,
+                message.msg_iovlen,
+            )?);
+        }
+        Ok(datagrams)
+    }
+
+    /// Refuse, by name, an outgoing `NETLINK_AUDIT` message that would act
+    /// on the *host* kernel's audit subsystem (see `crate::netlink_audit`).
+    /// Returns the refusal to hand the guest, or `None` when the send may
+    /// proceed: every non-audit descriptor, and audit requests that only
+    /// read. `datagrams` is one segment list per datagram (one entry
+    /// except for `sendmmsg`); each is classified on its own, as the
+    /// kernel parses each skb on its own.
+    ///
+    /// The refusal is a direct, deterministic `EPERM` in every mode,
+    /// named in the log: an audit write is serviceable in principle
+    /// (Linux answers it, with `-EPERM` for an unprivileged sender), so
+    /// the unsupported-operation policy, whose fail-closed arm ends the
+    /// run, is the wrong vehicle. Linux delivers that `-EPERM` as an
+    /// `NLMSG_ERROR` ack on a successful send; Detcore cannot queue the
+    /// ack on the host socket, so it surfaces as the send's own errno
+    /// instead -- same answer, different shape. A datagram too large to
+    /// inspect is refused as unclassifiable: no audit *request*
+    /// approaches the limit, and an uninspected tail could carry a write.
+    ///
+    /// Classification reads guest memory once, at handler entry. Sends
+    /// that would execute outside the caller's turn are refused by the
+    /// callers first (`audit_send_outside_turn`), on every guarded entry
+    /// point, so no first attempt delivers bytes this snapshot did not
+    /// classify. Two residuals remain, named rather than hidden: a
+    /// nonblocking-retry poll after `EAGAIN` re-imports guest memory on
+    /// its later attempts without reclassification (binding every
+    /// attempt would take the placeholder machinery's per-attempt
+    /// re-inspection, which this guard does not join), and without
+    /// sequentialized threads there is no turn to hold at all, the same
+    /// residual the placeholder-send inspection (io.rs
+    /// `inspect_send_placeholders`) accepts.
+    pub(crate) fn audit_write_refusal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        sysno: Sysno,
+        datagrams: &[Vec<(usize, usize)>],
+    ) -> Option<Result<i64, Error>> {
+        if !self.netlink_audit_fd(guest, fd) {
+            return None;
+        }
+        const AUDIT_SEND_INSPECT_LIMIT: usize = 64 * 1024;
+        let mut gathered: Vec<Vec<u8>> = Vec::with_capacity(datagrams.len());
+        for segments in datagrams {
+            let total: usize = segments
+                .iter()
+                .fold(0usize, |total, &(_, len)| total.saturating_add(len));
+            if total > AUDIT_SEND_INSPECT_LIMIT {
+                return Some(Self::audit_send_refused(
+                    guest,
+                    sysno,
+                    format!(
+                        "guest NETLINK_AUDIT datagram of {total} bytes exceeds the \
+                         {AUDIT_SEND_INSPECT_LIMIT}-byte inspection limit and cannot be \
+                         classified as read-only"
+                    ),
+                ));
+            }
+            let mut bytes = Vec::with_capacity(total);
+            for &(base, len) in segments {
+                if base == 0 || len == 0 {
+                    continue;
+                }
+                let address: AddrMut<'_, u8> = match AddrMut::from_raw(base) {
+                    Some(address) => address,
+                    None => return Some(Err(Errno::EFAULT.into())),
+                };
+                let mut segment = vec![0u8; len];
+                if let Err(error) = guest.memory().read_exact(address, &mut segment) {
+                    return Some(Err(error.into()));
+                }
+                bytes.extend_from_slice(&segment);
+            }
+            gathered.push(bytes);
+        }
+        let msg_type =
+            crate::netlink_audit::audit_sends_mutating_type(gathered.iter().map(Vec::as_slice))?;
+        Some(Self::audit_send_refused(
+            guest,
+            sysno,
+            format!(
+                "guest audit request type {msg_type} would act on the host kernel's \
+                 audit subsystem; audit writes are refused by name, not forwarded"
+            ),
+        ))
+    }
+
+    /// An audit-write refusal: named in the log, `EPERM` to the guest in
+    /// every execution mode.
+    pub(crate) fn audit_send_refused<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: Sysno,
+        reason: String,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        tracing::warn!("[dtid {dettid}] {sysno}: {reason}");
+        Err(Errno::EPERM.into())
+    }
+
+    /// Whether a send of `call` to an audit-flagged descriptor must be
+    /// refused without inspecting its bytes: it would execute outside the
+    /// caller's turn, where another guest thread could rewrite the buffer
+    /// between classification and the kernel reading it. Decided exactly
+    /// as the placeholder-send inspection decides its own `outside_turn`
+    /// (io.rs `inspect_send_placeholders`), and deliberately uniform
+    /// across record and replay: refusal makes no record/replay-tool
+    /// call in either mode, so record and replay inject identically. A
+    /// replay exemption would be unsound anyway -- `sendmmsg` is served
+    /// by neither recorder nor replayer (`replay_serves_socket_call_from_log`
+    /// returns false for it, so it still executes live in replay) -- and
+    /// for the log-served calls it would make replay consume a recording
+    /// entry that a refused-at-record send never wrote. Without
+    /// sequentialized threads there is no turn, that mode's named
+    /// residual, and this returns false. The price in record mode is
+    /// uniformity: every audit send on an external descriptor runs
+    /// outside the turn there, read-only `AUDIT_GET` included, so record
+    /// mode refuses audit sends outright rather than classify bytes
+    /// another thread can still rewrite. The same uninspected refusal
+    /// also precedes any `EFAULT` Linux would give a malformed send on
+    /// an audit descriptor in those configurations -- errno precedence
+    /// deviation, named like the ack-shape one above; a faulting
+    /// datagram is never queued either way.
+    pub(crate) fn audit_send_outside_turn<G, C>(&self, guest: &mut G, fd: RawFd, call: C) -> bool
+    where
+        G: Guest<Self>,
+        C: NonblockableSyscall + Into<Syscall> + Copy,
+    {
+        self.cfg.sequentialize_threads
+            && self.netlink_audit_fd(guest, fd)
+            && self.nonblockable_call_runs_outside_turn(guest, call)
     }
 
     /// Canonicalize host-assigned identities in a `NETLINK_SOCK_DIAG` reply that
@@ -6208,11 +6409,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             remaining -= take;
         }
 
-        // NETLINK_ROUTE and NETLINK_SOCK_DIAG replies need different
-        // sanitizers: one zeroes live interface counters, the other determinizes
-        // supported socket identities. The descriptor decides which, so a guest
-        // holding both kinds of socket gets each handled correctly.
-        let modified = if self.netlink_route_reply_fd(guest, fd) {
+        // Each flagged netlink protocol needs its own sanitizer: route
+        // zeroes live interface counters, sock-diag determinizes supported
+        // socket identities, audit zeroes the host audit subsystem's live
+        // counters. The descriptor decides which, so a guest holding
+        // several kinds of socket gets each handled correctly.
+        let modified = if self.netlink_audit_fd(guest, fd) {
+            crate::netlink_audit::sanitize_audit_reply(&mut buffer)
+        } else if self.netlink_route_reply_fd(guest, fd) {
             crate::netlink_route::sanitize_route_link_stats(&mut buffer)
         } else {
             crate::sock_diag::sanitize_sock_diag_identities(&mut buffer)

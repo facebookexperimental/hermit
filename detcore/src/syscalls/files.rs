@@ -11922,6 +11922,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .write_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
         }
+        if self.audit_send_outside_turn(guest, call.fd(), call) {
+            return Self::audit_send_refused(
+                guest,
+                Sysno::write,
+                "guest NETLINK_AUDIT send would execute outside the caller's turn, \
+                 where its bytes cannot be classified before delivery"
+                    .to_owned(),
+            );
+        }
+        if let Some(refusal) = self.audit_write_refusal(
+            guest,
+            call.fd(),
+            Sysno::write,
+            &[vec![(call.buf().map_or(0, |buf| buf.as_raw()), call.len())]],
+        ) {
+            return refusal;
+        }
 
         if call.len() > 0 {
             self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Reader)
@@ -12143,6 +12160,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.require_timer_slack_access(guest, call.fd(), true)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
+        }
+        if self.audit_send_outside_turn(guest, call.fd(), call) {
+            return Self::audit_send_refused(
+                guest,
+                Sysno::writev,
+                "guest NETLINK_AUDIT send would execute outside the caller's turn, \
+                 where its bytes cannot be classified before delivery"
+                    .to_owned(),
+            );
+        }
+        if self.netlink_audit_fd(guest, call.fd()) {
+            let segments = Self::read_iov_segments(
+                guest,
+                call.iov().map(|iov| iov.as_raw()).unwrap_or(0),
+                call.len(),
+            )?;
+            if let Some(refusal) =
+                self.audit_write_refusal(guest, call.fd(), Sysno::writev, &[segments])
+            {
+                return refusal;
+            }
         }
 
         self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Reader)
@@ -17453,10 +17491,11 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
-    /// Flag `AF_NETLINK`/`NETLINK_SOCK_DIAG` sockets so `handle_recvmsg`
-    /// determinizes the socket inode numbers carried by their binary dump
-    /// replies (see `crate::sock_diag`). Best-effort: if the descriptor lookup
-    /// fails the reply is simply left unsanitized.
+    /// Flag `AF_NETLINK` sockets whose binary replies carry host state --
+    /// `NETLINK_SOCK_DIAG` socket inode numbers (see `crate::sock_diag`),
+    /// `NETLINK_ROUTE` interface counters, `NETLINK_AUDIT` audit counters --
+    /// so the receive paths determinize them. Best-effort: if the descriptor
+    /// lookup fails the reply is simply left unsanitized.
     fn mark_sock_diag_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, call: &syscalls::Socket) {
         if call.family() != libc::AF_NETLINK {
             return;
@@ -17475,6 +17514,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let _ = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_netlink_route());
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // NETLINK_AUDIT status replies carry the host audit subsystem's
+        // live counters and the host auditd pid, and audit write requests
+        // instruct that host subsystem. `crate::netlink_audit` determinizes
+        // the replies; the send entry points refuse the writes by name.
+        if call.protocol() == libc::NETLINK_AUDIT {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_netlink_audit());
         }
     }
 

@@ -78,6 +78,7 @@ pub mod logdiff;
 pub mod machine;
 mod memory;
 pub mod native_exec;
+pub mod netlink_audit;
 pub mod netlink_route;
 pub mod nonwaiting_write;
 mod page;
@@ -7729,6 +7730,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         } else {
                             Err(Error::Errno(Errno::EINVAL))
                         }
+                    } else if let Syscall::Splice(splice) = call
+                        && (self.netlink_audit_fd(guest, splice.fd_in())
+                            || self.netlink_audit_fd(guest, splice.fd_out()))
+                    {
+                        // A forwarded splice neither classifies audit writes
+                        // nor sanitizes audit replies, so the compatibility
+                        // opt-out must not carry one through an audit socket
+                        // (crate::netlink_audit).
+                        tracing::warn!(
+                            "[dtid {}] splice: guest NETLINK_AUDIT splice refused by name; \
+                             a forwarded splice bypasses audit classification and sanitization",
+                            guest.thread_state().dettid
+                        );
+                        Err(Error::Errno(Errno::EPERM))
                     } else {
                         // A splice/tee FROM a procfs snapshot descriptor
                         // would copy live kernel bytes, bypassing the
@@ -8547,7 +8562,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             s.addr().is_some() && s.addr_len() != 0,
                             s.flags() & libc::MSG_OOB as u32 != 0,
                         );
-                        let result = self.handle_sendrecv(guest, s).await;
+                        let result = if self.audit_send_outside_turn(guest, s.fd(), s) {
+                            Self::audit_send_refused(
+                                guest,
+                                Sysno::sendto,
+                                "guest NETLINK_AUDIT send would execute outside the \
+                                 caller's turn, where its bytes cannot be classified \
+                                 before delivery"
+                                    .to_owned(),
+                            )
+                        } else {
+                            match self.audit_write_refusal(
+                                guest,
+                                s.fd(),
+                                Sysno::sendto,
+                                &[vec![(s.buf().map_or(0, |buf| buf.as_raw()), s.size())]],
+                            ) {
+                                Some(refusal) => refusal,
+                                None => self.handle_sendrecv(guest, s).await,
+                            }
+                        };
                         self.note_send_without_control(guest, send, &result);
                         result
                     }

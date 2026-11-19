@@ -1068,6 +1068,10 @@ struct OpenFileDescription {
     /// replies carry live interface counters that must be zeroed (see
     /// `crate::netlink_route`).
     netlink_route: bool,
+    /// Whether this open file is a `NETLINK_AUDIT` socket whose status
+    /// replies carry the host audit subsystem's live counters and whose
+    /// write requests address that subsystem (see `crate::netlink_audit`).
+    netlink_audit: bool,
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
@@ -1406,6 +1410,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("socket_receive_timestamp", &self.socket_receive_timestamp);
         debug.field("sock_diag", &self.sock_diag);
         debug.field("netlink_route", &self.netlink_route);
+        debug.field("netlink_audit", &self.netlink_audit);
         debug.field("loopback_peer", &self.loopback_peer);
         debug.field("network_channel", &self.network_channel);
         debug.field("network_lowat", &self.network_lowat);
@@ -1795,6 +1800,7 @@ impl DetFd {
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 netlink_route: false,
+                netlink_audit: false,
                 loopback_peer: false,
                 network_channel: false,
                 network_lowat: None,
@@ -3076,6 +3082,20 @@ impl DetFd {
     /// replies carry live interface counters.
     pub(crate) fn is_netlink_route(&self) -> bool {
         self.with_description(|d| d.netlink_route)
+    }
+
+    /// Mark this open file as a `NETLINK_AUDIT` socket. Like
+    /// `set_netlink_route` this applies to the open file description, so a
+    /// dup or fork alias of the same socket is covered too.
+    pub(crate) fn set_netlink_audit(&self) {
+        self.with_description(|d| d.netlink_audit = true);
+    }
+
+    /// Whether this open file is a `NETLINK_AUDIT` socket whose status
+    /// replies carry host audit counters and whose write requests address
+    /// the host audit subsystem.
+    pub(crate) fn is_netlink_audit(&self) -> bool {
+        self.with_description(|d| d.netlink_audit)
     }
 
     /// Update whether this open file is connected to a loopback peer.
