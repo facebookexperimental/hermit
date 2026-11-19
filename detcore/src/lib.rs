@@ -932,6 +932,24 @@ fn kept_timer_schedule(
     }
 }
 
+/// The timer `keep_timer_across_dropped_signal` arms at clock value `now` for
+/// `kept`, leaving the thread's armed offset and last timer as that timer's:
+/// a timer armed again for the same point keeps both. One re-armed inside its
+/// steps (one branch) takes no steps, so it has no offset, and the batch it
+/// ends records none (`update_logical_time_rcbs`); its point is one branch
+/// past `now`, so the next handler's overshoot check measures against it and
+/// does not report again the overshoot this stop has reported.
+fn rearm_kept_timer<T>(thread: &mut ThreadState<T>, kept: KeptTimer, now: u64) -> TimerSchedule {
+    match kept {
+        KeptTimer::Rearm(schedule) => schedule,
+        KeptTimer::InsideOffset { .. } => {
+            thread.armed_instruction_offset = None;
+            thread.last_rcb_timer = Some(now + 1 - thread.committed_clock_value);
+            TimerSchedule::Rcbs(1)
+        }
+    }
+}
+
 fn choose_rcb_timer(
     max_rcbs_remaining: u64,
     current_rcbs: u64,
@@ -3338,24 +3356,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         // unpreempted, so it fails closed, as every handler's clock read does.
         let now = guest.read_clock().expect("Couldn't read clock");
         assert!(thread_state_committed <= now);
-        let schedule = match kept_timer_schedule(thread_state_committed, armed, armed_offset, now) {
-            KeptTimer::Rearm(schedule) => schedule,
-            // The host-timed stop came during the steps toward the delivery
-            // point, and how many had run is not known here, so the event
-            // cannot be placed where the guest alone decides. Fail closed
-            // with the retryable marker, as a late PMU interrupt does.
-            KeptTimer::InsideOffset { target } => {
-                report_rcb_overshoot(
-                    self.cfg.panic_on_rcb_overshoot,
-                    guest.tid(),
-                    target,
-                    now,
-                    now - thread_state_committed,
-                    target - thread_state_committed,
-                );
-                TimerSchedule::Rcbs(1)
-            }
-        };
+        let kept = kept_timer_schedule(thread_state_committed, armed, armed_offset, now);
+        // The host-timed stop came during the steps toward the delivery
+        // point, and how many had run is not known here, so the event
+        // cannot be placed where the guest alone decides. Fail closed
+        // with the retryable marker, as a late PMU interrupt does.
+        if let KeptTimer::InsideOffset { target } = kept {
+            report_rcb_overshoot(
+                self.cfg.panic_on_rcb_overshoot,
+                guest.tid(),
+                target,
+                now,
+                now - thread_state_committed,
+                target - thread_state_committed,
+            );
+        }
+        let schedule = rearm_kept_timer(guest.thread_state_mut(), kept, now);
         let armed = if guest.config().imprecise_timers {
             guest.set_timer(schedule)
         } else {
@@ -10455,11 +10471,14 @@ mod rcb_overshoot_tests {
     use tracing::span::Record;
     use tracing::subscriber::with_default;
 
+    use super::Config;
     use super::InstructionOffset;
     use super::KeptTimer;
     use super::ReplayTimer;
+    use super::ThreadState;
     use super::kept_timer_schedule;
     use super::rcb_timer_overshot;
+    use super::rearm_kept_timer;
     use super::replay_timer_target;
     use super::report_rcb_overshoot;
 
@@ -10649,6 +10668,42 @@ mod rcb_overshoot_tests {
             kept_timer_schedule(100, 50, None, 151),
             KeptTimer::Rearm(TimerSchedule::Rcbs(1))
         ));
+    }
+
+    /// The thread's armed offset and last timer after a dropped signal's
+    /// stop are the re-armed timer's: armed again for the same target and
+    /// steps, it keeps both; re-armed inside its steps, for one branch and no
+    /// steps, it has no offset, so the batch that timer ends records none,
+    /// takes no step-precise event and gets no step allowance, and its last
+    /// timer is the one branch it is armed for. Before, the stale offset
+    /// stayed on the one-branch timer.
+    #[test]
+    fn a_kept_timer_rearmed_inside_its_steps_leaves_no_armed_offset() {
+        let offset = InstructionOffset {
+            rcb_target: 150,
+            instructions: 3,
+        };
+        let config = Config::default();
+        let mut thread = ThreadState::new(crate::types::DetPid::from_raw(3), &config, ());
+        thread.committed_clock_value = 100;
+        thread.last_rcb_timer = Some(50);
+        thread.armed_instruction_offset = Some(offset);
+        let kept = kept_timer_schedule(100, 50, Some(offset), 120);
+        assert!(matches!(
+            rearm_kept_timer(&mut thread, kept, 120),
+            TimerSchedule::RcbsAndInstructions(30, 3)
+        ));
+        assert_eq!(thread.armed_instruction_offset, Some(offset));
+        assert_eq!(thread.last_rcb_timer, Some(50));
+        let kept = kept_timer_schedule(100, 50, Some(offset), 152);
+        assert!(matches!(
+            rearm_kept_timer(&mut thread, kept, 152),
+            TimerSchedule::Rcbs(1)
+        ));
+        assert_eq!(thread.armed_instruction_offset, None);
+        // The one-branch timer's point, 153, is 53 branches past the clock
+        // value of the last handler.
+        assert_eq!(thread.last_rcb_timer, Some(53));
     }
 
     /// A replayed timeslice with a recorded offset is armed at the recorded

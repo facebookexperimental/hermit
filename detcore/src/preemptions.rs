@@ -4419,6 +4419,51 @@ mod tests {
         assert!(std::panic::catch_unwind(|| read_trace(&path)).is_err());
     }
 
+    /// A slice-boundary writer refuses an instruction offset in an event as in
+    /// a row: `--chaos-instruction-offset` refuses
+    /// `--strict-schedule-boundaries`, and the reader takes a slice-boundary
+    /// recording holding one for malformed, so the writer never writes one.
+    /// The same event without an offset is written.
+    #[test]
+    fn a_slice_boundary_writer_refuses_instruction_offsets_in_events_and_rows() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let refusal = |result: std::thread::Result<()>| {
+            let payload = result.expect_err("the writer must refuse the offset");
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| message.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap()
+        };
+        let event = std::panic::catch_unwind(|| {
+            let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+            writer.insert_schedevent(
+                SchedEvent::branches(tid, 1).with_instruction_offset(Some(offset)),
+            );
+        });
+        assert!(refusal(event).contains("slice-boundary protocol refuses instruction offsets"));
+        let row = std::panic::catch_unwind(|| {
+            let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(100),
+                10,
+                DEFAULT_PRIORITY,
+                20,
+                Some(offset),
+            );
+        });
+        assert!(refusal(row).contains("slice-boundary protocol refuses instruction offsets"));
+        let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+        writer.insert_schedevent(SchedEvent::branches(tid, 1));
+        assert_eq!(writer.boundary_records.as_ref().map(Vec::len), Some(1));
+    }
+
     #[test]
     fn bounded_summary_validates_boundaries_without_writing_or_retrying_on_drop() {
         let directory = tempfile::tempdir().unwrap();
@@ -7966,6 +8011,13 @@ impl PreemptionWriter {
             assert!(
                 ev.count > 0,
                 "slice-boundary protocol refuses zero-count events"
+            );
+            // --chaos-instruction-offset refuses --strict-schedule-boundaries,
+            // and a slice-boundary recording holding one is malformed
+            // (`BoundaryRecording::new`).
+            assert!(
+                ev.instruction_offset.is_none(),
+                "slice-boundary protocol refuses instruction offsets"
             );
             records.push(detcore_model::schedule::boundary::Record::Event(ev));
             return;

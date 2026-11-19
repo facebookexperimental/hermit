@@ -589,6 +589,59 @@ fn dropped_signal_rearms_only_an_available_timer_without_accounting() {
     }
 }
 
+/// A dropped signal's stop during the steps of a timer armed past its branch
+/// target (`--chaos-instruction-offset`) reports the overshoot once, by
+/// default (`panic_on_rcb_overshoot` off) as a retryable report, and re-arms
+/// one branch with no armed offset. That timer is the thread's last timer, so
+/// when it fires on time the next handler's overshoot check does not report
+/// the same thread and target again: one report, one event. With the offset
+/// cleared and the last timer left at the old point, that check reported the
+/// overshoot a second time; with the stale offset kept, the one-branch timer
+/// carried it.
+#[test]
+fn a_dropped_signal_inside_an_offsets_steps_reports_its_overshoot_once() {
+    let _lock = crate::skid_overshoots::tests::lock_global_skid_overshoots();
+    let _ = crate::skid_overshoots::take_skid_overshoots();
+    let mut config = Config::parse_from(["detcore"]);
+    config.sequentialize_threads = true;
+    config.backend.delivers_preemption_timer_events = true;
+    assert!(!config.panic_on_rcb_overshoot);
+    let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
+    let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
+    thread.detpid = Some(TID);
+    thread.next_timeslice(&config);
+    // The last handler armed 500 branches past 1_000, 3 steps past that
+    // target; the stop comes 2 branches into the steps.
+    thread.committed_clock_value = 1_000;
+    thread.last_rcb_timer = Some(500);
+    thread.armed_instruction_offset = Some(crate::resources::InstructionOffset {
+        rcb_target: 1_500,
+        instructions: 3,
+    });
+    let mut guest = ClockGuest {
+        config,
+        thread,
+        raw: 1_502,
+        reads: 0,
+        records: Mutex::new(Vec::new()),
+        precise_timers: Vec::new(),
+        imprecise_timers: Vec::new(),
+        rpc_state: None,
+    };
+    tool.keep_timer_across_dropped_signal(&mut guest);
+    assert_eq!(guest.precise_timers, vec![1]);
+    assert_eq!(guest.thread.armed_instruction_offset, None);
+    assert_eq!(guest.thread.last_rcb_timer, Some(503));
+    assert_eq!(guest.thread.committed_clock_value, 1_000);
+    // The one-branch timer fires on time, at 1_503.
+    guest.raw = 1_503;
+    futures::executor::block_on(tool.pre_handler_hook(&mut guest, false, CheckIn::Event));
+    assert_eq!(guest.thread.committed_clock_value, 1_503);
+    let (counts, details) = crate::skid_overshoots::take_skid_overshoots();
+    assert!(details.is_empty());
+    assert_eq!((counts.events, counts.reports), (1, 1));
+}
+
 #[tokio::test]
 async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer() {
     for delivers_timer in [false, true] {

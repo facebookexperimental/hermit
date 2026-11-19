@@ -1348,6 +1348,22 @@ fn reproducer_line(dir: Option<&str>, command: String) -> String {
 }
 
 impl AnalyzeOpts {
+    /// Checks, before any workspace or trial exists, the instruction offsets
+    /// `--chaos-instruction-offset` decides in the run arguments' chaos runs
+    /// and records in `recordings` (or in a record the run arguments replay).
+    /// Refuses (exit 122):
+    /// - a record of a newer format than this Hermit reads
+    ///   (`detcore::preemptions::RecordFormatRefusal`);
+    /// - a record whose rows hold offsets its schedule trace does not (written
+    ///   before schedule traces held them): the searches replay and splice
+    ///   schedule traces, and that one would stop each such slice at a branch;
+    /// - offsets, drawn or recorded, that the trials cannot stop at: off the
+    ///   ptrace backend, with imprecise timers (`--imprecise-search` too) or
+    ///   disabled ones, under `--no-rcb-time`, or on aarch64, as a
+    ///   `hermit run` replay refuses them (`instruction_offset_replay_refusal`).
+    ///
+    /// An analysis may combine recordings with offsets and without: each
+    /// event and each row carries its own offset or none, so a trial spliced
     /// from both replays each event as it was recorded. The default baseline,
     /// a run without chaos, never has any. (A `--run1-preemptions` analysis
     /// panics before its search on this base whatever it holds,
