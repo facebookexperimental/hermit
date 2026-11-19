@@ -649,7 +649,7 @@ pub const LIBC_V3_DETAIL: &str =
 /// Paths are read in the launch's view, as [`resolve_auto`] reads them:
 /// `program` is a host path, a script's interpreter and an absolute symlink
 /// target are guest paths mapped through `to_host`, and a relative target
-/// stays in its link's directory ([`followed_in_view`]). The C library is
+/// stays in its link's directory (`followed_in_view`). The C library is
 /// opened without blocking and without following a final link, and only a
 /// regular file is read, so a FIFO or a device there never makes auto wait.
 /// Nothing here refuses. A library that is absent, hidden, unreadable, not a

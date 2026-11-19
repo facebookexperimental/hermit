@@ -42,9 +42,9 @@ use crate::metadata::record_or_replay_config;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// Qualifies this host for replaying the recording in `dir`, in the calling
-/// process ([`qualified_host_facts`]). A caller that runs the replay in a
+/// process (`qualified_host_facts`). A caller that runs the replay in a
 /// container calls this before it forks the container, as `hermit replay` and
-/// a recording qualify: [`Replay::spawn`]'s own qualification then reuses this
+/// a recording qualify: `Replay::spawn`'s own qualification then reuses this
 /// process's ([`crate::cpu_profile_admission::admit`] qualifies once per
 /// process). Without it a host qualification cache miss runs the XINUSE probe
 /// inside the replay, whose log then holds the probe's lines and whose guest

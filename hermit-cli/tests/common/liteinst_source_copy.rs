@@ -869,13 +869,12 @@ fn path_transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
     // Failure path: the body error and the closing error both surface.
     let context = resolve(&copied, runner)?;
     io(fs::write(&role, &changed))?;
-    let body: Result<()> = Err("deliberate receipt-only body failure".into());
+    let body_error = "deliberate receipt-only body failure";
     let close = context.verify_unchanged(runner);
     io(fs::write(&role, &bytes))?;
     assert_eq!(io(fs::read(&role))?, bytes);
     let combined = format!(
-        "{}; compiled source transaction close failed: {}",
-        body.unwrap_err(),
+        "{body_error}; compiled source transaction close failed: {}",
         close.unwrap_err(),
     );
     assert!(

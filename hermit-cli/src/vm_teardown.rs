@@ -45,7 +45,7 @@
 //!   backend's synchronous destroy (the sink's duplicates close
 //!   locally, then the backend's own field drops are the last ones).
 //! - Adoption is bounded per adopting process: at most
-//!   [`MAX_IN_FLIGHT_BUNDLES`] unacknowledged bundles are outstanding
+//!   `MAX_IN_FLIGHT_BUNDLES` unacknowledged bundles are outstanding
 //!   from it, and adoption blocks past that. A bundle keeps one guest
 //!   memory's pinned pages alive, so an unbounded backlog would be
 //!   unbounded host memory; blocking degenerates to synchronous
