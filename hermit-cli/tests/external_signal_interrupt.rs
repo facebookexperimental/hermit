@@ -504,6 +504,14 @@ fn children_cpu() -> Duration {
 /// Hermit starts its own process group, or its own session as leader, so
 /// the tree is the cell). Walking `children` files costs O(tree); a full
 /// `/proc` scan every 50 ms measured more CPU than the cell itself.
+///
+/// Each live process contributes only its own utime+stime; waited-for
+/// descendant CPU (cutime+cstime) is taken at the root alone, whose
+/// cutime accumulates the whole tree's reaped CPU as exits propagate.
+/// Summing cutime at every ancestor instead counts a reaped descendant
+/// once per ancestor the walk reads after each reap — the walk is not
+/// atomic, and cell teardown cascades exits through it — which
+/// inflated the reading and tripped the CPU budget on healthy cells.
 fn pgid_cpu(root: u32) -> Duration {
     let clk_tck = {
         let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
@@ -527,7 +535,13 @@ fn pgid_cpu(root: u32) -> Duration {
             continue;
         }
         let parse = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok());
-        for i in [11, 12, 13, 14] {
+        // utime, stime for every process; cutime, cstime at the root only.
+        let fields = if pid == root {
+            [11, 12, 13, 14].as_slice()
+        } else {
+            [11, 12].as_slice()
+        };
+        for &i in fields {
             ticks = ticks.saturating_add(parse(i).unwrap_or(0));
         }
         if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
