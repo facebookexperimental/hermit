@@ -12829,8 +12829,8 @@ sys.exit(1 if failed else 0)
             (
                 "an x86-64-v3 admission refused for the host's XCR0",
                 row(
-                    "Error: --cpu-profile x86-64-v3 refused: XCR0 0x802ff enables components the \
-                     XINUSE probe does not cover (it covers 0x2ff)",
+                    "Error: --cpu-profile x86-64-v3 refused: XCR0 0x2ff enables components the \
+                     XINUSE probe does not cover (it covers 0x2e7)",
                 ),
             ),
             (

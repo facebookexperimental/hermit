@@ -57,11 +57,6 @@ branches from 0.5.0.
     between the attempts of its cell.
   - `hermit record start` and the library's launch functions are unchanged:
     x86-64-v2 unless the program declares x86-64-v3.
-  - Hosts whose XCR0 enables MPX (0x1f, 0x21f, 0xff, 0x2ff; Skylake-SP,
-    Cascade Lake and Cooper Lake, 0xff without PKU) now qualify for
-    x86-64-v3 when the startup probe passes there, where they were refused
-    before; default runs on bare-metal MPX hosts therefore present
-    x86-64-v3 instead of x86-64-v2 once the probe passes.
 - A glibc loader that aborts because the CPU lacks its x86-64 level
   ("Fatal glibc error: CPU does not support x86-64-v3", exit 127) is refused
   by name (exit 122) on the ptrace backend with virtual CPUID
