@@ -823,6 +823,581 @@
         }
       ]
     },
+    "futex": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1693,
+          "hash": "859c477feed16e25",
+          "id": "c1",
+          "last": 1693,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 4302,
+          "hash": "b25f86fbace0f785",
+          "id": "c10",
+          "last": 4314,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2151,
+          "hash": "663c77d392bf5e9c",
+          "id": "c11",
+          "last": 2160,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2163,
+          "hash": "4568e4e5bee3b04c",
+          "id": "c11",
+          "last": 2175,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2280,
+          "hash": "6bfd5fade7d227f7",
+          "id": "c11",
+          "last": 2291,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2316,
+          "hash": "10be7034a15fe2c0",
+          "id": "c12",
+          "last": 2327,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4068,
+          "hash": "662f35071774958b",
+          "id": "c13",
+          "last": 4074,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4095,
+          "hash": "d5a5ab427b42f7ff",
+          "id": "c13",
+          "last": 4111,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2260,
+          "hash": "4b664bcd41de3645",
+          "id": "c14",
+          "last": 2268,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2554,
+          "hash": "7144ba7686d9656b",
+          "id": "c14",
+          "last": 2585,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 4693,
+          "hash": "688969e66b120f88",
+          "id": "c15",
+          "last": 4712,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4726,
+          "hash": "a0168eaa8acd5ff7",
+          "id": "c15",
+          "last": 4731,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 11215,
+          "hash": "b86c15c942adf7db",
+          "id": "c16",
+          "last": 11231,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 4741,
+          "hash": "1bcf70280f690ece",
+          "id": "c17",
+          "last": 4777,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4817,
+          "hash": "c8cd42eaf3af444c",
+          "id": "c18",
+          "last": 4839,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4853,
+          "hash": "3f3c9cfe3ccd514e",
+          "id": "c18",
+          "last": 4893,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7776,
+          "hash": "df94ef34cbcd9267",
+          "id": "c18",
+          "last": 7801,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 9,
+          "hash": "91b9e9077eb55910",
+          "id": "c19",
+          "last": 37,
+          "path": "detcore/src/syscalls/pi_futex.rs"
+        },
+        {
+          "first": 8207,
+          "hash": "d2d3c094d795864e",
+          "id": "c2",
+          "last": 8207,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 157,
+          "hash": "b2e73df977d52d1a",
+          "id": "c20",
+          "last": 245,
+          "path": "detcore/src/syscalls/pi_futex.rs"
+        },
+        {
+          "first": 11536,
+          "hash": "c487e91b0a9a41f8",
+          "id": "c20",
+          "last": 11558,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 4645,
+          "hash": "7490c5e68fe63bbd",
+          "id": "c21",
+          "last": 4674,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 9,
+          "hash": "c801b8a2a49a4044",
+          "id": "c22",
+          "last": 23,
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "first": 47,
+          "hash": "1d76e41bfc68e48b",
+          "id": "c23",
+          "last": 55,
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "first": 79,
+          "hash": "7b3e52598c7286b0",
+          "id": "c23",
+          "last": 92,
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "first": 1063,
+          "hash": "3f9c8ca5a71c8b2c",
+          "id": "c24",
+          "last": 1075,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 7677,
+          "hash": "13820a398b0d0694",
+          "id": "c25",
+          "last": 7684,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 7419,
+          "hash": "22ee28df59d55410",
+          "id": "c26",
+          "last": 7445,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4491,
+          "hash": "450d2e0c323c71f6",
+          "id": "c26",
+          "last": 4491,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4851,
+          "hash": "de0ebb2237d48c24",
+          "id": "c26",
+          "last": 4852,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 8539,
+          "hash": "0c130f2386c67cc1",
+          "id": "c27",
+          "last": 8548,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 7306,
+          "hash": "0e361333065acd2a",
+          "id": "c28",
+          "last": 7321,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4895,
+          "hash": "05bce7983edda7f2",
+          "id": "c29",
+          "last": 4914,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 3986,
+          "hash": "563834780797a477",
+          "id": "c3",
+          "last": 4005,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7575,
+          "hash": "033f9f16428a7023",
+          "id": "c30",
+          "last": 7587,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4517,
+          "hash": "e58942a8c185f099",
+          "id": "c31",
+          "last": 4540,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2890,
+          "hash": "a16849c150828a53",
+          "id": "c32",
+          "last": 2902,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2950,
+          "hash": "6c584be735292ee5",
+          "id": "c32",
+          "last": 2950,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4478,
+          "hash": "44a498262b851e21",
+          "id": "c33",
+          "last": 4482,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7341,
+          "hash": "597b4687c1b20694",
+          "id": "c33",
+          "last": 7342,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 227,
+          "hash": "710a099e77f5dd01",
+          "id": "c34",
+          "last": 245,
+          "path": "detcore/src/syscalls/pi_futex.rs"
+        },
+        {
+          "first": 11135,
+          "hash": "468fce0b02bf0eef",
+          "id": "c35",
+          "last": 11158,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 11208,
+          "hash": "d1f9a5ebbdafe462",
+          "id": "c35",
+          "last": 11214,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 196,
+          "hash": "b68f14b37346fca5",
+          "id": "c36",
+          "last": 209,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 107,
+          "hash": "16ab62b7063c5855",
+          "id": "c36",
+          "last": 113,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 7185,
+          "hash": "37dabb093f4f456d",
+          "id": "c37",
+          "last": 7198,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7928,
+          "hash": "a905ad86f5750326",
+          "id": "c37",
+          "last": 7933,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2865,
+          "hash": "ce772002c3a36384",
+          "id": "c37",
+          "last": 2867,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2931,
+          "hash": "b87f2c66a0cb95ee",
+          "id": "c38",
+          "last": 2931,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4061,
+          "hash": "dd18729b57f7e601",
+          "id": "c39",
+          "last": 4065,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7240,
+          "hash": "7db243bd517e3fa0",
+          "id": "c4",
+          "last": 7257,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7107,
+          "hash": "5fa0358ecd813788",
+          "id": "c40",
+          "last": 7110,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7447,
+          "hash": "48f75ecfb7cbb137",
+          "id": "c41",
+          "last": 7474,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7478,
+          "hash": "cb27c4d9fe39f995",
+          "id": "c41",
+          "last": 7493,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7534,
+          "hash": "55802ed3e75b9395",
+          "id": "c41",
+          "last": 7563,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 7261,
+          "hash": "45fbb1b1506c2fa9",
+          "id": "c42",
+          "last": 7270,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 441,
+          "hash": "8f30b4feaeb64fe8",
+          "id": "c43",
+          "last": 452,
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "first": 187,
+          "hash": "0b42eea1d8ce9ab6",
+          "id": "c43",
+          "last": 200,
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "first": 11629,
+          "hash": "7874340bd526e7a7",
+          "id": "c44",
+          "last": 11668,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 11688,
+          "hash": "87144f7a94195791",
+          "id": "c44",
+          "last": 11734,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 247,
+          "hash": "7926010d4edf2e01",
+          "id": "c44",
+          "last": 260,
+          "path": "detcore/src/syscalls/pi_futex.rs"
+        },
+        {
+          "first": 11301,
+          "hash": "a4703e0ee87409c9",
+          "id": "c45",
+          "last": 11334,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 4778,
+          "hash": "a6a2753a83467e5b",
+          "id": "c45",
+          "last": 4815,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4161,
+          "hash": "31da286ade218a53",
+          "id": "c46",
+          "last": 4169,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4406,
+          "hash": "a9509f5f04adf099",
+          "id": "c46",
+          "last": 4408,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4499,
+          "hash": "22650461671e8cfa",
+          "id": "c46",
+          "last": 4504,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4013,
+          "hash": "11c3bd985dfaa4cb",
+          "id": "c5",
+          "last": 4037,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4038,
+          "hash": "0e5ce8544eb8a41b",
+          "id": "c6",
+          "last": 4059,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4075,
+          "hash": "7243796792a80e8c",
+          "id": "c7",
+          "last": 4084,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4125,
+          "hash": "8b582a97ce3650e4",
+          "id": "c8",
+          "last": 4147,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 4150,
+          "hash": "a04f88aeee09442f",
+          "id": "c9",
+          "last": 4160,
+          "path": "detcore/src/syscalls/threads.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EAGAIN",
+        "EDEADLK",
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "EMULATE",
+        "ENOSYS",
+        "EOWNERDEAD",
+        "EPERM",
+        "ERESTART",
+        "ERESTARTNOHAND",
+        "ERESTARTNOINTR",
+        "ERESTARTSYS",
+        "ESRCH",
+        "ETIMEDOUT",
+        "EWOULDBLOCK",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "futex_commands_are_classified_as_linux_dispatches_them"
+          ],
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "names": [
+            "futex_deadlines_are_measured_as_linux_measures_them",
+            "absolute_futex_timeout_is_rebased_to_logical_time",
+            "absolute_futex_timeout_detects_host_and_logical_clock_domains"
+          ],
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "names": [
+            "kernel_restart_errno_matches_linux_restart_policy"
+          ],
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "names": [
+            "a_futex_wake_takes_the_longest_waiter_first",
+            "a_futex_wake_count_of_zero_or_below_wakes_one_waiter",
+            "futex_wake_bitset_only_selects_intersecting_waiters",
+            "a_futex_requeue_wakes_the_oldest_and_moves_the_next_in_order",
+            "futex_requeue_counts_follow_linux"
+          ],
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "names": [
+            "an_unowned_word_is_taken_keeping_only_owner_died",
+            "the_owner_locking_again_is_a_deadlock_whatever_else_holds",
+            "unlock_hands_the_lock_to_the_next_owner_or_clears_the_word"
+          ],
+          "path": "detcore/src/syscalls/pi_futex.rs"
+        },
+        {
+          "names": [
+            "one_held_mutex_with_a_waiter_is_marked_then_woken",
+            "a_pending_op_on_a_zero_word_wakes_without_marking_it_dead",
+            "a_pi_entry_is_marked_but_not_woken_during_a_walk"
+          ],
+          "path": "detcore/src/syscalls/robust_list.rs"
+        },
+        {
+          "names": [
+            "futex2_syscalls_are_determinized_and_consistent"
+          ],
+          "path": "detcore/src/syscall_classification.rs"
+        }
+      ]
+    },
     "getrandom": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
