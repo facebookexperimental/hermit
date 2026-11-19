@@ -15,9 +15,9 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-use super::OWN_PID_NAMESPACE;
 use super::assert_success;
 use super::hermit_test;
+use super::own_pid_namespace;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -57,7 +57,7 @@ fn run(mode: &str, kind: Run) -> Output {
     command.args(["--signal=TERM", "--kill-after=5s", "60s"]);
     match kind {
         Run::Native => {
-            command.arg("unshare").args(OWN_PID_NAMESPACE);
+            command.arg("unshare").args(own_pid_namespace());
         }
         Run::Namespace => {
             command.arg(hermit_test::hermit_binary());
@@ -65,7 +65,7 @@ fn run(mode: &str, kind: Run) -> Output {
         Run::Chosen => {
             command
                 .arg("unshare")
-                .args(OWN_PID_NAMESPACE)
+                .args(own_pid_namespace())
                 .arg(hermit_test::hermit_binary());
         }
     }

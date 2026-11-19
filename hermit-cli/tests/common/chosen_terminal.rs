@@ -15,9 +15,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use super::OWN_PID_NAMESPACE;
 use super::assert_success;
 use super::hermit_test;
+use super::own_pid_namespace;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -50,7 +50,7 @@ fn guest() -> &'static Path {
 fn run_control(mode: &str, expected: &str) {
     for chosen in [false, true] {
         let mut command = Command::new("unshare");
-        command.args(OWN_PID_NAMESPACE);
+        command.args(own_pid_namespace());
         if chosen {
             command.arg(env!("CARGO_BIN_EXE_hermit")).args([
                 "run",

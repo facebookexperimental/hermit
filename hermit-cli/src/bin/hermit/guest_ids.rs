@@ -68,7 +68,7 @@ pub(super) fn resolve(
     required: Option<Required<'_>>,
     strict: bool,
 ) -> Result<(GuestIds, Option<String>), Error> {
-    resolve_with(no_namespace, required, strict, &Host)
+    resolve_with(no_namespace, required, strict, &Host::default())
 }
 
 /// Whether this process may choose its guests' process IDs at all, as the
@@ -77,7 +77,7 @@ pub(super) fn resolve(
 /// replay one another's records and so need IDs that do not depend on the
 /// host.
 pub(super) fn may_choose_ids() -> Result<(), String> {
-    let host = Host;
+    let host = Host::default();
     let pid_max = host.pid_max()?;
     let cursor = host.cursor().unwrap_or(pid_max / 2).clamp(1, pid_max - 1);
     host.may_choose(cursor)
@@ -105,9 +105,10 @@ impl Required<'_> {
 trait HostIds {
     /// `/proc/sys/kernel/pid_max`.
     fn pid_max(&self) -> Result<i32, String>;
-    /// The IDs of every host task `/proc` shows: each process's threads.
-    fn taken(&self) -> BTreeSet<i32>;
-    /// What holds `id` on the host.
+    /// One ID in the window of `size` at `base` (clamped below `pid_max`)
+    /// that a task in this process's PID namespace already holds.
+    fn holder_in(&self, base: i32, size: i32, pid_max: i32) -> Option<i32>;
+    /// What holds `id` in this process's PID namespace.
     fn holder(&self, id: i32) -> String;
     /// Whether legacy clone validates its original exit signal before the
     /// chosen-ID conversion may replace that signal.
@@ -125,7 +126,100 @@ trait HostIds {
     fn reserve(&self, index: i32, size: i32) -> Result<(), String>;
 }
 
-struct Host;
+/// Whether the /proc this process reads names this process's own PID
+/// namespace, as Reverie's aligned-proc check decides it: the calling
+/// thread's NSpid has exactly one level, the caller's TID (a mounted proc
+/// of an enclosing namespace lists every level out to its own, and the
+/// outermost number can coincide with the caller's TID by chance, which a
+/// `/proc/self` readlink comparison would misread as aligned). Where a
+/// container or test runs Hermit in a fresh PID namespace under a /proc of
+/// the enclosing namespace (a fresh proc mount of its own may be refused
+/// where the host masks /proc entries with overmounts), /proc enumeration
+/// would name the enclosing namespace's tasks, whose numbers say nothing
+/// about which IDs `set_tid` finds free here. No NSpid line, or an
+/// unreadable status, counts as not aligned: the namespace-local probes
+/// below stay correct either way, only slower.
+///
+/// Reachability: under ptrace a misaligned run is refused later, with
+/// EXDEV, by Reverie's ownership proofs; this branch decides admission
+/// before that, and serves backends and admission consumers (analyze,
+/// bisect) that make no such proof.
+fn proc_names_own_pid_namespace() -> bool {
+    // SAFETY: gettid through the raw syscall has no preconditions.
+    let me = unsafe { libc::syscall(libc::SYS_gettid) };
+    let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") else {
+        return false;
+    };
+    let Some(levels) = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+    else {
+        return false;
+    };
+    let mut levels = levels.split_ascii_whitespace();
+    levels.next().is_some_and(|level| level.parse::<i64>() == Ok(me)) && levels.next().is_none()
+}
+
+/// Whether a task with ID `id` exists in this process's PID namespace:
+/// signal 0 performs the kernel's existence and permission checks without
+/// delivering a signal, in the caller's namespace whatever /proc is
+/// mounted. A zombie still exists, as in /proc. Anything but ESRCH (a
+/// permission or LSM denial of an existing task included) is existence.
+fn task_exists(id: i32) -> bool {
+    if id < 1 {
+        return false;
+    }
+    // SAFETY: signal 0 delivers nothing; it only reports ESRCH or a denial.
+    (unsafe { libc::kill(id, 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether ID `id` is held in this process's PID namespace by a task or
+/// only as a process-group ID (its leader exited, a member lives): the
+/// group form `kill(-id, 0)` finds the group no /proc listing shows, and
+/// `set_tid` refuses such an ID all the same.
+fn id_held(id: i32) -> bool {
+    if task_exists(id) {
+        return true;
+    }
+    if id < 2 {
+        return false;
+    }
+    // SAFETY: signal 0 delivers nothing; a negative pid names the group.
+    (unsafe { libc::kill(-id, 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[derive(Default)]
+struct Host {
+    /// Every task /proc shows, read once; only consulted where /proc names
+    /// this process's namespace (see [`proc_names_own_pid_namespace`]).
+    taken: std::sync::OnceLock<BTreeSet<i32>>,
+}
+
+impl Host {
+    fn taken(&self) -> &BTreeSet<i32> {
+        self.taken.get_or_init(|| {
+            let numbers = |dir: &str| {
+                std::fs::read_dir(dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                    .collect::<Vec<_>>()
+            };
+            numbers("/proc")
+                .into_iter()
+                .flat_map(|pid| {
+                    // A process that exits meanwhile still held its own ID.
+                    let mut tasks = numbers(&format!("/proc/{pid}/task"));
+                    tasks.push(pid);
+                    tasks
+                })
+                .collect()
+        })
+    }
+}
 
 impl HostIds for Host {
     fn pid_max(&self) -> Result<i32, String> {
@@ -136,28 +230,28 @@ impl HostIds for Host {
             .map_err(|error| format!("cannot parse /proc/sys/kernel/pid_max {text:?}: {error}"))
     }
 
-    fn taken(&self) -> BTreeSet<i32> {
-        let numbers = |dir: &str| {
-            std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-                .collect::<Vec<_>>()
-        };
-        numbers("/proc")
-            .into_iter()
-            .flat_map(|pid| {
-                // A process that exits meanwhile still held its own ID.
-                let mut tasks = numbers(&format!("/proc/{pid}/task"));
-                tasks.push(pid);
-                tasks
-            })
-            .collect()
+    fn holder_in(&self, base: i32, size: i32, pid_max: i32) -> Option<i32> {
+        let mut window = base..base.saturating_add(size).min(pid_max);
+        if proc_names_own_pid_namespace() {
+            self.taken()
+                .range(window.clone())
+                .next()
+                .copied()
+                // A process-group ID with no leader task is in no listing.
+                .or_else(|| window.find(|id| id_held(*id)))
+        } else {
+            window.find(|id| id_held(*id))
+        }
     }
 
     fn holder(&self, id: i32) -> String {
-        detcore::chosen_id_holder(id)
+        if proc_names_own_pid_namespace() {
+            detcore::chosen_id_holder(id)
+        } else {
+            // /proc names another namespace's task of this number, if any;
+            // the holder here can only be named by its ID.
+            format!("task {id} in Hermit's PID namespace")
+        }
     }
 
     fn legacy_clone_signal_validation(&self) -> Result<(), String> {
@@ -293,9 +387,8 @@ fn resolve_with(
     {
         return Ok((GuestIds::Host, Some(host_ids_warning(&cause))));
     }
-    let taken = host.taken();
     let window = |base: i32| base..base.saturating_add(size).min(pid_max);
-    let holder_in = |base: i32| taken.range(window(base)).next().copied();
+    let holder_in = |base: i32| host.holder_in(base, size, pid_max);
     if pid_base.is_some() || strict {
         let base = pid_base.unwrap_or(pid_max / 2);
         // Every window the run's first IDs fall in.
@@ -584,8 +677,9 @@ mod tests {
         fn pid_max(&self) -> Result<i32, String> {
             Ok(self.pid_max)
         }
-        fn taken(&self) -> BTreeSet<i32> {
-            self.taken.clone()
+        fn holder_in(&self, base: i32, size: i32, pid_max: i32) -> Option<i32> {
+            let window = base..base.saturating_add(size).min(pid_max);
+            self.taken.range(window).next().copied()
         }
         fn holder(&self, id: i32) -> String {
             format!("process {id} (sshd)")
@@ -615,6 +709,45 @@ mod tests {
                 ))
             }
         }
+    }
+
+    #[test]
+    fn task_existence_is_namespace_local() {
+        // This test process itself holds its ID in its own namespace.
+        assert!(task_exists(std::process::id() as i32));
+        assert!(!task_exists(0));
+        assert!(!task_exists(-1));
+        assert!(proc_names_own_pid_namespace());
+        // A reaped child holds nothing (an always-true probe fails here).
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn a child to reap");
+        let reaped = child.id() as i32;
+        child.wait().expect("reap the child");
+        assert!(!task_exists(reaped), "reaped child {reaped} still exists");
+        assert!(!id_held(reaped), "reaped child {reaped} still held");
+        // A process-group ID outlives its leader while a member lives:
+        // no task has the ID, and it is held all the same.
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & echo; wait"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a group leader");
+        let group = leader.id() as i32;
+        // The member exists once its leader has backgrounded it and said so.
+        let mut ready = std::io::BufReader::new(leader.stdout.take().unwrap());
+        assert_eq!(ready.read_line(&mut String::new()).unwrap(), 1);
+        assert!(id_held(group));
+        // SAFETY: signals the leader this test spawned.
+        assert_eq!(unsafe { libc::kill(group, libc::SIGKILL) }, 0);
+        leader.wait().expect("reap the group leader");
+        assert!(!task_exists(group), "leader {group} still a task");
+        assert!(id_held(group), "group {group} not held by its member");
+        // SAFETY: signals the leftover group this test created.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
     }
 
     fn chosen(base: i32, refuse_host_ids: bool) -> GuestIds {

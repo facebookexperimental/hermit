@@ -15423,13 +15423,18 @@ fn chosen_guest_ids_guest() -> &'static Path {
 }
 
 /// `hermit run --no-namespace <args> -- chosen_guest_ids <guest_args>` as
-/// the init of a new user and PID namespace with its own /proc, where it may
-/// choose process IDs without privilege on the host, and which no other task
-/// shares, so the IDs half of `pid_max` up are free.
-fn no_namespace_in_own_pid_namespace(args: &[&str], guest_args: &[&str]) -> Output {
+/// the init of a new user and PID namespace (`namespace` says whether with
+/// its own /proc), where it may choose process IDs without privilege on the
+/// host, and which no other task shares, so the IDs half of `pid_max` up are
+/// free.
+fn no_namespace_in_own_pid_namespace(
+    namespace: &[&str],
+    args: &[&str],
+    guest_args: &[&str],
+) -> Output {
     let mut command = Command::new("unshare");
     command
-        .args(OWN_PID_NAMESPACE)
+        .args(namespace)
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--no-namespace", "--base-env=minimal"])
         .args(args)
@@ -15440,10 +15445,10 @@ fn no_namespace_in_own_pid_namespace(args: &[&str], guest_args: &[&str]) -> Outp
     hermit_test::hermit_output(&label, &mut command)
 }
 
-fn native_chosen_ids_fixture(guest_args: &[&str]) -> Output {
+fn native_chosen_ids_fixture(namespace: &[&str], guest_args: &[&str]) -> Output {
     let mut command = Command::new("unshare");
     command
-        .args(OWN_PID_NAMESPACE)
+        .args(namespace)
         .arg(chosen_guest_ids_guest())
         .args(guest_args);
     let label = format!("native {command:?}");
@@ -15488,7 +15493,7 @@ fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() 
         ("proc", "copied"),
     ] {
         let guest_args = ["cw-neighbor", capability, table];
-        let native = native_chosen_ids_fixture(&guest_args);
+        let native = native_chosen_ids_fixture(own_pid_namespace(), &guest_args);
         assert_success(&native, &guest_args);
         // The native helper is PID 1 in its own fresh PID namespace; this
         // fixture creates exactly two children and no threads or helper tasks.
@@ -15499,8 +15504,11 @@ fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() 
             stderr(&native)
         );
 
-        let chosen =
-            no_namespace_in_own_pid_namespace(&["--pid-base=5000", "--summary"], &guest_args);
+        let chosen = no_namespace_in_own_pid_namespace(
+            own_pid_namespace(),
+            &["--pid-base=5000", "--summary"],
+            &guest_args,
+        );
         assert_success(&chosen, &guest_args);
         assert_eq!(
             stdout(&chosen),
@@ -15517,7 +15525,8 @@ fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() 
     let guest_args = ["cw-neighbor", "proc", "shared"];
     // Automatic Chosen remains supported without an explicit base. Require
     // the reported base and exact creation-order offsets, never host fallback.
-    let automatic = no_namespace_in_own_pid_namespace(&["--summary"], &guest_args);
+    let automatic =
+        no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--summary"], &guest_args);
     assert_success(&automatic, &guest_args);
     let base = value(&automatic, "first process ");
     assert!(base > 0);
@@ -15568,7 +15577,7 @@ fn no_namespace_with_external_id_holder_mode(args: &[&str], mode: &str) -> Outpu
     let ack = directory.path().join("ack");
     let mut command = Command::new("unshare");
     command
-        .args(OWN_PID_NAMESPACE)
+        .args(own_pid_namespace())
         .arg(chosen_guest_ids_guest())
         .arg("external-holder")
         .arg(&request)
@@ -15599,6 +15608,42 @@ const OWN_PID_NAMESPACE: [&str; 7] = [
     "--net",
 ];
 
+/// [`OWN_PID_NAMESPACE`] without a new user namespace, for a test process
+/// that already holds CAP_SYS_ADMIN in its user namespace (a root test user
+/// in a CI job namespace). Hosts that mask /proc entries with overmounts (CI
+/// hosts masking `kmsg` and `boot_id`) lock those mounts into every
+/// descendant user namespace, where the kernel then refuses any fresh proc
+/// mount (`mount_too_revealing`), so the `--user` form cannot start there at
+/// all; in the mask's own user namespace the masks are ordinary child mounts
+/// and a fresh proc mounts. An inherited /proc is no substitute: Reverie's
+/// ptrace ownership proofs refuse a /proc of another PID namespace, and
+/// the guest's own /proc numbers would name the enclosing namespace.
+const OWN_PID_NAMESPACE_PRIVILEGED: [&str; 5] =
+    ["--pid", "--fork", "--mount", "--mount-proc", "--net"];
+
+/// The [`OWN_PID_NAMESPACE`] form this host admits with a fresh /proc of the
+/// test's own PID namespace: the privileged form where this process may
+/// make the namespaces directly, else a user namespace of its own. Probed
+/// once with the privileged form itself.
+fn own_pid_namespace() -> &'static [&'static str] {
+    static ADMITTED: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+    ADMITTED.get_or_init(|| {
+        let privileged = Command::new("unshare")
+            .args(OWN_PID_NAMESPACE_PRIVILEGED)
+            .arg("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if privileged {
+            &OWN_PID_NAMESPACE_PRIVILEGED
+        } else {
+            &OWN_PID_NAMESPACE
+        }
+    })
+}
+
 /// C4 deliberately narrows the former continuing-Chosen collision promise:
 /// a successful original clone3 preserves the guest's result, but its mutable
 /// input leaves a permanent lifecycle uncertainty. Reaping the child does not
@@ -15619,11 +15664,15 @@ fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging(
         } else {
             format!("{before_later}later child reaped\n")
         };
-        let native = native_chosen_ids_fixture(&guest_args);
+        let native = native_chosen_ids_fixture(own_pid_namespace(), &guest_args);
         assert_success(&native, &guest_args);
         assert_eq!(stdout(&native), complete);
 
-        let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &guest_args);
+        let refused = no_namespace_in_own_pid_namespace(
+            own_pid_namespace(),
+            &["--pid-base=5000"],
+            &guest_args,
+        );
         assert_eq!(
             refused.status.code(),
             Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -15645,6 +15694,7 @@ fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging(
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let path = directory.path().join("host-after-original-clone3.json");
         let tolerant = no_namespace_in_own_pid_namespace(
+            own_pid_namespace(),
             &[
                 "--summary",
                 "--record-preemptions-to",
@@ -15674,7 +15724,7 @@ fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging(
 #[test]
 fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
     let guest_args = ["guest-chosen-lifecycle", "no-child", "100"];
-    let native = native_chosen_ids_fixture(&guest_args);
+    let native = native_chosen_ids_fixture(own_pid_namespace(), &guest_args);
     assert_success(&native, &guest_args);
     let text = stdout(&native);
     let offset = text
@@ -15690,6 +15740,7 @@ fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let path = directory.path().join("chosen-after-no-child.json");
         let output = no_namespace_in_own_pid_namespace(
+            own_pid_namespace(),
             &[base, "--record-preemptions-to", path.to_str().unwrap()],
             &guest_args,
         );
@@ -15718,8 +15769,11 @@ fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
 #[test]
 fn no_namespace_validates_parent_signal_before_choosing_an_id() {
     for (signal, created, error) in [("65", 0, libc::EINVAL), ("17", 1, 0)] {
-        let output =
-            no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["parent-signal", signal]);
+        let output = no_namespace_in_own_pid_namespace(
+            own_pid_namespace(),
+            &["--pid-base=5000"],
+            &["parent-signal", signal],
+        );
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -15759,7 +15813,7 @@ fn a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_d
     let run = |args: &[String]| {
         let mut command = Command::new("unshare");
         command
-            .args(OWN_PID_NAMESPACE)
+            .args(own_pid_namespace())
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args(["--log=info", "run", "--no-namespace", "--base-env=minimal"])
             .args(args)
@@ -15830,14 +15884,20 @@ fn no_namespace_concurrent_runs_take_different_windows() {
         run("b")
     );
     let mut command = Command::new("unshare");
-    command.args(OWN_PID_NAMESPACE).args(["sh", "-c", &script]);
+    command
+        .args(own_pid_namespace())
+        .args(["sh", "-c", &script]);
     let label = format!("{command:?}");
     let output = hermit_test::hermit_output(&label, &mut command);
-    let read = |name: &str| fs::read_to_string(directory.path().join(name)).unwrap();
+    let read = |name: &str| {
+        fs::read_to_string(directory.path().join(name))
+            .unwrap_or_else(|error| format!("<{name} unreadable: {error}>"))
+    };
     assert_eq!(
         stdout(&output).trim(),
         "0 0",
-        "a: {}\nb: {}",
+        "outer stderr:\n{}\na: {}\nb: {}",
+        stderr(&output),
         read("a.err"),
         read("b.err")
     );
@@ -15879,7 +15939,7 @@ fn no_namespace_guest_ids_follow_the_base_and_creation_order() {
         "--verify-json",
         &report_arg,
     ];
-    let output = no_namespace_in_own_pid_namespace(&args, &[]);
+    let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &args, &[]);
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
@@ -15914,7 +15974,11 @@ fn no_namespace_guest_ids_follow_the_base_and_creation_order() {
 /// The summary and the INFO log say how the guest was numbered.
 #[test]
 fn no_namespace_reports_its_guest_numbering() {
-    let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000", "--summary"], &[]);
+    let output = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
+        &["--pid-base=5000", "--summary"],
+        &[],
+    );
     assert_success(&output, &["--pid-base=5000", "--summary"]);
     assert!(
         stderr(&output).contains(
@@ -16117,7 +16181,7 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
             "clone3 bad-tid: Bad address",
         ),
     ] {
-        let output = no_namespace_in_own_pid_namespace(&[base], call);
+        let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &[base], call);
         assert_success(&output, call);
         assert!(
             stdout(&output).starts_with(&format!("{expected}\n"))
@@ -16168,7 +16232,7 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
             "clone3 edge-tid: child +1, exit 0\n",
         ),
     ] {
-        let output = no_namespace_in_own_pid_namespace(&[base], call);
+        let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &[base], call);
         assert_success(&output, call);
         assert_eq!(
             stdout(&output),
@@ -16178,7 +16242,8 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
         );
     }
 
-    let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["no-caps"]);
+    let refused =
+        no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=5000"], &["no-caps"]);
     assert_eq!(
         refused.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16194,7 +16259,8 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
     );
     assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
 
-    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["no-caps"]);
+    let tolerant =
+        no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--summary"], &["no-caps"]);
     assert_success(&tolerant, &["no-caps"]);
     assert!(
         stdout(&tolerant).starts_with("clone3 no-caps: child ")
@@ -16223,7 +16289,7 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
         "--verify-json",
         &report_arg,
     ];
-    let output = no_namespace_in_own_pid_namespace(&args, &["newpid"]);
+    let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &args, &["newpid"]);
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
@@ -16273,7 +16339,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             newpid_child,
         ),
     ] {
-        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &[call]);
+        let output =
+            no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=5000"], &[call]);
         assert_eq!(
             output.status.code(),
             Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16289,7 +16356,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         assert_eq!(stdout(&output), before, "{call}: {}", stderr(&output));
     }
     for call in ["signal65", "vfork65"] {
-        let native = native_chosen_ids_fixture(&[call]);
+        let native = native_chosen_ids_fixture(own_pid_namespace(), &[call]);
         assert_success(&native, &["native", call]);
         let observed = stdout(&native);
         let created = if observed == format!("clone {call}: created\n") {
@@ -16298,7 +16365,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             assert_eq!(observed, format!("clone {call}: Invalid argument\n"));
             false
         };
-        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &[call]);
+        let tolerant =
+            no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--summary"], &[call]);
         assert_success(&tolerant, &[call]);
         assert_eq!(stdout(&tolerant), observed, "{call}: {}", stderr(&tolerant));
         // Ordinary failed clones created no task. A vfork fallback reports
@@ -16334,7 +16402,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             );
         }
     }
-    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["newpid-fork"]);
+    let tolerant =
+        no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--summary"], &["newpid-fork"]);
     assert_success(&tolerant, &["newpid-fork"]);
     assert_eq!(
         stdout(&tolerant),
@@ -16359,7 +16428,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         &["leader-gone", "wronly-args"],
     ] {
         for base in ["--pid-base=5000", "--summary"] {
-            let refused = no_namespace_in_own_pid_namespace(&[base], call);
+            let refused = no_namespace_in_own_pid_namespace(own_pid_namespace(), &[base], call);
             assert_eq!(
                 refused.status.code(),
                 Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16381,7 +16450,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
     // base, issued as made with its host ID reported by default, also after
     // the leader exited.
     for call in [&["wronly-tid"][..], &["leader-gone", "wronly-tid"]] {
-        let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], call);
+        let refused =
+            no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=5000"], call);
         assert_eq!(
             refused.status.code(),
             Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16394,7 +16464,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             "{call:?}: {}",
             stderr(&refused)
         );
-        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], call);
+        let tolerant = no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--summary"], call);
         assert_success(&tolerant, call);
         assert!(
             stderr(&tolerant).contains("1 host-ID report(s) accepted"),
@@ -16404,7 +16474,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         );
     }
     for base in ["--pid-base=5000", "--summary"] {
-        let output = no_namespace_in_own_pid_namespace(&[base], &["newpid-set-tid"]);
+        let output =
+            no_namespace_in_own_pid_namespace(own_pid_namespace(), &[base], &["newpid-set-tid"]);
         assert_eq!(
             output.status.code(),
             Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16421,7 +16492,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         ("nested", "unshare: Operation not permitted\n"),
         ("seccomp", "seccomp: Function not implemented\n"),
     ] {
-        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &[call]);
+        let output =
+            no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=5000"], &[call]);
         assert_eq!(output.status.code(), Some(1), "{call}: {}", stderr(&output));
         assert_eq!(stdout(&output), expected, "{call}: {}", stderr(&output));
     }
@@ -16431,7 +16503,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
 /// namespace's init) is refused before the guest starts, naming the holder.
 #[test]
 fn no_namespace_refuses_a_held_pid_base() {
-    let output = no_namespace_in_own_pid_namespace(&["--pid-base=1"], &[]);
+    let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=1"], &[]);
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16447,6 +16519,65 @@ fn no_namespace_refuses_a_held_pid_base() {
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
 }
 
+/// Admission reads Hermit's own PID namespace, not the mounted /proc's:
+/// under a /proc of the enclosing namespace (`unshare -U -r -p -f` with no
+/// fresh proc mount), a window held only outside (this test process's own
+/// host PID) is admitted, and ID 1, held inside, is refused naming it.
+/// Under ptrace the admitted run is then refused with EXDEV by Reverie's
+/// aligned-proc ownership proofs; admission itself must not refuse it for
+/// the outer holder.
+#[test]
+fn chosen_window_admission_reads_hermits_own_namespace_under_a_misaligned_proc() {
+    let probe = Command::new("unshare")
+        .args(["-U", "-r", "-p", "-f", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        record_test_skip(
+            "chosen_window_admission_reads_hermits_own_namespace_under_a_misaligned_proc",
+            "this host denies the outer user and PID namespaces the misaligned /proc needs",
+        );
+        return;
+    }
+    let run = |base: String| {
+        let mut command = Command::new("unshare");
+        command
+            .args(["-U", "-r", "-p", "-f"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--no-namespace", "--base-env=minimal"])
+            .arg(base)
+            .args(["--", "/bin/true"])
+            .stdin(Stdio::null());
+        let label = format!("{command:?}");
+        hermit_test::hermit_output(&label, &mut command)
+    };
+    let admitted = run(format!("--pid-base={}", std::process::id()));
+    let admitted_log = stderr(&admitted);
+    assert!(
+        !admitted_log.contains("must be free"),
+        "admission read the enclosing namespace: {admitted_log}"
+    );
+    assert!(
+        admitted.status.success() || admitted_log.contains("EXDEV"),
+        "admitted run neither ran nor hit the aligned-proc refusal: {admitted_log}"
+    );
+    let refused = run("--pid-base=1".to_owned());
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("needs the guest's process IDs chosen from 1")
+            && stderr(&refused).contains("task 1 in Hermit's PID namespace"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
 /// A chosen ID at pid_max is not one `set_tid` can give. With an explicit
 /// base, the run is refused when the guest's clone reaches it, before the
 /// guest's own call could create a task with a host ID: the base three below
@@ -16460,7 +16591,7 @@ fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
         .parse()
         .unwrap();
     let base = format!("--pid-base={}", pid_max - 3);
-    let output = no_namespace_in_own_pid_namespace(&[&base], &[]);
+    let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &[&base], &[]);
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16491,6 +16622,7 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     let record_arg = format!("--record-preemptions-to={}", path("recorded.json"));
     let epoch = "--epoch=2026-01-01T00:00:00Z";
     let recorded = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
         &["--pid-base=5000", "--chaos", "--seed=3", epoch, &record_arg],
         &[],
     );
@@ -16498,7 +16630,11 @@ fn no_namespace_preemption_records_replay_under_their_base() {
 
     let replay_arg = format!("--replay-preemptions-from={}", path("recorded.json"));
     let again_arg = format!("--record-preemptions-to={}", path("replayed.json"));
-    let replayed = no_namespace_in_own_pid_namespace(&[epoch, &replay_arg, &again_arg], &[]);
+    let replayed = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
+        &[epoch, &replay_arg, &again_arg],
+        &[],
+    );
     assert_success(&replayed, &["replay"]);
     assert_eq!(stdout(&replayed), stdout(&recorded));
     let schedule = |name: &str| {
@@ -16517,8 +16653,11 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     assert_eq!(guest_ids["Chosen"]["base"], 5000, "{guest_ids}");
     assert_eq!(schedule("replayed.json"), (global, per_thread, guest_ids));
 
-    let elsewhere =
-        no_namespace_in_own_pid_namespace(&["--pid-base=6000", epoch, &replay_arg], &[]);
+    let elsewhere = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
+        &["--pid-base=6000", epoch, &replay_arg],
+        &[],
+    );
     assert_eq!(
         elsewhere.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16537,7 +16676,11 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     let host = no_namespace_with_external_id_holder(&[epoch, &host_record_arg]);
     assert_success(&host, &["collide-external"]);
     let host_replay_arg = format!("--replay-preemptions-from={}", path("host.json"));
-    let refused = no_namespace_in_own_pid_namespace(&[epoch, &host_replay_arg], &["collide"]);
+    let refused = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
+        &[epoch, &host_replay_arg],
+        &["collide"],
+    );
     assert_eq!(
         refused.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16559,7 +16702,8 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     inner.as_object_mut().unwrap().remove("guest_ids");
     fs::write(path("stripped.json"), json.to_string()).unwrap();
     let stripped_arg = format!("--replay-preemptions-from={}", path("stripped.json"));
-    let stripped = no_namespace_in_own_pid_namespace(&[epoch, &stripped_arg], &[]);
+    let stripped =
+        no_namespace_in_own_pid_namespace(own_pid_namespace(), &[epoch, &stripped_arg], &[]);
     assert_eq!(
         stripped.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -16587,7 +16731,9 @@ fn no_namespace_preemption_records_replay_under_their_base() {
          echo rc=$?; echo >&3; wait $HOLDER"
     );
     let mut command = Command::new("unshare");
-    command.args(OWN_PID_NAMESPACE).args(["sh", "-c", &script]);
+    command
+        .args(own_pid_namespace())
+        .args(["sh", "-c", &script]);
     let label = format!("{command:?}");
     let held = hermit_test::hermit_output(&label, &mut command);
     assert!(
@@ -16629,7 +16775,7 @@ fn no_namespace_bisect_replays_the_schedules_it_writes() {
         let schedule = path(&format!("seed{seed}.json"));
         let mut command = Command::new("unshare");
         command
-            .args(OWN_PID_NAMESPACE)
+            .args(own_pid_namespace())
             .args([hermit, "run"])
             .args(run_args)
             .args([
@@ -16662,7 +16808,7 @@ fn no_namespace_bisect_replays_the_schedules_it_writes() {
     let report = path("report.json");
     let mut command = Command::new("unshare");
     command
-        .args(OWN_PID_NAMESPACE)
+        .args(own_pid_namespace())
         .args([hermit, "bisect"])
         .arg(format!("--good={good}"))
         .arg(format!("--bad={bad}"))
@@ -16706,7 +16852,7 @@ fn no_namespace_minimize_replays_its_candidate_records() {
     let report = directory.path().join("report.json").display().to_string();
     let mut command = Command::new("unshare");
     command
-        .args(OWN_PID_NAMESPACE)
+        .args(own_pid_namespace())
         .args([
             env!("CARGO_BIN_EXE_hermit"),
             "analyze",
@@ -76273,21 +76419,38 @@ fn a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with() {
 
 /// Runs hermit with `args` inside a new user namespace (as its root) whose
 /// `max_user_namespaces` is 0, so that hermit's own unshare(CLONE_NEWUSER)
-/// fails with ENOSPC, as where unprivileged user namespaces are denied. Returns
-/// `None` when this host denies the outer `unshare -U -r` itself.
+/// fails with ENOSPC, as where unprivileged user namespaces are denied. The
+/// limit write is tried through the inherited /proc first; only where that
+/// write is refused (a read-only host /proc) does the outer namespace mount
+/// a writable /proc of its own, with a PID namespace, which a proc mount in
+/// a user namespace needs. Returns `None` when neither form can install
+/// the denial on this host.
 fn hermit_where_user_namespaces_are_denied(args: &[&str]) -> Option<Output> {
-    let outer = Command::new("unshare")
-        .args(["-U", "-r", "true"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run unshare");
-    if !outer.status.success() {
+    const WRITE: &str = "echo 0 > /proc/sys/user/max_user_namespaces";
+    const INHERITED: [&str; 2] = ["-U", "-r"];
+    const FRESH: [&str; 6] = ["-U", "-r", "-m", "-p", "-f", "--mount-proc"];
+    let installs = |outer: &[&str]| {
+        Command::new("unshare")
+            .args(outer)
+            .args(["sh", "-c", WRITE])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let outer: &[&str] = if installs(&INHERITED) {
+        &INHERITED
+    } else if installs(&FRESH) {
+        &FRESH
+    } else {
         return None;
-    }
+    };
     let inner = hermit_command(args);
     let mut command = Command::new("unshare");
     command
-        .args(["-U", "-r", "sh", "-c"])
+        .args(outer)
+        .args(["sh", "-c"])
         .arg("echo 0 > /proc/sys/user/max_user_namespaces && exec \"$@\"")
         .arg("sh")
         .arg(inner.get_program())
@@ -76313,9 +76476,10 @@ fn hermit_where_user_namespaces_are_denied(args: &[&str]) -> Option<Output> {
 #[test]
 fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
     let Some(refused) = hermit_where_user_namespaces_are_denied(&["run", "--", "/bin/true"]) else {
-        eprintln!(
-            "a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied: SKIPPED: \
-             this host denies `unshare -U -r`, so the test cannot deny hermit's own"
+        record_test_skip(
+            "a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied",
+            "this host admits neither writing max_user_namespaces through its /proc nor a \
+             writable fresh /proc, so the test cannot deny hermit's own namespaces",
         );
         return;
     };
@@ -77149,6 +77313,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     let record_flag = format!("--record-preemptions-to={}", recording.display());
     let epoch = "--epoch=2026-01-01T00:00:00Z";
     let recorded = no_namespace_in_own_pid_namespace(
+        own_pid_namespace(),
         &[
             "--pid-base=5000",
             "--max-timeslice=disabled",
@@ -77237,7 +77402,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
         if route != "schedule" {
             args.push(&priority_flag);
         }
-        let replayed = no_namespace_in_own_pid_namespace(&args, &[]);
+        let replayed = no_namespace_in_own_pid_namespace(own_pid_namespace(), &args, &[]);
         if route == "both" {
             // Config's inherited CLI grammar rejects this combination before
             // either replay loader or the target is entered.

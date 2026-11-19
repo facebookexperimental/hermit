@@ -17,9 +17,9 @@ use std::process::Output;
 use std::sync::OnceLock;
 
 use super::HERMIT_POLICY_REFUSAL_EXIT;
-use super::OWN_PID_NAMESPACE;
 use super::assert_success;
 use super::hermit_test;
+use super::own_pid_namespace;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -50,7 +50,7 @@ fn guest() -> &'static Path {
 
 fn run(mode: &str, hermit_args: Option<&[&str]>) -> Output {
     let mut command = Command::new("unshare");
-    command.args(OWN_PID_NAMESPACE);
+    command.args(own_pid_namespace());
     if let Some(args) = hermit_args {
         command
             .arg(env!("CARGO_BIN_EXE_hermit"))
