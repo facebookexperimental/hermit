@@ -2372,4 +2372,90 @@ mod tests {
         assert!(layout.is_initial(&image, 0, 9));
         assert!(!layout.is_initial(&image, 4, 9));
     }
+
+    /// Recorded-layout SSE semantics (scope b): on the layouts recorded
+    /// for an EPYC 9D85 (XCR0 0x2e7, 2440 bytes, detcore's `epyc_9d85`
+    /// CPUID fixture) and a Xeon Gold 6138 (XCR0 0x2ff, 2696 bytes),
+    /// pin what `is_initial` decides for SSE across the full zero-XMM
+    /// matrix {MXCSR 0x1f80, 0x3f80} x {header bit clear, set}, plus
+    /// dirty XMM under each header state. This pins only the
+    /// `is_initial` half of the refusal: the measured Skylake-SP flip
+    /// (headers 0x2a1 and 0x2a3, MXCSR 0x3f80, XMM zero) is initial
+    /// on both sides here, and the probe refuses it through the
+    /// full-image `compare`, which this test does not exercise.
+    #[test]
+    fn recorded_layout_sse_flip_is_initial_on_both_sides_yet_differs() {
+        for (xcr0, size, components) in [
+            (
+                0x2e7u64,
+                2440usize,
+                vec![
+                    (2, 576, 256),
+                    (5, 832, 64),
+                    (6, 896, 512),
+                    (7, 1408, 1024),
+                    (9, 2432, 8),
+                ],
+            ),
+            (
+                0x2ff,
+                2696,
+                vec![
+                    (2, 576, 256),
+                    (3, 960, 64),
+                    (4, 1024, 64),
+                    (5, 1088, 64),
+                    (6, 1152, 512),
+                    (7, 1664, 1024),
+                    (9, 2688, 8),
+                ],
+            ),
+        ] {
+            let layout = Layout {
+                xcr0,
+                size,
+                components,
+            };
+            let mut before = vec![0u8; size];
+            before[24..28].copy_from_slice(&0x3f80u32.to_le_bytes());
+            before[512..520].copy_from_slice(&0x2a1u64.to_le_bytes());
+            let mut after = before.clone();
+            after[512..520].copy_from_slice(&0x2a3u64.to_le_bytes());
+            assert!(layout.is_initial(&before, 0, 1), "xcr0 {xcr0:#x} before");
+            assert!(layout.is_initial(&after, 0, 1), "xcr0 {xcr0:#x} after");
+            assert_ne!(before, after, "xcr0 {xcr0:#x}: header flip is visible");
+            // Default MXCSR reaches the values check on the header-set side.
+            after[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+            assert!(
+                layout.is_initial(&after, 0, 1),
+                "xcr0 {xcr0:#x} default MXCSR, header set"
+            );
+            // The fourth zero-XMM cell: default MXCSR, header clear.
+            before[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+            assert!(
+                layout.is_initial(&before, 0, 1),
+                "xcr0 {xcr0:#x} default MXCSR, header clear"
+            );
+            // With the header bit clear, the component counts as initial
+            // whatever the XMM area holds.
+            before[160] = 1;
+            assert!(
+                layout.is_initial(&before, 0, 1),
+                "xcr0 {xcr0:#x} dirty XMM under clear header"
+            );
+            // The same dirty bytes are live once the header bit is set,
+            // at either end of the XMM area.
+            before[512..520].copy_from_slice(&0x2a3u64.to_le_bytes());
+            assert!(
+                !layout.is_initial(&before, 0, 1),
+                "xcr0 {xcr0:#x} dirty XMM"
+            );
+            before[160] = 0;
+            before[415] = 1;
+            assert!(
+                !layout.is_initial(&before, 0, 1),
+                "xcr0 {xcr0:#x} dirty last XMM byte"
+            );
+        }
+    }
 }
