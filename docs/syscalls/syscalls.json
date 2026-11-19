@@ -8,8 +8,8 @@
   },
   "generated_by": "scripts/syscall-pages.rs aggregate",
   "prose_counts": {
-    "checked": 26,
-    "none": 357
+    "checked": 27,
+    "none": 356
   },
   "schema": "syscalls.json/v3",
   "syscalls": [
@@ -1143,9 +1143,9 @@
       "nr_x86_64": 56,
       "page": "docs/syscalls/clone.md",
       "passthrough_risk": null,
-      "prose_based_on": null,
-      "prose_reviewed_at": null,
-      "prose_status": "none",
+      "prose_based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "prose_reviewed_at": "2026-11-19",
+      "prose_status": "checked",
       "refused": false,
       "refused_only_when_fail_closed": false,
       "strategy": "determinized",

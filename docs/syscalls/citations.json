@@ -434,6 +434,411 @@
         }
       ]
     },
+    "clone": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1641,
+          "hash": "eff53fa4d4df46ff",
+          "id": "c1",
+          "last": 1641,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 11788,
+          "hash": "bb74122fed35d19a",
+          "id": "c10",
+          "last": 11797,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 2570,
+          "hash": "cbecd639f406e336",
+          "id": "c11",
+          "last": 2577,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 1006,
+          "hash": "177e3aca7f5c3580",
+          "id": "c11",
+          "last": 1017,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 3073,
+          "hash": "4ab19dbcec31933d",
+          "id": "c12",
+          "last": 3078,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 10654,
+          "hash": "f42198d980e5d9c9",
+          "id": "c13",
+          "last": 10663,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 10680,
+          "hash": "d8436d27fa02f1c9",
+          "id": "c13",
+          "last": 10686,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 5529,
+          "hash": "62e1e3db7af13966",
+          "id": "c14",
+          "last": 5538,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2777,
+          "hash": "27794f0170bb7d43",
+          "id": "c15",
+          "last": 2800,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2685,
+          "hash": "33db94879c9412bb",
+          "id": "c16",
+          "last": 2696,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2601,
+          "hash": "b2a564eb72ed0250",
+          "id": "c17",
+          "last": 2612,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2498,
+          "hash": "601a467855472096",
+          "id": "c18",
+          "last": 2505,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 620,
+          "hash": "5215652c2f07e57a",
+          "id": "c19",
+          "last": 629,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 8209,
+          "hash": "869aba0e4be284b3",
+          "id": "c2",
+          "last": 8217,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 716,
+          "hash": "eff0295014949ed9",
+          "id": "c20",
+          "last": 739,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 810,
+          "hash": "8e9e9c0abe5d9843",
+          "id": "c20",
+          "last": 813,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 901,
+          "hash": "76c23b03bd4deca1",
+          "id": "c20",
+          "last": 917,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 145,
+          "hash": "2ed0115d74493ddd",
+          "id": "c21",
+          "last": 152,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 288,
+          "hash": "8835c0b31c90cbfc",
+          "id": "c21",
+          "last": 322,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 7506,
+          "hash": "0c9817f20d17bc2c",
+          "id": "c22",
+          "last": 7520,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 2455,
+          "hash": "884406f2a339087a",
+          "id": "c23",
+          "last": 2459,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 5572,
+          "hash": "89390955cc169506",
+          "id": "c23",
+          "last": 5590,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 154,
+          "hash": "efdc09a625f68b71",
+          "id": "c24",
+          "last": 158,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 258,
+          "hash": "ddd137278197effd",
+          "id": "c24",
+          "last": 267,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 703,
+          "hash": "293a3a3bec9f84bd",
+          "id": "c24",
+          "last": 709,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 736,
+          "hash": "20c8203dbbbe0577",
+          "id": "c25",
+          "last": 740,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 856,
+          "hash": "83d22a1699fcbcfd",
+          "id": "c25",
+          "last": 860,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 879,
+          "hash": "5a398e580f984674",
+          "id": "c25",
+          "last": 891,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 825,
+          "hash": "cc0d0f6d50a9aa85",
+          "id": "c26",
+          "last": 839,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 816,
+          "hash": "97c93ddeae998213",
+          "id": "c27",
+          "last": 821,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 1920,
+          "hash": "93f777d339850c63",
+          "id": "c27",
+          "last": 1938,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 86,
+          "hash": "1294df3d700e8421",
+          "id": "c28",
+          "last": 105,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 6337,
+          "hash": "54d8d0885982d43b",
+          "id": "c28",
+          "last": 6350,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2700,
+          "hash": "2549ed5a3ec39310",
+          "id": "c29",
+          "last": 2714,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2460,
+          "hash": "35d742bcc5f1e6df",
+          "id": "c3",
+          "last": 2470,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2752,
+          "hash": "24fa1d204b3bc2ed",
+          "id": "c30",
+          "last": 2753,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 943,
+          "hash": "947726f7e1d78e68",
+          "id": "c31",
+          "last": 968,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 12271,
+          "hash": "28362aad92a74be4",
+          "id": "c32",
+          "last": 12287,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 12290,
+          "hash": "6c0044def6212fc3",
+          "id": "c32",
+          "last": 12296,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 5539,
+          "hash": "580a1a6089895dbd",
+          "id": "c33",
+          "last": 5569,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 2511,
+          "hash": "268c84db06b57bd0",
+          "id": "c34",
+          "last": 2517,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 5328,
+          "hash": "16fc7f0a8c0c0568",
+          "id": "c34",
+          "last": 5347,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 5768,
+          "hash": "61e365f7da3b957c",
+          "id": "c35",
+          "last": 5780,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 5781,
+          "hash": "0c6f6836cc95da88",
+          "id": "c35",
+          "last": 5805,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 10442,
+          "hash": "be369ffb98884c09",
+          "id": "c4",
+          "last": 10453,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 10406,
+          "hash": "1827611be72dc252",
+          "id": "c4",
+          "last": 10416,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 647,
+          "hash": "8a7b480bd0d7f36b",
+          "id": "c5",
+          "last": 671,
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        },
+        {
+          "first": 10178,
+          "hash": "97e3c452d611365e",
+          "id": "c6",
+          "last": 10202,
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "first": 12203,
+          "hash": "de87d70e069024ac",
+          "id": "c7",
+          "last": 12207,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 12220,
+          "hash": "b173a95f7f3f3896",
+          "id": "c7",
+          "last": 12226,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 6619,
+          "hash": "f21deb87dbe99073",
+          "id": "c8",
+          "last": 6635,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 12163,
+          "hash": "512a94acfb2c0336",
+          "id": "c9",
+          "last": 12171,
+          "path": "detcore/src/tool_global.rs"
+        }
+      ],
+      "cited_errnos": [
+        "E2BIG",
+        "EBADF",
+        "EEXIST",
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "ENOSYS",
+        "EPERM",
+        "ERESTARTNOINTR",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "only_the_kernels_flag_rules_refuse"
+          ],
+          "path": "detcore/src/syscalls/threads.rs"
+        },
+        {
+          "names": [
+            "a_clear_child_tid_wake_is_a_join_edge"
+          ],
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "names": [
+            "refused_and_inexpressible_calls",
+            "invalid_original_signals_are_not_normalized_into_valid_clones",
+            "a_stack_pointer_clone3_cannot_express_is_inexpressible",
+            "the_rewrite_drops_only_clone_untraced",
+            "a_pid_namespace_depth_counts_from_hermits"
+          ],
+          "path": "detcore/src/syscalls/chosen_ids.rs"
+        }
+      ]
+    },
     "epoll_create1": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
