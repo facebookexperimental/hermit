@@ -1,5 +1,14 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -363,7 +372,10 @@ fn print_command_help(command: &str) -> bool {
         "validate" => (
             "Validate manifests and their CI/DAG correspondence.",
             false,
-            "",
+            "  --without-footprint-check        Run every audit except the generated test-footprint\n  \
+                                              check, whose target/debug/generate-test-footprints runs\n  \
+                                              cargo metadata, and report that check NOT RUN (the\n  \
+                                              Buck-only gate's mode; the full gate runs it)",
             CommandEnvironment::None,
         ),
         "plan" => (
@@ -534,6 +546,8 @@ struct Args {
     /// `--parity-plan-of-test`: plan the parity golden's CPU profile from
     /// every cell of the selected test ([`parity_plan`]).
     parity_plan_of_test: bool,
+    /// `validate --without-footprint-check` ([`FootprintCheck::NotRun`]).
+    without_footprint_check: bool,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
     tpx_json: Option<PathBuf>,
@@ -645,6 +659,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             }
             "--allow-empty" => args.allow_empty = true,
             "--no-retry" => args.retries = Retries::Off,
+            "--without-footprint-check" => args.without_footprint_check = true,
             "--results" => {
                 args.results = Some(PathBuf::from(required_value(&mut values, "--results")))
             }
@@ -1108,6 +1123,9 @@ fn validate_args(command: &str, args: &Args) {
     if command != "run" && args.tpx_json.is_some() {
         fail("--tpx-json is accepted by run only");
     }
+    if command != "validate" && args.without_footprint_check {
+        fail("--without-footprint-check is accepted by validate only");
+    }
     if let Some(sha) = args.source_sha.as_deref() {
         let Some(repo_root) = args.repo_root.as_deref() else {
             fail(
@@ -1280,7 +1298,16 @@ fn main() -> ExitCode {
     // a recipe that the canonical manifest planner would refuse.
     run_manifest_plan(&root, args.source_sha.as_deref());
     match command.as_str() {
-        "validate" => validate(&root, &manifests),
+        "validate" => validate(
+            &root,
+            &manifests,
+            if args.without_footprint_check {
+                FootprintCheck::NotRun
+            } else {
+                FootprintCheck::Run
+            },
+            &tree_words(&root, &args),
+        ),
         "plan" => print_plan(&manifests, &args, Population::Required),
         "expected-plan" if args.execution_owner.is_none() => print_expected_plan(&root, &manifests),
         "expected-plan" => {
@@ -1321,14 +1348,54 @@ fn main() -> ExitCode {
     }
 }
 
-fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
+/// Whether `validate` runs the generated test-footprint check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FootprintCheck {
+    /// The full gate.manifest: run target/debug/generate-test-footprints --check.
+    Run,
+    /// `--without-footprint-check`, the Buck-only gate's mode (scripts/validate.rs
+    /// --buck-<name>, gate.manifest_<name>): that generator runs `cargo metadata`,
+    /// which the Buck-only run's refusing cargo shim would refuse, so the check
+    /// is named NOT RUN on stdout and in the PASS line, never skipped silently.
+    NotRun,
+}
+
+/// The line `validate --without-footprint-check` prints in place of the
+/// generated test-footprint check.
+const FOOTPRINT_CHECK_NOT_RUN: &str = "NOT RUN: the generated test-footprint check \
+     (target/debug/generate-test-footprints --check against ci/test-footprints.json): \
+     --without-footprint-check was given, because that generator runs cargo metadata; \
+     the full gate.manifest (test-harness validate) runs it";
+
+/// The words naming the tree a command was given (`--repo-root ROOT`, and
+/// `--source-sha SHA` with it), for the harness commands `validate` runs on
+/// that same tree ([`audit_cli_brackets`]). Empty when the command named no
+/// root: the harness then finds the checkout it was built in, which a
+/// Buck-built harness has none of, so the Buck-only gate passes both.
+fn tree_words(root: &Path, args: &Args) -> Vec<OsString> {
+    let mut words = Vec::new();
+    if args.repo_root.is_some() {
+        words.extend([OsString::from("--repo-root"), root.as_os_str().to_owned()]);
+        if let Some(sha) = &args.source_sha {
+            words.extend([OsString::from("--source-sha"), OsString::from(sha)]);
+        }
+    }
+    words
+}
+
+fn validate(
+    root: &Path,
+    manifests: &ManifestSet,
+    footprints: FootprintCheck,
+    tree: &[OsString],
+) -> ExitCode {
     // Keep the existing Rust manifest-plan front door as the authority for
     // inventory, schema, lane, workflow, and DAG consistency.  The cell
     // runner owns execution; it must not silently narrow `validate` to only
     // the expected-plan comparison during the shell removal.
     audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
-    audit_determinism_stress_evidence(root);
+    audit_determinism_stress_evidence(root).unwrap_or_else(|error| fail(error));
     // Only the generated-footprint check remains here: it compares committed
     // generated metadata with its source, which is what this gate owns. The
     // repository tools' own self-tests (TOOL_SELF_TESTS) are not preconditions
@@ -1336,20 +1403,26 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // through `test-harness selftest <name>`; nothing depends on those nodes,
     // and a failure still makes the validation red. Publish the child's output
     // on completion so a timeout retains its diagnostics.
-    let audit_jobs = validation_audit_worker_capacity(
-        std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
-        std::env::var(VALIDATE_AUDIT_JOBS_ENV).ok().as_deref(),
-    )
-    .configured();
-    run_audits_parallel(
-        root,
-        &[(
-            root.join("target/debug/generate-test-footprints"),
-            vec!["--check"],
-        )],
-        audit_jobs,
-    );
-    audit_cli_brackets(root);
+    match footprints {
+        FootprintCheck::Run => {
+            let audit_jobs = validation_audit_worker_capacity(
+                std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
+                std::env::var(VALIDATE_AUDIT_JOBS_ENV).ok().as_deref(),
+            )
+            .configured();
+            run_audits_parallel(
+                root,
+                &[(
+                    root.join("target/debug/generate-test-footprints"),
+                    vec!["--check"],
+                )],
+                audit_jobs,
+            );
+        }
+        FootprintCheck::NotRun => println!("{FOOTPRINT_CHECK_NOT_RUN}"),
+    }
+    let harness = std::env::current_exe().unwrap_or_else(|error| fail(error));
+    audit_cli_brackets(root, &harness, tree).unwrap_or_else(|error| fail(error));
     let cells = audit_expected_plan(root, manifests);
     // Byte for byte, so a hand edit that `sync-cells` would undo is refused
     // here rather than at the next flip.
@@ -1361,8 +1434,12 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
             stale.join(", ")
         ));
     }
+    let verdict = match footprints {
+        FootprintCheck::Run => "PASS",
+        FootprintCheck::NotRun => "PASS (generated test-footprint check NOT RUN)",
+    };
     println!(
-        "PASS: {} YAML manifests, {} required cells",
+        "{verdict}: {} YAML manifests, {} required cells",
         manifests.documents.len(),
         cells
     );
@@ -1461,8 +1538,25 @@ fn run_tool_self_test(values: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn audit_cli_brackets(root: &Path) {
-    let executable = std::env::current_exe().unwrap_or_else(|error| fail(error));
+/// Run `harness` (the test-harness itself, in `validate`) with malformed
+/// controls, each of which it must refuse, and one complete control that must
+/// select cells; print how many controls it refused. `tree` ([`tree_words`])
+/// goes right after the subcommand, before the control's own words, so a
+/// control that ends in an option missing its value still ends the argv.
+fn audit_cli_brackets(root: &Path, harness: &Path, tree: &[OsString]) -> Result<(), String> {
+    let accepted = |argv: &[&str]| -> Result<bool, String> {
+        Command::new(harness)
+            .arg(argv[0])
+            .args(tree)
+            .args(&argv[1..])
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .map_err(|error| format!("cannot execute {}: {error}", harness.display()))
+    };
+    let mut refused = 0;
     for option in [
         "--lane",
         "--category",
@@ -1476,60 +1570,41 @@ fn audit_cli_brackets(root: &Path) {
         "--format",
         "--jobs",
     ] {
-        let status = Command::new(&executable)
-            .args(["plan", option])
-            .current_dir(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap_or_else(|error| fail(error));
-        if status.success() {
-            fail(format!("missing value for {option} was accepted"));
+        if accepted(&["plan", option])? {
+            return Err(format!("missing value for {option} was accepted"));
         }
-        let status = Command::new(&executable)
-            .args(["plan", option, ""])
-            .current_dir(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap_or_else(|error| fail(error));
-        if status.success() {
-            fail(format!("empty value for {option} was accepted"));
+        if accepted(&["plan", option, ""])? {
+            return Err(format!("empty value for {option} was accepted"));
         }
+        refused += 2;
     }
-    let output = Command::new(&executable)
-        .args([
-            "plan",
-            "--lane",
-            "portable",
-            "--ci-only",
-            "--format",
-            "json",
-        ])
+    let output = Command::new(harness)
+        .arg("plan")
+        .args(tree)
+        .args(["--lane", "portable", "--ci-only", "--format", "json"])
         .current_dir(root)
         .output()
-        .unwrap_or_else(|error| fail(error));
+        .map_err(|error| format!("cannot execute {}: {error}", harness.display()))?;
     let cells = serde_json::from_slice::<Vec<JsonValue>>(&output.stdout).unwrap_or_default();
     if !output.status.success() || cells.is_empty() {
-        fail("complete CLI control was refused or selected no cells");
+        return Err("complete CLI control was refused or selected no cells".into());
     }
     for argv in [
-        vec!["run", "--jobs", "0"],
-        vec!["run", "--jobs", "not-a-number"],
-        vec!["run", "--jobs", "2", "--jobs", "3"],
-        vec!["plan", "--jobs", "2"],
+        ["run", "--jobs", "0"].as_slice(),
+        &["run", "--jobs", "not-a-number"],
+        &["run", "--jobs", "2", "--jobs", "3"],
+        &["plan", "--jobs", "2"],
     ] {
-        let status = Command::new(&executable)
-            .args(argv)
-            .current_dir(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap_or_else(|error| fail(error));
-        if status.success() {
-            fail("invalid --jobs control was accepted");
+        if accepted(argv)? {
+            return Err("invalid --jobs control was accepted".into());
         }
+        refused += 1;
     }
+    println!(
+        "CLI brackets: {refused} malformed controls refused; the complete control selected {} cells",
+        cells.len()
+    );
+    Ok(())
 }
 
 /// Run the canonical manifest planner over `root`. A `source_sha` means the
@@ -2089,19 +2164,22 @@ fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize
     );
 }
 
-fn audit_determinism_stress_evidence(root: &Path) {
+/// Run the determinism-stress library's comparison-evidence self-test, which
+/// prints its own pass line ("positive and refusal directions pass").
+fn audit_determinism_stress_evidence(root: &Path) -> Result<(), String> {
     let program = root.join("tests/e2e/lib/determinism-stress/common.sh");
     let status = Command::new(&program)
         .env("DETERMINISM_STRESS_EVIDENCE_SELF_TEST", "1")
         .current_dir(root)
         .status()
-        .unwrap_or_else(|error| fail(format!("cannot execute {}: {error}", program.display())));
+        .map_err(|error| format!("cannot execute {}: {error}", program.display()))?;
     if !status.success() {
-        fail(format!(
+        return Err(format!(
             "{} failed its comparison-evidence self-test",
             program.display()
         ));
     }
+    Ok(())
 }
 
 fn read_dag(path: &Path) -> Result<dagrun::DagConfig, String> {
@@ -2187,10 +2265,12 @@ fn command_runs_exactly(command: &str, inner: &str) -> bool {
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
     let committed_path = root.join("ci/dag/validate.json");
     let committed = read_dag(&committed_path)?;
+    let (mut nodes, mut buckets) = (0, 0);
     for lane in ["portable", "privileged"] {
         let path = &committed_path;
         let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])
             .map_err(|error| format!("{}: cannot select label {lane}: {error}", path.display()))?;
+        nodes += dag.steps.len();
         if dag
             .steps
             .iter()
@@ -2322,7 +2402,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                 path.display()
             ));
         }
+        buckets += actual.len();
     }
+    println!(
+        "DAG correspondence: {nodes} portable and privileged nodes and {buckets} manifest buckets checked against the manifests"
+    );
     Ok(())
 }
 
@@ -9396,6 +9480,139 @@ sys.exit(1 if failed else 0)
     }
 
     /// ci/buck-e2e/cell.sh runs every cell alone with `--parity-plan-of-test`.
+    /// Each audit `validate --without-footprint-check` runs (the Buck-only
+    /// gate's mode) accepts the committed input and refuses a deliberately
+    /// broken one. Each audit gets a tree holding only the files it reads, so
+    /// the accepted copy also proves the file list complete.
+    #[test]
+    fn validate_audits_each_accept_the_committed_input_and_refuse_a_broken_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = super::root(None);
+        let manifests = ManifestSet::load(&root).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "validate-audits-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        let copy = |name: &str, files: &[&str]| -> std::path::PathBuf {
+            let dir = fixture.join(name);
+            for file in files {
+                let target = dir.join(file);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                // fs::copy keeps the permission bits, so a script stays executable.
+                fs::copy(root.join(file), &target).unwrap();
+            }
+            dir
+        };
+        let edit = |path: &std::path::Path, from: &str, to: &str| {
+            let text = fs::read_to_string(path).unwrap();
+            assert_eq!(text.matches(from).count(), 1, "{}: {from}", path.display());
+            fs::write(path, text.replacen(from, to, 1)).unwrap();
+        };
+
+        // DAG correspondence: a portable manifest node whose command no longer
+        // runs its typed selector.
+        let dag = ["ci/dag/validate.json"];
+        let good = copy("dag-good", &dag);
+        super::audit_dag_correspondence(&good, &manifests).unwrap();
+        let broken = copy("dag-broken", &dag);
+        let path = broken.join(dag[0]);
+        let mut json: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let step = json["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["manifest"]["lane"] == "portable")
+            .expect("a portable manifest node");
+        let cmd = step["cmd"].as_str().unwrap().replace(
+            "target/debug/test-harness run --lane portable --category ",
+            "target/debug/test-harness run --lane portable --category broken-",
+        );
+        step["cmd"] = JsonValue::String(cmd);
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let error = super::audit_dag_correspondence(&broken, &manifests).unwrap_err();
+        assert!(
+            error.contains("does not execute its typed selector literally"),
+            "{error}"
+        );
+
+        // Budget ordering: a baseline inversion the DAG no longer has.
+        let budget = [
+            "ci/dag/validate.json",
+            ".github/workflows/ci-dag.yml",
+            ".github/workflows/ci-portable.yml",
+            ".github/workflows/ci-privileged.yml",
+            ".github/workflows/validation-levels.yml",
+            "ci/portable-shards.json",
+            "ci/budget-inversions-baseline.txt",
+        ];
+        let good = copy("budget-good", &budget);
+        super::audit_budget_ordering(&good).unwrap();
+        let broken = copy("budget-broken", &budget);
+        let baseline = broken.join("ci/budget-inversions-baseline.txt");
+        let mut text = fs::read_to_string(&baseline).unwrap();
+        text.push_str("e2e.not_a_node 1s >= 0s (job test-debug timeout-minutes)\n");
+        fs::write(&baseline, text).unwrap();
+        let error = super::audit_budget_ordering(&broken).unwrap_err();
+        assert!(
+            error.contains("budget-inversion baseline drifted") && error.contains("e2e.not_a_node"),
+            "{error}"
+        );
+
+        // Determinism-stress evidence: a library that reports a comparison
+        // policy when it observed none, which its self-test exists to refuse.
+        let stress = ["tests/e2e/lib/determinism-stress/common.sh"];
+        let good = copy("stress-good", &stress);
+        super::audit_determinism_stress_evidence(&good).unwrap();
+        let broken = copy("stress-broken", &stress);
+        edit(
+            &broken.join(stress[0]),
+            "local display=unknown relaxations=unknown",
+            "local display=BitwiseInfoV1 relaxations=none",
+        );
+        let error = super::audit_determinism_stress_evidence(&broken).unwrap_err();
+        assert!(
+            error.contains("failed its comparison-evidence self-test"),
+            "{error}"
+        );
+
+        // CLI brackets: a harness that accepts every control, and one that
+        // refuses every control (the complete one included).
+        let harness = |name: &str, status: i32| -> std::path::PathBuf {
+            let path = fixture.join(name);
+            fs::write(&path, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let error = super::audit_cli_brackets(&root, &harness("accepts-all", 0), &[]).unwrap_err();
+        assert_eq!(error, "missing value for --lane was accepted");
+        let error = super::audit_cli_brackets(&root, &harness("refuses-all", 2), &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "complete CLI control was refused or selected no cells"
+        );
+        // A harness that only refuses when its tree words are missing: the
+        // words reach every control, ahead of the control's own words.
+        let path = fixture.join("needs-tree");
+        fs::write(
+            &path,
+            "#!/bin/bash\n[ \"$2\" = --repo-root ] && [ \"$4\" = --source-sha ] || exit 9\n\
+             case \" $* \" in *' --lane portable --ci-only '*) echo '[{}]'; exit 0 ;; esac\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tree = ["--repo-root", "/r", "--source-sha", "s"].map(std::ffi::OsString::from);
+        super::audit_cli_brackets(&root, &path, &tree).unwrap();
+        let error = super::audit_cli_brackets(&root, &path, &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "complete CLI control was refused or selected no cells"
+        );
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
     /// For every cell a full-profile node plans, that one-cell run names the
     /// parity golden's CPU profile exactly when the node does, so a Buck cell
     /// presents the CPU Cargo validation presents; without the flag the

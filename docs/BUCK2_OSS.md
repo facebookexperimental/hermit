@@ -559,6 +559,11 @@ flag.
 `--buck-s1` does the same for `ci/buck-e2e/subsets/s1.json`, which is s0 plus
 the applications category. Its guests run the host's `git`, `ar`, `cc` and
 `python3`, so the host needs them.
+In place of `gate.manifest`, `gate.manifest_<name>` runs the staged Buck-built
+harness's `test-harness validate --without-footprint-check` over the staged
+source: every manifest audit `gate.manifest` runs, each printing what it
+checked, except the generated test-footprint check, whose generator runs
+`cargo metadata`. validate prints that check as NOT RUN.
 The last node of each Buck-only run, `gate.no_cargo_<name>`, waits for every
 import twin's recorded exit status instead of depending on the twins, so a
 failed twin no longer skips it. Its verdict is whether any node, the twins

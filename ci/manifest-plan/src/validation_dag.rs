@@ -2294,6 +2294,11 @@ pub const BUCK_S0_LABEL: &str = "buck-s0";
 /// the staged source the cells ran: a Buck-built harness has no compiled-in
 /// checkout root, and the rows record the staged `git archive` of SOURCE_SHA.
 const BUCK_S0_HARNESS: &str = "ci/buck-e2e/staged/bin/test-harness run --repo-root \"$PWD/ci/buck-e2e/staged/src\" --source-sha \"$(cat ci/buck-e2e/staged/SOURCE_SHA)\" ";
+/// gate.manifest's `test-harness validate` as the Buck-only gate runs it: the
+/// staged Buck-built harness over the staged source, as [`BUCK_S0_HARNESS`]
+/// names them (it has no checkout of its own to fall back on), with every
+/// audit but the generated test footprints, which it reports NOT RUN.
+const BUCK_GATE_VALIDATE: &str = "ci/buck-e2e/staged/bin/test-harness validate --without-footprint-check --repo-root \"$PWD/ci/buck-e2e/staged/src\" --source-sha \"$(cat ci/buck-e2e/staged/SOURCE_SHA)\"";
 /// Where `pre.reverie_pin` compiles its two rustc checkers and keeps its
 /// Reverie graph cache in a `--buck-s0` run: ignored/validation/pin-check, not
 /// the checkout's target/. ci/run-reverie-pin-check.sh compiles in
@@ -2584,8 +2589,9 @@ fn buck_s0_cargo_refusal_check(tag: &str) -> String {
 /// --from-buck, then the public buck2's stock test runner over the subset's
 /// cells) beside the preflight, waiting for the preflight before any cell;
 /// gate.manifest_s0, which refuses if any node ran cargo and runs the staged
-/// Buck-built harness's inventory check (sync-cells --check) in place of
-/// gate.manifest; and one import twin per (lane, category) of the subset,
+/// Buck-built harness's `validate --without-footprint-check`
+/// ([`BUCK_GATE_VALIDATE`]) in place of gate.manifest; and one import twin per
+/// (lane, category) of the subset,
 /// cloned from the committed `<bucket>_buck` twin with the staged Buck-built
 /// harness and the plan's other backends excluded, so each twin selects exactly
 /// the subset's cells of its bucket and writes that bucket's result files,
@@ -2730,22 +2736,23 @@ pub fn buck_subset_selection(
     steps.push(cells.clone());
 
     // gate.manifest runs the Cargo-built target/debug/test-harness validate.
-    // Its inventory check, the expected plan and the optional cells against the
-    // manifests, runs here with the staged Buck-built harness; its other
-    // audits (DAG correspondence, budget ordering, determinism-stress evidence,
-    // CLI brackets, and the generated footprints, a Cargo-built
-    // target/debug/generate-test-footprints) do not run in this mode.
+    // The staged Buck-built harness runs the same validate here, with
+    // --without-footprint-check: every audit (DAG correspondence, budget
+    // ordering, determinism-stress evidence, CLI brackets, the expected plan
+    // and the synced cell files, after the front-door manifest planner) except
+    // the generated footprints, whose target/debug/generate-test-footprints runs
+    // `cargo metadata`; validate prints that check as NOT RUN.
     let mut gate = find("gate.manifest")?;
     gate.job = gate_job.clone();
     let gate_template = gate.clone();
     gate.cmd = format!(
-        "{}; ci/buck-e2e/staged/bin/test-harness sync-cells --check --repo-root \"$PWD/ci/buck-e2e/staged/src\"",
+        "{}; {BUCK_GATE_VALIDATE}",
         buck_s0_cargo_refusal_check(&format!("gate.{gate_job}"))
     );
     gate.desc =
-        "Buck-only gate: no node ran cargo, and the staged harness's inventory check".into();
+        "Buck-only gate: no node ran cargo, and the staged harness's manifest audits".into();
     gate.description = format!(
-        "Selected only by scripts/validate.rs {flag}, in place of gate.manifest (the Cargo-built target/debug/test-harness validate). After {}, whose preflight wait means both preflight nodes have exited: it refuses if any {flag} node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to), then runs the staged Buck-built harness's ci/buck-e2e/staged/bin/test-harness sync-cells --check over the staged source, so manifests that drifted from ci/expected-e2e-plan.json or ci/optional-e2e-cells.txt fail the run as gate.manifest would (every harness command, the twins' included, also runs the front-door manifest schema and inventory authority). gate.manifest's other audits do not run in this mode: DAG correspondence, budget ordering, determinism-stress evidence, CLI brackets, and the generated test footprints (a Cargo-built target/debug/generate-test-footprints).",
+        "Selected only by scripts/validate.rs {flag}, in place of gate.manifest (the Cargo-built target/debug/test-harness validate). After {}, whose preflight wait means both preflight nodes have exited: it refuses if any {flag} node ran cargo ({BUCK_S0_CARGO_REFUSED_LOG}, which {BUCK_S0_NO_CARGO_SHIM} appends to), then runs the staged Buck-built harness's validate over the staged source ({BUCK_GATE_VALIDATE}). That is gate.manifest's own command on the Buck-built binary: the front-door manifest planner, then the DAG correspondence, budget ordering, determinism-stress evidence and CLI bracket audits, each printing what it checked, then the expected plan and the cell files synced from the manifests. One audit does not run in this mode, and validate prints it as NOT RUN: the generated test footprints, whose Cargo-built target/debug/generate-test-footprints runs cargo metadata.",
         cells.tag()
     );
     gate.deps = vec![cells.tag()];
@@ -9439,16 +9446,40 @@ sys.exit(37)
         // on any refused cargo call.
         let gate = &selected.steps[4];
         assert_eq!(gate.deps, vec!["e2e.buck_s0".to_string()]);
-        for needle in [
-            "ci/buck-e2e/staged/bin/test-harness sync-cells --check",
-            BUCK_S0_CARGO_REFUSED_LOG,
-        ] {
+        for needle in [BUCK_GATE_VALIDATE, BUCK_S0_CARGO_REFUSED_LOG] {
             assert!(
                 gate.cmd.contains(needle),
                 "gate lost {needle}: {}",
                 gate.cmd
             );
         }
+        // validate is the command's last program, and dagrun appends nothing
+        // after it (gate.manifest's jobs_flag is empty), so no extra word
+        // reaches the harness's parser.
+        assert!(gate.cmd.ends_with(BUCK_GATE_VALIDATE), "{}", gate.cmd);
+        assert_eq!(
+            dagrun::model::command_with_inner_jobs(
+                gate,
+                &selected.default_jobs_flag,
+                gate.hint.preferred_inner_jobs
+            ),
+            gate.cmd
+        );
+        // The full gate.manifest keeps the Cargo-built harness's whole
+        // validate, the footprint check included.
+        let full_gate = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "gate.manifest")
+            .unwrap();
+        assert!(
+            full_gate
+                .cmd
+                .ends_with("; target/debug/test-harness validate"),
+            "{}",
+            full_gate.cmd
+        );
+        assert!(!full_gate.cmd.contains("--without-footprint-check"));
         for step in [submodules, pin] {
             assert!(
                 step.cmd
