@@ -203,10 +203,11 @@ pub struct StartOpts {
 
     /// The CPU the recorded guest sees: auto (the default), x86-64-v2 or
     /// x86-64-v3, offered only on qualified ptrace hosts. Here auto reads
-    /// only the program's declarations: x86-64-v2 unless the program or its
-    /// interpreter declares x86-64-v3. It is resolved before recording, and
-    /// the recording holds what it resolved to. The long help states what
-    /// the qualification leaves uncovered.
+    /// only declarations: x86-64-v2 unless the program, its interpreter
+    /// or (for an image) the C library beside that interpreter declares
+    /// x86-64-v3. It is resolved before recording, and the recording
+    /// holds what it resolved to. The long help states what the
+    /// qualification leaves uncovered.
     /// HERMIT_CPU_PROFILE supplies it when the flag is absent, as for `hermit
     /// run`; the flag wins.
     #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
@@ -217,9 +218,16 @@ pub struct StartOpts {
     #[clap(skip)]
     auto_resolution: Option<String>,
 
-    /// The choice `--cpu-profile auto` made, where it asked the host
-    /// ([`hermit::cpu_profile_admission::choose_record_auto`]); `None` for a
-    /// named profile and for one resolved from declarations alone.
+    /// The C library beside the guest's interpreter whose x86-64-v3
+    /// declaration auto resolved for, where only it declared, so an
+    /// admission refusal can name the file that decided the profile.
+    #[clap(skip)]
+    auto_libc_path: Option<PathBuf>,
+
+    /// The choice `--cpu-profile auto` made, where it is not the plain
+    /// declared answer `cpu_profile_choice` reconstructs: a detail
+    /// (the C library's name) only the choice itself holds. `None` for
+    /// a named profile and for a declared one without a detail.
     #[clap(skip)]
     auto_choice: Option<hermit::cpu_profile_admission::ProfileChoice>,
 
@@ -504,8 +512,8 @@ impl StartOpts {
     }
 
     /// The profile this recording holds and why, for its manifest: auto
-    /// resolves by the program's declarations (`declared`), and by the host
-    /// only where the program's C library needs x86-64-v3
+    /// resolves by declarations alone (`declared`), the C library's
+    /// included, never by the host
     /// ([`hermit::cpu_profile_admission::choose_record_auto`]).
     fn cpu_profile_choice(&self) -> hermit::cpu_profile_admission::ProfileChoice {
         use hermit::cpu_profile_admission::ProfileReason;
@@ -528,9 +536,11 @@ impl StartOpts {
     /// program and its interpreter declare
     /// ([`hermit::cpu_profile_admission::resolve_auto`]), and the answer of
     /// `choose` ([`hermit::cpu_profile_admission::choose_record_auto`]) for
-    /// whether the program's C library needs x86-64-v3. That C library is
-    /// read, through the same view, only for an `image`: a program that is
-    /// not one keeps its own fault under the declarations' profile.
+    /// whether the program's C library declares x86-64-v3: a declared
+    /// x86-64-v3 either way, admitted (or refused by name) afterwards as
+    /// an explicit one is. That C library is read, through the same view,
+    /// only for an `image`: a program that is not one keeps its own fault
+    /// under the declarations' profile.
     fn with_auto_resolved(
         &self,
         program: &Path,
@@ -543,49 +553,54 @@ impl StartOpts {
         ) -> Result<hermit::cpu_profile_admission::AutoChoice, String>,
     ) -> Result<Self, Error> {
         use hermit::cpu_profile_admission::ProfileReason;
-        let libc_v3 = image
-            && hermit::cpu_profile_admission::libc_needs_v3(program, |guest| {
-                self.mapped_launch_path(guest)
-            });
-        let auto = choose(needs, libc_v3).map_err(Error::msg)?;
+        let libc_path = (image && needs != detcore_model::cpu_profile::CpuProfile::X86_64V3)
+            .then(|| {
+                hermit::cpu_profile_admission::v3_libc_path(program, |guest| {
+                    self.mapped_launch_path(guest)
+                })
+            })
+            .flatten();
+        let auto = choose(needs, libc_path.is_some()).map_err(Error::msg)?;
         let mut resolved = self.clone();
+        resolved.auto_libc_path = libc_path;
         resolved.cpu_profile = auto.choice.profile;
-        resolved.auto_resolution = Some(if auto.choice.reason == ProfileReason::Declared {
-            format!("--cpu-profile auto resolved to {needs}: {why}")
-        } else {
-            format!(
-                "--cpu-profile auto resolved to {}: {}; {why}",
-                auto.choice.profile,
-                auto.choice.because()
-            )
-        });
-        if auto.choice.reason != ProfileReason::Declared {
+        resolved.auto_resolution = Some(
+            if auto.choice.reason == ProfileReason::Declared && auto.choice.detail.is_none() {
+                format!("--cpu-profile auto resolved to {needs}: {why}")
+            } else if auto.choice.reason == ProfileReason::Declared {
+                // (detail is Some here: the arm above took Declared with none)
+                // The C library decided, so `why` (nothing exec'd first
+                // declares more) would contradict the choice it follows.
+                format!(
+                    "--cpu-profile auto resolved to {}: {}",
+                    auto.choice.profile,
+                    auto.choice.because()
+                )
+            } else {
+                format!(
+                    "--cpu-profile auto resolved to {}: {}; {why}",
+                    auto.choice.profile,
+                    auto.choice.because()
+                )
+            },
+        );
+        // A declared choice is reconstructed by `cpu_profile_choice`
+        // unless it carries a detail (only the C library's name),
+        // which only the choice itself holds.
+        if auto.choice.reason != ProfileReason::Declared || auto.choice.detail.is_some() {
             resolved.auto_log = auto.log;
-            // As for `hermit run`: an x86-64-v3 auto chose by the host logs
-            // its residual here, and the manifest keeps it, in place of a
-            // line on stderr.
-            if auto.choice.reason == ProfileReason::Admitted {
-                resolved
-                    .auto_log
-                    .push(detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
-            }
             resolved.auto_choice = Some(auto.choice);
         }
         Ok(resolved)
     }
 
-    /// Whether a verify match states x86-64-v3's residual for this recording.
-    /// As `hermit run` decides it: yes where the user asked for x86-64-v3
-    /// (named, or declared by the program), and no where auto chose it
-    /// because the host qualifies, whose residual goes to the debug log and
-    /// the recording's manifest instead. `--verify` keeps neither (it records
-    /// into a directory it removes and writes no manifest), so its match
-    /// states the residual of every x86-64-v3.
+    /// Whether a verify match states x86-64-v3's residual for this
+    /// recording: every x86-64-v3 recording states it, named or
+    /// declared (record auto never asks the host, so no recording's
+    /// v3 is host-admitted with the residual kept to its log and
+    /// manifest the way `hermit run` keeps an admitted one's).
     fn states_v3_residual(&self) -> bool {
         self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3
-            && (self.verify
-                || self.cpu_profile_choice().reason
-                    != hermit::cpu_profile_admission::ProfileReason::Admitted)
     }
 
     /// Logs what `--cpu-profile auto` resolved to, and what else auto said,
@@ -836,13 +851,11 @@ impl StartOpts {
                     }
                 };
             return self
-                .with_auto_resolved(
-                    &program,
-                    image,
-                    profile,
-                    why,
-                    hermit::cpu_profile_admission::choose_record_auto,
-                )?
+                .with_auto_resolved(&program, image, profile, why, |needs, libc_v3| {
+                    Ok(hermit::cpu_profile_admission::choose_record_auto(
+                        needs, libc_v3,
+                    ))
+                })?
                 .main_with_preparation(global, preparation);
         }
         if !replay_only {
@@ -868,8 +881,16 @@ impl StartOpts {
             // once, and the recorder and replayer reuse the result.
             let request = hermit::cpu_profile_admission::record_or_replay_request(false);
             let refuse = |refusal| {
-                Error::new(crate::app::container::PolicyRefusal)
-                    .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
+                let context = match &self.auto_libc_path {
+                    Some(libc) => format!(
+                        "--cpu-profile x86-64-v3 refused: {refusal}; auto chose x86-64-v3 \
+                         because the C library at {} declares that it needs x86-64-v3 or above; \
+                         pass --cpu-profile=x86-64-v2 if the guest really runs at x86-64-v2",
+                        libc.display()
+                    ),
+                    None => format!("--cpu-profile x86-64-v3 refused: {refusal}"),
+                };
+                Error::new(crate::app::container::PolicyRefusal).context(context)
             };
             if self.cpu_profile_choice().reason
                 == hermit::cpu_profile_admission::ProfileReason::Explicit
@@ -1699,6 +1720,7 @@ mod tests {
             program: Some(PathBuf::from("/bin/true")),
             cpu_profile: Default::default(),
             auto_resolution: None,
+            auto_libc_path: None,
             auto_choice: None,
             auto_log: Vec::new(),
             strict: false,
@@ -2235,6 +2257,7 @@ mod tests {
             program: Some(PathBuf::from("/proc/self/exe")),
             cpu_profile: Default::default(),
             auto_resolution: None,
+            auto_libc_path: None,
             auto_choice: None,
             auto_log: Vec::new(),
             strict: false,
@@ -2321,9 +2344,9 @@ mod tests {
     /// Auto's resolution reads an image's C library, beside its glibc
     /// interpreter and through this launch's view, and asks the chooser with
     /// what it found. A program that is not an image has no C library read.
-    /// An x86-64-v3 the host admitted for that C library is recorded with its
-    /// reason, names the C library, and logs the residual instead of stating
-    /// it.
+    /// An x86-64-v3 declared for that C library is recorded with its
+    /// detail, names the C library in the resolution, and states the
+    /// residual as a named x86-64-v3 does.
     #[test]
     fn auto_resolution_reads_the_c_library_of_an_image() {
         use detcore_model::cpu_profile::CpuProfile;
@@ -2345,9 +2368,9 @@ mod tests {
             &program,
             &isa_image(Some(&lib.join("ld-linux-x86-64.so.2")), None, false),
         );
-        let admitted = ProfileChoice {
+        let declared_libc = ProfileChoice {
             profile: CpuProfile::X86_64V3,
-            reason: ProfileReason::Admitted,
+            reason: ProfileReason::Declared,
             detail: Some(LIBC_V3_DETAIL.to_owned()),
         };
         let declared = |needs| AutoChoice {
@@ -2369,7 +2392,7 @@ mod tests {
                 |needs, libc_v3| {
                     asked = Some((needs, libc_v3));
                     Ok(AutoChoice {
-                        choice: admitted.clone(),
+                        choice: declared_libc.clone(),
                         log: vec!["announced".to_owned()],
                     })
                 },
@@ -2377,24 +2400,12 @@ mod tests {
             .unwrap();
         assert_eq!(asked, Some((CpuProfile::X86_64V2, true)));
         assert_eq!(resolved.cpu_profile, CpuProfile::X86_64V3);
-        assert_eq!(resolved.cpu_profile_choice(), admitted);
-        assert!(!resolved.states_v3_residual());
-        assert_eq!(
-            resolved.auto_log,
-            [
-                "announced".to_owned(),
-                detcore_model::cpu_profile::V3_RESIDUAL.to_owned()
-            ]
-        );
+        assert_eq!(resolved.cpu_profile_choice(), declared_libc);
+        assert!(resolved.states_v3_residual());
+        assert_eq!(resolved.auto_log, ["announced".to_owned()]);
         assert_eq!(
             resolved.auto_resolution.as_deref(),
-            Some(
-                format!(
-                    "--cpu-profile auto resolved to x86-64-v3: {LIBC_V3_DETAIL}, and this run \
-                     and host qualify for x86-64-v3; declarations"
-                )
-                .as_str()
-            )
+            Some(format!("--cpu-profile auto resolved to x86-64-v3: {LIBC_V3_DETAIL}").as_str())
         );
         // A program that is not an image: its C library is not read.
         let mut asked = None;
@@ -2452,13 +2463,13 @@ mod tests {
         assert!(libc_v3_seen(&mounted));
     }
 
-    /// A verify match states x86-64-v3's residual for a recording where the
-    /// user asked for x86-64-v3 (named, or declared by the program), and not
-    /// where auto chose it because the host qualifies, as for its C library
-    /// (`hermit run` decides the same way), whose debug log and manifest keep
-    /// it; nor for x86-64-v2. `--verify` keeps neither, so there a match
-    /// states it for every x86-64-v3. The one place record start sets the
-    /// flag a match reads is guarded by that decision.
+    /// A verify match states x86-64-v3's residual exactly where the
+    /// recording's profile is x86-64-v3: the flag is plainly that
+    /// equality, so a named x86-64-v3 and a declared one (record auto
+    /// never asks the host, including where only the C library
+    /// declares it) state it, under `--verify` as without, and
+    /// x86-64-v2 never does. The one place record start sets the flag
+    /// a match reads is guarded by that predicate.
     #[test]
     fn a_recording_states_the_v3_residual_where_nothing_else_keeps_it() {
         use detcore_model::cpu_profile::CpuProfile;
@@ -2471,19 +2482,8 @@ mod tests {
         options.auto_resolution = Some("--cpu-profile auto resolved to x86-64-v3".to_owned());
         assert_eq!(options.cpu_profile_choice().reason, ProfileReason::Declared);
         assert!(options.states_v3_residual(), "declared");
-        let admitted = ProfileChoice {
-            profile: CpuProfile::X86_64V3,
-            reason: ProfileReason::Admitted,
-            detail: Some(hermit::cpu_profile_admission::LIBC_V3_DETAIL.to_owned()),
-        };
-        options.auto_choice = Some(admitted.clone());
-        assert_eq!(options.cpu_profile_choice(), admitted);
-        assert!(!options.states_v3_residual(), "chosen for the C library");
         options.verify = true;
-        assert!(
-            options.states_v3_residual(),
-            "chosen for the C library, under --verify"
-        );
+        assert!(options.states_v3_residual(), "declared, under --verify");
         options.verify = false;
         options.cpu_profile = CpuProfile::X86_64V2;
         options.auto_choice = Some(ProfileChoice {

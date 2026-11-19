@@ -2790,6 +2790,12 @@ pub struct RunOpts {
     #[clap(skip)]
     auto_resolution: Option<String>,
 
+    /// The C library beside the guest's interpreter whose x86-64-v3
+    /// declaration auto resolved for, where only it declared, so an
+    /// admission refusal can name the file that decided the profile.
+    #[clap(skip)]
+    auto_libc_path: Option<PathBuf>,
+
     /// What else auto had to say (that it qualified the host, or why a check
     /// that can change between runs took x86-64-v3 away), logged with
     /// [`Self::auto_resolution`] and never printed on stderr.
@@ -13527,8 +13533,17 @@ impl RunOpts {
                 }
                 Ok(())
             }
-            Err(refusal) => Err(Error::new(PolicyRefusal)
-                .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
+            Err(refusal) => Err(
+                Error::new(PolicyRefusal).context(match &self.auto_libc_path {
+                    Some(libc) => format!(
+                        "--cpu-profile x86-64-v3 refused: {refusal}; auto chose x86-64-v3 \
+                         because the C library at {} declares that it needs x86-64-v3 or above; \
+                         pass --cpu-profile=x86-64-v2 if the guest really runs at x86-64-v2",
+                        libc.display()
+                    ),
+                    None => format!("--cpu-profile x86-64-v3 refused: {refusal}"),
+                }),
+            ),
         }
     }
 
@@ -13601,8 +13616,9 @@ impl RunOpts {
 
     /// Resolve `--cpu-profile auto` to a named profile before it is admitted
     /// like an explicit one (`hermit::cpu_profile_admission::choose_auto`):
-    /// x86-64-v3 where the guest program or its program interpreter declares
-    /// it (`hermit::cpu_profile_admission::resolve_auto`), or where this run
+    /// x86-64-v3 where the guest program, its program interpreter or (for a
+    /// run presenting a virtual CPU) its C library declares it
+    /// (`hermit::cpu_profile_admission::resolve_auto`), or where this run
     /// and host qualify for it; x86-64-v2 otherwise. The configuration, and
     /// with it the run's manifest and the second run of `--verify`, then
     /// holds only the named profile. A program auto cannot read or resolve
@@ -13653,8 +13669,19 @@ impl RunOpts {
         else {
             return Ok(());
         };
-        let auto = hermit::cpu_profile_admission::choose_auto(needs, &self.cpu_profile_request())
-            .map_err(Error::msg)?;
+        // The C library is read only where it can decide: where the
+        // executable and its interpreter ask for no more than
+        // x86-64-v2, its declaration alone may still need x86-64-v3.
+        let libc_path = (needs != CpuProfile::X86_64V3)
+            .then(|| hermit::cpu_profile_admission::v3_libc_path(&program, to_host))
+            .flatten();
+        self.auto_libc_path = libc_path.clone();
+        let auto = hermit::cpu_profile_admission::choose_auto(
+            needs,
+            libc_path.is_some(),
+            &self.cpu_profile_request(),
+        )
+        .map_err(Error::msg)?;
         // A v2 an old document's auto resolves to is the legacy
         // table it saved, resolved the pre-split way.
         let mut auto = auto;
@@ -13665,18 +13692,16 @@ impl RunOpts {
                 "pre-psABI document: x86-64-v2 reruns on the legacy table it saved".to_owned(),
             );
         }
-        // An x86-64-v3 the host admitted names the C library where it declares
-        // x86-64-v3, as `hermit record start` records it. The choice is the same
-        // either way; the C library is read only for an admitted choice.
-        let auto = if auto.choice.reason == ProfileReason::Admitted {
-            let libc_v3 = hermit::cpu_profile_admission::libc_needs_v3(&program, to_host);
-            hermit::cpu_profile_admission::name_libc_need(auto, libc_v3)
-        } else {
-            auto
-        };
         let profile = auto.choice.profile;
         self.auto_resolution = Some(if needs == CpuProfile::X86_64V3 {
             format!("--cpu-profile auto resolved to {profile}: {why}")
+        } else if libc_path.is_some() {
+            // The C library decided, so `why` (nothing exec'd first
+            // declares more) would contradict the choice it follows.
+            format!(
+                "--cpu-profile auto resolved to {profile}: {}",
+                auto.choice.because()
+            )
         } else {
             format!(
                 "--cpu-profile auto resolved to {profile}: {}; {why}",

@@ -124,6 +124,22 @@ pub struct AdmissionRequest<'a> {
     pub namespace_only: bool,
 }
 
+impl AdmissionRequest<'_> {
+    /// Whether the guest sees the host's real CPUID, so no virtual
+    /// x86-64 level bounds it: SaBRe, which does not trap CPUID, or a
+    /// run with nothing answering CPUID (`--namespace-only`,
+    /// `--strace-only`, `--no-virtualize-cpuid`). Every other
+    /// request presents a virtual CPU: the ptrace v3 table where the
+    /// run and host qualify, the x86-64-v2 table on KVM, DBT,
+    /// LiteInst and in-guest-trap (each traps CPUID -- the in-guest
+    /// runtime arms CPUID faulting before the guest's first
+    /// instruction -- but carries no CPU profile but x86-64-v2's)
+    /// and on an unqualified or `--gdbserver` ptrace run.
+    pub fn guest_sees_host_cpuid(&self) -> bool {
+        self.namespace_only || self.strace_only || !self.virtualize_cpuid || self.backend == "sabre"
+    }
+}
+
 /// The refusals that need no host probe, in the order they are checked.
 pub fn check_request(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefusal> {
     if !request.ptrace {
@@ -136,9 +152,11 @@ pub fn check_request(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefu
                 "Detcore answers DBT's CPUID, but the DBT runtime's configuration carries no \
                  CPU profile, so it answers only the x86-64-v2 table"
             }
-            "sabre" | "liteinst" | "in-guest-trap" => {
-                "this backend does not trap CPUID, so the guest would see the host's"
+            "liteinst" | "in-guest-trap" => {
+                "the in-guest runtime traps CPUID, but Detcore answers it only with the \
+                 x86-64-v2 table: no CPU profile reaches it"
             }
+            "sabre" => "this backend does not trap CPUID, so the guest would see the host's",
             _ => "only the ptrace backend is qualified",
         };
         return Err(format!("--backend={}: {why}", request.backend));
@@ -629,14 +647,14 @@ const GLIBC_C_LIBRARY: &str = "libc.so.6";
 /// path walk (`MAXSYMLINKS`).
 const MAX_FOLLOWED_LINKS: usize = 40;
 
-/// What an `admitted` choice says where the program's C library declares
-/// x86-64-v3 ([`name_libc_need`]).
+/// What a choice made for the program's C library declares x86-64-v3
+/// says (`detail`), in a manifest, a resolution line and a refusal.
 pub const LIBC_V3_DETAIL: &str =
-    "the C library beside the program interpreter declares that it needs x86-64-v3";
+    "the C library beside the program interpreter declares that it needs x86-64-v3 or above";
 
 /// Whether the C library of the image `program` execs first declares that it
-/// needs x86-64-v3, where its own and its interpreter's declarations do not
-/// need to say so ([`resolve_auto`]). This is the `libc.so.6` in the
+/// needs x86-64-v3 or above, where its own and its interpreter's
+/// declarations do not need to say so ([`resolve_auto`]). This is the `libc.so.6` in the
 /// directory of that image's glibc program interpreter, after the symlinks
 /// of the interpreter's own name, and then after the symlinks of its own.
 ///
@@ -652,38 +670,74 @@ pub const LIBC_V3_DETAIL: &str =
 /// stays in its link's directory (`followed_in_view`). The C library is
 /// opened without blocking and without following a final link, and only a
 /// regular file is read, so a FIFO or a device there never makes auto wait.
-/// Nothing here refuses. A library that is absent, hidden, unreadable, not a
-/// regular file, unmarked, malformed, or declaring another level gives
-/// `false`, and glibc's own check still refuses a guest that needs more than
-/// its profile presents.
+/// Nothing here refuses. A library that is absent, hidden, unreadable, not
+/// a regular file, unmarked or declaring another level gives `false` (a
+/// declaration that was found counts, as the loader counts it); glibc's
+/// own check is the last line for a needed library this read cannot find
+/// beside the interpreter.
 pub fn libc_needs_v3(program: &Path, to_host: impl Fn(&Path) -> Option<PathBuf>) -> bool {
-    use detcore::exec_record::IsaNeeds;
     if host_machine() != EM_X86_64 {
         return false;
     }
-    let read = || -> Option<bool> {
-        let image = exec_image(program, &to_host).ok()?;
-        let interpreter =
-            detcore::exec_record::program_interpreter_of(&image, EM_X86_64).ok()??;
-        if interpreter.file_name()? != std::ffi::OsStr::new(GLIBC_X86_64_INTERPRETER) {
-            return None;
-        }
-        let loader = followed_in_view(to_host(&interpreter)?, &to_host)?;
-        let library = followed_in_view(loader.parent()?.join(GLIBC_C_LIBRARY), &to_host)?;
-        let file = detcore::util::RawFd::open(
-            &library,
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW,
-        )
-        .ok()?;
-        if file.stat().ok()?.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return None;
-        }
-        Some(matches!(
-            IsaNeeds::read_file_strict(&file),
-            Some(IsaNeeds::Level(3))
-        ))
-    };
-    read().unwrap_or(false)
+    v3_libc_path(program, to_host).is_some()
+}
+
+/// The C library beside the glibc program interpreter of the image
+/// `program` execs first, where it declares that it needs x86-64-v3
+/// ([`libc_needs_v3`]): its host path in the launch's view, so a
+/// refusal can name the file that decided it.
+pub fn v3_libc_path(program: &Path, to_host: impl Fn(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    use detcore::exec_record::IsaNeeds;
+    if host_machine() != EM_X86_64 {
+        return None;
+    }
+    let image = exec_image(program, &to_host).ok()?;
+    let interpreter = detcore::exec_record::program_interpreter_of(&image, EM_X86_64).ok()??;
+    let (library, needs) = libc_beside(&interpreter, &to_host(&interpreter)?, &to_host)?;
+    // A declaration above x86-64-v3 counts as x86-64-v3's need here:
+    // no profile presents more, so the guest then runs under
+    // x86-64-v3 or is refused with it named, and the loader's own
+    // refusal is the last line for the level above -- as for any
+    // other needed library auto does not read. An executable or
+    // interpreter declaring that level refuses by name before any
+    // guest runs; this beside-library is a heuristic read (auto
+    // does not repeat the loader's search), so it never refuses on
+    // its own evidence alone.
+    matches!(needs, IsaNeeds::Level(level) if level >= 3).then_some(library)
+}
+
+/// The C library beside the glibc program interpreter `interpreter` (a
+/// guest path at host path `interpreter_on_host`), and the x86-64 ISA
+/// level it declares, read as the loader reads it (a declaration that
+/// was found counts, beside trailing state the reader cannot decide:
+/// glibc enforces the found declaration): the `libc.so.6` in the directory of
+/// the interpreter after the symlinks of its own name, then after the
+/// symlinks of its own, in the launch's view through `to_host`, opened
+/// without blocking and without following a final link, and read only as
+/// a regular file. `None` where the interpreter is not glibc's loader or
+/// that file is absent, hidden, unreadable or no regular file, or its
+/// declaration cannot be decided: that file is read for the declaration
+/// it makes, never as a refusal of its own.
+fn libc_beside(
+    interpreter: &Path,
+    interpreter_on_host: &Path,
+    to_host: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<(PathBuf, detcore::exec_record::IsaNeeds)> {
+    use detcore::exec_record::IsaNeeds;
+    if interpreter.file_name()? != std::ffi::OsStr::new(GLIBC_X86_64_INTERPRETER) {
+        return None;
+    }
+    let loader = followed_in_view(interpreter_on_host.to_path_buf(), to_host)?;
+    let library = followed_in_view(loader.parent()?.join(GLIBC_C_LIBRARY), to_host)?;
+    let file = detcore::util::RawFd::open(
+        &library,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW,
+    )
+    .ok()?;
+    if file.stat().ok()?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    Some((library, IsaNeeds::read_file(&file)?))
 }
 
 /// The host path `path` leads to after the symlinks of its own name, as the
@@ -795,11 +849,13 @@ pub enum ProfileReason {
     /// `--cpu-profile`, `HERMIT_CPU_PROFILE`, a run config or a manifest
     /// named the profile.
     Explicit,
-    /// auto, from what the program and its interpreter declare: x86-64-v3
-    /// where one declares it, admitted afterwards as an explicit x86-64-v3
-    /// is; and for `hermit record start`, which qualifies the host for auto
-    /// only where the program's C library needs x86-64-v3
-    /// ([`choose_record_auto`]), x86-64-v2 otherwise.
+    /// auto, from what the program, its interpreter or (beside a glibc
+    /// interpreter, for a run presenting a virtual CPU) its C library
+    /// declares: x86-64-v3 where one declares it, admitted afterwards
+    /// as an explicit x86-64-v3 is. A need only the C library declares
+    /// carries [`LIBC_V3_DETAIL`] as its `detail`. For
+    /// `hermit record start` this is auto's whole answer
+    /// ([`choose_record_auto`]).
     Declared,
     /// auto: this run's x86-64-v3 admission passed.
     Admitted,
@@ -845,8 +901,10 @@ pub struct ProfileChoice {
     pub profile: CpuProfile,
     pub reason: ProfileReason,
     /// For `qualification-refused` and `request-not-admissible`, the
-    /// refusal's own words; for an `admitted` choice whose program's C
-    /// library declares x86-64-v3 ([`name_libc_need`]), [`LIBC_V3_DETAIL`].
+    /// refusal's own words (with [`LIBC_V3_DETAIL`] first where only
+    /// the C library declared x86-64-v3 and the guest sees the host's
+    /// CPU); for a `declared` choice only the C library made,
+    /// [`LIBC_V3_DETAIL`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -857,10 +915,8 @@ impl ProfileChoice {
         let detail = self.detail.as_deref().unwrap_or_default();
         match self.reason {
             ProfileReason::Explicit => "named".to_owned(),
+            ProfileReason::Declared if self.detail.is_some() => detail.to_owned(),
             ProfileReason::Declared => "from the program's declarations".to_owned(),
-            ProfileReason::Admitted if self.detail.is_some() => {
-                format!("{detail}, and this run and host qualify for x86-64-v3")
-            }
             ProfileReason::Admitted => "this run and host qualify for x86-64-v3".to_owned(),
             ProfileReason::Hypervisor => {
                 "under a hypervisor, auto does not qualify the host for x86-64-v3".to_owned()
@@ -916,10 +972,20 @@ static AUTO_HOST: std::sync::OnceLock<AutoHost> = std::sync::OnceLock::new();
 pub const AUTO_HOST_TEST_ENV: &str = "HERMIT_TEST_CPU_PROFILE_AUTO_HOST";
 
 /// The profile `hermit run` presents under auto for a program whose
-/// declarations ask for `needs` ([`resolve_auto`]), for `request`:
+/// executable and interpreter ask for `needs` ([`resolve_auto`]) and
+/// whose C library beside a glibc interpreter does or does not
+/// declare x86-64-v3 (`libc_v3`, [`libc_needs_v3`]), for `request`:
 /// - x86-64-v3 for a program that declares it (`declared`), admitted
 ///   afterwards as an explicit x86-64-v3 is, so a run that cannot carry it
 ///   is refused;
+/// - where only the C library declares x86-64-v3, the same `declared`
+///   x86-64-v3 (its `detail` naming the C library) where this run
+///   presents a virtual CPU, so a backend or host that cannot carry
+///   x86-64-v3 refuses it by name instead of glibc refusing inside
+///   the guest; where the guest sees the host's real CPU
+///   ([`AdmissionRequest::guest_sees_host_cpuid`]) the declaration
+///   does not decide, exactly as before it was read, and is recorded
+///   in the choice's `detail`;
 /// - x86-64-v2 where `request` cannot carry x86-64-v3 ([`check_request`]);
 /// - otherwise the host's answer, once per process: x86-64-v3 where
 ///   [`admit`] passes, x86-64-v2 under a hypervisor without qualifying the
@@ -928,10 +994,11 @@ pub const AUTO_HOST_TEST_ENV: &str = "HERMIT_TEST_CPU_PROFILE_AUTO_HOST";
 /// An `Err` is a malformed [`AUTO_HOST_TEST_ENV`].
 pub fn choose_auto(
     needs: CpuProfile,
+    libc_v3: bool,
     request: &AdmissionRequest<'_>,
 ) -> Result<AutoChoice, String> {
     let mut announced = Vec::new();
-    let mut auto = choose_auto_with(needs, request, || {
+    let mut auto = choose_auto_with(needs, libc_v3, request, || {
         if let Some(host) = AUTO_HOST.get() {
             return Ok(host.clone());
         }
@@ -957,6 +1024,7 @@ fn announcement_for_log(line: &str) -> String {
 /// x86-64-v3.
 fn choose_auto_with(
     needs: CpuProfile,
+    libc_v3: bool,
     request: &AdmissionRequest<'_>,
     host: impl FnOnce() -> Result<AutoHost, String>,
 ) -> Result<AutoChoice, String> {
@@ -971,12 +1039,27 @@ fn choose_auto_with(
             log: Vec::new(),
         });
     }
+    if libc_v3 && !request.guest_sees_host_cpuid() {
+        return Ok(AutoChoice {
+            choice: chose(
+                CpuProfile::X86_64V3,
+                ProfileReason::Declared,
+                Some(LIBC_V3_DETAIL.to_owned()),
+            ),
+            log: Vec::new(),
+        });
+    }
     if let Err(why) = check_request(request) {
+        let detail = if libc_v3 {
+            format!("{LIBC_V3_DETAIL}; {why}")
+        } else {
+            why
+        };
         return Ok(AutoChoice {
             choice: chose(
                 CpuProfile::X86_64V2,
                 ProfileReason::RequestNotAdmissible,
-                Some(why),
+                Some(detail),
             ),
             log: Vec::new(),
         });
@@ -1010,57 +1093,32 @@ fn choose_auto_with(
 }
 
 /// The profile `hermit record start` records under `--cpu-profile auto`,
-/// for a program whose own and interpreter's declarations ask for `needs`
-/// ([`resolve_auto`]) and whose C library does or does not declare x86-64-v3
-/// (`libc_v3`, [`libc_needs_v3`]):
-/// - `needs`, from the declarations alone (`declared`), wherever the C
-///   library asks no more, so that the recording does not depend on the host;
-/// - where only the C library declares x86-64-v3, a program that runs at
-///   x86-64-v2 on no host, the answer [`choose_auto`] gives `hermit run` for
-///   this recording's request: x86-64-v3 where the recording and host
-///   qualify (`admitted`, with [`LIBC_V3_DETAIL`]), and x86-64-v2 elsewhere,
-///   where glibc then refuses the guest, as it would without this read.
-///
-/// An `Err` is a malformed [`AUTO_HOST_TEST_ENV`].
-pub fn choose_record_auto(needs: CpuProfile, libc_v3: bool) -> Result<AutoChoice, String> {
-    choose_record_auto_with(needs, libc_v3, |request| choose_auto(needs, request))
-}
-
-/// [`choose_record_auto`] with auto's choice for a request as a parameter,
-/// for the tests. It is asked only where the C library alone declares
-/// x86-64-v3.
-fn choose_record_auto_with(
-    needs: CpuProfile,
-    libc_v3: bool,
-    choose: impl FnOnce(&AdmissionRequest<'_>) -> Result<AutoChoice, String>,
-) -> Result<AutoChoice, String> {
-    if needs == CpuProfile::X86_64V3 || !libc_v3 {
-        return Ok(AutoChoice {
-            choice: ProfileChoice {
-                profile: needs,
-                reason: ProfileReason::Declared,
-                detail: None,
-            },
-            log: Vec::new(),
-        });
+/// for a program whose declarations ask for `needs` ([`resolve_auto`])
+/// and whose C library does or does not declare x86-64-v3 (`libc_v3`,
+/// [`libc_needs_v3`]): always `declared`, so the recording does not
+/// depend on the host -- `needs` itself, or x86-64-v3 with
+/// [`LIBC_V3_DETAIL`] where only the C library declares it (a
+/// recording always presents a virtual CPU,
+/// [`record_or_replay_request`]). A declared x86-64-v3 is admitted
+/// afterwards as an explicit one is, so a host that cannot carry it
+/// refuses the recording by name instead of recording a guest its
+/// own glibc refuses.
+pub fn choose_record_auto(needs: CpuProfile, libc_v3: bool) -> AutoChoice {
+    let (profile, detail) = if needs == CpuProfile::X86_64V3 {
+        (needs, None)
+    } else if libc_v3 {
+        (CpuProfile::X86_64V3, Some(LIBC_V3_DETAIL.to_owned()))
+    } else {
+        (needs, None)
+    };
+    AutoChoice {
+        choice: ProfileChoice {
+            profile,
+            reason: ProfileReason::Declared,
+            detail,
+        },
+        log: Vec::new(),
     }
-    Ok(name_libc_need(
-        choose(&record_or_replay_request(false))?,
-        true,
-    ))
-}
-
-/// Names the C library in an x86-64-v3 the host admitted (`admitted`) for a
-/// program whose C library declares that it needs x86-64-v3 (`libc_v3`,
-/// [`libc_needs_v3`]), with [`LIBC_V3_DETAIL`]: that declaration is why the
-/// program runs at x86-64-v2 on no host. `hermit run` and `hermit record
-/// start` both name it, so the two record the same choice for one program and
-/// host. Every other choice is left as it is.
-pub fn name_libc_need(mut auto: AutoChoice, libc_v3: bool) -> AutoChoice {
-    if libc_v3 && auto.choice.reason == ProfileReason::Admitted {
-        auto.choice.detail = Some(LIBC_V3_DETAIL.to_owned());
-    }
-    auto
 }
 
 /// What [`AUTO_HOST_TEST_ENV`] forces: the hypervisor bit, or a refusal.
@@ -2277,7 +2335,7 @@ pub(crate) mod tests {
     fn auto_asks_the_host_only_for_a_program_and_request_it_could_upgrade() {
         let unasked = || -> Result<AutoHost, String> { panic!("the host was asked") };
         let chosen = |needs, request: &AdmissionRequest<'_>, host: Result<AutoHost, String>| {
-            choose_auto_with(needs, request, || host).unwrap()
+            choose_auto_with(needs, false, request, || host).unwrap()
         };
         let choice = |profile, reason, detail: Option<&str>| ProfileChoice {
             profile,
@@ -2285,7 +2343,7 @@ pub(crate) mod tests {
             detail: detail.map(str::to_owned),
         };
         assert_eq!(
-            choose_auto_with(CpuProfile::X86_64V3, &request("kvm"), unasked).unwrap(),
+            choose_auto_with(CpuProfile::X86_64V3, false, &request("kvm"), unasked).unwrap(),
             AutoChoice {
                 choice: choice(CpuProfile::X86_64V3, ProfileReason::Declared, None),
                 log: Vec::new(),
@@ -2296,7 +2354,7 @@ pub(crate) mod tests {
             ..request("ptrace")
         };
         for r in [request("kvm"), request("dbt"), no_cpuid] {
-            let auto = choose_auto_with(CpuProfile::X86_64V2, &r, unasked).unwrap();
+            let auto = choose_auto_with(CpuProfile::X86_64V2, false, &r, unasked).unwrap();
             let why = check_request(&r).unwrap_err();
             assert_eq!(
                 auto.choice,
@@ -2355,7 +2413,7 @@ pub(crate) mod tests {
         );
         assert_eq!(dynamic.choice.reason, ProfileReason::QualificationRefused);
         assert_eq!(
-            choose_auto_with(CpuProfile::X86_64V2, &ptrace, || Err("bad".into())),
+            choose_auto_with(CpuProfile::X86_64V2, false, &ptrace, || Err("bad".into())),
             Err("bad".into())
         );
     }
@@ -2399,7 +2457,8 @@ pub(crate) mod tests {
                         dynamic,
                     }
                 );
-                let auto = choose_auto_with(CpuProfile::X86_64V2, &ptrace, || Ok(host)).unwrap();
+                let auto =
+                    choose_auto_with(CpuProfile::X86_64V2, false, &ptrace, || Ok(host)).unwrap();
                 assert_eq!(
                     auto.choice,
                     ProfileChoice {
@@ -3269,11 +3328,142 @@ pub(crate) mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// `resolve_auto` reads the executable and its interpreter alone:
+    /// a C library beside the interpreter declaring x86-64-v3 does not
+    /// move its answer (the chooser accounts for it, where the run's
+    /// CPUID mode is known), while [`libc_needs_v3`] on the same
+    /// layout reports it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn auto_resolution_reads_no_c_library() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = root.join("lib64").join(GLIBC_X86_64_INTERPRETER);
+        put(&loader, &isa_image(None, None, false));
+        let program = root.join("program");
+        put(&program, &isa_image(Some(&loader), None, false));
+        put(
+            &root.join("lib64").join(GLIBC_C_LIBRARY),
+            &isa_image(None, Some(0b111), false),
+        );
+        assert!(libc_needs_v3(&program, same));
+        let (resolved, _) = super::resolve_auto_on(super::EM_X86_64, &program, same).unwrap();
+        assert_eq!(resolved, CpuProfile::X86_64V2);
+    }
+
+    /// Where only the C library declares x86-64-v3, auto declares
+    /// x86-64-v3 (admitted or refused by name afterwards) for a run
+    /// presenting a virtual CPU, and keeps the unmarked choice --
+    /// recording the C library in its detail -- where the guest
+    /// sees the host's real CPU. `hermit record start` always
+    /// declares, never asking the host.
+    #[test]
+    fn auto_where_only_the_c_library_needs_v3() {
+        let unasked = || -> Result<AutoHost, String> { panic!("the host was asked") };
+        let declared_libc = AutoChoice {
+            choice: ProfileChoice {
+                profile: CpuProfile::X86_64V3,
+                reason: ProfileReason::Declared,
+                detail: Some(LIBC_V3_DETAIL.to_owned()),
+            },
+            log: Vec::new(),
+        };
+        for backend in ["ptrace", "kvm", "dbt", "liteinst", "in-guest-trap"] {
+            assert_eq!(
+                choose_auto_with(CpuProfile::X86_64V2, true, &request(backend), unasked).unwrap(),
+                declared_libc,
+                "{backend}"
+            );
+        }
+        let gdbserver = AdmissionRequest {
+            gdbserver: true,
+            ..request("ptrace")
+        };
+        assert_eq!(
+            choose_auto_with(CpuProfile::X86_64V2, true, &gdbserver, unasked).unwrap(),
+            declared_libc,
+            "gdbserver"
+        );
+        assert_eq!(declared_libc.choice.because(), LIBC_V3_DETAIL);
+        for (name, host_request) in [
+            ("sabre", request("sabre")),
+            (
+                "namespace-only",
+                AdmissionRequest {
+                    namespace_only: true,
+                    ..request("ptrace")
+                },
+            ),
+            (
+                "no-virtualize-cpuid",
+                AdmissionRequest {
+                    virtualize_cpuid: false,
+                    ..request("ptrace")
+                },
+            ),
+            (
+                "strace-only",
+                AdmissionRequest {
+                    strace_only: true,
+                    ..request("ptrace")
+                },
+            ),
+        ] {
+            let auto =
+                choose_auto_with(CpuProfile::X86_64V2, true, &host_request, unasked).unwrap();
+            assert_eq!(auto.choice.profile, CpuProfile::X86_64V2, "{name}");
+            assert_eq!(
+                auto.choice.reason,
+                ProfileReason::RequestNotAdmissible,
+                "{name}"
+            );
+            let detail = auto.choice.detail.expect("a recorded reason");
+            assert!(detail.starts_with(LIBC_V3_DETAIL), "{name}: {detail}");
+            let unmarked =
+                choose_auto_with(CpuProfile::X86_64V2, false, &host_request, unasked).unwrap();
+            assert!(
+                !unmarked
+                    .choice
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(LIBC_V3_DETAIL),
+                "{name} unmarked"
+            );
+        }
+        for (needs, libc_v3, profile, detail) in [
+            (CpuProfile::X86_64V2, false, CpuProfile::X86_64V2, None),
+            (CpuProfile::X86_64V3, false, CpuProfile::X86_64V3, None),
+            (CpuProfile::X86_64V3, true, CpuProfile::X86_64V3, None),
+            (
+                CpuProfile::X86_64V2,
+                true,
+                CpuProfile::X86_64V3,
+                Some(LIBC_V3_DETAIL.to_owned()),
+            ),
+        ] {
+            assert_eq!(
+                choose_record_auto(needs, libc_v3),
+                AutoChoice {
+                    choice: ProfileChoice {
+                        profile,
+                        reason: ProfileReason::Declared,
+                        detail,
+                    },
+                    log: Vec::new(),
+                },
+                "{needs} {libc_v3}"
+            );
+        }
+    }
+
     /// The C library beside glibc's program interpreter decides: one whose
-    /// highest needed level is x86-64-v3 gives `true`; any other level, no
-    /// declaration, one beside a note a strict read cannot decide, a file
-    /// that is no image and no file give `false`. The interpreter declares
-    /// nothing, as CentOS Stream 10's does.
+    /// highest needed level is x86-64-v3 or above gives `true` (above
+    /// counts as v3's need: no profile presents more); any lower level,
+    /// no declaration, a file that is no image and no file give
+    /// `false`. The interpreter declares nothing, as CentOS Stream 10's
+    /// does.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn libc_needs_v3_reads_the_c_library_beside_glibcs_interpreter() {
@@ -3292,14 +3482,15 @@ pub(crate) mod tests {
             (Some(0b11), false),
             (Some(0b1), false),
             (Some(0), false),
-            (Some(0b1111), false),
+            (Some(0b1111), true),
             (None, false),
         ] {
             put(&libc, &isa_image(None, needed, false));
             assert_eq!(libc_needs_v3(&program, same), v3, "{needed:?}");
         }
-        // Read strictly, as the program's own declaration is: a lenient read
-        // would take this x86-64-v3.
+        // Read as the loader reads it: a declaration that was found
+        // counts beside trailing state the reader cannot decide,
+        // which a strict read calls malformed but glibc enforces.
         put(&libc, &isa_image(None, Some(0b111), true));
         assert!(
             matches!(
@@ -3309,7 +3500,7 @@ pub(crate) mod tests {
             "{:?}",
             IsaNeeds::read_path_strict(&libc)
         );
-        assert!(!libc_needs_v3(&program, same));
+        assert!(libc_needs_v3(&program, same));
         put(&libc, b"not an image\n");
         assert!(!libc_needs_v3(&program, same));
         std::fs::remove_file(&libc).unwrap();
@@ -3519,162 +3710,6 @@ pub(crate) mod tests {
                     "{target:?} linked={linked}"
                 );
             }
-        }
-    }
-
-    /// `hermit record start`'s auto asks the host only where the C library
-    /// alone declares x86-64-v3, and then with the recording's request;
-    /// every other program records what its declarations need (`declared`),
-    /// whatever the host. A malformed forced answer is an error, as for
-    /// `hermit run`.
-    #[test]
-    fn record_auto_asks_the_host_only_where_the_c_library_alone_needs_v3() {
-        let unasked = |_: &AdmissionRequest<'_>| -> Result<AutoChoice, String> {
-            panic!("the host was asked")
-        };
-        for (needs, libc_v3) in [
-            (CpuProfile::X86_64V2, false),
-            (CpuProfile::X86_64V3, false),
-            (CpuProfile::X86_64V3, true),
-        ] {
-            assert_eq!(
-                choose_record_auto_with(needs, libc_v3, unasked).unwrap(),
-                AutoChoice {
-                    choice: ProfileChoice {
-                        profile: needs,
-                        reason: ProfileReason::Declared,
-                        detail: None,
-                    },
-                    log: Vec::new(),
-                },
-                "{needs} {libc_v3}"
-            );
-        }
-        let why = format!("{AUTO_HOST_TEST_ENV}=forced");
-        let unavailable = format!(
-            "x86-64-v3 is unavailable for this run ({why}); running x86-64-v2. Name \
-             --cpu-profile to choose the profile."
-        );
-        for (host, profile, reason, detail, log) in [
-            (
-                AutoHost::Admitted,
-                CpuProfile::X86_64V3,
-                ProfileReason::Admitted,
-                Some(LIBC_V3_DETAIL.to_owned()),
-                Vec::new(),
-            ),
-            (
-                AutoHost::Hypervisor,
-                CpuProfile::X86_64V2,
-                ProfileReason::Hypervisor,
-                None,
-                Vec::new(),
-            ),
-            (
-                AutoHost::Refused {
-                    why: why.clone(),
-                    dynamic: false,
-                },
-                CpuProfile::X86_64V2,
-                ProfileReason::QualificationRefused,
-                Some(why.clone()),
-                Vec::new(),
-            ),
-            (
-                AutoHost::Refused {
-                    why: why.clone(),
-                    dynamic: true,
-                },
-                CpuProfile::X86_64V2,
-                ProfileReason::QualificationRefused,
-                Some(why.clone()),
-                vec![unavailable.clone()],
-            ),
-        ] {
-            let auto = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
-                assert_eq!(check_request(request), Ok(()));
-                assert!(!request.gdbserver, "a recording's request has no gdbserver");
-                choose_auto_with(CpuProfile::X86_64V2, request, || Ok(host.clone()))
-            })
-            .unwrap();
-            assert_eq!(
-                auto,
-                AutoChoice {
-                    choice: ProfileChoice {
-                        profile,
-                        reason,
-                        detail,
-                    },
-                    log,
-                },
-                "{host:?}"
-            );
-        }
-        let admitted = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
-            choose_auto_with(CpuProfile::X86_64V2, request, || Ok(AutoHost::Admitted))
-        })
-        .unwrap();
-        assert_eq!(
-            admitted.choice.because(),
-            format!("{LIBC_V3_DETAIL}, and this run and host qualify for x86-64-v3")
-        );
-        assert!(
-            choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
-                choose_auto_with(CpuProfile::X86_64V2, request, || Err("bad".into()))
-            })
-            .is_err()
-        );
-    }
-
-    /// `hermit run` and `hermit record start` record the same choice (the
-    /// profile, the reason and its detail) for a program whose C library
-    /// alone declares x86-64-v3, whatever the host answers; and the C
-    /// library is named only in an x86-64-v3 the host admitted.
-    #[test]
-    fn run_and_record_choose_alike_where_the_c_library_alone_needs_v3() {
-        let why = format!("{AUTO_HOST_TEST_ENV}=forced");
-        for host in [
-            AutoHost::Admitted,
-            AutoHost::Hypervisor,
-            AutoHost::Refused {
-                why: why.clone(),
-                dynamic: false,
-            },
-            AutoHost::Refused {
-                why: why.clone(),
-                dynamic: true,
-            },
-        ] {
-            let run =
-                choose_auto_with(
-                    CpuProfile::X86_64V2,
-                    &request("ptrace"),
-                    || Ok(host.clone()),
-                )
-                .unwrap();
-            let record = choose_record_auto_with(CpuProfile::X86_64V2, true, |request| {
-                choose_auto_with(CpuProfile::X86_64V2, request, || Ok(host.clone()))
-            })
-            .unwrap();
-            assert_eq!(name_libc_need(run.clone(), true), record, "{host:?}");
-            assert_eq!(name_libc_need(run.clone(), false), run, "{host:?}");
-        }
-        for reason in [
-            ProfileReason::Explicit,
-            ProfileReason::Declared,
-            ProfileReason::Hypervisor,
-            ProfileReason::QualificationRefused,
-            ProfileReason::RequestNotAdmissible,
-        ] {
-            let auto = AutoChoice {
-                choice: ProfileChoice {
-                    profile: CpuProfile::X86_64V3,
-                    reason,
-                    detail: None,
-                },
-                log: Vec::new(),
-            };
-            assert_eq!(name_libc_need(auto.clone(), true), auto, "{reason:?}");
         }
     }
 }

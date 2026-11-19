@@ -62843,7 +62843,8 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
         (
             &["--backend=liteinst"],
             &["--max-timeslice=disabled"],
-            "--backend=liteinst: this backend does not trap CPUID",
+            "--backend=liteinst: the in-guest runtime traps CPUID, but Detcore answers it \
+             only with the x86-64-v2 table",
         ),
         (&[], &["--gdbserver"], "--gdbserver"),
         (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
@@ -65140,13 +65141,18 @@ fn glibc_layout_fixture(name: &str, libc_bits: Option<u32>) -> PathBuf {
     )
 }
 
-/// Where this run and host qualify, `hermit run`'s auto presents x86-64-v3 for
-/// a program whose C library declares x86-64-v3 as for any other, and names
-/// that library, as `hermit record start` records it: in the resolution line
-/// (`--log=debug`) and as the `detail` of the manifest's `cpu_profile`.
-/// Beside a C library that declares nothing, nothing is named. Where auto
-/// does not present x86-64-v3 the C library is not read, so the test records
-/// a named skip, or fails under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
+/// A program whose C library alone declares x86-64-v3 is declared, as one
+/// whose executable declares it is: where this run and host qualify,
+/// `hermit run`'s auto presents x86-64-v3 for it and names that library
+/// (the manifest's `detail`, the `--log=debug` resolution line); where
+/// they do not, the launch is refused by name (exit 122), the refusal
+/// naming the C library auto chose for -- under
+/// HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 that refusal is a failure, as a
+/// v2 presentation was. Beside a C library that declares nothing,
+/// nothing is named. On top of that, a launch that never depends on
+/// qualification: `--backend=kvm` is likewise refused by name. (The
+/// run presenting the host's real CPU is the next test, split out so
+/// it cannot exempt this one from the CPUID-faulting gate.)
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn auto_names_a_c_library_that_declares_x86_64_v3() {
@@ -65154,83 +65160,211 @@ fn auto_names_a_c_library_that_declares_x86_64_v3() {
     let detail = hermit::cpu_profile_admission::LIBC_V3_DETAIL;
     let declaring = glibc_layout_fixture("run-libc-v3", Some(0b111));
     let unmarked = glibc_layout_fixture("run-libc-unmarked", None);
-    let launch = |program: &Path| {
+    let libc = process_build_root("isa-needed").join("run-libc-v3/libc.so.6");
+    let launch = |args: &[&str]| {
         let run = UnpinnedRun::new();
-        let (status, stdout, stderr) = run.run(
-            &["--log=debug", "run", "--", program.to_str().unwrap()],
-            &[],
-        );
+        // A declared choice draws nothing from the host, so only
+        // `always` writes the manifest this test reads.
+        let (status, stdout, stderr) = run.run(args, &[("HERMIT_MANIFEST", "always")]);
+        (run, status, stdout, stderr)
+    };
+    let ran = |program: &Path, extra: &[&str]| {
+        let mut args = vec!["--log=debug", "run"];
+        args.extend_from_slice(extra);
+        args.extend(["--", program.to_str().unwrap()]);
+        let (run, status, stdout, stderr) = launch(&args);
         assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
         let manifests = run.manifests();
         assert_eq!(manifests.len(), 1, "{stderr}");
         (stderr, manifests[0].1.clone())
     };
-    // A qualification that fails closed under load gets one more run.
-    let attempt = |program: &Path| {
-        let (stderr, manifest) = launch(program);
-        if manifest["cpu_profile"]["reason"] == "qualification-refused" {
-            launch(program)
-        } else {
-            (stderr, manifest)
+    // A virtual-CPU backend that cannot carry x86-64-v3 refuses the
+    // launch by name, before any guest runs.
+    let (_run, status, _stdout, stderr) =
+        launch(&["--backend=kvm", "run", "--", declaring.to_str().unwrap()]);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "auto chose x86-64-v3 because the C library at {} declares",
+            libc.display()
+        )),
+        "{stderr}"
+    );
+    // The unmarked contrast runs before the declaring launch, so a
+    // refusal there cannot leave it silently unrun. Its expected
+    // outcome follows the sibling probe-and-retry pattern
+    // (with_no_profile_named_auto_presents_what_the_run_and_host_qualify_for):
+    // hypervisor, admitted, or qualification-refused, with one more
+    // run where a qualifying host's check fails closed under load.
+    let (profile, reason, because) = if host_reports_a_hypervisor() {
+        (
+            "x86-64-v2",
+            "hypervisor",
+            "under a hypervisor, auto does not qualify the host for x86-64-v3",
+        )
+    } else {
+        match cpu_profile_v3_qualification() {
+            Ok(()) => (
+                "x86-64-v3",
+                "admitted",
+                "this run and host qualify for x86-64-v3",
+            ),
+            Err(why) => {
+                assert!(
+                    std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
+                    "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify: {why}"
+                );
+                (
+                    "x86-64-v2",
+                    "qualification-refused",
+                    "the host does not qualify for x86-64-v3: ",
+                )
+            }
         }
     };
-    let (stderr, manifest) = attempt(&declaring);
-    if manifest["cpu_profile"]["profile"] != "x86-64-v3" {
+    let (mut stderr, mut manifest) = ran(&unmarked, &[]);
+    if reason == "admitted" && manifest["cpu_profile"]["reason"] == "qualification-refused" {
+        let retry = ran(&unmarked, &[]);
+        stderr = retry.0;
+        manifest = retry.1;
+    }
+    assert_eq!(manifest["cpu_profile"]["profile"], profile, "{manifest:#}");
+    assert_eq!(manifest["cpu_profile"]["reason"], reason, "{manifest:#}");
+    if reason == "qualification-refused" {
+        assert!(manifest["cpu_profile"]["detail"].is_string(), "{manifest:#}");
+    }
+    assert!(
+        stderr.contains(&format!(
+            "--cpu-profile auto resolved to {profile}: {because}"
+        )) && !stderr.contains(detail),
+        "{stderr}"
+    );
+    // The default (ptrace, virtual CPUID) launch: admitted and run, or
+    // refused by name where this host cannot carry a declared v3. A
+    // qualification that fails closed under load gets one more run.
+    let attempt = |program: &Path| {
+        let (run, status, stdout, stderr) =
+            launch(&["--log=debug", "run", "--", program.to_str().unwrap()]);
+        if status == Some(HERMIT_POLICY_REFUSAL_EXIT) {
+            launch(&["--log=debug", "run", "--", program.to_str().unwrap()])
+        } else {
+            (run, status, stdout, stderr)
+        }
+    };
+    let (run, status, stdout, stderr) = attempt(&declaring);
+    if status == Some(HERMIT_POLICY_REFUSAL_EXIT) {
         assert!(
             std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
-            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but auto did not present x86-64-v3: \
-             {manifest:#}"
+            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the declared x86-64-v3 was refused:\n{stderr}"
         );
-        assert!(!stderr.contains(detail), "{stderr}");
-        record_test_skip(test, &format!("auto presents {}", manifest["cpu_profile"]));
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "auto chose x86-64-v3 because the C library at {} declares",
+                libc.display()
+            )),
+            "{stderr}"
+        );
+        record_test_skip(
+            test,
+            "declared x86-64-v3 refused on this host; the admitted branch is untested here",
+        );
         return;
     }
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let manifest = &manifests[0].1;
     assert_eq!(
         manifest["cpu_profile"],
-        serde_json::json!({"profile": "x86-64-v3", "reason": "admitted", "detail": detail}),
+        serde_json::json!({"profile": "x86-64-v3", "reason": "declared", "detail": detail}),
         "{manifest:#}"
     );
     assert!(
         stderr.contains(&format!(
-            "--cpu-profile auto resolved to x86-64-v3: {detail}, and this run and host \
-             qualify for x86-64-v3; "
+            "--cpu-profile auto resolved to x86-64-v3: {detail}"
         )),
         "{stderr}"
     );
-    let (stderr, manifest) = attempt(&unmarked);
+}
+
+/// The same declaring program presenting the host's real CPU is not
+/// refused at all: auto keeps the choice it made before the C library
+/// was read (x86-64-v2, request-not-admissible) with the declaration
+/// recorded in its resolution. This case is its own test so this
+/// `--no-virtualize-cpuid` run cannot exempt the case above from the
+/// CPUID-faulting gate it satisfies: that one starts ptrace with
+/// virtual CPUID and must stay a named failure/NOT RUN where CPUID
+/// faulting is unavailable.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn auto_presents_the_hosts_cpu_for_a_libc_declaration() {
+    let detail = hermit::cpu_profile_admission::LIBC_V3_DETAIL;
+    let declaring = glibc_layout_fixture("host-libc-v3", Some(0b111));
+    let run = UnpinnedRun::new();
+    let (status, stdout, stderr) = run.run(
+        &[
+            "--log=debug",
+            "run",
+            "--no-virtualize-cpuid",
+            "--",
+            declaring.to_str().unwrap(),
+        ],
+        &[("HERMIT_MANIFEST", "always")],
+    );
+    assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "--cpu-profile auto resolved to x86-64-v2: this run cannot carry x86-64-v3: {detail};"
+        )),
+        "{stderr}"
+    );
+    let manifests = run.manifests();
+    assert_eq!(manifests.len(), 1, "{stderr}");
+    let manifest = &manifests[0].1;
     assert_eq!(
         manifest["cpu_profile"],
-        serde_json::json!({"profile": "x86-64-v3", "reason": "admitted"}),
+        serde_json::json!({
+            "profile": "x86-64-v2",
+            "reason": "request-not-admissible",
+            "detail": format!(
+                "{detail}; the profile is a virtual CPUID table, and this run does not virtualize CPUID"
+            ),
+        }),
         "{manifest:#}"
-    );
-    assert!(
-        stderr.contains(
-            "--cpu-profile auto resolved to x86-64-v3: this run and host qualify for x86-64-v3; "
-        ) && !stderr.contains(detail),
-        "{stderr}"
     );
 }
 
 /// `hermit record start` keeps a CPU profile auto chose by the host as `hermit
 /// run` keeps it: its manifest names the reason under `inputs.host_drawn`,
-/// shown here with the host's answer forced (`AUTO_HOST_TEST_ENV`) and as the
-/// host gives it, while a profile from the program's declarations draws
-/// nothing from the host. `record start --verify` keeps no recording, and so
-/// no manifest, so its match states x86-64-v3's residual on stderr for a v3
-/// auto chose for the program's C library. That part needs a host where auto
-/// presents x86-64-v3; elsewhere the test records a named skip, or fails
-/// under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
+/// shown here with the host's answer forced (`AUTO_HOST_TEST_ENV`) on a
+/// program declaring nothing, while a profile from declarations draws
+/// nothing from the host -- a program whose C library alone declares
+/// x86-64-v3 records `declared` (its `detail` naming the library)
+/// whatever answer is forced, or is refused by name where this host
+/// cannot carry a declared x86-64-v3. `record start --verify` keeps no
+/// recording, and so no manifest, so its match states x86-64-v3's
+/// residual on stderr for that declared v3. That part needs a host
+/// where a declared x86-64-v3 is admitted; elsewhere the named
+/// refusal is itself the asserted outcome, or a failure under
+/// HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn record_start_keeps_or_states_what_auto_chose_by_the_host() {
     let test = "record_start_keeps_or_states_what_auto_chose_by_the_host";
     const RESIDUAL: &str = "With --cpu-profile x86-64-v3, Hermit checks at startup";
+    let detail = hermit::cpu_profile_admission::LIBC_V3_DETAIL;
     let program = glibc_layout_fixture("record-libc-v3", Some(0b111));
     let program = program.to_str().unwrap();
     let unmarked = glibc_layout_fixture("record-libc-unmarked", None);
-    let record = |program: &str, env: &[(&str, &str)]| {
+    let unmarked = unmarked.to_str().unwrap();
+    let record_raw = |program: &str, env: &[(&str, &str)]| {
         let run = UnpinnedRun::new();
         let (status, stdout, stderr) = run.run(&["record", "start", "--", program], env);
+        (run, status, stdout, stderr)
+    };
+    let record = |program: &str, env: &[(&str, &str)]| {
+        let (run, status, stdout, stderr) = record_raw(program, env);
         assert_eq!(
             (status, stdout.as_str()),
             (Some(0), "ran\n"),
@@ -65242,20 +65376,22 @@ fn record_start_keeps_or_states_what_auto_chose_by_the_host() {
         assert_eq!(manifest["kind"], "full-syscall", "{manifest:#}");
         manifest
     };
+    // A recording never asks the host: the forced answers change
+    // nothing for a program declaring nothing, exactly as before.
     for host in ["hypervisor", "qualification-refused"] {
-        let manifest = record(program, &[(AUTO_HOST_TEST_ENV, host)]);
+        let manifest = record(unmarked, &[(AUTO_HOST_TEST_ENV, host)]);
         assert_eq!(
-            manifest["cpu_profile"]["profile"], "x86-64-v2",
-            "{manifest:#}"
+            manifest["cpu_profile"],
+            serde_json::json!({"profile": "x86-64-v2", "reason": "declared"}),
+            "{host}: {manifest:#}"
         );
-        assert_eq!(manifest["cpu_profile"]["reason"], host, "{manifest:#}");
         assert_eq!(
             manifest["inputs"]["host_drawn"],
-            serde_json::json!({"cpu-profile": host}),
-            "{manifest:#}"
+            serde_json::json!({}),
+            "{host}: {manifest:#}"
         );
     }
-    let manifest = record(unmarked.to_str().unwrap(), &[]);
+    let manifest = record(unmarked, &[]);
     assert_eq!(
         manifest["cpu_profile"],
         serde_json::json!({"profile": "x86-64-v2", "reason": "declared"}),
@@ -65266,46 +65402,82 @@ fn record_start_keeps_or_states_what_auto_chose_by_the_host() {
         serde_json::json!({}),
         "{manifest:#}"
     );
-    // The host's own answer. A qualification that fails closed under load
-    // gets one more run.
-    let mut manifest = record(program, &[]);
-    if manifest["cpu_profile"]["reason"] == "qualification-refused" {
-        manifest = record(program, &[]);
+    // The declaring program, with the host's answer forced and as the
+    // host gives it: declared draws nothing from the host, so every
+    // answer records the same choice, or refuses the recording by
+    // name where this host cannot carry a declared x86-64-v3. A
+    // qualification that fails closed under load gets one more run.
+    let mut refused = String::new();
+    let mut recorded = None;
+    for env in [
+        vec![(AUTO_HOST_TEST_ENV, "hypervisor")],
+        vec![(AUTO_HOST_TEST_ENV, "qualification-refused")],
+        vec![],
+    ] {
+        let (run, status, stdout, stderr) = record_raw(program, &env);
+        if status == Some(HERMIT_POLICY_REFUSAL_EXIT) {
+            assert!(stdout.is_empty(), "{env:?}: {stdout}");
+            assert!(
+                stderr.contains("--cpu-profile x86-64-v3 refused"),
+                "{env:?}:\n{stderr}"
+            );
+            refused = stderr;
+            continue;
+        }
+        assert_eq!(
+            (status, stdout.as_str()),
+            (Some(0), "ran\n"),
+            "{env:?}:\n{stderr}"
+        );
+        let manifests = run.manifests();
+        assert_eq!(manifests.len(), 1, "{env:?}:\n{stderr}");
+        let manifest = manifests[0].1.clone();
+        assert_eq!(manifest["kind"], "full-syscall", "{manifest:#}");
+        assert_eq!(
+            manifest["cpu_profile"],
+            serde_json::json!({
+                "profile": "x86-64-v3",
+                "reason": "declared",
+                "detail": detail,
+            }),
+            "{env:?}: {manifest:#}"
+        );
+        assert_eq!(
+            manifest["inputs"]["host_drawn"],
+            serde_json::json!({}),
+            "{env:?}: {manifest:#}"
+        );
+        assert!(
+            manifest["cpu_profile_residual"]
+                .as_str()
+                .is_some_and(|residual| residual.starts_with(RESIDUAL)),
+            "{env:?}: {manifest:#}"
+        );
+        recorded = Some(manifest);
     }
-    assert_eq!(
-        manifest["inputs"]["host_drawn"],
-        serde_json::json!({"cpu-profile": manifest["cpu_profile"]["reason"]}),
-        "{manifest:#}"
-    );
-    if manifest["cpu_profile"]["profile"] != "x86-64-v3" {
+    if recorded.is_none() {
+        // Every answer refused by name: the same passing outcome the
+        // `hermit run` case asserts for a declared x86-64-v3 this host
+        // cannot carry (a failure only where v3 is required), with a
+        // named skip recording the branch this host cannot reach.
         assert!(
             std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
-            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but record start did not present \
-             x86-64-v3: {manifest:#}"
+            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but record start refused the declared \
+             x86-64-v3: {refused}"
+        );
+        assert!(
+            refused.contains("auto chose x86-64-v3 because the C library at"),
+            "{refused}"
         );
         record_test_skip(
             test,
-            &format!("record start presents {}", manifest["cpu_profile"]),
+            "record start refuses a declared x86-64-v3 on this host; the declared and residual branches are untested here",
         );
         return;
     }
-    assert_eq!(
-        manifest["cpu_profile"],
-        serde_json::json!({
-            "profile": "x86-64-v3",
-            "reason": "admitted",
-            "detail": hermit::cpu_profile_admission::LIBC_V3_DETAIL,
-        }),
-        "{manifest:#}"
-    );
-    assert!(
-        manifest["cpu_profile_residual"]
-            .as_str()
-            .is_some_and(|residual| residual.starts_with(RESIDUAL)),
-        "{manifest:#}"
-    );
-    // The host just qualified, and its verdict is cached for this test's
-    // commands, so the same choice follows. A match without the residual
+    // A recording was admitted under one of the answers above (a
+    // forced answer is this command's alone and is not cached), so
+    // the same choice follows here. A match without the residual
     // gets one more run, which a lost residual fails too.
     let verify = || {
         let run = UnpinnedRun::new();

@@ -63,17 +63,20 @@ pub enum CpuProfile {
     #[serde(rename = "host-no-rdrand")]
     HostNoRdrand,
     /// The command line's default where no profile is named. For `hermit
-    /// run`: x86-64-v3 where the guest's image or its program interpreter
-    /// declares it (`GNU_PROPERTY_X86_ISA_1_NEEDED`), or where the run and
-    /// host qualify for it; x86-64-v2 otherwise. `hermit record start` reads
-    /// the declarations: x86-64-v2 unless one declares v3, except where the
-    /// glibc C library beside the program interpreter declares v3, which
-    /// gets x86-64-v3 where the recording and host qualify for it, as
-    /// `hermit run` does. The library's launch reads the declarations alone.
-    /// Each resolves it to that named profile before qualification and
-    /// launch, so a run's configuration, its manifest and a recording only
-    /// ever hold the named profile, and replay uses it without deriving it
-    /// again.
+    /// run`: x86-64-v3 where the guest's image, its program interpreter,
+    /// or (where the run presents a virtual CPU) the C library beside
+    /// that interpreter declares x86-64-v3 or above
+    /// (`GNU_PROPERTY_X86_ISA_1_NEEDED`),
+    /// or where the run and host qualify for it; x86-64-v2 otherwise,
+    /// including every host-CPUID run for a need only that C library
+    /// declares. `hermit record start` reads the declarations, the C
+    /// library's included: x86-64-v2 unless one declares x86-64-v3 or
+    /// above, admitted afterwards as an explicit x86-64-v3 is. The
+    /// library's launch reads the executable's and interpreter's
+    /// declarations alone. Each resolves it to that named profile
+    /// before qualification and launch, so a run's configuration, its
+    /// manifest and a recording only ever hold the named profile, and
+    /// replay uses it without deriving it again.
     #[value(name = "auto")]
     #[serde(rename = "auto")]
     Auto,
@@ -284,14 +287,18 @@ pub const CPU_PROFILE_LONG_HELP: &str = concat!(
      auto also reads what the guest's executable and its program interpreter declare they \
      need (GNU_PROPERTY_X86_ISA_1_NEEDED): a program declaring x86-64-v3 runs under it, \
      admitted as an explicit x86-64-v3 is, or is refused (exit 122) where it cannot run; one \
-     declaring x86-64-v4, or one auto cannot read, is refused rather than guessed. \
-     `hermit record start` resolves auto by those declarations, so that the recording of a \
-     program that runs at x86-64-v2 does not depend on the host: x86-64-v2 unless one declares \
-     x86-64-v3. The exception is a program whose glibc C library (the libc.so.6 beside its \
-     program interpreter) declares x86-64-v3, which runs at x86-64-v2 on no host: record start \
-     presents x86-64-v3 for it where the recording and host qualify, as `hermit run` does, and \
-     x86-64-v2 elsewhere, where glibc refuses it. Hermit's library launch reads the \
-     declarations alone. The chosen profile and why are logged at debug level and written to \
+     declaring x86-64-v4, or one auto cannot read, is refused rather than guessed. Where the \
+     run presents a virtual CPU, auto also reads the declaration of the glibc C library \
+     beside the program interpreter (the libc.so.6 the loader maps, which no exec loads): \
+     a program only it declares x86-64-v3 or above for likewise runs under x86-64-v3 or is refused by \
+     name, where its own glibc would otherwise refuse it inside the guest. Where the guest \
+     sees the host's real CPU (a backend that does not trap CPUID, --namespace-only, \
+     --strace-only, --no-virtualize-cpuid) that declaration does not decide: the guest runs \
+     as the host's CPU allows, and the manifest records the declaration. \
+     `hermit record start` resolves auto by the declarations alone, the C library's \
+     included, so that a recording does not depend on the host: x86-64-v2 unless one \
+     declares x86-64-v3, admitted or refused by name as an explicit x86-64-v3 is. Hermit's \
+     library launch reads the executable's and interpreter's declarations alone. The chosen profile and why are logged at debug level and written to \
      the run's manifest, and a recording holds the profile; replays and reruns use it and \
      never choose again. x86-64-v2 is exactly the psABI level; recordings made before it \
      meant that replay on the legacy table they recorded with, under their stored name. \

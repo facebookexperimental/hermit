@@ -1641,16 +1641,25 @@ recording, and so no manifest, so its match states the residual for every
 x86-64-v3. `hermit record start` chooses by what the program
 declares, so that the recording of a program that runs at x86-64-v2 does not
 depend on the host: x86-64-v2 unless the program or its interpreter declares
-x86-64-v3. The exception is a program whose glibc C library, the `libc.so.6`
-beside its program interpreter, declares x86-64-v3 (CentOS Stream 10's does),
-which runs at x86-64-v2 on no host: record start presents x86-64-v3 for it
-where the recording and host qualify, as `hermit run` does, and x86-64-v2
-elsewhere, where glibc refuses the guest as described below. Hermit's library
-launch reads the declarations alone. The run's manifest, and a recording's,
-records the profile and why, as `cpu_profile` with the reason `admitted`
-(with a `detail` naming the C library where it declares x86-64-v3), `hypervisor`,
-`qualification-refused`, `request-not-admissible`, `declared` (the program
-declares x86-64-v3, or a recording chose by the declarations) or `explicit`;
+x86-64-v3. For a run presenting a virtual CPU, `hermit run` and
+`hermit record start` also read the declaration of the glibc C library
+beside the program interpreter (the `libc.so.6` the loader maps, which no
+exec loads): where only it declares x86-64-v3 or above (CentOS Stream 10's
+declares x86-64-v3),
+auto likewise presents x86-64-v3 as a declaration -- admitted as an
+explicit x86-64-v3 is, or refused by name (exit 122) where the run or
+host cannot carry it -- instead of presenting x86-64-v2 for glibc itself
+to refuse the guest. Where the guest sees the host's real CPU (a backend
+that does not trap CPUID, `--namespace-only`, `--strace-only`,
+`--no-virtualize-cpuid`) that declaration does not decide: the guest runs
+as the host's CPU allows, and the manifest records the declaration in the
+choice's `detail`. Hermit's library launch reads the executable's and
+interpreter's declarations alone. The run's manifest, and a recording's,
+records the profile and why, as `cpu_profile` with the reason `admitted`,
+`hypervisor`, `qualification-refused`, `request-not-admissible`,
+`declared` (the program, its interpreter or its C library declares
+x86-64-v3 -- the C library named in `detail` where only it declares -- or
+a recording chose by the declarations) or `explicit`;
 its rerun (`hermit run --from`)
 presents the same profile. x86-64-v2 is exactly the psABI level.
 What an older document means by it is told by its version: a
