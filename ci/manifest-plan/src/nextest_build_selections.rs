@@ -735,9 +735,9 @@ fn preparation_profile<'a>(
         .map(|directory| {
             vec![
                 format!(
-                    "{profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/{directory}/stage-detcore-liteinst --git target"
+                    "{profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/{directory}/stage-detcore-liteinst --source-copy target"
                 ),
-                format!("{profile} && target/{directory}/stage-detcore-liteinst --git target"),
+                format!("{profile} && target/{directory}/stage-detcore-liteinst --source-copy target"),
             ]
         })
         .unwrap_or_default();
@@ -1157,7 +1157,7 @@ mod tests {
         for profile in ["full", "hosted-portable"] {
             let bare = format!("prefix && ./ci/nextest-binaries.rs prepare {profile}");
             let finalized =
-                format!("{bare} && target/validate/stage-detcore-liteinst --git target");
+                format!("{bare} && target/validate/stage-detcore-liteinst --source-copy target");
             for command in [&bare, &finalized] {
                 assert_eq!(
                     preparation_profile("producer", command).unwrap(),
@@ -1167,8 +1167,11 @@ mod tests {
             for refused in [
                 format!("{bare} && true"),
                 format!("{finalized} && true"),
-                format!("{bare} && target/debug/stage-detcore-liteinst --git target"),
-                format!("{finalized} --source-copy target"),
+                format!("{bare} && target/debug/stage-detcore-liteinst --source-copy target"),
+                // The Git authority binds git-sourced Reverie manifests only, and
+                // the workspace path-sources Reverie, so it is no finalizer here.
+                format!("{bare} && target/validate/stage-detcore-liteinst --git target"),
+                format!("{finalized} --git target"),
                 format!("{bare} && ./ci/nextest-binaries.rs prepare {profile}"),
                 format!("{bare} extra"),
             ] {
@@ -1181,7 +1184,7 @@ mod tests {
         // The pinned workspace prepare node alone may append its fixed
         // early-artifact gate after the finalizer; no other producer may.
         let gated = format!(
-            "prefix && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+            "prefix && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --source-copy target{}",
             crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
         );
         assert_eq!(
@@ -1209,7 +1212,7 @@ mod tests {
             "prefix && ./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" --cohort native-exec"
                 .to_string(),
             // With the default cohort's finalizer appended.
-            format!("{cohort_command} && target/validate/stage-detcore-liteinst --git target"),
+            format!("{cohort_command} && target/validate/stage-detcore-liteinst --source-copy target"),
             // An unregistered slug.
             cohort_command.replace("native-exec", "bogus"),
             // A non-unifying profile has no cohort prepare form.
@@ -1227,8 +1230,9 @@ mod tests {
                 Some((profile, crate::nextest_binaries::DEFAULT_COHORT))
             );
             for directory in ["debug", "validate"] {
-                let refused =
-                    format!("{bare} && target/{directory}/stage-detcore-liteinst --git target");
+                let refused = format!(
+                    "{bare} && target/{directory}/stage-detcore-liteinst --source-copy target"
+                );
                 assert!(
                     preparation_profile("producer", &refused).is_err(),
                     "{refused}"
@@ -1525,7 +1529,7 @@ mod tests {
         assert!(
             hosted_producer
                 .cmd
-                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable && target/validate/stage-detcore-liteinst --git target")
+                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable && target/validate/stage-detcore-liteinst --source-copy target")
         );
         let hosted_artifact = graph
             .steps
@@ -1557,13 +1561,13 @@ mod tests {
             .unwrap();
         assert!(
             execution_command(producer).unwrap().ends_with(&format!(
-                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --source-copy target{}",
                 crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
             ))
         );
         producer.cmd = producer.cmd.replace(
             &format!(
-                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --source-copy target{}",
                 crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
             ),
             "./ci/nextest-binaries.rs prepare portable",

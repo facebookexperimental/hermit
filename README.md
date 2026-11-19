@@ -83,7 +83,7 @@ Detcore preload after Cargo finishes, before using or copying the installation:
 
 ```bash
 cargo build --release --workspace
-./target/release/stage-detcore-liteinst --git target
+./target/release/stage-detcore-liteinst --source-copy target
 ./target/install_pkg/hermit --version
 ```
 

@@ -226,7 +226,7 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 // a profile this producer had stopped preparing, so the bracket refused a graph
 // that was correct. Renamed as well as retargeted: a constant whose name says
 // portable while its value says full is the same defect one layer down.
-const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" && target/validate/stage-detcore-liteinst --git target";
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" && target/validate/stage-detcore-liteinst --source-copy target";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str =
     "./ci/nextest-binaries.rs assert privileged --prepared-by full";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc)" || exit 1"#;
@@ -411,7 +411,7 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
 /// node's final gate compares against (for its early publisher) or the
 /// runtime file the node's preparation record hashed (hosted), then drop a
 /// Buck runtime closure and take that validate-profile binary.
-const EARLY_CARGO_PAYLOAD_BRANCH: &str = "cargo) target/validate/stage-detcore-liteinst --git target && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
+const EARLY_CARGO_PAYLOAD_BRANCH: &str = "cargo) target/validate/stage-detcore-liteinst --source-copy target && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const HOSTED_CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert hosted-portable && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const BUCK_PAYLOAD_BRANCH: &str = "buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;;";
 
@@ -35701,7 +35701,7 @@ output.chmod(0o755)
         write_executable(
             &root.path().join("target/validate/stage-detcore-liteinst"),
             r#"#!/bin/sh
-[ "$#" -eq 2 ] && [ "$1" = --git ] && [ "$2" = target ] || exit 2
+[ "$#" -eq 2 ] && [ "$1" = --source-copy ] && [ "$2" = target ] || exit 2
 test -f target/ci/nextest-binaries/current.json || exit 3
 printf finalized >target/finalized
 "#,

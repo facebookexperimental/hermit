@@ -69,7 +69,7 @@ install-deps: install-hooks check-submodules ## Build and stage the first-party 
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-liteinst -p hermit-install
-	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO_PROXY) target/release/stage-detcore-liteinst --git target
+	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO_PROXY) target/release/stage-detcore-liteinst --source-copy target
 	@echo 'make: first-party runtimes OK (release profile: detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a

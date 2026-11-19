@@ -2884,7 +2884,7 @@ pub fn unified_prebuild_command(
         ""
     };
     Ok(format!(
-        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}{build_mode} && target/validate/stage-detcore-liteinst --git target",
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}{build_mode} && target/validate/stage-detcore-liteinst --source-copy target",
         unified.join(" ")
     ))
 }
