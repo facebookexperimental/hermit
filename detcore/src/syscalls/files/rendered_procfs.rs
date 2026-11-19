@@ -1249,6 +1249,15 @@ pub(super) fn guest_procfs_mount_id() -> Result<u64, Error> {
     GuestProcfs::mount_id()
 }
 
+/// The kernel-format `fdinfo` Detcore answers for a descriptor of a file it
+/// renders, or of a placeholder `/proc` directory: its position, the guest's
+/// procfs mount and inode 0, with no status flags printed as Linux prints them
+/// (`0%o` in fs/proc/fd.c `seq_show`, so `00`). The procfs sanitizer then puts
+/// in the descriptor's own flags and identity.
+pub(super) fn rendered_target_fdinfo(offset: u64, mount_id: u64) -> Vec<u8> {
+    format!("pos:\t{offset}\nflags:\t00\nmnt_id:\t{mount_id}\nino:\t0\n").into_bytes()
+}
+
 /// The mode, owner and group of the guest's procfs root, `/proc` itself, as
 /// the guest's user namespace sees them, read once: the tool runs in the
 /// guest's mount and user namespaces outside record and replay
@@ -8738,6 +8747,31 @@ fn cmdline_path_overlaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rendered file's `fdinfo` prints its flags in Linux's spelling, the
+    /// bytes Detcore's own fdinfo renderer prints for the same values: a bare
+    /// `0` is no flags field Linux prints, and the procfs sanitizer refuses it
+    /// (`field flags: bad number`).
+    #[test]
+    fn a_rendered_files_fdinfo_prints_its_flags_as_linux() {
+        use crate::procfs::fdinfo::Fdinfo;
+        use crate::procfs::fdinfo::FdinfoKind;
+        assert_eq!(
+            rendered_target_fdinfo(17, 5),
+            b"pos:\t17\nflags:\t00\nmnt_id:\t5\nino:\t0\n"
+        );
+        assert_eq!(
+            rendered_target_fdinfo(17, 5),
+            crate::procfs::fdinfo::render(&Fdinfo {
+                pos: 17,
+                flags: 0,
+                mnt_id: 5,
+                ino: 0,
+                locks: Vec::new(),
+                kind: FdinfoKind::Plain,
+            })
+        );
+    }
 
     /// Where one tool process serves every guest process (ptrace's
     /// capabilities), a memfd identity it did not register is no

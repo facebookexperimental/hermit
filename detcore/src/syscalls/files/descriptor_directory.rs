@@ -3832,11 +3832,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(fd, |detfd| detfd.directory_stream_position())?,
             PlaceholderDirectory::Descriptors(_) => state.position,
         };
-        let contents = format!(
-            "pos:\t{position}\nflags:\t0\nmnt_id:\t{}\nino:\t0\n",
-            super::rendered_procfs::guest_procfs_mount_id()?
-        )
-        .into_bytes();
+        let contents = super::rendered_procfs::rendered_target_fdinfo(
+            position,
+            super::rendered_procfs::guest_procfs_mount_id()?,
+        );
         let inode = self
             .placeholder_metadata(guest, &state.directory, Some(fd))
             .await?

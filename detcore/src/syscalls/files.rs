@@ -9857,11 +9857,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let placeholder_inode = placeholder.as_ref().map(|(_, inode)| *inode);
         let contents = match (rendered_target, placeholder) {
-            (Some((_, offset)), _) => format!(
-                "pos:\t{offset}\nflags:\t0\nmnt_id:\t{}\nino:\t0\n",
-                rendered_procfs::guest_procfs_mount_id()?
-            )
-            .into_bytes(),
+            (Some((_, offset)), _) => rendered_procfs::rendered_target_fdinfo(
+                offset as u64,
+                rendered_procfs::guest_procfs_mount_id()?,
+            ),
             (None, Some((placeholder, _))) => placeholder,
             (None, None) => contents,
         };
