@@ -14,12 +14,11 @@
 //! keeps Hermit from saving each run's inputs under `~/.cache/hermit`.
 //!
 //! Not ported: `curl_client_only.sh` needs the network. `cat_proc_uptime.sh`
-//! no longer tests what it says. It expects `run --verify` of three
-//! `/proc/uptime` reads to find differences, but Detcore renders that file
-//! deterministically now, and the relaxed `--verify` it uses is refused
-//! before any comparison, so its nonzero exit would pass without measuring
-//! anything. The `strict_setitimer` and `strict_timer_create` scripts are not
-//! standalone targets internally either.
+//! runs only as the internal Buck standalone target; it asserts that a
+//! strict verified run renders `/proc/uptime` deterministically from virtual
+//! time, strictly increasing across sleeps. The `strict_setitimer` and
+//! `strict_timer_create` scripts are not standalone targets internally
+//! either.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
