@@ -434,6 +434,395 @@
         }
       ]
     },
+    "epoll_create1": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1658,
+          "hash": "9fc90e7d23855b26",
+          "id": "c1",
+          "last": 1658,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8431,
+          "hash": "0bc7d8f1e608e36c",
+          "id": "c2",
+          "last": 8436,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 3975,
+          "hash": "83122eb266387b58",
+          "id": "c3",
+          "last": 4001,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EBADF",
+        "EPOLL"
+      ],
+      "tests": []
+    },
+    "epoll_ctl": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1659,
+          "hash": "7533628e1d6d04aa",
+          "id": "c1",
+          "last": 1659,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8437,
+          "hash": "4582d17ffc4402a6",
+          "id": "c2",
+          "last": 8437,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 4003,
+          "hash": "601551fe5ad464fe",
+          "id": "c3",
+          "last": 4018,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [],
+      "tests": []
+    },
+    "epoll_pwait": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1662,
+          "hash": "d4ed4463d3455e52",
+          "id": "c1",
+          "last": 1662,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 4415,
+          "hash": "a4c01c4c712baa99",
+          "id": "c10",
+          "last": 4430,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2042,
+          "hash": "0f84c7a03dc9ccc4",
+          "id": "c11",
+          "last": 2054,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 400,
+          "hash": "12c8e4c0914d7258",
+          "id": "c11",
+          "last": 412,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 1235,
+          "hash": "3f3658f8ea97ecde",
+          "id": "c12",
+          "last": 1238,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8438,
+          "hash": "664c8a6bf3b2ff72",
+          "id": "c2",
+          "last": 8438,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 4057,
+          "hash": "04ee20abc4247de9",
+          "id": "c3",
+          "last": 4103,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4277,
+          "hash": "3939cc77b23bfeeb",
+          "id": "c4",
+          "last": 4313,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4105,
+          "hash": "3b245d8a70139fd0",
+          "id": "c5",
+          "last": 4147,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4149,
+          "hash": "fc1c5c641c0f326b",
+          "id": "c6",
+          "last": 4196,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4198,
+          "hash": "8761fb5dbc3a8401",
+          "id": "c7",
+          "last": 4249,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4251,
+          "hash": "639bb2c503409c4a",
+          "id": "c8",
+          "last": 4275,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 6338,
+          "hash": "eafbc4d65f9a0e77",
+          "id": "c8",
+          "last": 6365,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2440,
+          "hash": "a374ae7e78fc5501",
+          "id": "c9",
+          "last": 2468,
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "EVENT",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "under_the_gate_a_masked_epoll_pwait_follows_ep_poll_with_d37_s_exception"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        },
+        {
+          "names": [
+            "signal_interruption_errno_matches_linux_restart_policy",
+            "kernel_restart_errno_matches_linux_restart_policy"
+          ],
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ]
+    },
+    "epoll_pwait2": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1663,
+          "hash": "e80669ef0e9bb465",
+          "id": "c1",
+          "last": 1663,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1235,
+          "hash": "3f3658f8ea97ecde",
+          "id": "c10",
+          "last": 1238,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4149,
+          "hash": "fc1c5c641c0f326b",
+          "id": "c11",
+          "last": 4196,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1490,
+          "hash": "1e060c6c2facb54a",
+          "id": "c12",
+          "last": 1528,
+          "path": "detcore/src/syscalls/io/temporary_mask_forms.rs"
+        },
+        {
+          "first": 8003,
+          "hash": "ef8b797448b05a28",
+          "id": "c2",
+          "last": 8011,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 4315,
+          "hash": "198a6a56d5b1cb96",
+          "id": "c3",
+          "last": 4346,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4347,
+          "hash": "835f52b67f84ec64",
+          "id": "c4",
+          "last": 4413,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4452,
+          "hash": "1b4b28cce42224c2",
+          "id": "c5",
+          "last": 4511,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4550,
+          "hash": "aee5fa6078df7490",
+          "id": "c6",
+          "last": 4609,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4611,
+          "hash": "ed22bd50ebfcb4e8",
+          "id": "c7",
+          "last": 4635,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 6338,
+          "hash": "eafbc4d65f9a0e77",
+          "id": "c7",
+          "last": 6365,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 847,
+          "hash": "ff820c79e1e62b6a",
+          "id": "c8",
+          "last": 854,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2042,
+          "hash": "0f84c7a03dc9ccc4",
+          "id": "c9",
+          "last": 2054,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 400,
+          "hash": "12c8e4c0914d7258",
+          "id": "c9",
+          "last": 412,
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "EVENT",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "under_the_gate_a_masked_epoll_pwait2_takes_the_same_path"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        },
+        {
+          "names": [
+            "ppoll_timeout_uses_timespec_units",
+            "ppoll_timeout_rejects_invalid_timespecs"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ]
+    },
+    "epoll_wait": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1665,
+          "hash": "bfdbf2a22e3858a9",
+          "id": "c1",
+          "last": 1665,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8439,
+          "hash": "7c1671ef1a801fb4",
+          "id": "c2",
+          "last": 8440,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 4637,
+          "hash": "008e67c6c4db64a6",
+          "id": "c3",
+          "last": 4655,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4657,
+          "hash": "5709fa9d89869825",
+          "id": "c4",
+          "last": 4675,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2418,
+          "hash": "4cd11cf7083f25bd",
+          "id": "c5",
+          "last": 2438,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 4415,
+          "hash": "a4c01c4c712baa99",
+          "id": "c6",
+          "last": 4430,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8175,
+          "hash": "53ea3fafc31f865d",
+          "id": "c7",
+          "last": 8183,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2042,
+          "hash": "0f84c7a03dc9ccc4",
+          "id": "c8",
+          "last": 2054,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 400,
+          "hash": "12c8e4c0914d7258",
+          "id": "c8",
+          "last": 412,
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EINTR"
+      ],
+      "tests": [
+        {
+          "names": [
+            "signal_interruption_errno_matches_linux_restart_policy",
+            "kernel_restart_errno_matches_linux_restart_policy"
+          ],
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ]
+    },
     "getrandom": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
@@ -856,6 +1245,644 @@
         }
       ]
     },
+    "poll": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1827,
+          "hash": "caa5ce19ddb8f1f2",
+          "id": "c1",
+          "last": 1827,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 3863,
+          "hash": "ab139cf5afdd9eb3",
+          "id": "c10",
+          "last": 3880,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2359,
+          "hash": "d0e42374f196cec2",
+          "id": "c12",
+          "last": 2379,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 3325,
+          "hash": "8262b911d6d198a9",
+          "id": "c12",
+          "last": 3340,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 4638,
+          "hash": "b736b2502a415df5",
+          "id": "c13",
+          "last": 4644,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 3796,
+          "hash": "5f411e4e12ad0b62",
+          "id": "c13",
+          "last": 3837,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8420,
+          "hash": "522d15d3ca7ab32c",
+          "id": "c2",
+          "last": 8421,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 1466,
+          "hash": "31a2a8ad7e2ce7f8",
+          "id": "c3",
+          "last": 1484,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1485,
+          "hash": "64eb5453fb353bbc",
+          "id": "c4",
+          "last": 1505,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1407,
+          "hash": "b5a77f343dad1696",
+          "id": "c5",
+          "last": 1427,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3779,
+          "hash": "37b370a19b2a6ca5",
+          "id": "c6",
+          "last": 3793,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8175,
+          "hash": "c6137d6fbb2ca81b",
+          "id": "c7",
+          "last": 8196,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 1323,
+          "hash": "67b2fc9f7bde2848",
+          "id": "c8",
+          "last": 1335,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 113,
+          "hash": "793c3cb231ca70d5",
+          "id": "c9",
+          "last": 130,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EINTR",
+        "ERESTART",
+        "ERESTARTNOHAND",
+        "ERESTARTSYS"
+      ],
+      "tests": [
+        {
+          "names": [
+            "only_record_replay_and_unsequentialized_runs_poll_in_the_kernel",
+            "a_restarted_kernel_poll_waits_only_until_its_deadline",
+            "a_kernel_poll_without_a_deadline_restarts_by_running_again",
+            "a_kernel_poll_that_keeps_a_record_restarts_through_restart_syscall"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "zero_timeout_socket_poll_requests_a_strong_one_turn_yield",
+            "zero_timeout_non_socket_poll_keeps_the_existing_empty_turn"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        }
+      ]
+    },
+    "ppoll": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1828,
+          "hash": "740b4e35218266a2",
+          "id": "c1",
+          "last": 1828,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 3166,
+          "hash": "0b71490391b120db",
+          "id": "c10",
+          "last": 3193,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3315,
+          "hash": "ea37c8c14fa2fd9e",
+          "id": "c11",
+          "last": 3328,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3361,
+          "hash": "6a8f41228f27d699",
+          "id": "c11",
+          "last": 3366,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2981,
+          "hash": "0637b9ddbce26333",
+          "id": "c12",
+          "last": 2987,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3103,
+          "hash": "6ca08331a343c810",
+          "id": "c12",
+          "last": 3111,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3512,
+          "hash": "e047eb190f02abcd",
+          "id": "c13",
+          "last": 3518,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3550,
+          "hash": "034bebe77a07fd0b",
+          "id": "c13",
+          "last": 3551,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3205,
+          "hash": "3d475a2252804c1d",
+          "id": "c14",
+          "last": 3233,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3016,
+          "hash": "6f6a5b7c782cc495",
+          "id": "c15",
+          "last": 3023,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3087,
+          "hash": "394e30ffe6bb6a1b",
+          "id": "c15",
+          "last": 3111,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3249,
+          "hash": "e3797e23a015ac41",
+          "id": "c16",
+          "last": 3257,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3619,
+          "hash": "0568f82001bd4331",
+          "id": "c17",
+          "last": 3644,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3330,
+          "hash": "b32c8cfe58d51822",
+          "id": "c18",
+          "last": 3344,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3410,
+          "hash": "a0200b46be05f719",
+          "id": "c18",
+          "last": 3444,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2405,
+          "hash": "7bf1c07aa02a0505",
+          "id": "c19",
+          "last": 2409,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 3580,
+          "hash": "76ff2ce0e0eea903",
+          "id": "c19",
+          "last": 3591,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3325,
+          "hash": "8262b911d6d198a9",
+          "id": "c19",
+          "last": 3340,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 8430,
+          "hash": "0b0bce9538b9d1e7",
+          "id": "c2",
+          "last": 8430,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 3670,
+          "hash": "4561bb96f545d84f",
+          "id": "c20",
+          "last": 3677,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3432,
+          "hash": "386ea9715e44eaa5",
+          "id": "c20",
+          "last": 3436,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4638,
+          "hash": "b736b2502a415df5",
+          "id": "c21",
+          "last": 4644,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 3777,
+          "hash": "cfcd45667977ac30",
+          "id": "c21",
+          "last": 3785,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 847,
+          "hash": "ff820c79e1e62b6a",
+          "id": "c3",
+          "last": 854,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2919,
+          "hash": "0979a4ae82cd22b5",
+          "id": "c4",
+          "last": 2933,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 912,
+          "hash": "5a58d957a7fe9548",
+          "id": "c5",
+          "last": 931,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1235,
+          "hash": "3f3658f8ea97ecde",
+          "id": "c5",
+          "last": 1238,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1251,
+          "hash": "6b37b0f17f2cf730",
+          "id": "c6",
+          "last": 1257,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 895,
+          "hash": "7f7039d55995460f",
+          "id": "c7",
+          "last": 906,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3293,
+          "hash": "274d2e6ef8f9ac03",
+          "id": "c8",
+          "last": 3312,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3719,
+          "hash": "4681f4ebb5b5945b",
+          "id": "c9",
+          "last": 3737,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3012,
+          "hash": "2b698ee8cc7ffa96",
+          "id": "c9",
+          "last": 3015,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "ENOSYS",
+        "ERESTARTNOHAND",
+        "ERESTARTSYS",
+        "EVENT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "ppoll_timeout_uses_timespec_units",
+            "ppoll_timeout_rejects_invalid_timespecs"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "under_the_gate_a_masked_ppoll_follows_linux_order_and_waits_under_its_temporary_mask",
+            "under_the_gate_a_masked_ppoll_on_a_tight_stack_is_refused_without_a_probe"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        },
+        {
+          "names": [
+            "poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        }
+      ]
+    },
+    "pselect6": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1840,
+          "hash": "d6ebbe60c7510d38",
+          "id": "c1",
+          "last": 1840,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 779,
+          "hash": "0cbe3253f3da7ded",
+          "id": "c10",
+          "last": 799,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2520,
+          "hash": "9e1efceb881405fb",
+          "id": "c10",
+          "last": 2554,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1591,
+          "hash": "15731092de99e918",
+          "id": "c11",
+          "last": 1627,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 520,
+          "hash": "30d048ee8c6f4d92",
+          "id": "c12",
+          "last": 548,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1717,
+          "hash": "5fd0bd92c7cc302d",
+          "id": "c12",
+          "last": 1734,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1528,
+          "hash": "3e13a53969bc6fbf",
+          "id": "c13",
+          "last": 1562,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 736,
+          "hash": "4d5dffe8fa6c99eb",
+          "id": "c14",
+          "last": 777,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1850,
+          "hash": "eee72a26a924d2b2",
+          "id": "c15",
+          "last": 1854,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1914,
+          "hash": "0b135ae278e25410",
+          "id": "c15",
+          "last": 1926,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1638,
+          "hash": "35d29e0b609ca07f",
+          "id": "c16",
+          "last": 1644,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1676,
+          "hash": "214dbfdfb5c93b1e",
+          "id": "c16",
+          "last": 1685,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1564,
+          "hash": "907f60b51420f16f",
+          "id": "c17",
+          "last": 1589,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2081,
+          "hash": "498ecd7e2f6f793e",
+          "id": "c18",
+          "last": 2097,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8422,
+          "hash": "98c1dc96a01633bd",
+          "id": "c2",
+          "last": 8424,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 847,
+          "hash": "ff820c79e1e62b6a",
+          "id": "c3",
+          "last": 854,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1736,
+          "hash": "62431e3a33334a70",
+          "id": "c4",
+          "last": 1752,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1760,
+          "hash": "8fc9c2ed71e294be",
+          "id": "c4",
+          "last": 1791,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1828,
+          "hash": "fddc062ddde76412",
+          "id": "c4",
+          "last": 1848,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 414,
+          "hash": "4a4c5991b6ed6b42",
+          "id": "c5",
+          "last": 462,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1950,
+          "hash": "f5e3af55bf71a1d8",
+          "id": "c6",
+          "last": 1971,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1235,
+          "hash": "3f3658f8ea97ecde",
+          "id": "c7",
+          "last": 1238,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1974,
+          "hash": "5068129fcf7a8a2c",
+          "id": "c8",
+          "last": 1981,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1996,
+          "hash": "8288657c6920ff75",
+          "id": "c8",
+          "last": 2005,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2052,
+          "hash": "623e0380bb9bf7d9",
+          "id": "c8",
+          "last": 2080,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2126,
+          "hash": "2b7054343f534b63",
+          "id": "c8",
+          "last": 2142,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2233,
+          "hash": "986b88c02eff4f80",
+          "id": "c9",
+          "last": 2255,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2426,
+          "hash": "1c73cdf5fa213d57",
+          "id": "c9",
+          "last": 2435,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2474,
+          "hash": "69affac2f9ca8e4b",
+          "id": "c9",
+          "last": 2517,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EBADF",
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "EIO",
+        "ENOSYS",
+        "ERESTARTNOHAND",
+        "EVENT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "representative_policies_stay_in_their_reviewed_sections"
+          ],
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "names": [
+            "pselect6_fd_set_lengths_follow_the_raw_linux_abi"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "a_masked_pselect6_refusal_names_a_signal_only_when_one_is_pending",
+            "a_masked_pselect6_of_more_than_64_descriptors_is_refused_for_its_sets"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
+        }
+      ]
+    },
     "restart_syscall": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
@@ -936,6 +1963,122 @@
             "a_woken_poll_restarts_through_erestartsys_where_linux_restarts_it"
           ],
           "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ]
+    },
+    "select": {
+      "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
+      "citations": [
+        {
+          "first": 1892,
+          "hash": "195ee7715b5ea74a",
+          "id": "c1",
+          "last": 1892,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 609,
+          "hash": "872e84d1217549b3",
+          "id": "c10",
+          "last": 613,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 779,
+          "hash": "0cbe3253f3da7ded",
+          "id": "c10",
+          "last": 799,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2669,
+          "hash": "f50fc44da85d1a56",
+          "id": "c11",
+          "last": 2682,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 8425,
+          "hash": "305752807dff67b4",
+          "id": "c2",
+          "last": 8428,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 933,
+          "hash": "d57d41fd861108cb",
+          "id": "c3",
+          "last": 955,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2565,
+          "hash": "3f9b9b0478b76c76",
+          "id": "c4",
+          "last": 2625,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2628,
+          "hash": "77ef220cbb7a3547",
+          "id": "c5",
+          "last": 2668,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2725,
+          "hash": "28387d4452ce707c",
+          "id": "c6",
+          "last": 2795,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2797,
+          "hash": "f38e122776c86496",
+          "id": "c7",
+          "last": 2842,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 2875,
+          "hash": "517b1a7de0288498",
+          "id": "c8",
+          "last": 2910,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1508,
+          "hash": "838b939afa88f8d9",
+          "id": "c9",
+          "last": 1526,
+          "path": "detcore/src/syscalls/io.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EBADF",
+        "EFAULT",
+        "EINTR",
+        "EINVAL",
+        "ERESTARTNOHAND"
+      ],
+      "tests": [
+        {
+          "names": [
+            "representative_policies_stay_in_their_reviewed_sections"
+          ],
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "names": [
+            "select_timeout_folds_whole_seconds_out_of_microseconds"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in"
+          ],
+          "path": "detcore/src/tool_global/tests/gated_wait_turn_tests/temporary_mask_turn_tests.rs"
         }
       ]
     },

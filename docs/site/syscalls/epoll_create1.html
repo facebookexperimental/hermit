@@ -4,19 +4,38 @@
 <link rel="stylesheet" href="../site.css"><style>body{font-family:system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;line-height:1.55}table{border-collapse:collapse;width:100%}th,td{border:1px solid #8884;padding:.3rem .5rem;text-align:left}input,select{font:inherit;padding:.4rem;margin:0 .5rem 1rem 0}code{background:#8882;padding:.05rem .25rem;border-radius:.25rem}pre{background:#8881;padding:1rem;overflow:auto}</style></head><body>
 <header><p><a href="./">All syscalls</a></p><h1><code>epoll_create1</code> (291)</h1>
 <p>Strategy: <strong>determinized</strong> &middot; dispatch: <code>typed</code> &middot; <a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create1&amp;body=Discussion+for+the+%60epoll_create1%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create1.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create1%60%2C+or+in+what+the+page+says%3F%0A">discussion (new)</a></p></header>
-<h2>Strategy</h2>
+<p>Facts as of <code>403e350e9e82</code> &middot; prose checked 2026-11-17 at <code>7ac736d54e14</code></p>
+<h2>In short</h2>
+<p>Natively, the kernel picks the new descriptor number from the live descriptor table and can refuse when descriptor limits are reached. Hermit forwards the creation at a serialized point in the schedule and records the descriptor in its own table, so the number and later lookups repeat with the run. Known gaps: 3.</p>
+<h2>Determinism strategy</h2>
+<p><strong>What is nondeterministic natively.</strong> <code>epoll_create1</code> asks the kernel for a new epoll instance and a descriptor number for it, chosen from the calling thread's descriptor table as it stands at that instant, and the call can fail when the per-process descriptor-table limit has been reached.<sup>[linux]</sup> Under concurrent descriptor activity the number a run receives, and whether creation succeeds at all, therefore depend on host scheduling and on descriptor use outside this call.</p>
+<p><strong>What Hermit does.</strong> Detcore determinizes creation by giving it a defined place in the serialized schedule and then forwarding it: typed dispatch reaches a handler that first files an empty resource request, runs the call through the record-or-replay path, and registers the returned descriptor in the descriptor table Detcore consults for later descriptor operations, marked as an epoll descriptor with its close-on-exec state carried from the creation flags.<sup>[c1]</sup><sup>[c2]</sup><sup>[c3]</sup> The legacy <code>epoll_create</code> entry point reaches the same handler by conversion at dispatch, with no size argument left for the handler to judge, as named under Known gaps.<sup>[c2]</sup></p>
+<p><strong>Interface fidelity.</strong> The only creation flag with meaning is the close-on-exec flag, <code>EPOLL_CLOEXEC</code>, which shares its bit value with the corresponding open flag and is carried straight into the registered descriptor state.<sup>[c3]</sup><sup>[linux]</sup> Detcore checks no flag bits itself: a flags value the kernel rejects is rejected by the forwarded kernel call, and success or failure from descriptor limits is likewise the kernel answer Detcore forwards and registers only on success.<sup>[c3]</sup></p>
+<p><strong>Record &amp; replay.</strong> The call is subscribed in both run and record/replay modes (code facts in the Appendix).<sup>[c2]</sup> The handler always goes through the record-or-replay path and registers whatever descriptor number that path returns, so the descriptor-table entry is rebuilt on replay exactly where the recording created it.<sup>[c3]</sup></p>
+<h2>Known gaps</h2>
+<ul>
+<li>G1 (by design): the epoll instance itself is the host kernel object the forwarded call creates, not a Detcore model, and the descriptor number is the kernel number from that call; repeatability comes from serialized descriptor allocation and from replaying the creation, not from virtual descriptor numbering.<sup>[c3]</sup></li>
+<li>G2 (unmeasured): no dedicated unit test exercises this handler at this revision, and the integration guest credited in Tests exercises successful creation but not invalid-flag or descriptor-limit failure, so those forwarded-failure claims rest on the handler code alone pending such a test.<sup>[c3]</sup></li>
+<li>G3 (unimplemented): the legacy spelling's size argument is discarded by the conversion to this call, so a size of zero or less, which Linux refuses, instead creates an instance as a flags-free call here would; there is no fallback that restores the check.<sup>[c2]</sup><sup>[c3]</sup><sup>[linux]</sup></li>
+</ul>
+<h2>Discussion</h2>
+<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create1&amp;body=Discussion+for+the+%60epoll_create1%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create1.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create1%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_create1`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h2>Appendix</h2>
+<h3>Code facts</h3>
 <p>Detcore classifies <code>epoll_create1</code> (291) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.</p>
 <ul>
 <li>Reviewed list: <code>detcore/src/syscall_classification.rs:1658</code></li>
 <li>Dispatch: <code>detcore/src/lib.rs:8436</code></li>
 </ul>
-<p>This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.</p>
-<h2>Discussion</h2>
-<p><a href="https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+epoll_create1&amp;body=Discussion+for+the+%60epoll_create1%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Fepoll_create1.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60epoll_create1%60%2C+or+in+what+the+page+says%3F%0A">Start a discussion about `epoll_create1`</a> (opens a prefilled issue form; nothing is filed until you submit it).</p>
+<h3>Tests</h3>
+<p>Successful creation with the close-on-exec flag and descriptor-table use of the returned descriptor are exercised end to end by the guest program tests/c/epoll_determinism.c, run repeatedly for identical output by the integration test hermit-cli/tests/epoll_determinism.rs — what Hermit does, and interface fidelity. No dedicated unit test for this handler exists at this revision; that narrower absence is part of G2.<sup>[c3]</sup></p>
+<h3>Citations</h3>
+<p><sup>[linux]</sup>: Linux <code>epoll_create1(2)</code>: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/eventpoll.c?h=v7.1.3 <sup>[c1]</sup>: detcore/src/syscall_classification.rs:1658 sha256:9fc90e7d23855b26 <sup>[c2]</sup>: detcore/src/lib.rs:8431-8436 sha256:0bc7d8f1e608e36c https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8431-L8436 <sup>[c3]</sup>: detcore/src/syscalls/io.rs:3975-4001 sha256:83122eb266387b58</p>
 <h2>Status</h2>
 <ul>
 <li>2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.</li>
 <li>2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.</li>
+<li>2026-11-17 · rev 7ac736d54e14 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.</li>
 <li>2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.</li>
 </ul>
 </body></html>
