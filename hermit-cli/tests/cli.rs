@@ -55940,11 +55940,36 @@ fn absent_cpu_node_backlinks(backend: &str) {
             "stat fd link attribute: ok\n",
             "stat fd link control: ok\n",
             ", end page, data at 3 3, hole at 0 page, read there 0\n",
-            "online seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
-             cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n",
         ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
         }
+        // The largest seek a sysfs attribute accepts is bounded by the
+        // superblock's `s_maxbytes` through `generic_file_llseek`
+        // (`vfs_setpos`). `kernfs_fill_super` never set it, so it kept
+        // `alloc_super`'s `MAX_NON_LFS` (2^31 - 1) and a seek to
+        // `LLONG_MAX` was EINVAL, until 2467f9928c98 (fs/kernfs/mount.c,
+        // `kernfs_fill_super`, in v7.0) raised it to `MAX_LFS_FILESIZE`.
+        // Both answers are Linux's; which one the host gives says which
+        // side of that commit its kernel is on. Hermit's own answer is
+        // the later one on every host (asserted byte for byte in
+        // `expected` above); the native control may show either, and
+        // nothing else.
+        let new_max_seek = "online seek: read 1, dup at 1, dup read 1, at 2, \
+            set max 9223372036854775807, cur +1 EINVAL, dup at \
+            9223372036854775807, end max EINVAL\n";
+        let old_max_seek = "online seek: read 1, dup at 1, dup read 1, at 2, \
+            set max EINVAL, cur +1 3, dup at 3, end max EINVAL\n";
+        let host_form = if native.contains(new_max_seek) {
+            "v7.0+ (kernfs s_maxbytes = MAX_LFS_FILESIZE)"
+        } else if native.contains(old_max_seek) {
+            "pre-v7.0 (kernfs s_maxbytes = MAX_NON_LFS)"
+        } else {
+            panic!(
+                "neither documented online max-seek form natively \
+                 ({new_max_seek:?} or {old_max_seek:?}):\n{native}"
+            );
+        };
+        eprintln!("host sysfs max-seek form: {host_form}");
     }
     let verdict = directory.path().join("verify.json");
     let mut args = vec![
