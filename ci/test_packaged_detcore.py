@@ -39,7 +39,6 @@ EXPORT_REPOSITORY = "facebookexperimental/hermit"
 PROFILE_NAME = "fb-only/liteinst-runtime-profile.bzl"
 BUCK_NAME = "BUCK"
 FINALIZER_NAME = "hermit-install/src/bin/stage-detcore-liteinst.rs"
-VERIFIER_NAME = "ci/verify-packaged-detcore.py"
 
 
 def _load_verifier():
@@ -66,17 +65,21 @@ verifier = _load_verifier()
 def hermit_root(case):
     """The Hermit tree these tests read, at its repository paths.
 
-    In a source checkout (and the GitHub export) it is the parent of ci/.
-    Under Buck, where __file__ is not in that tree, the same files are
-    the test's resources, laid out as hermit/.
+    Under Buck, which runs the module in its package, the files are the
+    test's resources, laid out as hermit/, and are read only there: an
+    absent resources tree fails rather than falling back to the source
+    tree, which on a remote-execution worker holds only the test's own
+    inputs. Run as a script, in a source checkout or the GitHub export, the
+    tree is the parent of ci/.
     """
-    candidate = Path(__file__).resolve().parent.parent
-    try:
-        (candidate / VERIFIER_NAME).lstat()
-    except FileNotFoundError:
-        return case.enterContext(importlib.resources.as_file(
-            importlib.resources.files(__package__) / "hermit"))
-    return candidate
+    if not __package__:
+        return Path(__file__).resolve().parent.parent
+    resources = importlib.resources.files(__package__) / "hermit"
+    if not resources.is_dir():
+        raise FileNotFoundError(
+            f"the test's resources tree {resources} is absent: ci/BUCK "
+            "stages the files these controls read there")
+    return case.enterContext(importlib.resources.as_file(resources))
 
 
 def export_skip_reason(path, name, repository, what):
