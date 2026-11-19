@@ -2,10 +2,19 @@
 #
 # Reverie's first-party BUCK files say `fbsource//third-party/rust:thiserror`,
 # the same spelling Meta's internal build uses. Reindeer only emits such an
-# unsuffixed alias for crates that are direct dependencies of the manifest it
-# ran on, so Hermit's cell has aliases for Hermit's direct dependencies and not
+# unsuffixed alias for a direct dependency of a member of the manifest it ran
+# on, and only when that crate has a generated target. Every direct normal
+# dependency has one. A direct dev-dependency has one only when the members'
+# normal and build dependencies reach it as well, because Reindeer's walk never
+# follows dev edges (hermit-cli's `syn` qualifies; detcore's `test-case` does
+# not). So Hermit's cell has aliases for Hermit's direct dependencies and not
 # for Reverie's. That gap is the only thing that stopped one cell from serving
 # both; there is no version conflict behind it.
+#
+# Never list a crate Reindeer already aliases. bootstrap/regenerate-rust-deps
+# refuses such an entry after vendoring ("already exists in the generated
+# BUCK"); scripts/check-buck-graph-drift.rs applies the rule above statically,
+# from Cargo.lock, and refuses it before then.
 #
 # bootstrap/regenerate-rust-deps appends one alias per line below, resolving
 # each to whatever versioned target the generated BUCK actually contains, so a
@@ -21,6 +30,7 @@ kvm-bindings
 kvm-ioctls
 linked-hash-map
 linux-raw-sys
+liteinst
 liteinst-aarch64
 liteinst-aarch64-patch
 memmap2

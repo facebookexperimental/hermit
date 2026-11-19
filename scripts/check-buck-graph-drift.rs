@@ -35,9 +35,13 @@
 //!
 //! This check is static: no Buck, no network, no generated files. A
 //! reference counts as covered when the shared-cell list names it or
-//! when it is a direct (non-dev, non-build) dependency of a workspace
-//! member, which is the rule Reindeer aliases by
-//! (`shim/third-party/rust/shared-cell-aliases.txt` documents it). That
+//! when Reindeer aliases it: a direct normal dependency of a workspace
+//! member, or a direct dev-dependency of one that the members' normal and
+//! build dependencies reach through Cargo.lock (`direct_deps` says why,
+//! and what Cargo.lock cannot show;
+//! `shim/third-party/rust/shared-cell-aliases.txt` states the same rule).
+//! A shared-cell entry Reindeer already aliases is refused, since
+//! regeneration would refuse it after vendoring. That
 //! reproduces the generated graph's verdict for B1-B3 in under a
 //! second; `bootstrap/regenerate-rust-deps` stays the authority on the
 //! graph itself and still refuses an alias with no versioned target.
@@ -280,6 +284,13 @@ fn run() -> Result<Pass, Outcome> {
         }
     }
     let direct = direct_deps(&root)?;
+    for entry in already_aliased(&shared, &direct) {
+        violations.push(format!(
+            "{ALIASES}: `{entry}` is a dependency of a workspace member that \
+             Reindeer aliases itself, so bootstrap/regenerate-rust-deps refuses \
+             a second alias for it after vendoring; remove the entry"
+        ));
+    }
     let known: BTreeSet<&str> = KNOWN_MISSING.into_iter().collect();
     let dead: BTreeSet<&str> = DEAD_REFS.into_iter().collect();
     let mut via_shared = 0usize;
@@ -312,8 +323,8 @@ fn run() -> Result<Pass, Outcome> {
         } else {
             violations.push(format!(
                 "{shown}: `{REF_PREFIX}{name}` has no target: it is neither in \
-                 {ALIASES} nor a direct dependency of a workspace member, so \
-                 neither Reindeer nor the shared-cell append emits it"
+                 {ALIASES} nor a workspace member's dependency that Reindeer \
+                 aliases, so neither Reindeer nor the shared-cell append emits it"
             ));
         }
         if (known.contains(name.as_str()) || dead.contains(name.as_str()))
@@ -351,8 +362,8 @@ fn run() -> Result<Pass, Outcome> {
                     violations.push(format!(
                         "{shown}: `{label}`, which {REWRITES} renames to \
                          `third-party/rust:{krate}`, has no target: `{krate}` is \
-                         neither in {ALIASES} nor a direct dependency of a \
-                         workspace member"
+                         neither in {ALIASES} nor a workspace member's dependency \
+                         that Reindeer aliases"
                     ));
                 }
             }
@@ -686,8 +697,37 @@ fn lock_packages(text: &str) -> Result<BTreeSet<String>, String> {
     Ok(names)
 }
 
-/// Direct non-dev, non-build dependency package names of every
-/// workspace member: the set Reindeer emits unsuffixed aliases for.
+/// The package names Reindeer emits unsuffixed aliases for, as far as
+/// Cargo.lock shows: every workspace member's direct normal dependencies,
+/// plus each member's direct dev-dependencies that the members' normal and
+/// build dependencies reach through the Cargo.lock edges of packages
+/// outside the workspace.
+///
+/// Reindeer marks every direct dependency of a member public, dev ones
+/// included, but it generates targets only for the packages its walk
+/// reaches, and that walk starts from the members' normal and build
+/// dependencies and follows normal and build edges, never dev ones. It
+/// aliases only a public package that has a target. So detcore's
+/// dev-dependency `test-case` gets neither a target nor an alias, and
+/// neither does `test-case-macros`, needed only by `test-case`. hermit-cli's
+/// dev-dependency `syn` gets both, because `thiserror-impl` needs it on
+/// the normal path. Cargo.lock records only the normal and build
+/// dependencies of a package outside the workspace, so the walk below
+/// follows those entries. It never follows a member's own entry, which
+/// lists the member's dev-dependencies too.
+///
+/// The walk is necessary, not sufficient: Cargo.lock does not record what
+/// can cut an edge out of Reindeer's walk. Three classes of gate are
+/// invisible here:
+/// - the target platform (`windows-*`, `wasi`, `wasm-bindgen`);
+/// - cargo features (`valuable`);
+/// - fixups that drop a build dependency, such as generic-array's
+///   `buildscript.run = false`. Its build dependency `version_check` stays
+///   reachable here, because Cargo.lock does not tell build edges from
+///   normal ones; only the vendored manifests do.
+/// So a crate this admits can still lack a target, and
+/// `bootstrap/regenerate-rust-deps` stays the authority: it refuses an
+/// alias with no versioned target.
 fn direct_deps(root: &Path) -> Result<BTreeSet<String>, String> {
     let manifest: toml::Value = read(root, "Cargo.toml")?
         .parse()
@@ -701,6 +741,9 @@ fn direct_deps(root: &Path) -> Result<BTreeSet<String>, String> {
         .ok_or("Cargo.toml: no workspace.members list")?;
     let inherited = workspace.get("dependencies");
     let mut direct = BTreeSet::new();
+    let mut build = BTreeSet::new();
+    let mut dev = BTreeSet::new();
+    let mut member_names = BTreeSet::new();
     for member in members {
         let member = member
             .as_str()
@@ -715,24 +758,123 @@ fn direct_deps(root: &Path) -> Result<BTreeSet<String>, String> {
         let member_manifest: toml::Value = read(root, &path)?
             .parse()
             .map_err(|error| format!("{path}: {error}"))?;
-        collect_deps(&member_manifest, inherited, &path, &mut direct)?;
+        let name = member_manifest
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("{path}: no package.name"))?;
+        member_names.insert(name.to_string());
+        collect_deps(
+            &member_manifest,
+            "dependencies",
+            inherited,
+            &path,
+            &mut direct,
+        )?;
+        collect_deps(
+            &member_manifest,
+            "build-dependencies",
+            inherited,
+            &path,
+            &mut build,
+        )?;
+        collect_deps(
+            &member_manifest,
+            "dev-dependencies",
+            inherited,
+            &path,
+            &mut dev,
+        )?;
     }
+    let roots: BTreeSet<&str> = direct.iter().chain(&build).map(String::as_str).collect();
+    let reached = lock_reachable(&read(root, "Cargo.lock")?, &member_names, &roots)?;
+    direct.extend(dev.into_iter().filter(|name| reached.contains(name)));
     Ok(direct)
 }
 
+/// The package names reachable from `roots` (the roots included) through
+/// the Cargo.lock dependency edges of packages outside the workspace. A
+/// member's own entry is never followed: it lists the member's
+/// dev-dependencies too, and `roots` already holds its normal and build
+/// dependencies. Names are matched without versions.
+fn lock_reachable(
+    text: &str,
+    members: &BTreeSet<String>,
+    roots: &BTreeSet<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let lock: toml::Value = text
+        .parse()
+        .map_err(|error| format!("Cargo.lock: {error}"))?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or("Cargo.lock: no [[package]] entries read")?;
+    let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or("Cargo.lock: a [[package]] entry has no name")?;
+        if members.contains(name) {
+            continue;
+        }
+        let out = edges.entry(name).or_default();
+        for dependency in package
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            // Each entry is "name", "name version" or "name version (source)".
+            if let Some(dependency) = dependency
+                .as_str()
+                .and_then(|entry| entry.split(' ').next())
+            {
+                out.insert(dependency);
+            }
+        }
+    }
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Vec<&str> = roots.iter().copied().collect();
+    while let Some(name) = pending.pop() {
+        if !reached.insert(name.to_string()) {
+            continue;
+        }
+        if let Some(next) = edges.get(name) {
+            pending.extend(next.iter().copied());
+        }
+    }
+    Ok(reached)
+}
+
+/// The shared-cell entries Reindeer already aliases as a workspace
+/// member's dependency. regenerate-rust-deps refuses each such entry
+/// ("already exists in the generated BUCK"), but only after vendoring.
+fn already_aliased<'a>(shared: &'a [String], direct: &BTreeSet<String>) -> Vec<&'a str> {
+    shared
+        .iter()
+        .filter(|entry| direct.contains(*entry))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Collects the package names of `manifest`'s `kind` table
+/// (`dependencies`, `build-dependencies` or `dev-dependencies`) and of
+/// every `[target.*.<kind>]` table into `names`.
 fn collect_deps(
     manifest: &toml::Value,
+    kind: &str,
     inherited: Option<&toml::Value>,
     path: &str,
-    direct: &mut BTreeSet<String>,
+    names: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let mut tables: Vec<&toml::Value> = Vec::new();
-    if let Some(deps) = manifest.get("dependencies") {
+    if let Some(deps) = manifest.get(kind) {
         tables.push(deps);
     }
     if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
         for target in targets.values() {
-            if let Some(deps) = target.get("dependencies") {
+            if let Some(deps) = target.get(kind) {
                 tables.push(deps);
             }
         }
@@ -742,7 +884,7 @@ fn collect_deps(
             .as_table()
             .ok_or_else(|| format!("{path}: a dependencies value is not a table"))?;
         for (key, value) in table {
-            direct.insert(package_name(key, value, inherited, path)?);
+            names.insert(package_name(key, value, inherited, path)?);
         }
     }
     Ok(())
@@ -1005,6 +1147,108 @@ mod tests {
         assert!(buildscript_cfg_preserved(&parses(
             "['cfg(target_os = \"linux\")']\ncfgs = [\"relaxed_coherence\"]"
         )));
+    }
+
+    /// A workspace of `members`, each a package named after its directory
+    /// with the given manifest tables, whose Cargo.lock is `lock`.
+    fn workspace_of(name: &str, members: &[(&str, &str)], lock: &str) -> PathBuf {
+        let root = scratch(name);
+        let list: Vec<String> = members
+            .iter()
+            .map(|(dir, _)| format!("\"{dir}\""))
+            .collect();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\nmembers = [{}]\n", list.join(", ")),
+        )
+        .unwrap();
+        for (dir, tables) in members {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(
+                root.join(dir).join("Cargo.toml"),
+                format!("[package]\nname = \"{dir}\"\n\n{tables}"),
+            )
+            .unwrap();
+        }
+        fs::write(root.join("Cargo.lock"), lock).unwrap();
+        root
+    }
+
+    #[test]
+    fn dev_dependencies_count_when_the_normal_and_build_walk_reaches_them() {
+        // serde -> thiserror-impl -> {quote, syn} on the normal path, and
+        // cc -> shlex on the build path, so the dev-dependencies syn, quote
+        // (a target table) and shlex are reached; test-case is not.
+        let root = workspace_of(
+            "dev-deps-reached",
+            &[(
+                "a",
+                "[dependencies]\nserde = \"1\"\n\n\
+                 [build-dependencies]\ncc = \"1\"\n\n\
+                 [dev-dependencies]\nsyn = \"2\"\nshlex = \"1\"\ntest-case = \"3\"\n\n\
+                 [target.'cfg(unix)'.dev-dependencies]\nquote = \"1\"\n",
+            )],
+            // Cargo.lock lists a workspace member's dev-dependencies, but
+            // only the normal and build dependencies of a package outside it.
+            "[[package]]\nname = \"a\"\nversion = \"0.0.0\"\n\
+             dependencies = [\"cc\", \"quote\", \"serde\", \"shlex\", \"syn\", \"test-case\"]\n\n\
+             [[package]]\nname = \"cc\"\nversion = \"1.0.0\"\ndependencies = [\"shlex\"]\n\n\
+             [[package]]\nname = \"quote\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
+             dependencies = [\"thiserror-impl\"]\n\n\
+             [[package]]\nname = \"shlex\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"syn\"\nversion = \"2.0.0\"\n\n\
+             [[package]]\nname = \"test-case\"\nversion = \"3.0.0\"\n\n\
+             [[package]]\nname = \"thiserror-impl\"\nversion = \"2.0.0\"\n\
+             dependencies = [\"quote 1.0.0\", \"syn 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)\"]\n",
+        );
+        let direct = direct_deps(&root).unwrap();
+        // A member's build dependency is a root of the walk, not an alias
+        // this check counts.
+        let expected: BTreeSet<String> =
+            ["quote", "serde", "shlex", "syn"].map(String::from).into();
+        assert_eq!(direct, expected);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_dev_only_chain_does_not_count() {
+        // test-case-macros has a dependent outside the workspace, test-case,
+        // but test-case is itself only a dev-dependency, so Reindeer's walk
+        // reaches neither and emits neither. Member b's normal dependency on
+        // member a does not open a's own Cargo.lock entry, which lists a's
+        // dev-dependencies.
+        let root = workspace_of(
+            "dev-only-chain",
+            &[
+                (
+                    "a",
+                    "[dependencies]\nserde = \"1\"\n\n\
+                     [dev-dependencies]\ntest-case = \"3\"\ntest-case-macros = \"3\"\n",
+                ),
+                ("b", "[dependencies]\na = { path = \"../a\" }\n"),
+            ],
+            "[[package]]\nname = \"a\"\nversion = \"0.0.0\"\n\
+             dependencies = [\"serde\", \"test-case\", \"test-case-macros\"]\n\n\
+             [[package]]\nname = \"b\"\nversion = \"0.0.0\"\ndependencies = [\"a\"]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"test-case\"\nversion = \"3.0.0\"\n\
+             dependencies = [\"test-case-macros\"]\n\n\
+             [[package]]\nname = \"test-case-macros\"\nversion = \"3.0.0\"\n",
+        );
+        let direct = direct_deps(&root).unwrap();
+        // b's path dependency on a is a direct normal dependency like any
+        // other; a is a member, not a third-party reference.
+        let expected: BTreeSet<String> = ["a", "serde"].map(String::from).into();
+        assert_eq!(direct, expected);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn shared_entries_reindeer_already_aliases_are_named() {
+        let shared: Vec<String> = ["liteinst", "syn", "thiserror"].map(String::from).into();
+        let direct: BTreeSet<String> = ["serde", "syn"].map(String::from).into();
+        assert_eq!(already_aliased(&shared, &direct), ["syn"]);
     }
 
     #[test]
