@@ -146,13 +146,15 @@ fn reverie_is_path_sourced(manifest_text: &str) -> proof::Result<bool> {
     path_sourced.ok_or_else(|| "manifest names no Reverie git or path dependency".into())
 }
 
-/// The compiled-source layout for this workspace: the content-only
+/// The compiled-source layout for this workspace, selecting the pin
+/// proof and the recorded inventory: the content-only
 /// `PathCheckout` layout only for a gitless path-sourced Reverie root;
 /// a root carrying its own Git metadata takes `GitlinkCheckout` even when
 /// the manifests spell path dependencies, so the content factory's
 /// pin proof (HEAD and gitlink equal to the pin) always runs for a
-/// real checkout. This only selects the factory arm; the arm binds
-/// its own shape exactly.
+/// real checkout. The manifest spelling is a separate fact: the
+/// factory observes it from fresh metadata and binds each spelling
+/// exactly.
 fn reverie_layout(
     manifest_text: &str,
     reverie_root: &Path,
@@ -1047,14 +1049,18 @@ fn run() -> proof::Result<()> {
         "no Reverie pin label: no submodule checkout, reverie.submodule.txt marker, or gitlink names one full revision",
     )?;
     let manifest_text = fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
-    // `--git` is judged on the manifest spelling: the Git factory
-    // binds the exact Git source string and refuses path-form
-    // packages, whatever layout the content route below selects.
-    require(
-        authority != "--git" || !reverie_is_path_sourced(&manifest_text)?,
-        "--git requires git-sourced Reverie manifests; this workspace is path-sourced, use --source-copy",
-    )?;
+    let path_sourced = reverie_is_path_sourced(&manifest_text)?;
     let layout = reverie_layout(&manifest_text, &root.join("reverie"))?;
+    // `--git` requires the checkout pin proof, so it is judged on
+    // the layout: a gitless source copy has no HEAD or gitlink to
+    // prove. The manifest spelling then selects the factory below —
+    // the Git factory binds the exact Git source string, while a
+    // path-spelled checkout resolves declared content under the
+    // same pin proof.
+    require(
+        authority != "--git" || layout == proof::CompiledSourceLayout::GitlinkCheckout,
+        "--git requires a Reverie Git checkout for its pin proof; this workspace is a gitless source copy, use --source-copy",
+    )?;
     let expectation = proof::CompiledSourceExpectation {
         layout,
         image_kind: proof::FixedImageKind::Detcore,
@@ -1063,8 +1069,11 @@ fn run() -> proof::Result<()> {
         reverie_pin: &pin,
         consumer: Some(consumer_source_declaration()),
     };
-    // Explicit authority; a failed Git resolution never downgrades to content.
-    let sources = if authority == "--git" {
+    // Explicit authority: the Git factory only for git-spelled
+    // manifests under `--git`; every other Cargo authority resolves
+    // declared content. A failed resolution never retries the other
+    // factory.
+    let sources = if authority == "--git" && !path_sourced {
         proof::VerifiedCompiledSources::resolve_with_repository(
             &expectation,
             reverie_repository(),

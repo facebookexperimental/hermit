@@ -127,7 +127,9 @@ fn main() {
     // root carrying its own Git metadata takes the Git layout even
     // when the manifests spell path dependencies, so the factory's
     // pin proof (checkout HEAD and Hermit gitlink equal to the pin)
-    // always runs for a real checkout.
+    // always runs for a real checkout. The layout selects that proof
+    // and the recorded inventory only; the factory observes the
+    // manifest spelling from fresh metadata itself.
     let layout = if path_sourced
         && !artifact::reverie_root_has_git_metadata(&source_root.join("reverie"))
     {

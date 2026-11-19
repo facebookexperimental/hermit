@@ -90,8 +90,9 @@ pub(crate) fn reverie_root_has_git_metadata(reverie_root: &Path) -> bool {
 /// Whether a manifest spells its Reverie dependencies by path (`true`),
 /// by git revision (`false`), or neither/both (refused). Only non-comment
 /// lines naming a Reverie package vote, every vote must agree, and the
-/// selected shape is then bound exactly by the content factory: this
-/// selects which factory arm runs, it never downgrades a refusal.
+/// selected shape is then bound exactly by the content factory, which
+/// observes the same spelling from fresh metadata: this vote only
+/// routes the layout below, it never downgrades a refusal.
 /// The gitless content-only layout is selected only when this vote is
 /// path AND [`reverie_root_has_git_metadata`] is false for the Reverie
 /// root; a path-spelled Git checkout takes the Git layout so its HEAD
@@ -1306,7 +1307,8 @@ pub(crate) mod native {
         .unwrap_or_else(|e| panic!("native Reverie layout refused: {e}"));
         // Same route as the standalone build: the content-only layout
         // is for gitless Reverie roots alone; a root with its own Git
-        // metadata takes the Git layout so the pin proof runs.
+        // metadata takes the Git layout so the pin proof runs. The
+        // factory observes the manifest spelling itself.
         let layout = if path_sourced && !reverie_root_has_git_metadata(&root.join("reverie")) {
             qualifier::CompiledSourceLayout::PathCheckout
         } else {

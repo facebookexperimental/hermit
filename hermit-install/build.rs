@@ -190,7 +190,7 @@ fn main() {
     // Never expose this invocation's validate/LTO-off DSO as an installed one.
     // The absent resource makes an unfinalized installation fail closed.
     println!(
-        "cargo:warning=finish LiteInst packaging with target/<profile>/stage-detcore-liteinst --git target (make install-deps does this automatically)"
+        "cargo:warning=finish LiteInst packaging with target/<profile>/stage-detcore-liteinst --source-copy target (make install-deps does this automatically)"
     );
 
     let repository = manifest_dir
