@@ -80,11 +80,13 @@ build:
 | `wrap_test_suite` | 1 | The upstream rr test-suite wrapper (296 targets). |
 | `excluded_paths_test` | 1 | The internal import-exclusion check, which has no meaning in this tree. |
 | `go_binary` | 1 | `detcore/tests/lit:hello_world_go_main`, the Go lit guest. The open-source build configures no Go toolchain. |
+| `buck_sh_test`, marked `broken-in-oss`, script absent | 1 | Reverie's `check-layering`, whose script `fb-only/check_layering_test.sh` the export strips. The shim defines this target without its script (naming a missing file would fail the whole package at load time), so it is listed and skipped as incompatible. A `broken-in-oss` shell test whose script is present is defined as usual, and a missing script on any other shell test still fails. Reverie's tree carries the check as `scripts/check-layering.sh`. |
 
-The table covers Hermit's packages. Reverie's stand-ins `gated_test`,
-`excluded_paths_test` and `downstream_source_exports`
-(`shim/hermetic_infra/reverie/fb-only/defs.bzl`) also define no target;
-Reverie's BUCK files do not evaluate in this tree yet.
+Apart from the `buck_sh_test` row, the table covers Hermit's packages.
+Reverie's stand-ins `gated_test`, `excluded_paths_test` and
+`downstream_source_exports` (`shim/hermetic_infra/reverie/fb-only/defs.bzl`)
+also define no target. With Reverie at c3f8de29 or later, Reverie's BUCK files
+evaluate in this tree.
 
 `flaky-tests:use_configurable_flaky_service` is marked `broken-in-oss` (the
 shim has no curl), as are the root package's `backend-abstraction-repository`,
