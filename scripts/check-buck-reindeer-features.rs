@@ -538,7 +538,7 @@ fn forwards_kwargs_entry(tokens: &[Lexeme], index: usize) -> bool {
     // The literal tuple or list of plain strings around `index`.
     let mut open = index;
     loop {
-        match open.checked_sub(1).and_then(|before| token(before)) {
+        match open.checked_sub(1).and_then(&token) {
             Some(Token::Punct(",")) => open -= 1,
             Some(Token::Str(_)) if plain(open - 1) => open -= 1,
             Some(Token::Punct("(" | "[")) => {
