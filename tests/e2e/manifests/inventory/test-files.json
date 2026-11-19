@@ -5842,7 +5842,7 @@
       "disposition": "integration-helper",
       "path": "tests/standalone/cat_proc_uptime.sh",
       "runner": "none: the internal Buck matrix's standalone target only",
-      "why": "tests/standalone/cat_proc_uptime.sh is the source of an internal standalone target that is not ported: it expects run --verify to find differences in /proc/uptime, which Detcore now renders deterministically, and the relaxed --verify it uses is refused before any comparison, so it would pass without measuring anything."
+      "why": "tests/standalone/cat_proc_uptime.sh is the source of an internal standalone target that is not ported: its negative form expected run --verify to find differences in /proc/uptime, which Detcore renders deterministically from virtual time, and the relaxed --verify it used is refused before any comparison, so it passed without measuring anything (the one passing base run is that policy refusal's nonzero exit, not a found difference). The requirement now stands in positive form: a strict verified run renders /proc/uptime deterministically, strictly increasing across sleeps."
     },
     {
       "disposition": "integration-helper",
