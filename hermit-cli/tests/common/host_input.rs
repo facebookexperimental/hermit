@@ -644,3 +644,163 @@ pub fn verify_ended_in_run_1(
     .unwrap_or_else(|error| panic!("parse verify json: {error}\n{stderr}"));
     (status.code(), stderr, report)
 }
+
+/// The guest for [`verify_across_a_host_cache_rename`], run by a shell that
+/// the dynamic loader starts with `--inhibit-cache`, so that loading the shell
+/// never opens `/etc/ld.so.cache`. It waits for the host on `fifo`, then
+/// prints two sizes: the host's file that Hermit froze the cache from, read
+/// by its own path (`$1/etc/ld.so.cache`), and `/etc/ld.so.cache`. The first
+/// shows that the host's rename came before the guest's reads; the guest's
+/// first open of `/etc/ld.so.cache` comes after both.
+pub const HOST_CACHE_RENAME_GUEST: &str = r#"
+    read line < "$1/fifo" || exit 3
+    wc -c < "$1/etc/ld.so.cache"
+    wc -c < /etc/ld.so.cache
+"#;
+
+/// What [`verify_across_a_host_cache_rename`] saw.
+pub struct HostCacheRename {
+    pub stderr: String,
+    pub stdout: String,
+    pub report: hermit::canonical_verdict::VerificationReport,
+    pub code: Option<i32>,
+    /// The cache Hermit froze: `/etc/ld.so.cache` when the run started.
+    pub frozen: Vec<u8>,
+    /// The file the host renamed over it during run 1.
+    pub replacement: Vec<u8>,
+    /// `/etc/ld.so.cache` once hermit exited.
+    pub after: Vec<u8>,
+}
+
+/// The frozen-cache divergence of facebookexperimental/hermit#500, end to end
+/// under `--verify`. hermit runs [`HOST_CACHE_RENAME_GUEST`] as `run --strict
+/// --verify --verify-strict` in a user and mount namespace whose `/etc` is
+/// the test's own copy (`unshare -rm`, as `procfs_determinism.rs`'s
+/// `guest_etc_survives_a_host_rename_of_ld_so_cache`), so the rename below
+/// replaces the very file Hermit froze `/etc/ld.so.cache` from, never the
+/// host's. While run 1's guest waits on the FIFO (after run 1's setup, and
+/// before the guest first opens the path), the test renames a replacement
+/// over that file, as ldconfig does. Run 2 gets its line with nothing
+/// renamed. A pair rerun (which nothing here should name) gets its lines too,
+/// so that it ends on the caller's assertions rather than on a guest waiting
+/// for a line.
+pub fn verify_across_a_host_cache_rename(hermit: &Path, name: &str) -> HostCacheRename {
+    use std::io::Write;
+
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    let etc = root.join("etc");
+    std::fs::create_dir_all(&etc).expect("create the test's /etc");
+    let frozen = std::fs::read("/etc/ld.so.cache").expect("read the host's loader cache");
+    std::fs::write(etc.join("ld.so.cache"), &frozen).expect("write the test's cache");
+    for file in ["group", "hosts"] {
+        std::fs::copy(Path::new("/etc").join(file), etc.join(file))
+            .unwrap_or_else(|error| panic!("copy /etc/{file}: {error}"));
+    }
+    let replacement = b"replaced by the host\n".to_vec();
+    let new = root.join("ld.so.cache.new");
+    std::fs::write(&new, &replacement).expect("write the replacement");
+    let fifo = root.join("fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("mkfifo");
+    let report_path = root.join("verify.json");
+    let stderr_path = root.join("stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
+    let mut child = Command::new("timeout")
+        .args(["--kill-after", "5s", "300s"])
+        .args(["unshare", "-rm", "/bin/sh", "-c"])
+        .arg(r#"mount --bind "$1/etc" /etc || exit 9; shift; exec "$@""#)
+        .arg("sh")
+        .arg(&root)
+        .arg(hermit)
+        .arg("run")
+        .args(["--strict", detcore_model::config::CANONICAL_TEST_EPOCH_ARG])
+        .args(["--verify", "--verify-strict", "--verify-json"])
+        .arg(&report_path)
+        .args([
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/tmp/host-input-workdir",
+            "--workdir=/tmp/host-input-workdir",
+            "--",
+            "/lib64/ld-linux-x86-64.so.2",
+            "--inhibit-cache",
+            "/bin/sh",
+            "-c",
+            HOST_CACHE_RENAME_GUEST,
+            "sh",
+        ])
+        .arg(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr_file)
+        .spawn()
+        .expect("failed to start hermit");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(290);
+
+    'attempts: for attempt in 0..2 {
+        // As in `verify_across_attempts`: this attempt's Run 1 banner first,
+        // so that the writer never pairs with the previous pair's reader.
+        while std::fs::read_to_string(&stderr_path)
+            .unwrap_or_default()
+            .matches("Run1")
+            .count()
+            <= attempt
+        {
+            // A hermit that ended after the first pair did not rerun it.
+            if attempt > 0 && child.try_wait().expect("poll hermit").is_some() {
+                break 'attempts;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run 1 of attempt {} never started\n{}",
+                attempt + 1,
+                hermit_state(&mut child, &stderr_path)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
+        if attempt == 0 {
+            std::fs::rename(&new, etc.join("ld.so.cache")).expect("replace the cache");
+        }
+        writeln!(writer, "go").expect("send run 1 its line");
+        drop(writer);
+
+        while std::fs::read_to_string(&stderr_path)
+            .unwrap_or_default()
+            .matches("Run2")
+            .count()
+            <= attempt
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run 2 of attempt {} never started\n{}",
+                attempt + 1,
+                hermit_state(&mut child, &stderr_path)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
+        writeln!(writer, "go").expect("send run 2 its line");
+        drop(writer);
+    }
+
+    let output = child.wait_with_output().expect("wait for hermit");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let report = hermit::canonical_verdict::VerificationReport::from_current_json_slice(
+        &std::fs::read(&report_path)
+            .unwrap_or_else(|error| panic!("read verify json: {error}\n{stderr}")),
+    )
+    .unwrap_or_else(|error| panic!("parse verify json: {error}\n{stderr}"));
+    HostCacheRename {
+        stderr,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        report,
+        code: output.status.code(),
+        frozen,
+        replacement,
+        after: std::fs::read(etc.join("ld.so.cache")).expect("read the test's cache"),
+    }
+}

@@ -338,6 +338,48 @@ fn a_host_file_replaced_in_both_attempts_keeps_the_infrastructure_verdict() {
     );
 }
 
+/// facebookexperimental/hermit#500 under `--verify`: the host renames a new
+/// `/etc/ld.so.cache` over the file Hermit froze it from while run 1's guest
+/// waits, before the guest first opens the path. The guest's `/etc` is
+/// Hermit's private stage, which no host rename reaches, so both runs read
+/// the frozen cache: they compare bit for bit, and nothing is named or rerun.
+/// (When Hermit bound the frozen copy over the host's own file, the rename
+/// detached that bind: run 1 read the replacement, run 2 its copy, and the
+/// runs diverged with no host input named.)
+#[test]
+fn a_host_rename_of_the_frozen_cache_during_run_1_changes_nothing_verify_sees() {
+    let run = host_input::verify_across_a_host_cache_rename(
+        Path::new(env!("CARGO_BIN_EXE_hermit")),
+        "frozen-cache-host-rename",
+    );
+    let stderr = &run.stderr;
+    assert_eq!(
+        run.after, run.replacement,
+        "the host's file really was replaced: {stderr}"
+    );
+    assert!(
+        run.report.verified,
+        "verdict {:?}: {stderr}",
+        run.report.verdict
+    );
+    assert!(run.report.bitwise_parity, "{stderr}");
+    assert_eq!(run.report.infrastructure_error, None, "{stderr}");
+    assert!(
+        run.report.discarded_attempts.is_empty(),
+        "nothing is named, so the pair is not rerun: {stderr}"
+    );
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert_eq!(run.code, Some(0), "{stderr}");
+    // The guest's two sizes: the host's file is already the replacement when
+    // the guest reads, and `/etc/ld.so.cache` is still the frozen cache.
+    let sizes = format!("{}\n{}\n", run.replacement.len(), run.frozen.len());
+    assert!(
+        run.stdout.contains(&sizes),
+        "expected the guest to print {sizes:?}; stdout {:?}: {stderr}",
+        run.stdout
+    );
+}
+
 /// The control: the same guest diverging because the host sent each run a
 /// different line, with no host file changed. That divergence is not
 /// attributed to a host input change.
