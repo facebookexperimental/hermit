@@ -486,13 +486,101 @@ fn shared_report_matches(
         && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
 }
 
+/// How long a probe refusal published in the shared verdict is reused
+/// instead of measuring again. A refusal can be transient (host load
+/// switched the probe's calibration spins out), so it is never kept
+/// like a pass; but a caller that spawns Hermit processes in a loop —
+/// a chaos search starts one per iteration — must not pay a fresh
+/// multi-second refusal in every process while the condition lasts.
+/// One minute bounds that to at most one probe attempt per minute per
+/// host and binary, and a host that recovers is re-measured within it.
+/// The verdict's key (the host key and the probe options) does not
+/// include CPU affinity, so a refusal measured by a CPU-confined
+/// process — the probe chooses its CPU among the ones that process
+/// may run on — can be reused by an unconfined process for at most
+/// this minute; that bounded over-refusal is accepted rather than
+/// keying coordination by every affinity mask.
+const REFUSAL_REUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One probe outcome as published for other processes of this user on
+/// this host: a passing report, or a refusal with the
+/// `CLOCK_BOOTTIME` second it was measured, reused only within
+/// [`REFUSAL_REUSE`]. The per-host cache in
+/// `crate::host_qualification` still stores passes only; this file
+/// is coordination between concurrent processes, not a record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum SharedVerdict {
+    Passed(ProbeReport),
+    Refused {
+        reason: String,
+        at_boottime_secs: u64,
+    },
+}
+
+/// The current `CLOCK_BOOTTIME` in seconds, or 0 if the clock cannot
+/// be read. Zero therefore means "unknown" — a failed clock read, or
+/// the first second after boot — and is never treated as a usable
+/// stamp ([`refusal_age`]). Boottime, not wall time, so a backward
+/// clock step cannot keep a refusal fresh; the host key the verdict
+/// is stored under already pins the boot (`HostKey.boot_id`), so
+/// boottime stamps are only ever compared within one boot.
+fn boottime_now_secs() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a writable timespec and CLOCK_BOOTTIME is a
+    // valid clock id.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec).unwrap_or(0)
+}
+
+/// The age in seconds of a refusal stamped `at_boottime_secs` when
+/// the boottime clock now reads `now`, or `None` when the age is
+/// unknown: either value is the unknown stamp 0 (with a persistently
+/// unreadable clock both read 0 and an age of 0 would keep the first
+/// refusal "fresh" until reboot, breaking the [`REFUSAL_REUSE`]
+/// bound), or the stamp is ahead of the reader's clock (a different
+/// time namespace has its own `CLOCK_BOOTTIME`). An unknown age
+/// measures instead of reusing (fail-closed).
+fn refusal_age(at_boottime_secs: u64, now: u64) -> Option<u64> {
+    if at_boottime_secs == 0 || now == 0 {
+        return None;
+    }
+    now.checked_sub(at_boottime_secs)
+}
+
+/// A refusal measured by another Hermit process and reused within
+/// [`REFUSAL_REUSE`], marked as such: the run that presents it did
+/// not measure this host itself.
+fn reused_refusal(reason: String, age_secs: u64) -> ProbeRefusal {
+    format!(
+        "{reason} (reused refusal: measured by another Hermit process on this \
+         host {age_secs}s ago and reused for up to {}s instead of measuring again)",
+        REFUSAL_REUSE.as_secs()
+    )
+}
+
 /// Runs the qualification on a new thread pinned to an idle, low-numbered CPU.
 /// Returns the report, or the reason v3 cannot be offered on this host.
 pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    let lock_path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.lock"));
-    let verdict_path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.json"));
+    // The lock serializes probes of every Hermit build of this user
+    // (they contend for the same pinned CPU), so its name is per user
+    // only. The verdict is one binary's measurement, so its name also
+    // carries the binary suffix: two builds no longer overwrite each
+    // other's verdict on every run (issue 452). Both live in the
+    // coordination directory, which per-test TMPDIR isolation cannot
+    // split ([`crate::host_qualification::coordination_dir`]).
+    let dir = crate::host_qualification::coordination_dir();
+    let lock_path = dir.join(format!("hermit-xinuse-probe-{uid}.lock"));
+    let verdict_path = dir.join(format!(
+        "hermit-xinuse-probe-{uid}-{}.json",
+        crate::host_qualification::binary_suffix()
+    ));
     qualify_coordinated(
         options,
         &lock_path,
@@ -513,11 +601,15 @@ pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
 /// named, for tests. Probes pin themselves to the same CPU, so two at once
 /// would switch each other out until both refused; they serialize per user
 /// on `lock_path`. A waiter does not just queue on that lock: the holder
-/// publishes its passing report at `verdict_path` (under the host
-/// qualification key, like the per-host cache), and a waiter polls for it
-/// and reuses it, so concurrent Hermit processes on one host — donor
-/// validations with separate cache directories included — measure the host
-/// once instead of one timing out behind the other. Under a hypervisor
+/// publishes its outcome at `verdict_path` (under the host qualification
+/// key, like the per-host cache), and a waiter polls for it and reuses
+/// it, so concurrent Hermit processes on one host — donor validations
+/// with separate cache directories included — measure the host once
+/// instead of one timing out behind the other. A refusal is published
+/// too but reused only within [`REFUSAL_REUSE`], so processes started
+/// in a loop do not each pay a fresh multi-second refusal while the
+/// condition lasts, and no refusal outlives it by more than that bound.
+/// Under a hypervisor
 /// nothing is shared, for the live-migration reason the per-host cache
 /// gives; waiters there queue as before.
 fn qualify_coordinated(
@@ -540,38 +632,68 @@ fn qualify_coordinated(
     }
     let host = crate::host_qualification::HostKey::current();
     let inputs = format!("options={options:?}");
-    let shared = |path: &std::path::Path| -> Option<ProbeReport> {
+    // The shared verdict as this call may use it: a passing report this
+    // host's probe would produce, or a refusal still within
+    // REFUSAL_REUSE. A mismatched pass and a stale refusal are both
+    // ignored, never a refusal: the caller measures for itself.
+    let shared = |path: &std::path::Path| -> Option<Result<ProbeReport, ProbeRefusal>> {
         // SAFETY: XGETBV with ECX 0, as in `Layout::host`.
         let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
-        crate::host_qualification::load::<ProbeReport>(path, &host, &inputs)
-            .filter(|report| shared_report_matches(report, xcr0, options, hypervisor))
+        match crate::host_qualification::load::<SharedVerdict>(path, &host, &inputs)? {
+            SharedVerdict::Passed(report) => {
+                shared_report_matches(&report, xcr0, options, hypervisor).then_some(Ok(report))
+            }
+            SharedVerdict::Refused {
+                reason,
+                at_boottime_secs,
+            } => refusal_age(at_boottime_secs, boottime_now_secs())
+                .filter(|age| *age < REFUSAL_REUSE.as_secs())
+                .map(|age| Err(reused_refusal(reason, age))),
+        }
     };
-    let publish = |report: &ProbeReport| {
-        crate::host_qualification::store(verdict_path, &host, &inputs, report);
+    let publish = |verdict: &SharedVerdict| {
+        crate::host_qualification::store(verdict_path, &host, &inputs, verdict);
     };
-    if let Some(report) = shared(verdict_path) {
-        return Ok(report);
+    // Measure once (the caller holds the probe lock) and publish the
+    // outcome, pass or refusal, for the processes waiting on it.
+    fn measure<F: FnOnce(ProbeOptions) -> Result<ProbeReport, ProbeRefusal>>(
+        run: F,
+        options: ProbeOptions,
+        publish: &impl Fn(&SharedVerdict),
+    ) -> Result<ProbeReport, ProbeRefusal> {
+        match run(options) {
+            Ok(report) => {
+                publish(&SharedVerdict::Passed(report.clone()));
+                Ok(report)
+            }
+            Err(reason) => {
+                publish(&SharedVerdict::Refused {
+                    reason: reason.clone(),
+                    at_boottime_secs: boottime_now_secs(),
+                });
+                Err(reason)
+            }
+        }
+    }
+    if let Some(outcome) = shared(verdict_path) {
+        return outcome;
     }
     if let Some(_serialized) = ProbeLock::try_acquire(lock_path)? {
-        if let Some(report) = shared(verdict_path) {
-            return Ok(report);
+        if let Some(outcome) = shared(verdict_path) {
+            return outcome;
         }
-        let report = run(options)?;
-        publish(&report);
-        return Ok(report);
+        return measure(run, options, &publish);
     }
     let deadline = std::time::Instant::now() + wait;
     loop {
-        if let Some(report) = shared(verdict_path) {
-            return Ok(report);
+        if let Some(outcome) = shared(verdict_path) {
+            return outcome;
         }
         if let Some(_serialized) = ProbeLock::try_acquire(lock_path)? {
-            if let Some(report) = shared(verdict_path) {
-                return Ok(report);
+            if let Some(outcome) = shared(verdict_path) {
+                return outcome;
             }
-            let report = run(options)?;
-            publish(&report);
-            return Ok(report);
+            return measure(run, options, &publish);
         }
         if std::time::Instant::now() >= deadline {
             break;
@@ -582,16 +704,15 @@ fn qualify_coordinated(
     // holder's lock is free, and the loop above takes it): queue for the
     // lock as before rather than refuse a host that may well qualify.
     let _serialized = ProbeLock::acquire(lock_path)?;
-    if let Some(report) = shared(verdict_path) {
-        return Ok(report);
+    if let Some(outcome) = shared(verdict_path) {
+        return outcome;
     }
-    let report = run(options)?;
-    publish(&report);
-    Ok(report)
+    measure(run, options, &publish)
 }
 
-/// An exclusive `flock` on a per-user file in the temporary directory, held
-/// for one probe.
+/// An exclusive `flock` on a per-user file in the coordination
+/// directory ([`crate::host_qualification::coordination_dir`]),
+/// held for one probe.
 struct ProbeLock {
     _file: std::fs::File,
 }
@@ -1613,7 +1734,7 @@ mod tests {
                 &holder_verdict,
                 &host,
                 &format!("options={:?}", ProbeOptions::default()),
-                &fake_report(98765),
+                &SharedVerdict::Passed(fake_report(98765)),
             );
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
@@ -1681,12 +1802,12 @@ mod tests {
         holder.join().unwrap();
         let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
         if !hypervisor {
-            let published: Option<ProbeReport> = crate::host_qualification::load(
+            let published: Option<SharedVerdict> = crate::host_qualification::load(
                 &verdict_path,
                 &crate::host_qualification::HostKey::current(),
                 &format!("options={:?}", ProbeOptions::default()),
             );
-            assert_eq!(published.map(|report| report.cpu), Some(12345));
+            assert_eq!(published, Some(SharedVerdict::Passed(fake_report(12345))));
         }
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -1704,7 +1825,7 @@ mod tests {
             &verdict_path,
             &crate::host_qualification::HostKey::current(),
             &format!("options={:?}", ProbeOptions::default()),
-            &mismatched,
+            &SharedVerdict::Passed(mismatched),
         );
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let waiter_ran = ran.clone();
@@ -1722,6 +1843,137 @@ mod tests {
         assert_eq!(report.cpu, 12345, "the mismatched verdict was not reused");
         assert!(ran.load(Ordering::SeqCst), "the waiter measured for itself");
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A fresh shared refusal is the waiter's outcome without its probe
+    /// running, so a loop of Hermit processes pays one refusal per
+    /// REFUSAL_REUSE instead of one per process. Under a hypervisor
+    /// nothing is shared and the waiter measures.
+    #[test]
+    fn a_fresh_shared_refusal_is_reused_without_measuring() {
+        use std::sync::atomic::AtomicBool;
+        let (lock_path, verdict_path, directory) = coordinated_paths("refused");
+        crate::host_qualification::store(
+            &verdict_path,
+            &crate::host_qualification::HostKey::current(),
+            &format!("options={:?}", ProbeOptions::default()),
+            &SharedVerdict::Refused {
+                reason: "synthetic refusal".into(),
+                at_boottime_secs: boottime_now_secs(),
+            },
+        );
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_ran = ran.clone();
+        let outcome = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            move |_| {
+                waiter_ran.store(true, Ordering::SeqCst);
+                Ok(fake_report(12345))
+            },
+        );
+        let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        if hypervisor {
+            assert_eq!(outcome.unwrap().cpu, 12345);
+            assert!(ran.load(Ordering::SeqCst));
+        } else {
+            let refusal = outcome.unwrap_err();
+            assert!(
+                refusal.starts_with("synthetic refusal (reused refusal:"),
+                "a reused refusal is marked as measured elsewhere: {refusal}"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "the waiter's probe never ran");
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A refusal older than REFUSAL_REUSE is stale: the waiter measures
+    /// for itself (and here passes), because a transient refusal must
+    /// not keep x86-64-v3 off a host that has recovered.
+    #[test]
+    fn a_stale_shared_refusal_is_ignored() {
+        use std::sync::atomic::AtomicBool;
+        let (lock_path, verdict_path, directory) = coordinated_paths("stale-refusal");
+        crate::host_qualification::store(
+            &verdict_path,
+            &crate::host_qualification::HostKey::current(),
+            &format!("options={:?}", ProbeOptions::default()),
+            &SharedVerdict::Refused {
+                reason: "synthetic old refusal".into(),
+                at_boottime_secs: boottime_now_secs().saturating_sub(REFUSAL_REUSE.as_secs() + 60),
+            },
+        );
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_ran = ran.clone();
+        let report = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            move |_| {
+                waiter_ran.store(true, Ordering::SeqCst);
+                Ok(fake_report(12345))
+            },
+        )
+        .unwrap();
+        assert_eq!(report.cpu, 12345, "the stale refusal was not reused");
+        assert!(ran.load(Ordering::SeqCst), "the waiter measured for itself");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A holder whose probe refuses publishes that refusal, stamped
+    /// now, so the next process reuses it instead of measuring again.
+    #[test]
+    fn a_refusing_holder_publishes_its_refusal() {
+        let (lock_path, verdict_path, directory) = coordinated_paths("publish-refusal");
+        let outcome = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            |_| Err("synthetic refusal".to_owned()),
+        );
+        assert_eq!(outcome.unwrap_err(), "synthetic refusal");
+        let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        if !hypervisor {
+            let published: Option<SharedVerdict> = crate::host_qualification::load(
+                &verdict_path,
+                &crate::host_qualification::HostKey::current(),
+                &format!("options={:?}", ProbeOptions::default()),
+            );
+            match published {
+                Some(SharedVerdict::Refused {
+                    reason,
+                    at_boottime_secs,
+                }) => {
+                    assert_eq!(reason, "synthetic refusal");
+                    assert!(
+                        boottime_now_secs().saturating_sub(at_boottime_secs)
+                            < REFUSAL_REUSE.as_secs(),
+                        "the published refusal is stamped fresh"
+                    );
+                }
+                other => panic!("expected a published refusal, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A zero boottime stamp or reading, and a stamp ahead of the
+    /// reader's clock, have no age: with a persistently unreadable
+    /// clock a saturating subtraction would reuse the first refusal
+    /// until reboot, and a stamp from another time namespace must
+    /// not read as fresh either. Known in-range stamps age.
+    #[test]
+    fn a_zero_boottime_stamp_or_reading_has_no_age() {
+        assert_eq!(refusal_age(0, 0), None);
+        assert_eq!(refusal_age(0, 5000), None);
+        assert_eq!(refusal_age(5000, 0), None);
+        assert_eq!(refusal_age(5030, 5000), None, "a future stamp is stale");
+        assert_eq!(refusal_age(5000, 5030), Some(30));
+        assert_eq!(refusal_age(5000, 5000), Some(0));
     }
 
     /// The cooperative wall deadline the matrix, trials and calibration

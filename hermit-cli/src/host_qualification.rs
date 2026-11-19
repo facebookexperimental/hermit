@@ -207,9 +207,77 @@ struct Entry<T> {
 }
 
 /// Where a qualification named `name` is cached, or `None` without a home
-/// directory.
+/// directory. The file name carries [`binary_suffix`], so two Hermit
+/// builds sharing one cache directory keep separate verdicts instead of
+/// overwriting each other's on every run (issue 452); the
+/// host key inside the file still binds the verdict to the binary that
+/// measured it.
 pub(crate) fn default_path(name: &str) -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("hermit").join(format!("{name}.json")))
+    dirs::cache_dir().map(|dir| {
+        dir.join("hermit")
+            .join(format!("{name}-{}.json", binary_suffix()))
+    })
+}
+
+/// A short filename-safe token naming the running Hermit binary: the
+/// first 16 hex digits of its GNU build ID, or, without one, its file
+/// identity ([`binary_identity`]) with every non-alphanumeric byte
+/// replaced by `-`, truncated. Stable across processes of one binary;
+/// distinct binaries get distinct tokens with overwhelming likelihood,
+/// and a collision only costs a cache miss, because the entry's host
+/// key still has to match exactly ([`load`]).
+pub(crate) fn binary_suffix() -> &'static str {
+    static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SUFFIX.get_or_init(|| match build_id() {
+        Some(id) => id.chars().take(16).collect(),
+        None => binary_identity()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(32)
+            .collect(),
+    })
+}
+
+/// The directory holding the probe's per-user coordination files (its
+/// lock and shared verdict): the user's runtime directory
+/// (`$XDG_RUNTIME_DIR`) where there is a usable one, else the
+/// temporary directory. The runtime directory is the same for every
+/// process of one user on one host, where `TMPDIR` is routinely set
+/// per test or per sandbox; coordination files under a per-test
+/// `TMPDIR` serialize nothing, and concurrent probes then switch
+/// each other out until they all refuse. A runtime directory that
+/// is missing, not a directory, owned by another user, or not
+/// writable is not usable: sandboxes routinely forward a stale
+/// `XDG_RUNTIME_DIR` naming no such directory, and coordination
+/// files there would fail on every run, so those fall back too.
+pub(crate) fn coordination_dir() -> PathBuf {
+    coordination_dir_from(dirs::runtime_dir(), nix::unistd::geteuid().as_raw())
+}
+
+/// [`coordination_dir`] with the runtime-directory candidate and the
+/// effective user named, for tests.
+fn coordination_dir_from(runtime_dir: Option<PathBuf>, euid: u32) -> PathBuf {
+    match runtime_dir {
+        Some(dir) if runtime_dir_usable(&dir, euid) => dir,
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// Whether `dir` can hold this user's coordination files: it exists,
+/// is a directory, is owned by `euid`, and this process may create
+/// files in it (write plus search permission).
+fn runtime_dir_usable(dir: &Path, euid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = fs::metadata(dir) else {
+        return false;
+    };
+    metadata.is_dir()
+        && metadata.uid() == euid
+        && nix::unistd::access(
+            dir,
+            nix::unistd::AccessFlags::W_OK | nix::unistd::AccessFlags::X_OK,
+        )
+        .is_ok()
 }
 
 /// The verdict cached at `path` for `host` and `inputs`, if there is one.
@@ -516,6 +584,25 @@ mod tests {
         assert!(read_bounded_as(&path, me.wrapping_add(1)).is_none());
     }
 
+    /// The default cache path names the running binary, so two builds
+    /// sharing one cache directory do not share one file (issue 452).
+    #[test]
+    fn the_default_cache_path_names_the_binary() {
+        let suffix = binary_suffix();
+        assert!(!suffix.is_empty());
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        );
+        if let Some(path) = default_path("some-probe") {
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                format!("some-probe-{suffix}.json")
+            );
+        }
+    }
+
     #[test]
     fn writable_and_locked_report_and_serialize_the_cache_directory() {
         let directory = tempfile::tempdir().unwrap();
@@ -527,5 +614,41 @@ mod tests {
         fs::write(&blocker, b"a file where the directory would go").unwrap();
         assert!(!writable(&blocker.join("v.json")));
         assert_eq!(locked(&blocker.join("v.json"), || 6), 6);
+    }
+
+    /// A usable runtime directory is the coordination directory — this
+    /// is what serializes probes across per-test `TMPDIR` isolation,
+    /// so it must fail if `coordination_dir` ever reverts to the
+    /// temporary directory unconditionally. A missing, non-directory
+    /// or other-owned candidate, and no candidate at all, fall back
+    /// to the temporary directory instead of failing every run.
+    #[test]
+    fn a_usable_runtime_dir_is_the_coordination_dir_and_an_unusable_one_falls_back() {
+        let me = nix::unistd::geteuid().as_raw();
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            coordination_dir_from(Some(directory.path().to_owned()), me),
+            directory.path(),
+            "a usable runtime directory must be chosen over temp_dir()"
+        );
+        let temp = std::env::temp_dir();
+        assert_eq!(coordination_dir_from(None, me), temp);
+        assert_eq!(
+            coordination_dir_from(Some(directory.path().join("missing")), me),
+            temp,
+            "a missing runtime directory falls back"
+        );
+        let file = directory.path().join("a-file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert_eq!(
+            coordination_dir_from(Some(file), me),
+            temp,
+            "a non-directory runtime path falls back"
+        );
+        assert_eq!(
+            coordination_dir_from(Some(directory.path().to_owned()), me.wrapping_add(1)),
+            temp,
+            "a runtime directory owned by another user falls back"
+        );
     }
 }
