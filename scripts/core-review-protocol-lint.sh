@@ -9,13 +9,26 @@
 # or is missing a required PR-body section.
 #
 # A PR carrying that label may only land when ALL hold:
-#   (a) every review family in the shared contract has a numbered activity label;
-#   (b) every family has its approval label;
-#   (b') every family's newest verdict comment binds the exact current head with
-#        `APPROVED-AT: <family> <40-hex>`;
-#   (c) the PR body contains the required sections: Summary, Determinism,
+#   (a) the review seats the owner's depth rule requires have bound the exact
+#       current head with `APPROVED-AT: <lane> <40-hex>` verdict comments and
+#       no refusal stands in any lane: ONE seat in any lane by default, and
+#       TWO seats in two different lanes when a current-head
+#       REVIEW-DISPATCH-ATTESTATION names a critical class (hermit-syscall,
+#       detcore-scheduling, reverie-api) — the owner depth rule of 2026-11-05
+#       (dual review only for big policy/algorithm changes; 0-1 reviews for
+#       repairs; none for quick failing-test fixes, which carry no label and
+#       take the not-applicable path below), as refined 2026-11-14 (one seat
+#       by complexity; two models only for core Reverie types or the Detcore
+#       engine). Mirrors `review_lane_policy` in the reference verifier.
+#   (b) the PR body contains the required sections: Summary, Determinism,
 #       Linux Semantics, Validation, Human Review Required, and — when the PR
 #       touches KVM — Relationship to gVisor.
+#
+# Numbered round labels (`adversarial-review-<family><n>`) and approval
+# labels (`passed-review-<family>`) are NOT required: today's verdict forms
+# do not produce them, and this lint itself has always called them caches,
+# not authority. Demanding them manufactured unactionable problems on
+# compliant reviews (the 8 on Hermit PR #5175, skills-overhaul decision D4).
 #
 # A PR without the contract's post-facto label passes unconditionally; this
 # lint never second-guesses whether the label should have been applied.
@@ -40,23 +53,44 @@
 # history is lost — a superseded approval stops satisfying the gate and remains
 # visible forever as the record of what was reviewed and when.
 #
-# The labels are still required. Keeping (b) alongside (b') makes this gate
-# strictly stronger than before in every case, which is the only safe direction
-# for a change to an authorization check.
+# Approval LABELS were also required until the D4 change, on the argument
+# that keeping them made the gate strictly stronger. That argument expired
+# with the depth rule above: a compliant single-seat review produces neither
+# the second family's labels nor numbered round labels, so the extra checks
+# no longer added strength — they only reported problems no one could act
+# on. The exact-head comment binding below is the authority; labels remain
+# caches other tooling may keep, and this lint neither requires nor reads
+# them beyond the post-facto trigger itself.
 #
 # GRAMMAR. Mirrors the reference verifier `ci-hub/health/approval_binding.py`
 # in the dev-hermit parent, which the landing path (`ci-hub/landing/land-pr.sh`)
 # and `ci-hub/health/pr_status.py` already call. Exactly one shape carries
-# authority:
+# authority, in any of today's lanes (claude, codex, muse — the reference's
+# `LANES`):
 #
-#     APPROVED-AT: <claude|codex> <40-hex> [BY <agent>]
+#     APPROVED-AT: <claude|codex|muse> <40-hex> [BY <agent>]
 #
 # matched case-insensitively against the whole line after whole-line markdown
-# emphasis is removed. Rejections mirror it and win within a comment:
+# emphasis is removed. Rejections mirror it and win within a comment; the
+# spellings without `-AT` are read as refusals too, as the reference reads
+# them, so a real refusal is dischargeable instead of a permanent malformed
+# line:
 #
-#     CHANGES-REQUESTED-AT: <claude|codex> <40-hex> [BY <agent>]
-#     CHANGES-REQUESTED-WITHDRAWN-AT: <claude|codex> <40-hex> [BY <agent>]
+#     CHANGES-REQUESTED-AT: <claude|codex|muse> <40-hex> [BY <agent>]
+#     CHANGES-REQUESTED: <claude|codex|muse> <40-hex> [BY <agent>]
+#     CHANGES REQUESTED: <claude|codex|muse> <40-hex> [BY <agent>]
+#     CHANGES-REQUESTED-WITHDRAWN-AT: <claude|codex|muse> <40-hex> [BY <agent>]
 #     REQUEST CHANGES AT <40-hex>              (historical, lane-less)
+#
+# Criticality (the two-seat tier) is attested the way the reference reads
+# it: a comment carrying the exact line `REVIEW-DISPATCH-ATTESTATION` with
+# `critical-class: <hermit-syscall|detcore-scheduling|reverie-api|none>` and
+# `head: <40-hex>` fields. A valid record naming a critical class requires
+# two seats on ANY head (the classification carries across a push, as the
+# reference carries it); only `none`, or no record at all, leaves the
+# one-seat default. A comment carrying
+# the marker but no readable record BLOCKS: it plainly meant to attest, and
+# guessing its tier is the fail-open shape this gate exists to remove.
 #
 # Verdicts are chronological: a rejection clears that lane's earlier approvals.
 # It remains a standing refusal until its own issuer later approves that lane,
@@ -117,9 +151,7 @@ if ! contract_output=$(python3 "$REVIEW_CONTRACT_ADAPTER" --format lint-records)
 fi
 
 post_facto_label=
-declare -a review_families=()
-declare -A approval_labels=()
-declare -A round_labels_csv=()
+declare -A seen_families=()
 while IFS=$'\t' read -r first second third extra; do
     if [ "$first" = post-facto ]; then
         if [ -n "$post_facto_label" ] || [ -z "$second" ] || [ -n "$third" ] || [ -n "$extra" ]; then
@@ -129,20 +161,24 @@ while IFS=$'\t' read -r first second third extra; do
         post_facto_label=$second
     else
         if [ -z "$first" ] || [ -z "$second" ] || [ -z "$third" ] || [ -n "$extra" ] \
-            || [ -n "${approval_labels[$first]+set}" ]; then
+            || [ -n "${seen_families[$first]+set}" ]; then
             echo "::error::PR #${PR_NUMBER:-unknown}: malformed review-family contract record." >&2
             exit 2
         fi
-        review_families+=("$first")
-        approval_labels[$first]=$second
-        round_labels_csv[$first]=$third
+        seen_families[$first]=1
     fi
 done <<<"$contract_output"
 
-if [ -z "$post_facto_label" ] || [ "${#review_families[@]}" -eq 0 ]; then
+# Only the trigger label is read from the contract now. The per-family
+# records are still parsed (a malformed contract must refuse, not be
+# half-read), but no round or approval label is required any more, and the
+# lanes a verdict may bind in are this lint's grammar (claude, codex, muse),
+# matching the reference verifier's `LANES`.
+if [ -z "$post_facto_label" ]; then
     echo "::error::PR #${PR_NUMBER:-unknown}: review-label contract is incomplete." >&2
     exit 2
 fi
+readonly REVIEW_LANES=(claude codex muse)
 
 pr="${PR_NUMBER:-unknown}"
 is_kvm="${PR_IS_KVM:-false}"
@@ -248,23 +284,6 @@ has_label() {
     match_status_or_refuse "label lookup" "$status"
 }
 
-# True when one of the contract's exact numbered labels is present.
-has_round_label() {
-    local family=$1 round_label
-    local -a accepted=()
-    IFS=, read -r -a accepted <<<"${round_labels_csv[$family]}"
-    for round_label in "${accepted[@]}"; do
-        has_label "$round_label" && return 0
-    done
-    return 1
-}
-
-# Spell the exact accepted alternatives from the shared contract.
-round_label_alternatives() {
-    local family=$1
-    printf '%s' "${round_labels_csv[$family]//,/, }"
-}
-
 # True when the body contains SECTION as a heading. Accepts a Markdown ATX
 # heading (`## Section`), a bold label (`**Section**`), or a bare heading line
 # ending in a colon (`Section:`), matched case-insensitively at line start. The
@@ -316,11 +335,17 @@ readonly MARKER_ISSUER_SUFFIX_RE="([[:space:]]+BY[[:space:]]+(${AGENT_ID_RE}))?"
 # visible too. An approval still binds only when APPROVE_RE matches the original
 # undecorated line exactly; `## APPROVED-AT: ...` therefore refuses rather than
 # authorising.
-readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
-readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
-readonly WITHDRAW_RE="^CHANGES-REQUESTED-WITHDRAWN-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex|muse)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex|muse)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+# The same refusal without `-AT`, which today's verdict forms also produce
+# and the reference reads as a refusal. Group numbering matches REJECT_RE
+# (lane, sha, suffix, issuer) so both feed the one refusal path. Recognising
+# it can only turn a permanent malformed-line block into a dischargeable
+# refusal — never an admission.
+readonly REJECT_ALT_RE="^CHANGES[-[:space:]]REQUESTED:[[:space:]]*(claude|codex|muse)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly WITHDRAW_RE="^CHANGES-REQUESTED-WITHDRAWN-AT:[[:space:]]*(claude|codex|muse)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
 readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+(${SHA40_RE})$"
-readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|CHANGES[-[:space:]]REQUESTED:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 # The same keywords ANYWHERE on the line, not only at column 0.
 #
 # ⚠️ A LEADING WORD IS NOT STRUCTURE, AND THAT IS HOW A REJECTION WENT MISSING.
@@ -350,7 +375,7 @@ readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUE
 # prose quotation of a marker also refuses, and a refusal that says "this line
 # looks like a verdict and binds nothing" is recoverable, while a silently
 # swallowed rejection is not.
-readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|CHANGES[-[:space:]]REQUESTED:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 readonly STRUCTURAL_PREFIX_RE='^(#{1,6}[[:space:]]*|>[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
 readonly AUTHORITY_PREFIX_RE='^(#{1,6}[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
 readonly FENCE_RE='^ {0,3}(`{3,}|~{3,})[[:space:]]*(.*)$'
@@ -447,7 +472,7 @@ strip_authority_prefix() {
 # both consumers agree again; that belongs in a dev-hermit change, not here.
 readonly SUSPECT_RE="^(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
 readonly RETIRES_RE='(^|[^[:alnum:]_])RETIRES[[:space:]]+#?([0-9]{6,})([^[:alnum:]_]|$)'
-readonly CITATION_MARKER_RE="^(APPROVED-AT|CHANGES-REQUESTED-AT|CHANGES-REQUESTED-WITHDRAWN-AT):[[:space:]]+(claude|codex)[[:space:]]+([0-9a-fA-F]{7,40})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly CITATION_MARKER_RE="^(APPROVED-AT|CHANGES-REQUESTED-AT|CHANGES-REQUESTED-WITHDRAWN-AT):[[:space:]]+(claude|codex|muse)[[:space:]]+([0-9a-fA-F]{7,40})${MARKER_ISSUER_SUFFIX_RE}$"
 
 # The GitHub account is shared for relayed review comments, so `.user.login`
 # cannot identify the reviewer. Agent comments carry their writer in the
@@ -559,6 +584,9 @@ verdict_is_citation() {
 #
 #   S <index> <sha>  a SHA this lane bound itself to, oldest first
 #   R <comment-id> <index> <sha> <issuer>  a refusal not discharged
+#   L <comment-id> <index> <sha> <issuer>  a lane-less legacy refusal not
+#                                          discharged in THIS lane's scan; the
+#                                          caller aggregates across scans
 #   M <line>   a verdict-ish line matching no known shape
 #
 # Everything travels out through stdout ON PURPOSE. The caller reads this with
@@ -572,6 +600,13 @@ scan_lane() {
     local -a comment_lines=()
     local -a found=()
     local -a outstanding=()
+    # Outstanding rows (exact row text) a lane-less legacy refusal made, so
+    # the caller can aggregate them across lane scans: every scan sees the
+    # same legacy refusal, and any one scan's discharge of it (the issuer
+    # approving that scan's lane, withdrawing, or RETIRES) is the refusal's
+    # discharge under the one-seat default. Reporting it per scan would let
+    # a lane nobody used resurrect a refusal the issuer already discharged.
+    local -A legacy_rows=()
     local -a withdrawals=()
     local -a issued_verdicts=()
     local idx=-1
@@ -602,6 +637,7 @@ scan_lane() {
                 authority_line=$(strip_authority_prefix "$undecorated")
                 if [[ $undecorated =~ $APPROVE_RE ]] \
                    || [[ $verdict_line =~ $REJECT_RE ]] \
+                   || [[ $verdict_line =~ $REJECT_ALT_RE ]] \
                    || [[ $authority_line =~ $WITHDRAW_RE ]] \
                    || [[ $verdict_line =~ $REJECT_LEGACY_RE ]] \
                    || { ! [[ $verdict_line =~ $WITHDRAW_RE ]] \
@@ -700,9 +736,10 @@ scan_lane() {
                 rejected=1
                 refusing_issuer=$author
                 outstanding+=("$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}")
+                legacy_rows["$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}"]=1
                 continue
             fi
-            if [[ $verdict_line =~ $REJECT_RE ]]; then
+            if [[ $verdict_line =~ $REJECT_RE ]] || [[ $verdict_line =~ $REJECT_ALT_RE ]]; then
                 local rejected_lane=${BASH_REMATCH[1]}
                 if [ "${rejected_lane,,}" = "$lane" ]; then
                     rejected_sha=${BASH_REMATCH[2]}
@@ -777,6 +814,7 @@ scan_lane() {
                    || [[ $verdict_line =~ $EXPLICIT_VERDICT_ANYWHERE_RE ]] \
                    || [[ $verdict_line =~ $SUSPECT_RE ]]; } \
                  && ! [[ $verdict_line =~ $REJECT_RE ]] \
+                 && ! [[ $verdict_line =~ $REJECT_ALT_RE ]] \
                  && ! [[ $verdict_line =~ $WITHDRAW_RE ]] \
                  && ! [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
                 if [[ $undecorated =~ $CITATION_MARKER_RE ]]; then
@@ -877,8 +915,102 @@ scan_lane() {
         printf 'S %s\n' "$row"
     done
     for row in ${outstanding[@]+"${outstanding[@]}"}; do
-        printf 'R %s\n' "$row"
+        if [ -n "${legacy_rows[$row]+set}" ]; then
+            printf 'L %s\n' "$row"
+        else
+            printf 'R %s\n' "$row"
+        fi
     done
+}
+
+# Scan every comment for a REVIEW-DISPATCH-ATTESTATION record and emit:
+#
+#   C <critical-class>  a valid record naming a critical class, on ANY head
+#                       (the two-seat tier)
+#   B <index> <problem> a comment carrying the marker but no readable record
+#
+# Mirrors `critical_attestation_evidence` in the reference verifier, whose
+# consumers raise the tier on any valid critical attestation in the comment
+# history (`critical_required = bool(critical_attestation_evidence(...))`,
+# carried across a mechanical rebase): the marker is an exact whole line
+# among the comment's prose lines, fields are `key: value` lines read
+# case-insensitively, a duplicate field or a missing or unsupported
+# `critical-class`/`head` is a problem, and only `critical-class: none`
+# attests nothing. The head a record names must be a well-formed 40-hex
+# commit but need NOT be the current head: a change attested critical does
+# not drop to one seat because a push moved its head.
+#
+# No role-tag or association filter here, deliberately unlike approvals:
+# `ci-hub/bin/review-attest` posts this record with no role tag at all, and
+# the tag filter above may only remove a positive (an approval), never
+# anything that blocks — an attestation only ever raises the tier or
+# refuses as unreadable, both of which are blocking directions.
+critical_attestations() {
+    local cid encoded body line key value
+    local -a comment_lines=()
+    local idx=-1
+    while IFS=$'\x1f' read -r cid _login _assoc _created _updated encoded; do
+        [ -n "$encoded" ] || continue
+        idx=$((idx + 1))
+        body=$(printf '%s' "$encoded" | base64 -d)
+        mapfile -t comment_lines < <(marker_lines "$body")
+        local marker_count=0
+        local class='' attested_head='' problem=''
+        local -A seen_fields=()
+        while IFS= read -r line; do
+            line=${line%$'\r'}
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [ "$line" = 'REVIEW-DISPATCH-ATTESTATION' ]; then
+                marker_count=$((marker_count + 1))
+                continue
+            fi
+            case $line in
+                *:*)
+                    key=${line%%:*}
+                    value=${line#*:}
+                    key="${key#"${key%%[![:space:]]*}"}"
+                    key="${key%"${key##*[![:space:]]}"}"
+                    key=${key,,}
+                    value="${value#"${value%%[![:space:]]*}"}"
+                    value="${value%"${value##*[![:space:]]}"}"
+                    value=${value,,}
+                    if [ -n "${seen_fields[$key]+set}" ]; then
+                        problem="duplicate field '${key}'"
+                    fi
+                    seen_fields[$key]=1
+                    case $key in
+                        critical-class) class=$value ;;
+                        head) attested_head=$value ;;
+                    esac
+                    ;;
+            esac
+        done < <(printf '%s\n' "${comment_lines[@]}")
+        [ "$marker_count" -gt 0 ] || continue
+        if [ "$marker_count" -ne 1 ]; then
+            problem='attestation marker must occur exactly once'
+        fi
+        case $class in
+            hermit-syscall|detcore-scheduling|reverie-api|none) ;;
+            *) problem="critical-class is missing or unsupported ('${class}')" ;;
+        esac
+        if ! [[ $attested_head =~ ^[0-9a-f]{40}$ ]]; then
+            problem='head is not an exact 40-hex commit'
+        fi
+        if [ -n "$problem" ]; then
+            printf 'B %s %s\n' "$idx" "$problem"
+        elif [ "$class" != none ]; then
+            printf 'C %s\n' "$class"
+        fi
+    done < <(printf '%s' "$comments_json" \
+        | jq -r '.[]? | if type == "object" then
+                            [(.id // "" | tostring),
+                             ((.user // {}) | if type == "object" then (.login // "") else "" end),
+                             (.author_association // ""),
+                             (.created_at // ""),
+                             (.updated_at // ""),
+                             (.body // "" | tostring | @base64)]
+                        else ["", "", "", "", "", ""] end | join("\u001f")')
 }
 
 # AN INERT TRIGGER LABEL IS NOT A PASS.
@@ -952,57 +1084,11 @@ fail() {
     errors=$((errors + 1))
 }
 
-# (a) Adversarial review happened for every family (any accepted round).
+# (a) The required review seats bound the EXACT current head.
 #
-# STATE THE OBSERVATION, NOT A CAUSE THIS GATE CANNOT SEE. A label is a cache,
-# not the event: this script reads label names and has no view of reviews,
-# commits, or which revision anything was approved against. "codex has not
-# approved the current revision" is a DIAGNOSIS; "the label is absent from the
-# supplied set" is the OBSERVATION, and only the second is established here.
-#
-# The distinction is not pedantry. An absent approval label has more than one
-# cause, and the routine one is not misconduct: the invalidator strips approval
-# labels when a new commit lands, so "approved, then the PR moved" and
-# "never approved" look identical from here. Naming only the second sends the
-# author to argue with a reviewer instead of re-requesting review after a push.
-#
-# Where the gate CAN narrow it, it does: the round label is evidence it holds.
-# This is why the message below is not a flat "could be anything" -- an
-# unconditional list of candidates would be the same defect wearing humility.
-missing_approval() {
-    local reviewer=$1
-    local approval_label=${approval_labels[$reviewer]}
-    local alternatives
-    alternatives=$(round_label_alternatives "$reviewer")
-    if has_round_label "$reviewer"; then
-        fail "${approval_label} is absent from the supplied labels, but one of \
-${alternatives} is present. Review ran; the approval label is not here. \
-Either ${reviewer} has not approved, or it approved an earlier revision and a later push \
-invalidated the label -- re-request review at the current head."
-    else
-        fail "${approval_label} is absent from the supplied labels, and none of \
-${alternatives} is present: no round label for ${reviewer} is present at all. \
-No ${reviewer} review is recorded on this PR."
-    fi
-}
-
-for reviewer in "${review_families[@]}"; do
-    if ! has_round_label "$reviewer"; then
-        fail "no accepted ${reviewer} round label is present in the supplied labels \
-(need one of $(round_label_alternatives "$reviewer"))."
-    fi
-done
-
-# (b) The latest reviews approved.
-for reviewer in "${review_families[@]}"; do
-    has_label "${approval_labels[$reviewer]}" || missing_approval "$reviewer"
-done
-
-# (b') Each lane's newest verdict binds the EXACT current head.
-#
-# Fail closed on the inputs first. A missing or malformed head, or comments that
-# are not a JSON array, must BLOCK — never silently skip the binding check and
-# fall back to (b), which is the fail-open shape being removed here.
+# Fail closed on the inputs first. A missing or malformed head, or comments
+# that are not a JSON array, must BLOCK — never silently skip the binding
+# check, which is the fail-open shape being removed here.
 binding_inputs_ok=1
 if ! [[ $head_sha =~ ^${SHA40_RE}$ ]]; then
     binding_inputs_ok=0
@@ -1043,13 +1129,37 @@ fi
 if [ "$binding_inputs_ok" -eq 1 ]; then
     head_lc=${head_sha,,}
     malformed_seen=""
-    for lane in codex claude; do
+    # The tier first, from any attestation in the history, so the seat
+    # count below is decided before lanes are read.
+    critical_classes=()
+    while IFS= read -r row; do
+        case $row in
+            'C '*) critical_classes+=("${row#C }") ;;
+            'B '*)
+                row=${row#B }
+                fail "unreadable REVIEW-DISPATCH-ATTESTATION at comment index ${row%% *}: ${row#* }. Fix the attestation record (its critical-class and head fields) so the review tier can be decided."
+                ;;
+        esac
+    done < <(critical_attestations)
+    required_seats=1
+    tier='one seat in any lane (claude, codex or muse)'
+    if [ "${#critical_classes[@]}" -gt 0 ]; then
+        required_seats=2
+        tier="two seats in two different lanes (critical class: ${critical_classes[*]})"
+    fi
+    bound_lanes=()
+    seat_notes=()
+    all_malformed=()
+    seat_oldest_idx=-1
+    declare -A legacy_counts=()
+    for lane in "${REVIEW_LANES[@]}"; do
         lane_bound=()
         lane_malformed=()
         lane_unauthorized=()
         lane_edited=()
         lane_truncated=()
         lane_refused=()
+        lane_legacy_refused=()
         lane_unauthorized_withdrawal=()
         newest_idx=-1
         while IFS= read -r row; do
@@ -1064,6 +1174,7 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
                 'E '*) lane_edited+=("${row#E }") ;;
                 'X '*) lane_truncated+=("${row#X }") ;;
                 'R '*) lane_refused+=("${row#R }") ;;
+                'L '*) lane_legacy_refused+=("${row#L }") ;;
                 'W '*) lane_unauthorized_withdrawal+=("${row#W }") ;;
             esac
         done < <(scan_lane "$lane")
@@ -1096,21 +1207,29 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         # prose verdict headline: #2176 and #2172 hold four such lines between
         # them, and no amount of correct re-approval would clear them. A gate
         # that cannot be satisfied by doing the right thing gets routed around,
-        # which is how it stops protecting anything. Lines at or after the
-        # newest binding still block, because those could be the rejection the
-        # parser failed to read.
+        # which is how it stops protecting anything. Lines at or after a
+        # seat's binding still block for that seat, because those could be
+        # the rejection the parser failed to read.
+        # Collected across lanes; the supersession cut is applied once,
+        # after every lane is read, against the OLDEST binding among the
+        # lanes bound to the current head (see below): a line is history
+        # only when EVERY seat has superseded it. Cutting at the newest
+        # binding instead would let one seat's later approval hide a garbled
+        # refusal an earlier seat never answered. Cutting per lane would let
+        # a lane with no binding of its own resurrect a malformed line every
+        # seat has already superseded.
         for entry in ${lane_malformed[@]+"${lane_malformed[@]}"}; do
-            m_idx=${entry%% *}
-            m_line=${entry#* }
-            if [ "$newest_idx" -ge 0 ] && [ "$m_idx" -lt "$newest_idx" ]; then
-                continue
-            fi
-            case $'\n'"$malformed_seen" in
-                *$'\n'"$m_line"$'\n'*) ;;
-                *) malformed_seen+="${m_line}"$'\n' ;;
-            esac
+            all_malformed+=("$entry")
+        done
+        for entry in ${lane_legacy_refused[@]+"${lane_legacy_refused[@]}"}; do
+            legacy_counts["$entry"]=$((${legacy_counts["$entry"]:-0} + 1))
         done
 
+        # A standing refusal blocks at either tier, including in a lane no
+        # seat was required from (the reference's rule: an unresolved
+        # objection always blocks). Anything short of a current binding is
+        # otherwise only a note toward the one seat verdict below, so a
+        # compliant single-seat review is not reported once per empty lane.
         if [ "${#lane_refused[@]}" -gt 0 ]; then
             latest_refusal=${lane_refused[-1]}
             refusal_cid=${latest_refusal%% *}
@@ -1120,22 +1239,63 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
             refusal_sha=${refusal_detail%% *}
             refusal_issuer=${refusal_detail#* }
             fail "${#lane_refused[@]} standing refusal(s) remain for ${lane}; latest is at ${refusal_sha} from ${refusal_issuer} (comment ${refusal_cid}, index ${refusal_idx}). Only that issuer's later approval or withdrawal, or an entitled RETIRES naming that comment, can discharge it."
-        elif [ "${#lane_bound[@]}" -eq 0 ] && [ "${#lane_unauthorized[@]}" -gt 0 ]; then
-            fail "no trusted role-tagged exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an eligible review comment (${lane_unauthorized[0]}). A bare or public-commenter body is not authority; the comment must contain a bracketed reviewer or relay role tag and have OWNER, MEMBER, or COLLABORATOR association."
-        elif [ "${#lane_bound[@]}" -eq 0 ]; then
-            fail "no exact-head approval from ${lane}: found no \`APPROVED-AT: ${lane} <40-hex>\` line in any comment (the passed-review-${lane} label is a cache, not authority)."
-        elif [ "${lane_bound[-1]}" != "$head_lc" ]; then
-            fail "superseded approval from ${lane}: its newest binding is ${lane_bound[-1]}, but the current head is ${head_lc}; the approval must be re-earned at this head."
+        elif [ "${#lane_bound[@]}" -gt 0 ] && [ "${lane_bound[-1]}" = "$head_lc" ]; then
+            bound_lanes+=("$lane")
+            if [ "$seat_oldest_idx" -lt 0 ] || [ "$newest_idx" -lt "$seat_oldest_idx" ]; then
+                seat_oldest_idx=$newest_idx
+            fi
+        elif [ "${#lane_bound[@]}" -gt 0 ]; then
+            seat_notes+=("superseded approval from ${lane}: its newest binding is ${lane_bound[-1]}, but the current head is ${head_lc}; the approval must be re-earned at this head")
+        elif [ "${#lane_unauthorized[@]}" -gt 0 ]; then
+            seat_notes+=("no trusted role-tagged exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an eligible review comment (${lane_unauthorized[0]}). A bare or public-commenter body is not authority; the comment must contain a bracketed reviewer or relay role tag and have OWNER, MEMBER, or COLLABORATOR association")
         fi
     done
 
+    # A lane-less legacy refusal stands only when no lane scan discharged
+    # it: present in every scan. Discharged in even one (its issuer approving
+    # that lane, a withdrawal there, or RETIRES anywhere), it is discharged.
+    for legacy_row in "${!legacy_counts[@]}"; do
+        if [ "${legacy_counts["$legacy_row"]}" -eq "${#REVIEW_LANES[@]}" ]; then
+            refusal_cid=${legacy_row%% *}
+            refusal_detail=${legacy_row#* }
+            refusal_idx=${refusal_detail%% *}
+            refusal_detail=${refusal_detail#* }
+            refusal_sha=${refusal_detail%% *}
+            refusal_issuer=${refusal_detail#* }
+            fail "a standing lane-less refusal remains at ${refusal_sha} from ${refusal_issuer} (comment ${refusal_cid}, index ${refusal_idx}). Only that issuer's later approval or withdrawal, or an entitled RETIRES naming that comment, can discharge it."
+        fi
+    done
+
+    for entry in ${all_malformed[@]+"${all_malformed[@]}"}; do
+        m_idx=${entry%% *}
+        m_line=${entry#* }
+        if [ "$seat_oldest_idx" -ge 0 ] && [ "$m_idx" -lt "$seat_oldest_idx" ]; then
+            continue
+        fi
+        case $'\n'"$malformed_seen" in
+            *$'\n'"$m_line"$'\n'*) ;;
+            *) malformed_seen+="${m_line}"$'\n' ;;
+        esac
+    done
     while IFS= read -r bad; do
         [ -n "$bad" ] || continue
         fail "unparseable verdict line (matches no known APPROVED-AT / CHANGES-REQUESTED-AT shape, so it binds nothing): ${bad}"
     done <<< "$malformed_seen"
+
+    if [ "${#bound_lanes[@]}" -lt "$required_seats" ]; then
+        bound_list='none'
+        [ "${#bound_lanes[@]}" -eq 0 ] || bound_list=${bound_lanes[*]}
+        notes=''
+        for note in ${seat_notes[@]+"${seat_notes[@]}"}; do
+            notes+=" ${note}."
+        done
+        fail "exact-head review seats not satisfied: this PR needs ${tier} bound to ${head_lc} by an \`APPROVED-AT: <lane> <40-hex>\` line in a trusted role-tagged review comment; found ${#bound_lanes[@]} bound lane(s) (${bound_list}).${notes} Re-request review at the current head."
+    else
+        echo "PR #${pr}: exact-head review seats satisfied (${bound_lanes[*]}; requires ${tier})."
+    fi
 fi
 
-# (c) Required PR-body sections. AGENTS.md requires the first section of every
+# (b) Required PR-body sections. AGENTS.md requires the first section of every
 # PR description to be "Plain Language Summary and Project Impact"; a section
 # titled "Summary" is still accepted, as before that rule.
 has_section "Plain Language Summary and Project Impact" || has_section "Summary" \

@@ -380,37 +380,43 @@ run_message_case "a missing summary section names both accepted titles" 1 \
     $'## Determinism\nx\n## Linux Semantics\ny\n## Validation\nz\n## Human Review Required\nt' \
     "$FULL_APPROVALS" "$HEAD_SHA"
 
-# --- Missing review labels blocks --------------------------------------------
-run_case "missing adversarial-review-codex blocks" 1 \
+# --- Review labels are caches, not requirements (D4) -------------------------
+# Round labels and approval labels used to be required here; today's verdict
+# forms do not produce them, and the comment bindings are the authority.
+# These label-deficient sets pass on the strength of the default dual
+# comment approvals, and "THE DEFECT" cases below keep proving labels alone
+# (with no binding comments) still block.
+run_case "missing adversarial-review-codex label does not block" 0 \
     $'post-facto-human-review\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
     "$FULL_BODY"
 
-run_case "missing adversarial-review-claude blocks" 1 \
+run_case "missing adversarial-review-claude label does not block" 0 \
     $'post-facto-human-review\nadversarial-review-codex1\npassed-review-codex\npassed-review-claude' \
     "$FULL_BODY"
 
-run_case "missing passed-review-codex blocks" 1 \
+run_case "missing passed-review-codex label does not block" 0 \
     $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1\npassed-review-claude' \
     "$FULL_BODY"
 
-run_case "missing passed-review-claude blocks" 1 \
+run_case "missing passed-review-claude label does not block" 0 \
     $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1\npassed-review-codex' \
     "$FULL_BODY"
 
-run_case "adversarial review present but not approved blocks" 1 \
+run_case "round labels without approval labels do not block when comments bind" 0 \
     $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1' \
     "$FULL_BODY"
 
-run_case "round label out of range (round 5) does not count, blocks" 1 \
+run_case "a round label out of the old range (round 5) does not block" 0 \
     $'post-facto-human-review\nadversarial-review-codex5\nadversarial-review-claude5\npassed-review-codex\npassed-review-claude' \
     "$FULL_BODY"
 
-run_case "non-label review-round-codex does not count, blocks" 1 \
-    $'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
+run_case "no review labels at all beyond the trigger does not block" 0 \
+    $'post-facto-human-review\nreview-round-codex' \
     "$FULL_BODY"
 
-# Every numbered label accepted by the writer's shared contract must also pass
-# this reader when the other families use their first accepted label.
+# Every numbered label accepted by the writer's shared contract must still
+# pass this reader (they are ignored now, never read as a defect) when the
+# other families use their first accepted label.
 contract_output=$(python3 "$CONTRACT_ADAPTER" --format lint-records)
 declare -a contract_families=()
 declare -A contract_approval=()
@@ -444,20 +450,10 @@ for family in "${contract_families[@]}"; do
     done
 done
 
-if owns_case; then
-    diagnostic_status=0
-    diagnostic=$(PR_LABELS=$'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
-        PR_BODY="$FULL_BODY" PR_NUMBER=test bash "$LINT" 2>&1) || diagnostic_status=$?
-    if [ "$diagnostic_status" -eq 1 ] \
-        && [[ $diagnostic == *"adversarial-review-codex1, adversarial-review-codex2, adversarial-review-codex3, adversarial-review-codex4"* ]] \
-        && [[ $diagnostic != *"review-round-codex"* ]]; then
-        echo "ok   - missing-round diagnostic names exact accepted alternatives"
-        pass=$((pass + 1))
-    else
-        echo "FAIL - missing-round diagnostic did not name exact accepted alternatives"
-        fail=$((fail + 1))
-    fi
-fi
+run_message_absent_case "missing round labels produce no round diagnostic (D4)" 0 \
+    'round label' \
+    $'post-facto-human-review\nreview-round-codex' \
+    "$FULL_BODY" "$FULL_APPROVALS" "$HEAD_SHA"
 
 # --- Missing body sections blocks --------------------------------------------
 run_case "missing Summary section blocks" 1 \
@@ -673,10 +669,13 @@ run_case "whole-line markdown emphasis around a binding still passes" 0 \
     "[{\"body\": \"**APPROVED-AT: codex ${HEAD_SHA}**\"},
       {\"body\": \"\`APPROVED-AT: claude ${HEAD_SHA}\`\"}]" "$HEAD_SHA"
 
-run_case "uppercase lane binds; an upper-case SHA does NOT (mirrors the reference) blocks" 1 \
+run_case "an upper-case lane name binds" 0 \
     "$FULL_LABELS" "$FULL_BODY" false \
-    "[{\"body\": \"APPROVED-AT: CODEX ${HEAD_SHA}\"},
-      {\"body\": \"approved-at: claude $(printf '%s' "$HEAD_SHA" | tr 'a-f' 'A-F')\"}]" \
+    "[{\"body\": \"APPROVED-AT: CODEX ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "an upper-case SHA does NOT bind (mirrors the reference), blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"approved-at: claude $(printf '%s' "$HEAD_SHA" | tr 'a-f' 'A-F')\"}]" \
     "$HEAD_SHA"
 
 run_case "a rejection followed by a later approval at the head passes" 0 \
@@ -802,15 +801,16 @@ run_case "outside markers bind while indented documentation is ignored" 0 \
     "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\\n\\n    CHANGES-REQUESTED-AT: codex ${HEAD_SHA}\\n    APPROVED-AT: claude bad\"},
       {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
+# One seat suffices now, so these fixtures carry only the one seat-shaped
+# approval under test: if the fenced/indented example bound, the gate would
+# pass, which is exactly what they prove.
 run_case "a fenced approval example does not bind" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
-    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"${REVIEWER_902}\\n~~~\\nAPPROVED-AT: claude ${HEAD_SHA}\\n~~~\"}]" "$HEAD_SHA"
+    "[{\"body\": \"${REVIEWER_902}\\n~~~\\nAPPROVED-AT: claude ${HEAD_SHA}\\n~~~\"}]" "$HEAD_SHA"
 
 run_case "an indented approval example does not bind" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
-    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"${REVIEWER_902}\\n\\n    APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+    "[{\"body\": \"${REVIEWER_902}\\n\\n    APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
 run_case "a fenced withdrawal example does not discharge" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
@@ -921,7 +921,7 @@ run_case "THE DEFECT: both labels present but bindings are at an OLD head blocks
     "[{\"body\": \"APPROVED-AT: codex ${OLD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${OLD_SHA}\"}]" "$HEAD_SHA"
 
-run_case "one lane bound, the other stale, blocks" 1 \
+run_case "one lane bound, the other stale, passes at one-seat depth (D4)" 0 \
     "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${OLD_SHA}\"}]" "$HEAD_SHA"
@@ -1067,11 +1067,14 @@ run_message_case "non-array PR_COMMENTS_JSON is diagnosed as a bad comment paylo
 # be reported as stale and must name both SHAs, so an operator can act on it.
 run_message_case "a stale approval is diagnosed as superseded and names both SHAs" \
     1 "superseded approval from claude" "$FULL_LABELS" "$FULL_BODY" \
-    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+    "[{\"body\": \"APPROVED-AT: codex ${OLD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${OLD_SHA}\"}]" "$HEAD_SHA"
 
-run_message_case "a missing binding is diagnosed as absent, not as stale" \
-    1 "no exact-head approval from codex" "$FULL_LABELS" "$FULL_BODY" "[]" "$HEAD_SHA"
+run_message_case "a missing binding is diagnosed as no seat bound, not as stale" \
+    1 "found 0 bound lane(s) (none)" "$FULL_LABELS" "$FULL_BODY" "[]" "$HEAD_SHA"
+
+run_message_absent_case "a missing binding is not diagnosed as superseded" \
+    1 "superseded approval" "$FULL_LABELS" "$FULL_BODY" "[]" "$HEAD_SHA"
 
 # An unlabeled PR is still out of scope even with no binding inputs at all: this
 # lint never second-guesses whether the label should have been applied.
@@ -1103,10 +1106,10 @@ run_case "a malformed line in the SAME comment as the newest binding blocks" 1 \
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\nLGTM ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
-run_case "an old malformed line still blocks when that lane never re-bound" 1 \
+run_case "an old malformed line still blocks when no seat bound the head after it" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"APPROVED AT EXACT HEAD ${OLD_SHA} -- prose headline\"},
-      {\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"}]" "$HEAD_SHA"
+      {\"body\": \"APPROVED-AT: codex ${OLD_SHA}\"}]" "$HEAD_SHA"
 
 # --- WHO MAY APPROVE ----------------------------------------------------------
 #
@@ -1324,13 +1327,13 @@ run_raw_case "a tag below an opening heading still counts as a review comment" 0
     "[{\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
       {\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
+# Only the one approval under test is present (one seat suffices now), so
+# these still prove the fenced/indented tag authenticated nothing.
 run_raw_case "a fenced role tag cannot authenticate an outside approval" 1 \
-    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"author_association\": \"OWNER\", \"body\": \"~~~\n${TAG_REVIEWER}\n~~~\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+    "[{\"author_association\": \"OWNER\", \"body\": \"~~~\n${TAG_REVIEWER}\n~~~\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 run_raw_case "an indented role tag cannot authenticate an outside approval" 1 \
-    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"author_association\": \"OWNER\", \"body\": \"Documentation:\n\n    ${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+    "[{\"author_association\": \"OWNER\", \"body\": \"Documentation:\n\n    ${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 run_raw_case "a fenced disclosure cannot own an outside refusal" 1 \
     "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
@@ -1526,6 +1529,98 @@ if owns_case; then
     fi
     rm -f "$comments_tmp"
 fi
+
+# --- Owner depth rule: seats, lanes and the critical tier (D4) ---------------
+#
+# One seat in any of today's lanes (claude, codex, muse) by default; two seats
+# in two different lanes only when a REVIEW-DISPATCH-ATTESTATION anywhere in
+# the history names a critical class. Mirrors `review_lane_policy` in the reference
+# verifier. run_case fixtures are authenticated (role tag + OWNER) by
+# authenticate_comments, which is also what makes an attestation eligible.
+run_case "D4: a single muse seat passes with no review labels at all" 0 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "D4: a single claude seat passes" 0 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "D4: an attested critical class with only one seat blocks" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: detcore-scheduling\\nhead: ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: an attested critical class with two different lanes passes" 0 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: detcore-scheduling\\nhead: ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: two seats in the SAME lane do not satisfy the critical tier" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA} BY seat-one\"},
+      {\"body\": \"APPROVED-AT: muse ${HEAD_SHA} BY seat-two\"},
+      {\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: reverie-api\\nhead: ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: a critical-class none attestation keeps the one-seat default" 0 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: none\\nhead: ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: a stale-head critical attestation still raises the tier, one seat blocks" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: hermit-syscall\\nhead: ${OLD_SHA}\"},
+      {\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: a carried critical classification passes with two lanes at the new head" 0 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: hermit-syscall\\nhead: ${OLD_SHA}\"},
+      {\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+# ci-hub/bin/review-attest posts the record with no role tag; the tag filter
+# may only remove approvals, never an escalation.
+run_raw_case "D4: an untagged critical attestation still raises the tier, one seat blocks" 1 \
+    "[{\"author_association\":\"OWNER\",\"body\":\"REVIEW-DISPATCH-ATTESTATION\\nfamily: muse\\ncritical-class: detcore-scheduling\\nhead: ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: muse ${HEAD_SHA}\"}]"
+
+run_case "D4: a garbled refusal between two seats' approvals still blocks" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA} trailing-garbage\"},
+      {\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+run_message_case "D4: an unreadable attestation blocks by name" \
+    1 "unreadable REVIEW-DISPATCH-ATTESTATION" \
+    'post-facto-human-review' "$FULL_BODY" \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"REVIEW-DISPATCH-ATTESTATION\\ncritical-class: detcore-scheduling\"}]" \
+    "$HEAD_SHA"
+
+run_case "D4: CHANGES-REQUESTED without -AT is a refusal and blocks" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES-REQUESTED: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "D4: CHANGES REQUESTED (space spelling) is a refusal and blocks" 1 \
+    'post-facto-human-review' "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: muse ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES REQUESTED: codex ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_raw_case "D4: a lane-less legacy refusal is discharged by its issuer's one muse approval" 0 \
+    "[{\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: muse ${HEAD_SHA}\"}]"
+
+run_raw_case "D4: a muse refusal blocks another lane's seat" 1 \
+    "[{\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: muse ${HEAD_SHA}\"}]"
 
 # PR_COMMENTS_FILE must WIN over PR_COMMENTS_JSON, or the workflow's real input
 # could be silently shadowed by a stale inline value.

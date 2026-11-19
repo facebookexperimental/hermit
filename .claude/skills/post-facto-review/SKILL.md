@@ -56,10 +56,13 @@ author, for engine changes (core Reverie types, the Detcore engine and its
 scheduler). A triggered PR gets exact-head approval at that depth. Role-tagged
 review comments carrying the full head SHA are authority; numbered review and
 `passed-review-*` labels are caches. Any push invalidates the approvals.
-Interim: until its separate reviewer-grammar change lands,
-`scripts/core-review-protocol-lint.sh` still requires both a Claude-family and
-a Codex-family approval on every labeled PR, so a labeled PR needs both to pass
-the lint.
+`scripts/core-review-protocol-lint.sh` encodes the same depth: one exact-head
+seat in any lane (claude, codex or muse) by default, and two seats in two
+different lanes when a `REVIEW-DISPATCH-ATTESTATION` in the comment history
+names a critical class (`hermit-syscall`, `detcore-scheduling`,
+`reverie-api`) — the classification carries across a push, so a new head does
+not drop the change back to one seat; it requires no round or approval
+labels.
 
 Every PR contains `Plain Language Summary and Project Impact` first, then
 `Determinism`, `Linux Semantics`, and `Validation`.
