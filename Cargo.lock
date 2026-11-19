@@ -1836,6 +1836,7 @@ dependencies = [
  "reverie-linuxemu",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1862,7 +1863,7 @@ dependencies = [
  "libc",
  "reverie-core",
  "reverie-kvm-core",
- "reverie-procfs",
+ "reverie-proc-grammar",
  "thiserror",
  "tracing",
 ]
@@ -1926,16 +1927,6 @@ dependencies = [
  "syscalls",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "reverie-procfs"
-version = "0.5.7"
-dependencies = [
- "libc",
- "reverie-proc-grammar",
- "serde",
- "tracing",
 ]
 
 [[package]]
