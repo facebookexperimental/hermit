@@ -1,5 +1,5 @@
 ---
-schema: syscall-pages/v2
+schema: syscall-pages/v3
 syscall: fstat
 nr_x86_64: 5
 related: []
@@ -15,23 +15,93 @@ code_facts:
   refused_only_when_fail_closed: false
   subscribed_run: true
   subscribed_record_replay: true
+# prose: human/agent-authored, machine-checked (syscall-pages.rs check); v3 only
+prose:
+  status: checked
+  reviewed_at: 2026-11-20
+  based_on: 403e350e9e82ee540529f097daccae6a60832d07
 ---
 
-## Strategy
+## In short
+
+Natively, `fstat` reports the host metadata of the file behind an open descriptor, so the guest sees that file's host identity numbers and the times host activity stamped on it. Hermit runs the guest's own descriptor call in the kernel, then rewrites the copy in guest memory with pooled identity numbers, epoch access and status-change times, and a per-file virtual modification time. A descriptor for a file Detcore itself renders is answered from that rendered form, and a still-inherited standard stream keeps a fixed inode whatever the host connected it to. Known gaps: 7.
+
+## Determinism strategy
+
+**What is nondeterministic natively.** `fstat` fills its result from the open file its descriptor names, with no pathname lookup to repeat, so the identity, size and times it writes are the host inode's own and follow every host-side change to that file for as long as the descriptor stays open.[^linux]
+
+**What Hermit does.** Detcore determinizes `fstat` when metadata virtualization is on, its default, in the shared stat-family handler, reached by typed dispatch with the descriptor itself as the target rather than any path: the guest's call is injected into the kernel — any `/proc` lookup Detcore makes alongside it respelled where numbers are translated[^c24] — the filled result is read back, determinized and written again.[^c1][^c2][^c3][^c4] The inode the guest sees is minted from a run-wide counter in sighting order and the device takes the next pooled device in observation order, never the host's own numbers.[^c8][^c10] Which sighting a result counts as is read from the result itself: a positive link count is a name sighting, which discards any retired mapping for that host inode, while no links — the descriptor held over an unlink — is a descriptor sighting, which keeps that mapping, so the unlinked file keeps its number through this descriptor.[^c7][^c8] Apart from a kept canonical value and a time the guest explicitly sets, no reported time is the host's, and none is read from a clock as the call runs: access and status-change times report the configured epoch, and the modification time reports a per-file virtual value settled once — at its first resolving stat, unless an earlier write has left its bump pending (a host time of exactly zero or one whole seconds kept as deliberately written, every other host time becoming the epoch) — and afterwards moved only by a handled write's bump — global logical time; the command line refuses metadata virtualization without virtual time — or by a time the guest explicitly sets and the kernel stores.[^c6][^c9][^c12][^c13] A still-inherited standard stream bypasses sighting order for its inode: it reports a fixed inode and the epoch for its modification time whatever pipe, terminal or file backs it on the host, and a directory's host-churned size and link count are pinned to `4096` bytes, eight blocks and one link.[^c11][^c18]
+
+**Interface fidelity.** The file described is entirely the open file's doing: this call resolves no path, honors no flag, and has no link to follow or leave alone, and a descriptor whose file has since lost its last name still describes that file, under the number the sighting rule keeps, exactly as the kernel still answers for it.[^c3][^c7][^linux] What comes back otherwise is what the kernel filled and the rewrite left alone — mode, ownership, the device-file number and, outside the directory pin, size, block size and blocks — so even a standard stream's kind still follows what the host connected it to while its inode does not, the classic result has no birth-time or mount field to pass through, and a missing result pointer is answered with `EFAULT`.[^c4][^c14][^c18] A descriptor for a memory-map file Detcore may render from the backend's memory map reports size zero and no blocks, as files procfs prints at read time do, whatever the backend's backing file holds.[^c21] A descriptor for a file Detcore renders is answered from the rendered path recorded with that descriptor, before any injection, and where Detcore must name a procfs entry to number the file it follows the calling thread's own descriptor link; a result that turns out to be its placeholder directory becomes `ENOENT` with the buffer restored, in either branch.[^c4][^c15][^c16][^c17]
+
+**Record & replay.** The call is subscribed in both run and record/replay modes (code facts in the Appendix).[^c2][^c19] Record and replay always run without metadata virtualization, so that subscription serves the unvirtualized branch: the record-or-replay tool records the kernel's answer for the descriptor's file and replay returns it unchanged, host identity numbers and host times included: under record and replay Detcore renders no procfs file and has no placeholder directory, so neither the rendered-form answer nor the placeholder hiding on that branch ever fires.[^c5][^c26] The virtualized rewrite carries no recording of its own: it injects the call directly rather than handing it to the record-or-replay tool, so no replay regenerates a pooled answer for this call.[^c20]
+
+## Known gaps
+
+- G1 (by design): neither time a reader would use to see activity ever advances: the access time and the status-change time are the configured epoch in every answer — a descriptor read from since the last call, or a file whose metadata changed, is indistinguishable from one left alone.[^c6]
+- G2 (by design): through a long-lived descriptor the settled virtual modification time can go stale in full view: a writer outside the run, or a change no handled bump covers, leaves it at its settled or last bumped value while this same call reports the file's new size from the kernel, so the two fields together need not describe the same moment of the file.[^c8][^c9]
+- G3 (by design): a directory reached by descriptor reports `4096` bytes, eight blocks and one link however much it holds — the zero link count of a directory removed while this descriptor holds it passes through, and a proved procfs directory keeps its host size and count — and where a backend cannot prove a directory is not on procfs, the size is the host's rather than the pin.[^c11]
+- G4 (by design): what the rewrite does not touch is the host file's as the injected call found it — its mode, ownership, device-file number and unpinned size — including the plainest case, the kind of a standard stream, which follows the pipe, terminal or file the host supplied even under its fixed inode; its device is not fixed with its inode either, but pooled from whatever the host connected in first-observation order, so that choice changes the stream's reported device and renumbers every device first seen after it.[^c10][^c14][^c18]
+- G5 (by design): turning metadata virtualization off turns all of the above off with it and host identity numbers and real host times reach the guest from the descriptor's file, save that a file Detcore renders is still answered from its rendered form first and a result naming the placeholder directory is still hidden: a plain run in that configuration is faithful and not repeatable, while in record and replay — which always run that way, with neither exception in force — replay fidelity rests on the recording returning the recorded answer.[^c5][^c25][^c26]
+- G6 (unimplemented): host inode reuse is contained, not handled: a file that never had a name, or one that disappears without the guest removing its name, is never retired, so a named file the host gives its freed inode inherits its pooled number and its virtual modification time, and whether the host reuses the inode differs between runs.[^c22]
+- G7 (unimplemented): a procfs file Detcore cannot name — threads not sequentialized, the guest mount table unreadable, a file outside the guest procfs mounts, a failed reopen, or a result buffer over the guest path — is numbered by its raw host identity instead of a rendered name, and the run records a determinism loss for it.[^c23]
+
+## Discussion
+
+[Start a discussion about `fstat`](https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fstat&body=Discussion+for+the+%60fstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffstat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fstat%60%2C+or+in+what+the+page+says%3F%0A) (opens a prefilled issue form; nothing is filed until you submit it).
+
+## Appendix
+
+### Code facts
 
 Detcore classifies `fstat` (5) as determinized via typed dispatch; deterministic refusal: false; run subscription: true; record/replay subscription: true.
 
 - Reviewed list: `detcore/src/syscall_classification.rs:1689`
 - Dispatch: `detcore/src/lib.rs:8186`
 
-This facts-only page was generated from Detcore code facts. Checked analysis prose has not been added yet.
+### Tests
 
-## Discussion
+How a determinized answer takes its epoch in every time field — a container stream's included — its rendered or pooled inode, and its directory pins: `detcore/src/syscalls/files/determinize_stat_tests.rs` (`determinize_stat_reads_the_mode_and_epoch_it_is_configured_with`, `determinize_stat_reports_one_link_for_directories_only`, `determinize_stat_nlink_pin_edges`) — what Hermit does. That unit fixture also exercises a defensive branch the command line never builds; it is not evidence for record and replay. That an unlinked file keeps its number and its pending modification time through its descriptors, and that only an exact whole-second host modification time of zero or one is kept as written: `detcore/src/tool_global.rs` (`an_unlinked_file_keeps_its_number_through_its_descriptors`, `a_pending_mtime_stays_with_its_file_after_the_last_name_goes`, `only_exact_canonical_host_mtimes_are_kept`) — what Hermit does, and interface fidelity. That inodes and devices are pooled in observation order rather than passed through: `detcore/src/tool_global.rs` (`det_inodes_are_minted_not_passed_through`, `device_pool_remaps_deterministically`) — what Hermit does. Guest programs stat_metadata_identity and record_replay_fd_metadata under tests/c, through the C library wrappers — which on current glibc can reach the shared handler by the newfstatat entry rather than syscall 5 itself — exercise descriptor metadata, pipes included, end to end and through a recording — what Hermit does, and record & replay.
 
-[Start a discussion about `fstat`](https://github.com/facebookexperimental/hermit/issues/new?title=Syscall+discussion%3A+fstat&body=Discussion+for+the+%60fstat%60+syscall+page%3A+https%3A%2F%2Fgithub.com%2Ffacebookexperimental%2Fhermit%2Fblob%2Fmain%2Fdocs%2Fsyscalls%2Ffstat.md%0A%0AWhat+should+change+in+how+Detcore+handles+%60fstat%60%2C+or+in+what+the+page+says%3F%0A) (opens a prefilled issue form; nothing is filed until you submit it).
+### Citations
+
+[^linux]: Linux `fstat(2)`:
+  entry: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/stat.c?h=v7.1.3#n546
+  the descriptor side: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/stat.c?h=v7.1.3#n276
+  filling from the inode: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/stat.c?h=v7.1.3#n82
+  the classic result copy: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/stat.c?h=v7.1.3#n466
+[^c1]: detcore/src/syscall_classification.rs:1689 sha256:a4a200c06320b690
+[^c2]: detcore/src/lib.rs:8186 sha256:49191409399c8244
+  https://github.com/facebookexperimental/hermit/blob/main/detcore/src/lib.rs#L8186
+[^c3]: detcore/src/syscalls/files.rs:3434-3453 sha256:4aa170e8f8244e0a
+[^c4]: detcore/src/syscalls/files.rs:13760-13773 sha256:e6bdb72028ce09a7; detcore/src/syscalls/files.rs:13787-13792 sha256:ae286eb9abdbfa7b; detcore/src/syscalls/files.rs:13823-13828 sha256:d9854c31211bd0f6
+[^c5]: detcore/src/syscalls/files.rs:13841-13859 sha256:2a2759ce16acd125
+[^c6]: detcore/src/syscalls/files.rs:13492-13501 sha256:eb300fe90c78934f; detcore/src/syscalls/files.rs:13709-13719 sha256:678229367b7eb651
+[^c7]: detcore/src/syscalls/files.rs:13539-13556 sha256:c9a08cb4cfea5435
+[^c8]: detcore/src/tool_global.rs:650-653 sha256:03cb9289676fd691; detcore/src/tool_global.rs:682-686 sha256:09e54225fef74f5f; detcore/src/tool_global.rs:711-726 sha256:d710614a575e8000; detcore/src/tool_global.rs:7980-7991 sha256:ce607b672f87dd02
+[^c9]: detcore/src/tool_global.rs:321-341 sha256:504cadaa9cf64da0
+[^c10]: detcore/src/syscalls/files.rs:13603-13610 sha256:9f2e7b21b6bfb3e8; detcore/src/tool_global.rs:1169-1185 sha256:911eb680f2cbee9f; detcore/src/tool_global.rs:8018-8028 sha256:7e18488c7ded0b47
+[^c11]: detcore/src/syscalls/files.rs:13649-13663 sha256:6664919e96f08b5d; detcore/src/syscalls/files.rs:13697-13707 sha256:d08c01284ad16287
+[^c12]: detcore/src/syscalls/files.rs:12121-12124 sha256:78ea05a910e47c5e; detcore/src/tool_global.rs:8093-8105 sha256:3e3443044cde2bf0
+[^c13]: detcore/src/syscalls/files.rs:17288-17305 sha256:630073d24e9d58ea
+[^c14]: detcore/src/stat.rs:164-188 sha256:aa1e92afc2426348
+[^c15]: detcore/src/syscalls/files/rendered_procfs.rs:6045-6072 sha256:a2d5b52eba520150
+[^c16]: detcore/src/syscalls/files.rs:13403-13411 sha256:a1f768832a52702d
+[^c17]: detcore/src/syscalls/files/descriptor_directory.rs:1984-1999 sha256:d41c6cf3e2a1de26
+[^c18]: detcore/src/syscalls/files.rs:2896-2911 sha256:a317b5ccb7de593a; detcore/src/syscalls/files.rs:13528-13538 sha256:7b6794448d678375
+[^c19]: detcore/src/tool_local.rs:954-963 sha256:76c3a02dd0ddb4cb
+[^c20]: detcore/src/syscalls/files/procfs_numbers.rs:525-534 sha256:2f66d64f35d4e433
+[^c22]: detcore/src/tool_global.rs:611-613 sha256:f82534f1f5e06fc0; detcore/src/tool_global.rs:623-627 sha256:6aa1303484ad62a8
+[^c23]: detcore/src/syscalls/files.rs:3463-3477 sha256:b994713baaf730e2; detcore/src/syscalls/files.rs:3486-3491 sha256:2826534f684f3c82; detcore/src/syscalls/files.rs:13591-13597 sha256:cfe44e3bca5b52b6; detcore/src/syscalls/files.rs:13480-13490 sha256:8b8bc26bbd638b82
+[^c24]: detcore/src/syscalls/files/procfs_numbers.rs:96-102 sha256:c97f91460b46b20e; detcore/src/syscalls/files/procfs_numbers.rs:562-565 sha256:483edb1fa08f2544
+[^c25]: detcore/src/syscalls/files.rs:13830-13840 sha256:5ff82ca2a7d932e4
+[^c21]: detcore/src/syscalls/files.rs:13731-13747 sha256:8446ffc7d9f131b3
+[^c26]: detcore/src/syscalls/files/rendered_procfs.rs:2575-2581 sha256:8e38dc8b4bf7b529; detcore/src/syscalls/files/rendered_procfs.rs:2726-2727 sha256:23dbb6fc6a914224
 
 ## Status
 
 - 2026-11-15 · rev 54bd03547df0 · facts-only page generated from Detcore code facts at this revision.
 - 2026-11-16 · rev 7ac736d54e14 · facts refreshed from Detcore at this revision.
 - 2026-11-18 · rev 403e350e9e82 · facts refreshed from Detcore at this revision.
+- 2026-11-19 · rev 403e350e9e82 · checked determinism-strategy prose added (rubric v3); citations verified at this revision.
+- 2026-11-20 · rev 403e350e9e82 · checked prose corrected after review; citations re-verified at this revision.
