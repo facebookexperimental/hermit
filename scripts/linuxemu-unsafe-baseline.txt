@@ -3,7 +3,7 @@
 # that moves unsafe; see that file for the counting method.
 # An increase for a file requires a justify line below,
 # written with --justify <path>=<reason> and judged by the seat.
-total 644
+total 643
 capture_identity.rs 7
 core_dump.rs 3
 credentials.rs 6
@@ -44,7 +44,7 @@ native_exit_broker/exec_client.rs 9
 native_exit_broker/raw.rs 95
 pidfd_shadow.rs 6
 proc_mechanics.rs 2
-signal.rs 5
+signal.rs 4
 terminal_cleanup.rs 1
 terminal_read.rs 15
 justify executor/uaccess.rs 36 GuestOut admissions (D132368105): 32 unsafe impls + 1 unsafe trait replace two uncontracted generic write paths; file.rs flock copyout routed through the mirror (-1 block)
