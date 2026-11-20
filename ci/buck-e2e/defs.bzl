@@ -13,7 +13,8 @@ Routing (per cell, first match wins; see _route):
          workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), a verify cell on a backend whose strictness follows its
          host (HOST_LEVEL_BACKENDS: RE workers would run it relaxed), a PMU-armed cell
-         under -c hermit_e2e.pmu_on_re=false, or
+         unless -c hermit_e2e.pmu_on_re=true (default false: RE guarantees no exact
+         retired-branch counter), or
          the ptrace verify cell of a test whose kvm, liteinst or in-guest-trap verify cell
          runs locally (its parity reference).
          A sabre or dbt verify cell also runs locally whenever its test's ptrace verify
@@ -22,7 +23,9 @@ Routing (per cell, first match wins; see _route):
 `-c hermit_e2e.cpuid_on_re=true` (default false: the routing above, unchanged) lifts
 only the host-capability gate for a liteinst or in-guest-trap verify cell needing
 cpuid-faulting alone: it then faces every later local rule and, on RE, requests a
-worker advertising the platform property cpuid_faulting=true. No ptrace cell moves
+worker advertising the platform property cpuid_faulting=true. pmu_armed counts those
+cells, so under the default pmu_on_re (false) they move only when a run also passes
+-c hermit_e2e.pmu_on_re=true. No ptrace cell moves
 under it (ptrace replay, chaos and verify need an exact retired-branch counter RE
 does not guarantee) and no kvm cell moves (RE has no /dev/kvm). A moved cell's ptrace
 reference stays local (HOST_LEVEL_BACKENDS), so that pair loses clean parity credit
@@ -156,7 +159,12 @@ def _route(cell, pmu_on_re, cpuid_on_re, re_exclusions, local_candidates):
     if cell["mode"] == "verify" and cell["backend"] in HOST_LEVEL_BACKENDS:
         return ("local", "runs at its host's strictness level; RE workers lack CPUID faulting or an exact branch counter, so it would run relaxed there")
     if pmu_armed(cell) and not pmu_on_re:
-        return ("local", "arms the PMU and -c hermit_e2e.pmu_on_re=false")
+        if cell["backend"] in ["liteinst", "in-guest-trap"]:
+            # Only reachable under -c hermit_e2e.cpuid_on_re=true: an in-guest cell
+            # arms no preemption timer (ci/manifest-plan/src/runner.rs
+            # strict_run_arms_the_preemption_timer), but pmu_armed still counts it.
+            return ("local", "in-guest backend: it arms no preemption timer, but pmu_armed counts it, so RE also needs -c hermit_e2e.pmu_on_re=true")
+        return ("local", "arms the PMU, and RE guarantees no exact branch counter (-c hermit_e2e.pmu_on_re=true opts in)")
     if cell["backend"] == "ptrace" and cell["mode"] == "verify" and cell["test"] in local_candidates:
         # Backend parity credits a candidate verify cell against this test's ptrace verify
         # cell only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
@@ -320,7 +328,19 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
         "stock_artifact_root",
         "buck-out/v2/test/execution",
     )
-    pmu_on_re = read_root_config("hermit_e2e", "pmu_on_re", "true") == "true"
+    # Default false: a PMU-armed cell runs locally unless a run opts in. RE
+    # advertises no exact retired-branch counter: its worker host facts are arch,
+    # os_version, hostname, tw_job/tw_task and cpuid_faulting (fbcode/
+    # remote_execution/docs/engineering/agent/configuration.md), no CPU vendor,
+    # and its AMD EPYC 9D64 workers fail Reverie's validation with
+    # AmdSpecLockMapShouldBeDisabled, so Hermit's strict runs refuse there.
+    # With cpuid_on_re at its default, every PMU-armed cell of the plan already
+    # meets an earlier local rule; this keeps a future one from reaching RE by
+    # default. pmu_armed also counts the liteinst and in-guest-trap backends,
+    # so under -c hermit_e2e.cpuid_on_re=true the in-guest verify cells it moves
+    # to RE also need -c hermit_e2e.pmu_on_re=true (ci/test_buck_e2e_cell.py
+    # PmuOnReDefaultTest).
+    pmu_on_re = read_root_config("hermit_e2e", "pmu_on_re", "false") == "true"
     cpuid_on_re = read_root_config("hermit_e2e", "cpuid_on_re", "false") == "true"
     # -c hermit_e2e.nonce=X gives every cell a fresh action digest: a cache-busting rerun.
     nonce = read_root_config("hermit_e2e", "nonce", "")

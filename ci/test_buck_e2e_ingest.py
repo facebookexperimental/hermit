@@ -448,6 +448,32 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(rows, [(X, 1, "PASS", "rx3"), (Y, 1, "PASS", "ry1")])
         self.assertEqual(printed["withheld_on_re_executions"], 2)
 
+    def test_an_amd_speclockmap_re_withholding_is_rerun_locally_and_judged_there(self):
+        """cell.sh labels an execution withheld on an AMD SpecLockMap RE worker ("worker
+        lacks a validated PMU (AMD SpecLockMap)") and keeps it failed, so its uploads stay
+        those of any RE withholding (test_buck_e2e_cell's
+        test_an_amd_speclockmap_withholding_on_re_is_labelled_and_still_fails); this ingest
+        never reads the reason. The RE run lists the cell for its local rerun, and the
+        rerun's rows are the cell's verdict, a failing rerun as much as a passing one: the
+        cell never ends as a skip with no run anywhere."""
+        printed, rows, _ = self.accepted(
+            {"RE": [withheld_on("re", X, 100, "rx1"), Y_PASSES]}, withheld_on_re=[X_SLUG]
+        )
+        self.assertEqual(rows, [(Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_on_re_every_execution"], 1)
+        for outcome in ("PASS", "FAIL"):
+            with self.subTest(rerun=outcome):
+                printed, rows, summary = self.accepted(
+                    {
+                        "RE": [withheld_on("re", X, 100, "rx1"), Y_PASSES],
+                        "RERUN": [execution(X, 200, outcome, "rx2")],
+                    }
+                )
+                self.assertEqual(rows, [(X, 1, outcome, "rx2"), (Y, 1, "PASS", "ry1")])
+                self.assertEqual(printed["withheld_on_re_executions"], 1)
+                self.assertEqual(printed["withheld_on_re_every_execution"], 0)
+                self.assertEqual(summary.get("host_inapplicable_cells"), None)
+
     def test_only_a_claim_made_on_re_is_skipped(self):
         """A claim this machine made, or one whose route is not recorded, still
         takes its number, so the PASS after it is attempt 2."""

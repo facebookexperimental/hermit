@@ -763,6 +763,26 @@ def withheld_here(pair):
     details["reason"] = "SKIP: " + (reason if isinstance(reason, str) and reason else "host-inapplicable")
     return dict(record, details=json.dumps(details))
 
+#: The Reverie validation-failure kinds (named in parentheses in `hermit host-capabilities`'s
+#: exact_branch_counter evidence, which the harness's reason carries) of an AMD Zen worker
+#: whose SpecLockMap optimization miscounts locked instructions: a fleet setting, not the cell.
+AMD_SPECLOCKMAP_KINDS = ("AmdSpecLockMapShouldBeDisabled", "AmdSpecLockMapBranchOvercount")
+WORKER_LACKS_VALIDATED_PMU = "worker lacks a validated PMU (AMD SpecLockMap)"
+
+def amd_speclockmap_label(pair):
+    """WORKER_LACKS_VALIDATED_PMU and ": " when the withheld cell's reason says this machine's
+    exact branch counter failed Reverie's validation on an AMD SpecLockMap kind; else "".
+
+    A label only: off a local route the cell still FAILS, so ingest.py numbers the
+    execution as no attempt and the cell is rerun and judged on another host
+    (ci/buck-e2e/run's local rerun). A skip would end the cell with no run anywhere."""
+    reason = pair[1].get("reason") if pair else None
+    if not isinstance(reason, str) or "exact-branch-counter (" not in reason:
+        return ""
+    if any(f"({kind})" in reason for kind in AMD_SPECLOCKMAP_KINDS):
+        return WORKER_LACKS_VALIDATED_PMU + ": "
+    return ""
+
 def required_here(pair):
     """A failure for the withheld or recorded cell on a local route whose host must have
     the capability (HERMIT_E2E_REQUIRE_HOST_CAPS=1); else None. A recorded host-image
@@ -812,7 +832,8 @@ def verdict():
                       f"machine: {refused[1]['reason']}")
     if pair:
         # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
-        return failed(f"harness rc={rc} produced {len(done)} test_done records")
+        # An AMD SpecLockMap worker's withholding is labelled, and still fails.
+        return failed(amd_speclockmap_label(pair) + f"harness rc={rc} produced {len(done)} test_done records")
     lost = no_result_pair(done, rows)
     if lost:
         # A failure like any other, which ingest.py keeps as the attempt it was, so a Tpx

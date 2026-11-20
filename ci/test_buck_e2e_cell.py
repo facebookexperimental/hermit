@@ -1104,6 +1104,45 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("produced 2 test_done records", details_json(done)["reason"])
 
+    # The harness's reason for a cell withheld on a worker whose exact branch counter failed
+    # Reverie's validation: `hermit host-capabilities` names the kind in parentheses.
+    AMD_SPECLOCKMAP_REASON = (
+        "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter (AMD EPYC "
+        "9D64: Reverie performance-counter validation failed (AmdSpecLockMapShouldBeDisabled); "
+        "`hermit run --strict` names the measured counts)")
+
+    def test_an_amd_speclockmap_withholding_on_re_is_labelled_and_still_fails(self) -> None:
+        # The label may change how the RE attempt reads, never that it fails: a skip would
+        # end the cell with no run anywhere. It keeps exactly what ingest.py reads as an RE
+        # withholding (route re, the host-inapplicable claim, no row), so the execution is
+        # no attempt and the cell is rerun and judged on another host; test_buck_e2e_ingest's
+        # test_an_amd_speclockmap_re_withholding_is_rerun_locally_and_judged_there ingests that.
+        done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re",
+                                     FAKE_WITHHELD_REASON=self.AMD_SPECLOCKMAP_REASON)
+        self.assertEqual(done["status"], "failed", done)
+        reason = details_json(done)["reason"]
+        self.assertTrue(reason.startswith("worker lacks a validated PMU (AMD SpecLockMap): "), reason)
+        self.assertIn("produced 2 test_done records", reason)
+        self.assertEqual(result["route"], "re")
+        artifacts = self.tmp / "tpx" / "artifacts"
+        summary = json.loads((artifacts / "summary.json").read_text())
+        self.assertEqual(len(summary["host_inapplicable_cells"]), 1, summary)
+        self.assertFalse((artifacts / "results.jsonl").exists()
+                         and (artifacts / "results.jsonl").read_text().strip())
+
+    def test_only_an_amd_speclockmap_withholding_is_labelled(self) -> None:
+        # NEGATIVE CONTROLS: another validation kind on RE fails unlabelled; the same reason on
+        # a local route is the usual skip, unlabelled.
+        other = self.AMD_SPECLOCKMAP_REASON.replace("AmdSpecLockMapShouldBeDisabled", "IocPeriodBugDetected")
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re",
+                                FAKE_WITHHELD_REASON=other)
+        self.assertEqual(done["status"], "failed", done)
+        self.assertNotIn("worker lacks a validated PMU", details_json(done)["reason"])
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                FAKE_WITHHELD_REASON=self.AMD_SPECLOCKMAP_REASON)
+        self.assertEqual(done["status"], "skipped", done)
+        self.assertNotIn("worker lacks a validated PMU", details_json(done)["reason"])
+
     # HERMIT_E2E_REQUIRE_HOST_CAPS=1: a CI host that must have the capability. A withheld
     # cell there is a failure naming the harness's reason, never a skip that reads as
     # coverage; every other verdict, and the RE route, are unchanged.
@@ -2026,14 +2065,15 @@ class DefsSkipTest(unittest.TestCase):
         self.assertEqual(str(skipped.exception), reason)
 
 
-def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None,
-                   **cells_kwargs) -> dict[str, dict]:
-    """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name.
+def evaluate_cells(routing: str, pmu_on_re: str | None = "true", cpuid_on_re: str | None = None,
+                   plan: dict | None = None, **cells_kwargs) -> dict[str, dict]:
+    """Runs defs.bzl's hermit_e2e_cells over the real plan, or PLAN if given; returns each
+    target's attrs by name.
 
-    cpuid_on_re=None leaves the key unset, so defs.bzl's own default applies; any
-    other value is supplied as -c hermit_e2e.cpuid_on_re. The stand-in rule only
-    captures target kwargs: _cell_test_impl never runs here, so executor
-    properties are checked through those kwargs, not an executed executor.
+    pmu_on_re=None or cpuid_on_re=None leaves that key unset, so defs.bzl's own
+    default applies; any other value is supplied as -c hermit_e2e.<key>. The
+    stand-in rule only captures target kwargs: _cell_test_impl never runs here, so
+    executor properties are checked through those kwargs, not an executed executor.
     """
     targets: dict[str, dict] = {}
     rule_calls = []
@@ -2044,7 +2084,9 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
             return lambda **kwargs: targets.__setitem__(kwargs["name"], kwargs)
         return _Anything()
 
-    config = {("hermit_e2e", "routing"): routing, ("hermit_e2e", "pmu_on_re"): pmu_on_re}
+    config = {("hermit_e2e", "routing"): routing}
+    if pmu_on_re is not None:
+        config[("hermit_e2e", "pmu_on_re")] = pmu_on_re
     if cpuid_on_re is not None:
         config[("hermit_e2e", "cpuid_on_re")] = cpuid_on_re
     namespace = {
@@ -2058,8 +2100,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
     }
     exec(compile(defs_source(), str(DEFS), "exec"), namespace)
     assert "_cell_test_impl" in rule_calls, rule_calls
-    namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()),
-                                  **cells_kwargs)
+    namespace["hermit_e2e_cells"](plan if plan is not None else json.loads(PLAN.read_text()),
+                                  json.loads(RE_EXCLUSIONS.read_text()), **cells_kwargs)
     return targets
 
 
@@ -2467,6 +2509,70 @@ class CpuidOnReRouteTest(unittest.TestCase):
         self.assertEqual(dual["route"], "local")
         self.assertEqual(dual.get("re_properties"), {})
         self.assertNotIn("hermit_e2e_re_cpuid_faulting", dual["labels"])
+
+
+class PmuOnReDefaultTest(unittest.TestCase):
+    """With -c hermit_e2e.pmu_on_re unset, a PMU-armed cell stays off RE: RE guarantees no
+    exact retired-branch counter, and its AMD EPYC 9D64 workers fail Reverie's PMU
+    validation (AmdSpecLockMapShouldBeDisabled). pmu_armed() also counts the liteinst
+    and in-guest-trap cells, so under this default -c hermit_e2e.cpuid_on_re=true moves
+    them to RE only together with -c hermit_e2e.pmu_on_re=true."""
+
+    def routes(self, *config) -> dict[str, str]:
+        return {name: target["route"] for name, target in evaluate_cells(*config).items()}
+
+    def test_an_unset_pmu_on_re_routes_like_false(self) -> None:
+        for cpuid_on_re in (None, "true"):
+            unset = self.routes("hybrid", None, cpuid_on_re)
+            self.assertEqual(unset, self.routes("hybrid", "false", cpuid_on_re), cpuid_on_re)
+            self.assertEqual(sorted(n for n, route in unset.items() if route == "re"), [], cpuid_on_re)
+        # What makes the default observable at the current plan: opting in moves the 469
+        # eligible in-guest verify cells (CpuidOnReRouteTest), which an unset key keeps local.
+        opted_in = self.routes("hybrid", "true", "true")
+        self.assertEqual(len([n for n, route in opted_in.items() if route == "re"]), 469)
+
+    def test_the_default_keeps_a_synthetic_re_eligible_pmu_armed_cell_local(self) -> None:
+        # The default seen without the in-guest cells: a plan whose one cell is a ptrace
+        # replay cell that no earlier rule keeps local (a real row, minus its host
+        # capability), evaluated through hermit_e2e_cells with the key unset.
+        real = json.loads(PLAN.read_text())
+        row = next(c for c in real["cells"] if c["backend"] == "ptrace" and c["mode"] == "replay")
+        cell = {k: v for k, v in row.items() if k != "requires_host_capabilities"}
+        cell.update(test="c-programs/synthetic-pmu-armed", category="c-programs", lane="portable")
+        plan = dict(real, cells=[cell])
+        name = cell_slug(cell)
+        unset = evaluate_cells("hybrid", None, plan=plan)[name]
+        self.assertEqual(unset["route"], "local")
+        self.assertEqual(unset["env"]["HERMIT_E2E_ROUTE_REASON"],
+                         "arms the PMU, and RE guarantees no exact branch counter "
+                         "(-c hermit_e2e.pmu_on_re=true opts in)")
+        self.assertEqual(evaluate_cells("hybrid", "true", plan=plan)[name]["route"], "re")
+
+    def test_an_in_guest_cell_states_the_opt_in_it_needs(self) -> None:
+        # Under the cpuid opt-in with pmu_on_re unset, an in-guest verify cell is kept
+        # local by pmu_armed, and its reason says what moves it, not that it arms the PMU.
+        targets = evaluate_cells("hybrid", None, "true")
+        reasons = {t["env"]["HERMIT_E2E_ROUTE_REASON"] for t in targets.values()
+                   if t["args"][2] in IN_GUEST_BACKENDS and "pmu" in t["env"]["HERMIT_E2E_ROUTE_REASON"]}
+        self.assertEqual(reasons, {"in-guest backend: it arms no preemption timer, but pmu_armed "
+                                   "counts it, so RE also needs -c hermit_e2e.pmu_on_re=true"})
+        moved = [n for n, t in targets.items() if t["args"][2] in IN_GUEST_BACKENDS
+                 and t["env"]["HERMIT_E2E_ROUTE_REASON"].startswith("in-guest backend:")]
+        self.assertEqual(len(moved), 469)
+
+    def test_the_pmu_veto_keeps_an_otherwise_re_eligible_cell_local(self) -> None:
+        # A ptrace replay cell that no earlier rule keeps local (every such plan row
+        # today names cpuid-faulting, which does), so only the PMU veto decides.
+        defs, _ = load_defs()
+        cell = {"test": "synthetic/pmu-armed", "mode": "replay", "backend": "ptrace",
+                "category": "c-programs", "lane": "portable", "requires": ["linux", "x86_64"]}
+        self.assertTrue(defs["pmu_armed"](cell))
+        self.assertEqual(
+            defs["_route"](cell, False, False, {}, {}),
+            ("local", "arms the PMU, and RE guarantees no exact branch counter "
+                      "(-c hermit_e2e.pmu_on_re=true opts in)"),
+        )
+        self.assertEqual(defs["_route"](cell, True, False, {}, {}), ("re", ""))
 
 
 if __name__ == "__main__":
