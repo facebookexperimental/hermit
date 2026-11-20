@@ -71,10 +71,11 @@ PINNED_ROOT_ONLY = {
     "c-programs/environment-and-workdir/replay": "asserts a fresh tmpfs workdir at /test, which cell.sh gives only pinned-root cells (elsewhere the workdir is the bound /tmp/test)",
 }
 
-# ptrace/liteinst/in-guest-trap cells that run with --max-timeslice=disabled and so never arm the PMU.
+# Cells of a PMU_TIMER_BACKENDS backend that run with --max-timeslice=disabled and so
+# never arm the PMU. The in-guest backends (liteinst, in-guest-trap) need no entry:
+# pmu_armed never counts them.
 PMU_FREE_CELLS = [
     "c-programs/io-uring-fallback/custom@ptrace",
-    "system-utils/clock-determinism/custom@liteinst",
     "system-utils/clock-determinism/custom@ptrace",
 ]
 

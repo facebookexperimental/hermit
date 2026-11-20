@@ -2547,7 +2547,10 @@ class PmuOnReDefaultTest(unittest.TestCase):
         # The cpuid opt-in alone moves the 469 eligible in-guest verify cells
         # (CpuidOnReRouteTest), which arm no preemption timer, and pmu_on_re changes
         # nothing more at the current plan: every PMU-armed cell meets an earlier local
-        # rule.
+        # rule. So unset, false and true route alike here, and this test cannot tell a
+        # default of false from one of true:
+        # test_the_default_keeps_a_synthetic_re_eligible_pmu_armed_cell_local is the pin
+        # for the pmu_on_re default.
         for cpuid_on_re, moved in ((None, 0), ("true", 469)):
             unset = self.routes("hybrid", None, cpuid_on_re)
             self.assertEqual(unset, self.routes("hybrid", "false", cpuid_on_re), cpuid_on_re)
