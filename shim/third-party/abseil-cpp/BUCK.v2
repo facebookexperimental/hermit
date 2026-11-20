@@ -1,0 +1,248 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+load("@//third-party:defs.bzl", "pkgconfig_system_library")
+
+oncall("open_source")
+
+# One target per abseil component the vendored gVisor tests use
+# (third-party/gvisor-syscall-tests/build/targets.json). Target names match
+# fbsource//third-party/abseil-cpp so one label serves both builds;
+# pkg-config names follow abseil's own .pc files, and inter-component
+# dependencies ride in each .pc file's Requires. Inside the hermetic
+# validation image these must resolve from the image's pinned packages
+# (ci/hermetic/flake.nix), never from the host or the network.
+
+pkgconfig_system_library(
+    name = "algorithm__container",
+    pkgconfig_name = "absl_algorithm_container",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "base__core_headers",
+    pkgconfig_name = "absl_core_headers",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "base__no_destructor",
+    pkgconfig_name = "absl_no_destructor",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "cleanup",
+    pkgconfig_name = "absl_cleanup",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "container__btree",
+    pkgconfig_name = "absl_btree",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "container__flat_hash_map",
+    pkgconfig_name = "absl_flat_hash_map",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "container__flat_hash_set",
+    pkgconfig_name = "absl_flat_hash_set",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "container__node_hash_map",
+    pkgconfig_name = "absl_node_hash_map",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "container__node_hash_set",
+    pkgconfig_name = "absl_node_hash_set",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "flags__flag",
+    pkgconfig_name = "absl_flags",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "flags__parse",
+    pkgconfig_name = "absl_flags_parse",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "log",
+    pkgconfig_name = "absl_log",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "memory",
+    pkgconfig_name = "absl_memory",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "random",
+    pkgconfig_name = "absl_random_random",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "status",
+    pkgconfig_name = "absl_status",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "status__statusor",
+    pkgconfig_name = "absl_statusor",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "strings",
+    pkgconfig_name = "absl_strings",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "strings__str_format",
+    pkgconfig_name = "absl_str_format",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "strings__string_view",
+    pkgconfig_name = "absl_string_view",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "synchronization",
+    pkgconfig_name = "absl_synchronization",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "time",
+    pkgconfig_name = "absl_time",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "types__optional",
+    pkgconfig_name = "absl_optional",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)
+
+pkgconfig_system_library(
+    name = "types__span",
+    pkgconfig_name = "absl_span",
+    packages = {
+        "//os:linux-fedora": ["abseil-cpp-devel"],
+        "//os:linux-ubuntu": ["libabsl-dev"],
+        "//os:macos-homebrew": ["abseil"],
+    },
+)

@@ -1,0 +1,26 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load(":defs.bzl", "hermit_execution_platforms")
+
+oncall("open_source")
+
+# Build execution platforms. Select one with
+#   -c build.execution_platforms=gh_facebook_buck2_shims_meta//platforms:<name>
+# (shim/modes/* does this). The default, prelude//platforms:default, stays local.
+[
+    hermit_execution_platforms(
+        name = mode,
+        cpu_configuration = "prelude//cpu:x86_64",
+        mode = mode,
+        os_configuration = "prelude//os:linux",
+        use_case = read_root_config("hermit", "re_use_case", "buck2-default"),
+        visibility = ["PUBLIC"],
+    )
+    for mode in ["local", "local-cache", "hybrid", "remote"]
+]
