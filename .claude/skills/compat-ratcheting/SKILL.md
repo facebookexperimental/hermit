@@ -141,12 +141,11 @@ bug in Detcore's shared logic hits every backend and gets one Detcore fix.
   "Linux semantics live in Detcore or in Hermit-independent crates that
   Detcore uses, never in a backend." A backend-specific fix is only for
   genuine backend mechanism.
-- Behaviour Hermit models is written once, in Detcore or a crate it uses
-  (principle 3). Kernel
-  behaviour that a backend's injected syscalls reach belongs to the Linux
-  provider under `Guest::inject`: the host kernel for ptrace and the in-guest
-  backends, `reverie-linuxemu` for KVM (principle 2). It never goes in a
-  backend crate.
+- Behaviour Hermit models is written once, in Detcore or a Hermit-independent
+  crate it uses (principle 3). Kernel behaviour that a backend's injected
+  syscalls reach belongs to the Linux provider under `Guest::inject`: the host
+  kernel for ptrace and the in-guest backends, `reverie-linuxemu` for KVM
+  (principle 2). It never goes in a backend crate.
 - A feature a backend does not support never reaches the guest as a silent
   `ENOSYS` or other plausible errno: the backend records Reverie's
   `UnsupportedRefusal` with the errno it returns, and the run stops naming it
