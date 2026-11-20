@@ -2590,14 +2590,14 @@ fn buck_s0_cargo_refusal_check(tag: &str) -> String {
 /// cells) beside the preflight, waiting for the preflight before any cell;
 /// gate.manifest_s0, which refuses if any node ran cargo and runs the staged
 /// Buck-built harness's `validate --without-footprint-check`
-/// ([`BUCK_GATE_VALIDATE`]) in place of gate.manifest; and one import twin per
+/// (`BUCK_GATE_VALIDATE`) in place of gate.manifest; and one import twin per
 /// (lane, category) of the subset,
 /// cloned from the committed `<bucket>_buck` twin with the staged Buck-built
 /// harness and the plan's other backends excluded, so each twin selects exactly
 /// the subset's cells of its bucket and writes that bucket's result files,
 /// recording its exit status; and gate.no_cargo_s0, which waits for every
 /// twin's record and then refuses if any node ran cargo, so its verdict exists
-/// even when a twin fails ([`buck_no_cargo_wait_then_check`]).
+/// even when a twin fails (`buck_no_cargo_wait_then_check`).
 /// Every other node is left out. Every node runs with the refusing cargo shim
 /// first on its PATH (`BUCK_S0_NO_CARGO_PATH`).
 ///

@@ -1370,7 +1370,7 @@ enum FootprintCheck {
     /// The full gate.manifest: run target/debug/generate-test-footprints --check.
     Run,
     /// `--without-footprint-check`, the Buck-only gate's mode (scripts/validate.rs
-    /// --buck-<name>, gate.manifest_<name>): that generator runs `cargo metadata`,
+    /// `--buck-<name>`, `gate.manifest_<name>`): that generator runs `cargo metadata`,
     /// which the Buck-only run's refusing cargo shim would refuse, so the check
     /// is named NOT RUN on stdout and in the PASS line, never skipped silently.
     NotRun,
