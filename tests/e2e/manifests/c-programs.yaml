@@ -1522,8 +1522,9 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  # Power/weight 2026-11-20 @ Hermit 7b5809a84133, ptrace chaos/verify,
-  # devbig014 (316-core host): ELEMENTS 65536 -> 16384 and a yield every
+  # Power/weight 2026-11-20 @ Hermit 7b5809a84133, ptrace chaos/verify, on
+  # the host recorded in docs/TESTING_ENVIRONMENTS.md ("Named measurement
+  # hosts"): ELEMENTS 65536 -> 16384 and a yield every
   # 256 -> every 64 iterations, keeping 256 sched_yield points. Validate
   # profile Hermit: chaos wall/CPU 37.975s/28.40s before (one sample)
   # -> 28.349s/19.85s after (median of 3; about 1.43x CPU); chaos
