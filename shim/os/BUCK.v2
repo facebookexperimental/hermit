@@ -1,0 +1,44 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+config_setting(
+    name = "linux-fedora",
+    constraint_values = [
+        "prelude//os/constraints:os[linux]",
+        "//os/linux/distro/constraints:distro[fedora]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "linux-ubuntu",
+    constraint_values = [
+        "prelude//os/constraints:os[linux]",
+        "//os/linux/distro/constraints:distro[ubuntu]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+# Internal BUCK files name this as ovr_config//os:linux-x86_64. Here the
+# ovr_config cell is the prelude, whose os package has linux-arm64 but no
+# linux-x86_64, so shims.bzl maps that label to this one.
+config_setting(
+    name = "linux-x86_64",
+    constraint_values = [
+        "prelude//cpu/constraints:x86_64",
+        "prelude//os/constraints:os[linux]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "macos-homebrew",
+    constraint_values = [
+        "prelude//os/constraints:os[macos]",
+    ],
+    visibility = ["PUBLIC"],
+)
