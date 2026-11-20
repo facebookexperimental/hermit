@@ -2187,8 +2187,7 @@ pub(crate) mod tests {
             "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)";
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("probe.json");
-        let (result, ran, warnings) =
-            probe_through_cache(Some(&path), 0x2e7, Err(COVERAGE.into()));
+        let (result, ran, warnings) = probe_through_cache(Some(&path), 0x2e7, Err(COVERAGE.into()));
         assert_eq!(result, Err(COVERAGE.into()));
         assert!(ran);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -2221,8 +2220,7 @@ pub(crate) mod tests {
             let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Err(cached.into()));
             assert_eq!(result, Err(cached.into()), "{cached}");
             assert!(ran, "{cached}");
-            let (result, ran, _) =
-                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
             assert_eq!(result, Err(cached.into()), "{cached}: second admission");
             assert!(!ran, "{cached}: second admission re-measured");
         }
@@ -2238,13 +2236,15 @@ pub(crate) mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("probe.json");
-            let (result, ran, _) =
-                probe_through_cache(Some(&path), 0x2e7, Err(transient.into()));
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Err(transient.into()));
             assert_eq!(result, Err(transient.into()), "{transient}");
             assert!(ran, "{transient}");
-            let (result, ran, _) =
-                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
-            assert_eq!(result, Ok(probe_report(0x2e7)), "{transient}: second admission");
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert_eq!(
+                result,
+                Ok(probe_report(0x2e7)),
+                "{transient}: second admission"
+            );
             assert!(ran, "{transient}: second admission did not measure");
         }
     }
@@ -2271,8 +2271,7 @@ pub(crate) mod tests {
                 &probe_cache_inputs(0x2e7),
                 &CachedProbeVerdict::Refused(stored.into()),
             );
-            let (result, ran, _) =
-                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
             assert_eq!(ran, want_ran, "{stored}");
             if want_ran {
                 assert_eq!(result, Ok(probe_report(0x2e7)), "{stored}");
