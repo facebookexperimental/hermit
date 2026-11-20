@@ -36,10 +36,18 @@ https://github.com/rrnewton/hermit/issues/4659.
    for KVM, on a swappable Linux provider behind a trait (host Linux, or an
    emulated-Linux crate). A backend crate never embeds Linux semantics itself.
    Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
-3. **Re-implemented Linux lives only in Detcore's shared layer.** Behaviour
-   Hermit must model rather than pass through (futexes, scheduling, signals,
-   `/proc`, pids, time) is written once in Detcore and is identical for every
-   backend.
+3. **Linux semantics live in Detcore or in Hermit-independent crates that
+   Detcore uses, never in a backend** (owner, 2026-11-19). Behaviour Hermit
+   must model rather than pass through (futexes, scheduling, signals,
+   `/proc`, pids, namespaces, mounts, time) is written once above the
+   backend, in Detcore or a Hermit-independent crate it uses, and is
+   identical for every backend. Kernel behaviour that an injected syscall
+   reaches belongs to the Linux provider under `Guest::inject` (2): the host
+   kernel, or LinuxEmu for KVM. A backend supplies mechanism only
+   (1, 4, 5), so a compatibility gap is fixed where the behaviour lives, in
+   that shared code or by making the provider agree with Linux, never by a
+   backend-specific semantic patch; a backend-specific fix is only for
+   genuine backend mechanism (the `compat-ratcheting` skill).
    Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
 4. **Detcore never branches on the backend.** Per-backend differences (task
    creation by fork, clone or vfork; exec; delivering a signal to a handler
