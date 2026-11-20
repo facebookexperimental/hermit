@@ -1,6 +1,6 @@
 ---
 name: validation-evidence
-description: "How to state a Hermit result: what counts as a backend, assurance levels L0 to L4 and the commands that establish them, the verify comparators, KVM L2 claims, and the backend, log level and relaxations every report names. Use before claiming that any Hermit run passes, is deterministic, or reaches a level, and when reviewing such a claim."
+description: "How to state a Hermit result: what counts as a backend, assurance levels L0 to L4 and the commands that establish them, the verify comparators, KVM L2 claims, what a validate run establishes, and the backend, log level and relaxations every report names. Use before claiming that any Hermit run passes, is deterministic, or reaches a level, and when reviewing such a claim."
 ---
 
 # Validation evidence
@@ -75,3 +75,36 @@ requires syscall output-buffer hashes) and names nonzero compared INFO-message
 counts. An unreadable or truncated comparison must refuse with
 `verdict: no_result` rather than report a match. A backend's capability is never
 evidence that a particular guest passed.
+
+## What a validate run establishes
+
+`validate.sh` runs `scripts/validate.rs`. Facts about it that bear on a claim
+(checked 2026-11-19):
+
+- **Commit anchoring.** Unless the gate is skipped (its skip flag, or an
+  off-the-record run), it refuses a working tree with unstaged or untracked
+  changes (exit 2). Staged-only changes run, but the record carries
+  `commit_anchored: false`, which earns neither the tree-keyed cache nor a
+  receipt. An off-the-record run
+  (`--allow-local-off-the-record-run`) writes no ledger row, publishes no
+  receipt and cannot be cited as validation evidence.
+- **Selective by default.** A bare run executes only the nodes affected since
+  the last green baseline, and falls back to the full label when no
+  trustworthy baseline exists (one that is not an ancestor of `HEAD` counts as
+  none) or selection fails. `--all` (`--full-run`) runs the complete suite and
+  is the landing form. A selective pass never answers a full cache lookup or
+  publishes a full receipt, even when it fell back to the full label.
+- **Caps.** Every node in `ci/dag/validate.json` carries both a CPU-time cap
+  and a wall cap, and a breach fails the run (except in nodes a level marks
+  nonblocking); `--run-timeout` bounds the whole invocation. Success,
+  failure, refusal, timeout and interruption all print a wall and CPU summary
+  line.
+- **No performance gate.** No performance baseline or timing-regression
+  threshold fails a run; `--envelope-compare FILE` compares working-envelope
+  counts and fails when one falls below the baseline. A green run says nothing
+  about performance (`benchmark`).
+- **E2E determinism goes through Hermit's verifier.** E2E manifest verify
+  cells use `--verify-strict` unless the cell declares `comparator: stripped`,
+  which is below L2 and recorded as a relaxation, so each cell's level comes
+  from its own report. Some Rust integration tests compare two runs' output
+  directly; that is an output-only comparison, below L2.

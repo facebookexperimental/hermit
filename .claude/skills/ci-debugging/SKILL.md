@@ -27,15 +27,16 @@ tests or incomplete declared coverage is a no-result.
 
 ## Reproduce only the failing node
 
-The portable and privileged lanes are DAGs under `ci/dag/`. Each `group.job`
+The portable and privileged lanes are labels in the one DAG
+`ci/dag/validate.json`. Each `group.job`
 tag names one independently runnable command. Use the receipt or DAG-runner log
 to identify the failing tag, build prerequisites once, and then iterate only on
 that tag:
 
 ```bash
-./scripts/validate.rs --only portable test.sabre_examples
-ci/run-node.sh portable test.sabre_examples
-ci/run-node.sh portable e2e.manifest_backend_parity_c,test.dbt_parity
+./scripts/validate.rs --only portable test.cli
+ci/run-node.sh portable test.cli_on_host
+ci/run-node.sh portable e2e.manifest_c_programs_on_host,test.regular_crates_on_host
 ```
 
 Prefer `scripts/validate.rs --only` as the user-facing entrypoint. `ci/run-node.sh` is
