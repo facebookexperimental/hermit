@@ -6,7 +6,10 @@
 //! `hermit run --verify-run` processes started under it adopts one sealed
 //! input set, and each run reads the frozen stdin from its start.
 
+use std::ffi::CString;
 use std::fs;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
@@ -169,6 +172,33 @@ fn a_verify_run_binds_the_ld_so_cache_its_holder_sealed() {
     );
 }
 
+/// How a run refuses an unsealed regular file at `path` in place of a sealed
+/// object. Outside tmpfs, Linux answers F_GET_SEALS on it with EINVAL
+/// (mm/memfd.c `memfd_get_seals`). A tmpfs inode that memfd_create did not
+/// make starts with F_SEAL_SEAL and can take no other seal (mm/shmem.c
+/// `__shmem_get_inode`), so there F_GET_SEALS reports exactly 0x1 and the run
+/// refuses those seals instead.
+fn substituted_refusal(path: &Path) -> &'static str {
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut filesystem = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `name` is NUL-terminated and statfs fills `filesystem` before
+    // it is read.
+    let status = unsafe { libc::statfs(name.as_ptr(), filesystem.as_mut_ptr()) };
+    assert_eq!(
+        status,
+        0,
+        "statfs {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: statfs returned 0, so it filled `filesystem`.
+    if unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC {
+        "has seals 0x1, not the sealed 0xf"
+    } else {
+        "is not a sealed object"
+    }
+}
+
 #[test]
 fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
     let _guard = hermit_run_guard();
@@ -191,7 +221,7 @@ fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
             "substituted",
             // The same bytes from an unsealed file are not the sealed object.
             &format!("eval \"exec $fd<{}\"", other.display()) as &str,
-            "is not a sealed object",
+            substituted_refusal(&other),
         ),
         (
             "unsealed manifest",
@@ -213,7 +243,7 @@ fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
         );
         assert!(
             stderr(&output).contains(expected),
-            "{label}: {}",
+            "{label}: expected {expected:?}: {}",
             stderr(&output)
         );
         assert!(
