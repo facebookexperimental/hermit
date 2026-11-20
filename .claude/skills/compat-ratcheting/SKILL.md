@@ -84,11 +84,9 @@ a result is in `validation-evidence`.
   file." Edit only the manifest mode (enable the backend, set its `ci` true,
   drop its disabled reason), run `ci/sync-cell-config.sh`, and commit the
   manifest with every file it rewrites. The diff of
-  `ci/expected-e2e-plan.json` is the record; `ci/sync-cell-config.sh --check`
-  and validation refuse drift. The script does not update the exact
-  population pin in `scripts/validate.rs`, a known defect: until it is
-  replaced, a flip that changes that population updates it in the same
-  change.
+  `ci/required-e2e-cells.txt` (every required cell, on every execution owner)
+  is the record; `ci/sync-cell-config.sh --check` and validation refuse
+  drift.
 - **Measure before promoting.** Measure an applicable cell the plan does not
   list with `ci/compat-envelope/pressure-test.rs run --test <test> --mode
   <mode> --backend <backend>` (or `test-harness run --include-manual`), and a
