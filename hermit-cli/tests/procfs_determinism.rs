@@ -282,6 +282,219 @@ fn assert_absent(path: &str) {
     }
 }
 
+/// How many times each batched read below launches Hermit. Two launches
+/// keep determinism a pairwise byte-for-byte comparison; RUNS still
+/// governs every single-file read in this file.
+const BATCHED_RUNS: usize = 2;
+
+/// One file's outcome in a batched read: the `cat` exit status the guest
+/// shell reported for it and the bytes it printed.
+struct BatchedRead {
+    status: i64,
+    contents: Vec<u8>,
+}
+
+/// The `/bin/sh -c` script reading each of `paths` with `/bin/cat` in one
+/// guest, framing every file as an `@@FILE <index> <path>` line, the
+/// file's bytes, and an `@@EXIT <index> <status>` line carrying that
+/// `cat`'s own exit status, then an `@@END` line. The shell runs on
+/// after a failed `cat` and exits 0, so callers must check every
+/// `@@EXIT`, as the assertions below do. An absent-file batch
+/// (`merge_stderr`) folds each `cat`'s stderr into its frame so the
+/// ENOENT text is checked per file.
+fn batched_read_script(paths: &[&str], merge_stderr: bool) -> String {
+    let mut script = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        script += &format!(
+            "printf '@@FILE {index} %s\\n' '{path}'; /bin/cat '{path}'{}; printf '@@EXIT {index} %s\\n' \"$?\"; ",
+            if merge_stderr { " 2>&1" } else { "" }
+        );
+    }
+    script + "printf '@@END\\n'"
+}
+
+/// One Hermit launch running `script` in `/bin/sh`, with the flags
+/// `read_procfs_with` and `assert_absent` use; `standard_proc` adds the
+/// `--proc=standard` those helpers pass for STANDARD_LEVEL_FILES.
+fn run_batched_read(script: &str, standard_proc: bool) -> std::process::Output {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        // x86-64-v2 beside --no-virtualize-cpuid: see read_procfs_with.
+        "--no-virtualize-cpuid",
+        "--cpu-profile=x86-64-v2",
+        "--max-timeslice=disabled",
+    ]);
+    if standard_proc {
+        command.arg("--proc=standard");
+    }
+    command.args(["--", "/bin/sh", "-c", script]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "batched read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+/// Splits one batched read's stdout into each file's BatchedRead, in
+/// `paths` order. The framing must consume the whole output exactly: a
+/// missing, reordered or extra frame fails here rather than letting
+/// one file's bytes stand for another's. No framed file's contents
+/// contain a line starting `@@FILE`, `@@EXIT` or `@@END`; one that did
+/// would still fail, as the frames after it would not line up.
+fn parse_batched_reads(paths: &[&str], stdout: &[u8]) -> Vec<BatchedRead> {
+    let mut lines = stdout.split_inclusive(|byte| *byte == b'\n');
+    let mut reads = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let header = format!("@@FILE {index} {path}\n");
+        assert_eq!(
+            lines.next(),
+            Some(header.as_bytes()),
+            "batched read is missing the frame for {path}:\n{}",
+            String::from_utf8_lossy(stdout),
+        );
+        let exit_prefix = format!("@@EXIT {index} ");
+        let mut contents = Vec::new();
+        let status = loop {
+            let line = lines.next().unwrap_or_else(|| {
+                panic!(
+                    "batched read ended inside {path}:\n{}",
+                    String::from_utf8_lossy(stdout)
+                )
+            });
+            if line.starts_with(exit_prefix.as_bytes()) {
+                let text = std::str::from_utf8(line).expect("exit frame should be UTF-8");
+                break text
+                    .trim_end()
+                    .strip_prefix(exit_prefix.as_str())
+                    .and_then(|status| status.parse::<i64>().ok())
+                    .unwrap_or_else(|| panic!("unparseable exit frame {text:?} for {path}"));
+            }
+            contents.extend_from_slice(line);
+        };
+        reads.push(BatchedRead { status, contents });
+    }
+    assert_eq!(
+        lines.next(),
+        Some(&b"@@END\n"[..]),
+        "batched read is missing its end frame:\n{}",
+        String::from_utf8_lossy(stdout),
+    );
+    assert!(
+        lines.next().is_none(),
+        "batched read printed past its end frame:\n{}",
+        String::from_utf8_lossy(stdout),
+    );
+    reads
+}
+
+/// Every file in `paths` read in one guest: each `cat` succeeds, each
+/// file validates against its first launch's bytes, and each file
+/// reads byte-for-byte the same in the second launch. The batched form
+/// of `assert_deterministic` for files sharing one flag set
+/// (`standard_proc` batches run with `--proc=standard`).
+fn assert_batched_deterministic(
+    paths: &[&str],
+    standard_proc: bool,
+    validate: impl Fn(&str, &[u8]),
+) {
+    let _guard = hermit_run_lock();
+    let script = batched_read_script(paths, false);
+    let first = parse_batched_reads(paths, &run_batched_read(&script, standard_proc).stdout);
+    for (path, read) in paths.iter().zip(&first) {
+        assert_eq!(read.status, 0, "{path} could not be read in the batch");
+        assert!(
+            !read.contents.is_empty(),
+            "{path} unexpectedly returned no data"
+        );
+        validate(path, &read.contents);
+    }
+    for run in 2..=BATCHED_RUNS {
+        let again = parse_batched_reads(paths, &run_batched_read(&script, standard_proc).stdout);
+        for (path, (expected, read)) in paths.iter().zip(first.iter().zip(&again)) {
+            assert_eq!(read.status, 0, "{path} could not be read in the batch");
+            assert_eq!(
+                expected.contents,
+                read.contents,
+                "{path} differed between run 1 and run {run}\nrun 1: {}\nrun {run}: {}",
+                String::from_utf8_lossy(&expected.contents),
+                String::from_utf8_lossy(&read.contents),
+            );
+        }
+    }
+}
+
+/// `assert_batched_deterministic` with each file's exact bytes as its
+/// validation.
+fn assert_batched_exact(files: &[(&str, &[u8])], standard_proc: bool) {
+    let paths = files.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+    assert_batched_deterministic(&paths, standard_proc, |path, contents| {
+        let expected = files
+            .iter()
+            .find(|(candidate, _)| *candidate == path)
+            .map(|(_, expected)| *expected)
+            .expect("validated a file outside the batch");
+        assert_eq!(contents, expected, "{path}");
+    });
+}
+
+/// No file in `paths` exists for the guest, in either launch: the
+/// batched form of `assert_absent`. Each `cat` fails with ENOENT's text
+/// in its own frame, and the two launches agree per file.
+fn assert_batched_absent(paths: &[&str]) {
+    let _guard = hermit_run_lock();
+    let script = batched_read_script(paths, true);
+    let mut first: Option<Vec<BatchedRead>> = None;
+    for run in 1..=BATCHED_RUNS {
+        let reads = parse_batched_reads(paths, &run_batched_read(&script, false).stdout);
+        for (path, read) in paths.iter().zip(&reads) {
+            assert_ne!(read.status, 0, "run {run}: {path} read succeeded");
+            let text = String::from_utf8_lossy(&read.contents);
+            assert!(
+                text.contains("No such file or directory"),
+                "run {run}: {path} did not fail with ENOENT:\n{text}"
+            );
+        }
+        if let Some(first) = &first {
+            for (path, (expected, read)) in paths.iter().zip(first.iter().zip(&reads)) {
+                assert_eq!(expected.status, read.status, "{path}");
+                assert_eq!(expected.contents, read.contents, "{path}");
+            }
+        } else {
+            first = Some(reads);
+        }
+    }
+}
+
+/// One CPU's interrupt table (`/proc/interrupts`, `/proc/softirqs`): a
+/// `CPU0` header and one zero counter per row, at the kernel's
+/// `" %10u"` width.
+fn assert_one_cpu_interrupt_table(path: &str, contents: &[u8]) {
+    let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
+    let header = text.lines().next().expect("interrupt table has a header");
+    assert_eq!(
+        header.split_whitespace().collect::<Vec<_>>(),
+        ["CPU0"],
+        "{path}"
+    );
+    for row in text.lines().skip(1) {
+        let (_, counters) = row.split_once(':').expect("interrupt row has a label");
+        assert!(counters.starts_with("          0"), "{path}: {row}");
+        assert!(
+            !counters[11..].starts_with(char::is_numeric),
+            "{path}: {row}"
+        );
+    }
+}
+
 fn first_hwmon_input() -> Option<PathBuf> {
     let mut hwmon_dirs = fs::read_dir("/sys/class/hwmon")
         .ok()?
@@ -778,43 +991,46 @@ fn proc_cpuinfo_is_deterministic() {
 
 #[test]
 fn sys_cpu_lists_report_one_virtual_cpu() {
-    for path in [
-        "/sys/devices/system/cpu/online",
-        "/sys/devices/system/cpu/possible",
-        "/sys/devices/system/cpu/present",
-        "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
-        "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
-        "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_list",
-    ] {
-        assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
-    }
-    assert_deterministic(
-        "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
-        |contents| assert_eq!(contents, b"1\n"),
+    // Batched by flag set, two launches each: the CPU-list and mask
+    // files at the default /proc level, then the interrupt tables,
+    // which only the standard level has, with --proc=standard as
+    // before. The tables' counts are fixed at 0 for the one virtual
+    // CPU, so reading another file first in the same guest cannot move
+    // them.
+    assert_batched_exact(
+        &[
+            ("/sys/devices/system/cpu/online", b"0\n"),
+            ("/sys/devices/system/cpu/possible", b"0\n"),
+            ("/sys/devices/system/cpu/present", b"0\n"),
+            (
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+                b"0\n",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
+                b"0\n",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_list",
+                b"0\n",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+                b"1\n",
+            ),
+        ],
+        false,
+    );
+    assert_batched_deterministic(
+        &["/proc/interrupts", "/proc/softirqs"],
+        true,
+        assert_one_cpu_interrupt_table,
     );
     // The node directory's lists and masks are gone with the directory.
-    assert_absent("/sys/devices/system/node/node0/cpulist");
-    assert_absent("/sys/devices/system/node/node0/cpumap");
-    for path in ["/proc/interrupts", "/proc/softirqs"] {
-        assert_deterministic(path, |contents| {
-            let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
-            let header = text.lines().next().expect("interrupt table has a header");
-            assert_eq!(
-                header.split_whitespace().collect::<Vec<_>>(),
-                ["CPU0"],
-                "{path}"
-            );
-            // One counter per row, at the kernel's `" %10u"` width.
-            for row in text.lines().skip(1) {
-                let (_, counters) = row.split_once(':').expect("interrupt row has a label");
-                assert!(counters.starts_with("          0"), "{path}: {row}");
-                assert!(
-                    !counters[11..].starts_with(char::is_numeric),
-                    "{path}: {row}"
-                );
-            }
-        });
-    }
+    assert_batched_absent(&[
+        "/sys/devices/system/node/node0/cpulist",
+        "/sys/devices/system/node/node0/cpumap",
+    ]);
 }
 
 /// The CPU files that are numbers or flags describe one CPU, as on such a
@@ -827,6 +1043,7 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
 /// as the guest cannot open it either.
 #[test]
 fn sys_cpu_numbers_describe_one_cpu_and_no_node() {
+    let mut files = Vec::new();
     for (path, expected) in [
         ("/sys/devices/system/cpu/kernel_max", &b"127\n"[..]),
         ("/sys/devices/system/cpu/enabled", b"0\n"),
@@ -844,9 +1061,12 @@ fn sys_cpu_numbers_describe_one_cpu_and_no_node() {
             eprintln!("skipping {path}: the host kernel does not have it");
             continue;
         }
-        assert_deterministic(path, |contents| assert_eq!(contents, expected, "{path}"));
+        files.push((path, expected));
     }
-    for path in [
+    if !files.is_empty() {
+        assert_batched_exact(&files, false);
+    }
+    assert_batched_absent(&[
         "/sys/devices/system/node/online",
         "/sys/devices/system/node/possible",
         "/sys/devices/system/node/has_cpu",
@@ -854,9 +1074,7 @@ fn sys_cpu_numbers_describe_one_cpu_and_no_node() {
         "/sys/devices/system/node/has_normal_memory",
         "/sys/devices/system/node/has_generic_initiator",
         "/sys/devices/system/node/node0/distance",
-    ] {
-        assert_absent(path);
-    }
+    ]);
 }
 
 /// `nproc` asks `sched_getaffinity`; `getconf _NPROCESSORS_ONLN` asks glibc's
