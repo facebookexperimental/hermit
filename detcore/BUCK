@@ -1,4 +1,5 @@
 load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "run_gated_only")
+load("@fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags.bzl", "LITEINST_RUNTIME_FLAGS_CONSTRAINT", "LITEINST_RUNTIME_SELECT_RUSTC_FLAGS")
 load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_test")
@@ -55,6 +56,10 @@ rust_library(
     # detcore should be backend agnostic. However, it's okay to depend on
     # reverie-ptrace in tests.
     named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     # detcore virtualizes the x86 cpuid instruction (raw_cpuid crate and the
     # cpuid interception module are x86-64-only), so the hermit stack is
     # inherently x86; arm CI must skip it instead of failing rustc.

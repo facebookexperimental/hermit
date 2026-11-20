@@ -1,3 +1,4 @@
+load("@fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags.bzl", "LITEINST_RUNTIME_FLAGS_CONSTRAINT", "LITEINST_RUNTIME_SELECT_RUSTC_FLAGS")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
@@ -16,6 +17,10 @@ rust_library(
         },
     },
     named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    rustc_flags = select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     # x86-64 only until the aarch64 port's arch-aware syscall histogram
     # lands: src/syscall_histogram.rs labels every table
     # ARCHITECTURE = "x86_64", malformation() refuses any other architecture,

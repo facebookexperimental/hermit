@@ -3,6 +3,7 @@ load("@fbcode//hermetic_infra/hermit/fb-only:release.bzl", "HERMIT_REVERIE_PIN")
 load("@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl", "MEMBER_MANIFESTS")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests_data.bzl", "EXTERNAL_SRCS")
 load("@fbcode//hermetic_infra/hermit_import:excluded_paths.bzl", "excluded_paths_test")
+load("@fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags.bzl", "LITEINST_RUNTIME_FLAGS_CONSTRAINT", "LITEINST_RUNTIME_SELECT_RUSTC_FLAGS")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
@@ -131,7 +132,10 @@ rust_library(
     # `-bundle=gcc`: static libgcc, from which the `-u` linker flags above
     # extract __udivti3/__floatuntidf (in Cargo these come from
     # compiler_builtins); without it they bind libgcc_s.so.1 by version.
-    rustc_flags = ["-lstatic:-bundle=gcc_eh", "-lstatic:-bundle=gcc"],
+    rustc_flags = ["-lstatic:-bundle=gcc_eh", "-lstatic:-bundle=gcc"] + select({
+        "DEFAULT": [],
+        LITEINST_RUNTIME_FLAGS_CONSTRAINT: LITEINST_RUNTIME_SELECT_RUSTC_FLAGS,
+    }),
     target_compatible_with = [
         "ovr_config//cpu:x86_64",
         "ovr_config//os:linux",
