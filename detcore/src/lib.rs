@@ -6566,6 +6566,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             guest.tid(),
             detpid
         );
+        // Pairing for offline joins at every thread start: backend
+        // (Reverie) per-event lines carry guest tids and must not
+        // name dtids, so this one Detcore line joins them to this
+        // dtid. The guest ids are OS ids on ptrace, where the
+        // backend's per-event guest_tid is the OS tid; on KVM they
+        // are emulated guest-namespace ids, which is likewise the
+        // key its backend lines carry. A non-leader exec retargets
+        // the backend identity without a fresh thread start, so
+        // handle_post_exec re-emits this pairing there.
+        debug!(
+            "[detcore, dtid {}] thread registration: dtid={} guest_tid={} guest_pid={}",
+            new_dettid,
+            new_dettid,
+            guest.tid(),
+            guest.pid()
+        );
 
         // Delayed initialization of thread_state for this new thread:
         let thread_state = guest.thread_state_mut();
@@ -6724,6 +6740,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
+        // Re-emit the registration pairing under the identity the exec
+        // bound: a non-leader exec retargets the backend guest_tid to
+        // the leader's tid with no fresh thread start, so backend
+        // per-event lines after this point join to this dtid through
+        // this line, not the registration one.
+        // Re-read the dtid after binding: on a non-leader exec it is
+        // the leader identity now, not the pre-exec local captured
+        // above.
+        let dettid = guest.thread_state().dettid;
+        debug!(
+            "[detcore, dtid {}] thread registration after exec: dtid={} guest_tid={} guest_pid={}",
+            dettid,
+            dettid,
+            guest.tid(),
+            guest.pid()
+        );
         // A successful exec while a caught crash signal's handler runs takes
         // the post-crash switch (`crate::post_crash`).
         post_crash::note_exec(guest).await;
