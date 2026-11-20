@@ -82,8 +82,8 @@ elif grep -q ": reverie-procfs at buck2" <<<"$OUT"; then fail "reverie-procfs ba
 elif grep "^FLAGGED" <<<"$OUT" | grep -v "reverie-linuxemu-ext-procfs" \
     | grep -qv ": reverie-procfs at Cargo"; then
     fail "a flagged debt other than the KVM maps extension or Cargo-surface procfs: $OUT";
-elif ! grep -q ": reverie-procfs at Cargo" <<<"$OUT"; then
-    fail "real graph passed without Cargo-surface reverie-procfs flagged: $OUT";
+elif ! grep -q ": reverie-linuxemu-ext-procfs at Cargo" <<<"$OUT"; then
+    fail "real graph passed without the Cargo-surface procfs extension (reverie-linuxemu-ext-procfs, renamed from reverie-procfs) flagged: $OUT";
 elif { grep -q "buck2 deps closure" <<<"$OUT" \
     || grep -q "Buck closure via buck2 uquery" <<<"$OUT"; } \
     && ! grep -q "^FLAGGED.*reverie-linuxemu-ext-procfs" <<<"$OUT"; then
@@ -158,8 +158,8 @@ echo "twin 5b: today's real graph refuses after the allow-until deadline"
 OUT=$("${CHECKER_CMD[@]}" --repo-root "$REPO_ROOT" \
     --today 2027-06-01 --skip-negative-control 2>&1); RC=$?
 if ((RC != 1)); then fail "real-graph expiry: rc=$RC (want 1): $OUT";
-elif ! grep -q "EXPIRED" <<<"$OUT" || ! grep -q ": reverie-procfs at Cargo" <<<"$OUT"; then
-    fail "real-graph expiry does not name Cargo-surface reverie-procfs EXPIRED: $OUT";
+elif ! grep -q "EXPIRED" <<<"$OUT" || ! grep -q ": reverie-linuxemu-ext-procfs at Cargo" <<<"$OUT"; then
+    fail "real-graph expiry does not name the Cargo-surface procfs extension (reverie-linuxemu-ext-procfs) EXPIRED: $OUT";
 elif grep -q "buck2 deps closure" <<<"$OUT" \
     && ! grep -q "reverie-linuxemu-ext-procfs .*EXPIRED" <<<"$OUT"; then
     fail "real-graph expiry judged the Buck closure without expiring the extension: $OUT";
