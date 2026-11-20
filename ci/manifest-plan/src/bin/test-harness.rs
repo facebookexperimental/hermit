@@ -27,6 +27,7 @@ use dagrun::TestAttemptOutcome;
 use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
+use hermit_manifest_plan::backend_order;
 use hermit_manifest_plan::bundle_record;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::imported_results;
@@ -253,6 +254,15 @@ this output.
 ci/sync-cell-config.sh runs this and then every generator downstream of it;
 run that rather than this alone.
 
+Before writing anything, both modes check the backend order over the union of
+every run type's required cells: a dbt, kvm or in-guest-trap cell needs the
+same test and mode required on ptrace by some run type (ptrace first), and a
+liteinst or sabre cell needs it required on in-guest-trap (the Subset rule).
+Each required cell without its prerequisite must be named, with its reason, in
+ci/backend-order-exceptions.json, and each exception there must name such a
+cell. Otherwise the run writes nothing and names every such cell and stale
+exception. It never changes a selection.
+
 Options:
   --check                          Exit 1 naming each stale file; write nothing
   --write                          Rewrite the stale files
@@ -261,7 +271,8 @@ Options:
   -h, --help                       Print this help
 
 Exit status: 0 when the files match (--check) or were written (--write), 1 when
---check finds a stale file, 2 for an unreadable input or a usage error.";
+--check finds a stale file or either mode finds the backend order broken, 2 for
+an unreadable input or a usage error.";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
@@ -1339,6 +1350,8 @@ fn main() -> ExitCode {
             audit_dag_correspondence(&root, &manifests).unwrap_or_else(|error| fail(error));
             audit_budget_ordering(&root).unwrap_or_else(|error| fail(error));
             audit_expected_plan(&root, &manifests);
+            // No validation DAG node runs audit-ci; validate is the gate.
+            audit_backend_order(&root, &manifests);
             ExitCode::SUCCESS
         }
         "build" => build(&root, &manifests, &args),
@@ -1424,6 +1437,7 @@ fn validate(
     let harness = std::env::current_exe().unwrap_or_else(|error| fail(error));
     audit_cli_brackets(root, &harness, tree).unwrap_or_else(|error| fail(error));
     let cells = audit_expected_plan(root, manifests);
+    audit_backend_order(root, manifests);
     // Byte for byte, so a hand edit that `sync-cells` would undo is refused
     // here rather than at the next flip.
     let synced = synced_cell_files(root).unwrap_or_else(|error| fail(error));
@@ -1841,6 +1855,17 @@ fn print_expected_plan(root: &Path, manifests: &ManifestSet) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The backend order (ptrace first, and the Subset rule for patcher
+/// backends) over the union of every run type's required cells, against
+/// ci/backend-order-exceptions.json: prints the one-line summary naming every
+/// excepted cell, or fails naming every cell without its prerequisite and
+/// every stale exception.
+fn audit_backend_order(root: &Path, manifests: &ManifestSet) {
+    let excepted =
+        backend_order::check_checkout(root, manifests).unwrap_or_else(|error| fail(error));
+    println!("{}", backend_order::summary(&excepted));
+}
+
 fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     let (cell_count, actual) = required_plan_rows(manifests);
     let expected: serde_json::Value =
@@ -1948,6 +1973,18 @@ fn sync_cells(values: &[String]) -> ExitCode {
         fail("sync-cells needs --check or --write; see `test-harness sync-cells --help`")
     };
     let root = root(repo_root.as_deref());
+    // Refuse before writing, so a plan that breaks the order is never
+    // regenerated without its decision: a selected prerequisite, a deselected
+    // cell, or a named exception.
+    let manifests = ManifestSet::load(&root)
+        .unwrap_or_else(|error| fail(format!("sync-cells: {error}; nothing was written")));
+    match backend_order::check_checkout(&root, &manifests) {
+        Ok(excepted) => println!("sync-cells: {}", backend_order::summary(&excepted)),
+        Err(error) => {
+            eprintln!("sync-cells: {error}\nsync-cells: nothing was written");
+            return ExitCode::FAILURE;
+        }
+    }
     let files = synced_cell_files(&root)
         .unwrap_or_else(|error| fail(format!("sync-cells: {error}; nothing was written")));
     let stale = stale_files(&root, &files);
@@ -15101,6 +15138,56 @@ sys.exit(1 if refused else 0)
         assert_eq!(
             fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap(),
             committed
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `sync-cells --write` checks the backend order before it writes: with
+    /// no exceptions, the committed selection's cells without their
+    /// prerequisite refuse the run, and the stale plan stays as it was. With
+    /// the committed exceptions the same run rewrites the plan.
+    #[test]
+    fn sync_cells_refuses_a_broken_backend_order_and_writes_nothing() {
+        let root = sync_cells_fixture("order");
+        let plan_path = root.join(super::EXPECTED_PLAN_PATH);
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+        plan["cells"].as_array_mut().unwrap().pop();
+        let stale = serde_json::to_string_pretty(&plan).unwrap() + "\n";
+        fs::write(&plan_path, &stale).unwrap();
+        let exceptions = root.join(hermit_manifest_plan::backend_order::EXCEPTIONS_PATH);
+        let committed = fs::read_to_string(&exceptions).unwrap();
+        // The fixture links ci/ entries to the checkout: replace the link, not
+        // the checkout's file.
+        fs::remove_file(&exceptions).unwrap();
+        fs::write(
+            &exceptions,
+            r#"{"schema": 1, "about": "none", "exceptions": []}"#,
+        )
+        .unwrap();
+        let args = |mode: &str| {
+            vec![
+                mode.to_string(),
+                "--repo-root".to_string(),
+                root.to_str().unwrap().to_string(),
+            ]
+        };
+        let failure = format!("{:?}", std::process::ExitCode::FAILURE);
+        assert_eq!(
+            format!("{:?}", super::sync_cells(&args("--write"))),
+            failure
+        );
+        assert_eq!(fs::read_to_string(&plan_path).unwrap(), stale);
+
+        fs::write(&exceptions, committed).unwrap();
+        assert_eq!(
+            format!("{:?}", super::sync_cells(&args("--write"))),
+            format!("{:?}", std::process::ExitCode::SUCCESS)
+        );
+        assert_ne!(fs::read_to_string(&plan_path).unwrap(), stale);
+        assert_eq!(
+            format!("{:?}", super::sync_cells(&args("--check"))),
+            format!("{:?}", std::process::ExitCode::SUCCESS)
         );
         fs::remove_dir_all(&root).unwrap();
     }

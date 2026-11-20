@@ -122,6 +122,11 @@ fn validate_without_footprint_check_runs_and_counts_every_other_audit() {
         "{brackets}"
     );
     assert!(number_before(brackets, " cells") > 0, "{brackets}");
+    let (order_at, order) = line(&stdout, "backend order: ");
+    assert!(
+        order.contains(" exception(s) in ci/backend-order-exceptions.json"),
+        "{order}"
+    );
     let (pass_at, pass) = line(&stdout, "PASS (generated test-footprint check NOT RUN): ");
     assert!(number_before(pass, " YAML manifests") > 0, "{pass}");
     assert!(number_before(pass, " required cells") > 0, "{pass}");
@@ -131,10 +136,28 @@ fn validate_without_footprint_check_runs_and_counts_every_other_audit() {
             && budget_at < stress_at
             && stress_at < not_run_at
             && not_run_at < brackets_at
-            && brackets_at < pass_at,
+            && brackets_at < order_at
+            && order_at < pass_at,
         "{stdout}"
     );
     assert!(!stdout.contains("\nPASS: "), "{stdout}");
+}
+
+/// `audit-ci` runs the backend-order check too. No validation DAG node runs
+/// `audit-ci`, so this test is what keeps its claim true.
+#[test]
+fn audit_ci_runs_the_backend_order_check() {
+    let root = repo_root();
+    let root_arg = root.to_str().expect("a UTF-8 checkout path");
+    let output = harness(&root, &["audit-ci", "--repo-root", root_arg]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    let (_, order) = line(&stdout, "backend order: ");
+    assert!(
+        order.contains(" exception(s) in ci/backend-order-exceptions.json"),
+        "{order}"
+    );
 }
 
 #[test]

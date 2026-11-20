@@ -55,6 +55,18 @@ every non-naked mode partitions the complete `ptrace`, `dbt`, `kvm`, `sabre`,
 include ptrace so the reference behavior is established before another backend
 ratchets it.
 
+Selection keeps that order. The check covers the union of every run type's
+required cells, for every execution owner: full validation's and those of the
+focused run types, such as `super`, `sabre-compat-only` and `archived-nightly`.
+A `dbt`, `kvm` or `in-guest-trap` cell that some run type requires needs the
+same test and mode required on ptrace by some run type. A `liteinst` or
+`sabre` cell needs it required on `in-guest-trap` (the Subset rule in
+`docs/ARCHITECTURE.md`). `test-harness validate` and `sync-cells` fail, naming
+the cell and its missing prerequisite, unless `ci/backend-order-exceptions.json`
+names that cell with the reason it stays selected. They also fail on an
+exception that no longer names such a cell. `test-harness audit-ci` runs the
+same check, but no validation DAG node runs `audit-ci`.
+
 `ci/matrix-symmetry-baseline.json` records the small amount of older policy
 debt: ptrace-less manifest rows and guest fixtures owned by a driver for one
 backend or for e9patch preprocessing. `hermit-manifest-plan` requires that

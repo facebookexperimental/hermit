@@ -213,7 +213,11 @@ per-backend results is paused until that is consolidated. The target layout:
   through Detcore's protected tool-output socket and report dispatch counts
   through `BackendStatsSource` and `DispatchStats`.
 - **Subset rule.** A result may be enabled or credited for a patcher backend
-  only if the same test and mode pass on in-guest-trap.
+  only if the same test and mode pass on in-guest-trap. Validation refuses a
+  patcher cell that some run type requires when no run type requires its
+  in-guest-trap cell, unless `ci/backend-order-exceptions.json` names it with
+  its reason (`tests/e2e/manifests/README.md`, "Matrix symmetry and the test
+  front door").
 
 ## Startup and lifetime
 

@@ -47,6 +47,7 @@ pub fn compiled_manifest_dir_from(cargo_manifest_dir: Option<&str>) -> std::path
 }
 
 pub mod archived;
+pub mod backend_order;
 pub mod bundle_record;
 #[cfg_attr(not(buck_build), path = "../../../hermit-cli/src/canonical_verdict.rs")]
 #[cfg_attr(buck_build, path = "../mapped/hermit-cli/canonical_verdict.rs")]

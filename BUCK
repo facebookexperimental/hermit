@@ -532,6 +532,8 @@ buck_filegroup(
             # determinism-stress/example-race runs it directly and
             # thread-output's fixture execs it by relative path.
             "examples/race.sh",
+            # test-harness validate checks the backend order against it.
+            "ci/backend-order-exceptions.json",
             "ci/ci-reason-baseline.json",
             "ci/execution-owners.json",
             "ci/expected-e2e-plan.json",

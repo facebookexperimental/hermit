@@ -1,0 +1,174 @@
+{
+  "schema": 1,
+  "about": "Cells that some run type requires (ci: true) although no run type requires the same test and mode on the backend the backend order puts first: ptrace for dbt, kvm and in-guest-trap (ptrace first, tests/e2e/manifests/README.md), in-guest-trap for liteinst and sabre (the Subset rule, docs/ARCHITECTURE.md). The population is the union of every run type's required cells, for every execution owner: full validation's (ci/expected-e2e-plan.json) and those of the focused run types, such as super, sabre-compat-only and archived-nightly. Each entry is a known exception with its reason, kept visible until the prerequisite cell is selected or the cell is deselected. test-harness validate and sync-cells fail on any such cell this list does not name and on any entry that names no such cell, and so does test-harness audit-ci, which no validation DAG node runs (ci/manifest-plan/src/backend_order.rs).",
+  "exceptions": [
+    {
+      "test": "bin-c/posix-timer-test",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/child-subreaper-refusal",
+      "mode": "verify",
+      "backend": "dbt",
+      "prerequisite": "ptrace",
+      "reason": "A refusal test: it asserts that a backend refuses the subreaper prctls with ENOSYS. ptrace supports them (Detcore's wait model re-parents orphans there), so its cell is disabled and c-programs/child-subreaper-support asserts the support instead. The test is already recorded as ptrace front-door debt in ci/matrix-symmetry-baseline.json."
+    },
+    {
+      "test": "c-programs/child-subreaper-refusal",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "prerequisite": "ptrace",
+      "reason": "A refusal test: it asserts that a backend refuses the subreaper prctls with ENOSYS. ptrace supports them (Detcore's wait model re-parents orphans there), so its cell is disabled and c-programs/child-subreaper-support asserts the support instead. The test is already recorded as ptrace front-door debt in ci/matrix-symmetry-baseline.json."
+    },
+    {
+      "test": "c-programs/dbt-exec-failure",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/dbt-self-sigqueue",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/dbt-wait-lifecycle",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/hello-alarm",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/hello-signals",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/inotify-protection-key-fault",
+      "mode": "custom",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe custom cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap custom cell is disabled: the in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)."
+    },
+    {
+      "test": "c-programs/inotify-protection-key-fault",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled: the in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)."
+    },
+    {
+      "test": "c-programs/periodic-setitimer-delivery",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/setitimer-determinism",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/sigaction-state",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/sigaltstack-state",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/signal-disposition",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "c-programs/sigpipe-siginfo",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled under the owner directive of 2026-10-02: in-guest-trap is scored as its own column, apart from liteinst, and its verify cells return only through their own track (step C4 of https://github.com/rrnewton/hermit/issues/3520); this test's cell has not returned."
+    },
+    {
+      "test": "compat/logger",
+      "mode": "verify",
+      "backend": "kvm",
+      "prerequisite": "ptrace",
+      "reason": "The ptrace verify cell is unselected as crash-error (tests/e2e/manifests/compat.yaml, `unselected`, re-measured 2026-11-06 in the pinned root): logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1, because the pinned root has no journal socket. The KVM cell passes because KVM's guest provides that socket, so the two backends do not see the same inputs and the ptrace reference is not established. The fix is a /dev/log stub in the pinned root or a reworked argv, tracked by the evidence that manifest entry links."
+    },
+    {
+      "test": "compat/mpstat-softirqs",
+      "mode": "verify",
+      "backend": "liteinst",
+      "prerequisite": "in-guest-trap",
+      "reason": "The in-guest-trap verify cell is disabled: its first run in the second local survey of 2026-10-08 (release Hermit 81f3e50d) was refused because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745). The selected liteinst cell runs with REVERIE_LITEINST_SITE_PATCHING=0 and REVERIE_LITEINST_SIGALRM_HANDLERS=1 (compat.yaml, the liteinst entry's row_env): site patching off, which is the in-guest-trap configuration, plus the in-guest SIGALRM handler path. The in-guest-trap cell has not been measured with that handler path; selecting it needs 10 of 10 verify runs on a host with CPUID faulting."
+    },
+    {
+      "test": "compat/mpstat-softirqs",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the sabre-compat-only run type (tests/e2e/manifests/compat.yaml, `focused`). The in-guest-trap verify cell is disabled: its first run in the second local survey of 2026-10-08 (release Hermit 81f3e50d) was refused because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)."
+    },
+    {
+      "test": "compat/pidstat-disk",
+      "mode": "verify",
+      "backend": "liteinst",
+      "prerequisite": "in-guest-trap",
+      "reason": "The in-guest-trap verify cell is disabled: its first run in the second local survey of 2026-10-08 (release Hermit 81f3e50d) was refused because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745). The selected liteinst cell runs with REVERIE_LITEINST_SITE_PATCHING=0 and REVERIE_LITEINST_SIGALRM_HANDLERS=1 (compat.yaml, the liteinst entry's row_env): site patching off, which is the in-guest-trap configuration, plus the in-guest SIGALRM handler path. The in-guest-trap cell has not been measured with that handler path; selecting it needs 10 of 10 verify runs on a host with CPUID faulting."
+    },
+    {
+      "test": "compat/pidstat-disk",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the sabre-compat-only run type (tests/e2e/manifests/compat.yaml, `focused`). The in-guest-trap verify cell is disabled: its first run in the second local survey of 2026-10-08 (release Hermit 81f3e50d) was refused because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)."
+    },
+    {
+      "test": "compat/python3",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the sabre-compat-only run type (tests/e2e/manifests/compat.yaml, `focused`). The in-guest-trap verify cell is kept off by coordinator ruling: it diverged in 1 of 10 runs before the in-guest start-up heap-layout fix, and the second local survey of 2026-10-08, at the fixed tree 81f3e50d, passed 10 of 10 (https://github.com/rrnewton/hermit/issues/3745)."
+    },
+    {
+      "test": "compat/ruby",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the sabre-compat-only run type (tests/e2e/manifests/compat.yaml, `focused`). The in-guest-trap verify cell is disabled: its first run in the second local survey of 2026-10-08 (release Hermit 81f3e50d) was refused because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)."
+    },
+    {
+      "test": "system-utils/startup-tls-guards",
+      "mode": "verify",
+      "backend": "sabre",
+      "prerequisite": "in-guest-trap",
+      "reason": "The SaBRe verify cell is required by the archived-nightly run type, the run type of the archived SaBRe backend's cells (ci/manifest-plan/src/archived.rs). The in-guest-trap verify cell is disabled: glibc copies the kernel's AT_RANDOM into the TLS stack canary and pointer guard in the loader window before the in-guest runtime starts, so STACK_CANARY and POINTER_GUARD differ between runs; it closes when the root launch goes through the launcher."
+    }
+  ]
+}
