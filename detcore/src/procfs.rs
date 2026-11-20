@@ -10524,6 +10524,33 @@ THPeligible:    0\n"
     }
 
     #[test]
+    fn fdinfo_rendered_directory_spelling_sanitizes() {
+        // The contents `initialize_procfs_snapshot` fabricates for a
+        // rendered directory target (a procfs directory opened as a
+        // placeholder): flags must use the kernel's %#o minimum "00",
+        // never a lone "0", or the strict fdinfo grammar refuses the
+        // read one syscall later (bad number at the flags token).
+        let fabricated = b"pos:\t3\nflags:\t00\nmnt_id:\t1\nino:\t0\n";
+        assert_eq!(
+            sanitize_fdinfo(fabricated, Some((9000, 0o200000, 42, 1))),
+            b"pos:\t3\nflags:\t0200000\nmnt_id:\t1\nino:\t9000\n"
+        );
+    }
+
+    #[test]
+    fn fdinfo_placeholder_directory_spelling_sanitizes() {
+        // The exact bytes `placeholder_fdinfo` fabricates for a described
+        // directory, with the mount ID substituted: flags in the kernel's
+        // %#o minimum "00" spelling, never a lone "0", which the strict
+        // fdinfo grammar refuses at the flags token.
+        let fabricated = b"pos:\t0\nflags:\t00\nmnt_id:\t1\nino:\t0\n";
+        assert_eq!(
+            sanitize_fdinfo(fabricated, Some((9000, 0o200000, 42, 1))),
+            b"pos:\t0\nflags:\t0200000\nmnt_id:\t1\nino:\t9000\n"
+        );
+    }
+
+    #[test]
     fn fdinfo_mount_ids_match_distinct_mountinfo_rows_and_repeat() {
         let mountinfo = b"37 29 8:1 / / rw - ext4 /dev/a rw\n\
 48 37 0:22 / /proc rw - proc proc rw\n";
