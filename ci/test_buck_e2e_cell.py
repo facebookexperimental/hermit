@@ -60,6 +60,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -2359,9 +2360,10 @@ class InGuestRouteTest(unittest.TestCase):
     def test_every_in_guest_cell_runs_locally_under_every_config(self) -> None:
         # ParityRouteTest.CONFIGS leaves cpuid_on_re at its default (off), which is
         # the scope of this all-local assertion; CpuidOnReRouteTest covers the
-        # switch on. With the switch on but pmu_on_re off or routing local, every
-        # in-guest cell still runs locally, so those configs are in scope here too.
-        for routing in ParityRouteTest.CONFIGS + (("hybrid", "false", "true"), ("local", "true", "true")):
+        # switch on, which moves the eligible in-guest verify cells to RE whatever
+        # pmu_on_re. With the switch on but routing local, every in-guest cell still
+        # runs locally, so that config is in scope here too.
+        for routing in ParityRouteTest.CONFIGS + (("local", "true", "true"),):
             targets = evaluate_cells(*routing)
             for backend in IN_GUEST_BACKENDS:
                 cells = [t for t in targets.values() if t["args"][2] == backend]
@@ -2409,8 +2411,9 @@ class CpuidOnReRouteTest(unittest.TestCase):
 
     def expected_re_slugs(self) -> set[str]:
         # The candidates that also clear every later veto, derived from the plan rows
-        # and defs.bzl's own veto data; pmu_on_re=true lifts the PMU veto, and the
-        # parity-reference veto moves ptrace cells only.
+        # and defs.bzl's own veto data; the PMU veto never applies (the in-guest
+        # backends arm no preemption timer), and the parity-reference veto moves
+        # ptrace cells only.
         defs, _ = load_defs()
         re_exclusions = json.loads(RE_EXCLUSIONS.read_text())["tests"]
         expected = set()
@@ -2447,26 +2450,44 @@ class CpuidOnReRouteTest(unittest.TestCase):
         for config in (("hybrid", "true"), ("hybrid", "true", "false"), ("hybrid", "false", "false")):
             self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
 
-    def test_cpuid_on_with_pmu_off_still_routes_nothing_to_re(self) -> None:
-        config = ("hybrid", "false", "true")
-        self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
-
-    def test_cpuid_on_with_routing_local_routes_nothing_to_re(self) -> None:
-        config = ("local", "true", "true")
-        targets = evaluate_cells(*config)
-        self.assert_no_re_and_no_cpuid_property(targets, config)
-        # The forced-local override must not keep _route's RE audit reason: the
-        # cells that would run on RE under hybrid run here, and say so.
+    def test_cpuid_on_moves_the_same_cells_whatever_pmu_on_re(self) -> None:
+        # The in-guest backends arm no preemption timer, so pmu_armed does not count
+        # their cells and pmu_on_re, unset or false, holds none of the 469 back: the
+        # cpuid opt-in alone moves them, with the RE properties and labels they get
+        # under pmu_on_re=true (test_cpuid_on_moves_exactly_the_eligible_in_guest_verify_cells).
+        opted_in = evaluate_cells("hybrid", "true", "true")
         expected = self.expected_re_slugs()
         self.assertEqual(len(expected), 469)
-        for name, target in targets.items():
-            self.assertNotIn("routes to RE", target["env"]["HERMIT_E2E_ROUTE_REASON"], (config, name))
-        for name in sorted(expected):
-            self.assertEqual(
-                targets[name]["env"]["HERMIT_E2E_ROUTE_REASON"],
-                "needs host capability cpuid-faulting; runs locally under -c hermit_e2e.routing=local",
-                name,
-            )
+        for pmu_on_re in (None, "false"):
+            config = ("hybrid", pmu_on_re, "true")
+            targets = evaluate_cells(*config)
+            self.assertEqual(set(targets), set(opted_in), config)
+            self.assertEqual({n for n, t in targets.items() if t["route"] == "re"}, expected, config)
+            for name, target in targets.items():
+                self.assertEqual(
+                    (target["route"], target.get("re_properties"), sorted(target["labels"])),
+                    (opted_in[name]["route"], opted_in[name].get("re_properties"),
+                     sorted(opted_in[name]["labels"])),
+                    (config, name),
+                )
+
+    def test_cpuid_on_with_routing_local_routes_nothing_to_re(self) -> None:
+        expected = self.expected_re_slugs()
+        self.assertEqual(len(expected), 469)
+        for pmu_on_re in ("true", None):
+            config = ("local", pmu_on_re, "true")
+            targets = evaluate_cells(*config)
+            self.assert_no_re_and_no_cpuid_property(targets, config)
+            # The forced-local override must not keep _route's RE audit reason: the
+            # cells that would run on RE under hybrid run here, and say so.
+            for name, target in targets.items():
+                self.assertNotIn("routes to RE", target["env"]["HERMIT_E2E_ROUTE_REASON"], (config, name))
+            for name in sorted(expected):
+                self.assertEqual(
+                    targets[name]["env"]["HERMIT_E2E_ROUTE_REASON"],
+                    "needs host capability cpuid-faulting; runs locally under -c hermit_e2e.routing=local",
+                    (config, name),
+                )
 
     def test_cpuid_on_moves_exactly_the_eligible_in_guest_verify_cells(self) -> None:
         targets = evaluate_cells("hybrid", "true", "true")
@@ -2514,22 +2535,25 @@ class CpuidOnReRouteTest(unittest.TestCase):
 class PmuOnReDefaultTest(unittest.TestCase):
     """With -c hermit_e2e.pmu_on_re unset, a PMU-armed cell stays off RE: RE guarantees no
     exact retired-branch counter, and its AMD EPYC 9D64 workers fail Reverie's PMU
-    validation (AmdSpecLockMapShouldBeDisabled). pmu_armed() also counts the liteinst
-    and in-guest-trap cells, so under this default -c hermit_e2e.cpuid_on_re=true moves
-    them to RE only together with -c hermit_e2e.pmu_on_re=true."""
+    validation (AmdSpecLockMapShouldBeDisabled). pmu_armed() counts the backends whose
+    strict run arms the PMU preemption timer, as ci/manifest-plan/src/runner.rs
+    strict_run_arms_the_preemption_timer names them; the liteinst and in-guest-trap
+    cells arm none, so -c hermit_e2e.cpuid_on_re=true alone moves their verify cells."""
 
     def routes(self, *config) -> dict[str, str]:
         return {name: target["route"] for name, target in evaluate_cells(*config).items()}
 
     def test_an_unset_pmu_on_re_routes_like_false(self) -> None:
-        for cpuid_on_re in (None, "true"):
+        # The cpuid opt-in alone moves the 469 eligible in-guest verify cells
+        # (CpuidOnReRouteTest), which arm no preemption timer, and pmu_on_re changes
+        # nothing more at the current plan: every PMU-armed cell meets an earlier local
+        # rule.
+        for cpuid_on_re, moved in ((None, 0), ("true", 469)):
             unset = self.routes("hybrid", None, cpuid_on_re)
             self.assertEqual(unset, self.routes("hybrid", "false", cpuid_on_re), cpuid_on_re)
-            self.assertEqual(sorted(n for n, route in unset.items() if route == "re"), [], cpuid_on_re)
-        # What makes the default observable at the current plan: opting in moves the 469
-        # eligible in-guest verify cells (CpuidOnReRouteTest), which an unset key keeps local.
-        opted_in = self.routes("hybrid", "true", "true")
-        self.assertEqual(len([n for n, route in opted_in.items() if route == "re"]), 469)
+            self.assertEqual(len([n for n, route in unset.items() if route == "re"]), moved,
+                             cpuid_on_re)
+            self.assertEqual(unset, self.routes("hybrid", "true", cpuid_on_re), cpuid_on_re)
 
     def test_the_default_keeps_a_synthetic_re_eligible_pmu_armed_cell_local(self) -> None:
         # The default seen without the in-guest cells: a plan whose one cell is a ptrace
@@ -2548,17 +2572,22 @@ class PmuOnReDefaultTest(unittest.TestCase):
                          "(-c hermit_e2e.pmu_on_re=true opts in)")
         self.assertEqual(evaluate_cells("hybrid", "true", plan=plan)[name]["route"], "re")
 
-    def test_an_in_guest_cell_states_the_opt_in_it_needs(self) -> None:
-        # Under the cpuid opt-in with pmu_on_re unset, an in-guest verify cell is kept
-        # local by pmu_armed, and its reason says what moves it, not that it arms the PMU.
+    def test_an_in_guest_cell_needs_only_the_cpuid_opt_in(self) -> None:
+        # Under the cpuid opt-in with pmu_on_re unset, no in-guest cell is held back by
+        # the PMU: it arms no preemption timer. The 469 eligible verify cells route to RE
+        # on the cpuid reason.
         targets = evaluate_cells("hybrid", None, "true")
-        reasons = {t["env"]["HERMIT_E2E_ROUTE_REASON"] for t in targets.values()
-                   if t["args"][2] in IN_GUEST_BACKENDS and "pmu" in t["env"]["HERMIT_E2E_ROUTE_REASON"]}
-        self.assertEqual(reasons, {"in-guest backend: it arms no preemption timer, but pmu_armed "
-                                   "counts it, so RE also needs -c hermit_e2e.pmu_on_re=true"})
+        held = [n for n, t in targets.items() if t["args"][2] in IN_GUEST_BACKENDS
+                and "pmu" in t["env"]["HERMIT_E2E_ROUTE_REASON"]]
+        self.assertEqual(held, [])
         moved = [n for n, t in targets.items() if t["args"][2] in IN_GUEST_BACKENDS
-                 and t["env"]["HERMIT_E2E_ROUTE_REASON"].startswith("in-guest backend:")]
+                 and t["route"] == "re"]
         self.assertEqual(len(moved), 469)
+        self.assertEqual(
+            {targets[n]["env"]["HERMIT_E2E_ROUTE_REASON"] for n in moved},
+            {"needs host capability cpuid-faulting; routes to RE workers advertising "
+             "cpuid_faulting=true under -c hermit_e2e.cpuid_on_re=true"},
+        )
 
     def test_the_pmu_veto_keeps_an_otherwise_re_eligible_cell_local(self) -> None:
         # A ptrace replay cell that no earlier rule keeps local (every such plan row
@@ -2573,6 +2602,22 @@ class PmuOnReDefaultTest(unittest.TestCase):
                       "(-c hermit_e2e.pmu_on_re=true opts in)"),
         )
         self.assertEqual(defs["_route"](cell, True, False, {}, {}), ("re", ""))
+        for backend in IN_GUEST_BACKENDS:
+            self.assertFalse(defs["pmu_armed"](dict(cell, backend=backend)), backend)
+
+    def test_the_pmu_timer_backends_are_the_runners(self) -> None:
+        # pmu_armed's backend list is the runner's: the backends whose strict run arms
+        # the PMU preemption timer (ci/manifest-plan/src/runner.rs).
+        defs, _ = load_defs()
+        runner = (CI / "manifest-plan" / "src" / "runner.rs").read_text()
+        match = re.search(
+            r"fn strict_run_arms_the_preemption_timer\(backend: &str\) -> bool \{\s*"
+            r"matches!\(backend, ([^)]*)\)",
+            runner,
+        )
+        self.assertIsNotNone(match, "runner.rs strict_run_arms_the_preemption_timer")
+        backends = sorted(part.strip().strip('"') for part in match.group(1).split("|"))
+        self.assertEqual(sorted(defs["PMU_TIMER_BACKENDS"]), backends)
 
 
 if __name__ == "__main__":
