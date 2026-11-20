@@ -5204,6 +5204,505 @@
       "cited_errnos": [],
       "tests": []
     },
+    "timer_create": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1950,
+          "hash": "70a45d9bd52644fc",
+          "id": "c1",
+          "last": 1950,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 15253,
+          "hash": "3c49ffa3f5160d88",
+          "id": "c10",
+          "last": 15266,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 679,
+          "hash": "ed099ae5fe96ec77",
+          "id": "c11",
+          "last": 700,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 303,
+          "hash": "9b1397d27cb41441",
+          "id": "c12",
+          "last": 329,
+          "path": "detcore/src/cpu_clock.rs"
+        },
+        {
+          "first": 65,
+          "hash": "31f653c9c9e6d869",
+          "id": "c13",
+          "last": 67,
+          "path": "detcore/src/scheduler/discarded_at_send.rs"
+        },
+        {
+          "first": 4692,
+          "hash": "bbb4e384cf9d57c7",
+          "id": "c14",
+          "last": 4709,
+          "path": "detcore/src/syscalls/signal.rs"
+        },
+        {
+          "first": 13675,
+          "hash": "0c67a1be57c9a924",
+          "id": "c14",
+          "last": 13688,
+          "path": "detcore/src/tool_global.rs"
+        },
+        {
+          "first": 99,
+          "hash": "4c81d5eab1a828b8",
+          "id": "c15",
+          "last": 101,
+          "path": "detcore/src/scheduler/itimer_coalesce.rs"
+        },
+        {
+          "first": 6319,
+          "hash": "b1ccc906a01b3862",
+          "id": "c16",
+          "last": 6327,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 6798,
+          "hash": "a1fdd7b6fcc4aa05",
+          "id": "c16",
+          "last": 6807,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 767,
+          "hash": "7c11f2515495f32b",
+          "id": "c16",
+          "last": 769,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 1114,
+          "hash": "23e73efddeeebc79",
+          "id": "c17",
+          "last": 1214,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 1224,
+          "hash": "9bcb2fdbd4eff3f3",
+          "id": "c18",
+          "last": 1235,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1474,
+          "hash": "8b1e7bd8cfd081f5",
+          "id": "c18",
+          "last": 1497,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1438,
+          "hash": "c1493767e96d2337",
+          "id": "c19",
+          "last": 1448,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 8248,
+          "hash": "39a81cea9bf11c60",
+          "id": "c19",
+          "last": 8253,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 8699,
+          "hash": "ee577679df5ad921",
+          "id": "c2",
+          "last": 8699,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 389,
+          "hash": "43dead366d82aee3",
+          "id": "c20",
+          "last": 393,
+          "path": "detcore/src/scheduler/sigalrm.rs"
+        },
+        {
+          "first": 1979,
+          "hash": "97d007ff86f1af6b",
+          "id": "c20",
+          "last": 1979,
+          "path": "detcore/src/syscalls/signal.rs"
+        },
+        {
+          "first": 1861,
+          "hash": "9eea619c6b34b578",
+          "id": "c21",
+          "last": 1870,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 159,
+          "hash": "d83754d307dc6a2d",
+          "id": "c22",
+          "last": 162,
+          "path": "detcore/src/scheduler/timed_waiters.rs"
+        },
+        {
+          "first": 1252,
+          "hash": "88c89f02f6e66c8f",
+          "id": "c3",
+          "last": 1277,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1278,
+          "hash": "1f574223b34aa78b",
+          "id": "c4",
+          "last": 1311,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1317,
+          "hash": "57473cddc6157838",
+          "id": "c5",
+          "last": 1323,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1329,
+          "hash": "ef9c5c1f171bbf4a",
+          "id": "c6",
+          "last": 1345,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1346,
+          "hash": "e66d6c465c485c23",
+          "id": "c7",
+          "last": 1352,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1356,
+          "hash": "d42f5e549e99e28a",
+          "id": "c8",
+          "last": 1367,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 98,
+          "hash": "3e04a29cb95b771a",
+          "id": "c9",
+          "last": 114,
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINVAL",
+        "ENOSYS",
+        "EOPNOTSUPP",
+        "EPERM"
+      ],
+      "tests": [
+        {
+          "names": [
+            "timer_create_clock_refusal_matches_linuxs_clock_table"
+          ],
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "names": [
+            "timer_create_checks_the_task_a_cpu_clock_names"
+          ],
+          "path": "detcore/src/cpu_clock/handler_tests.rs"
+        },
+        {
+          "names": [
+            "ids_are_deterministic_and_sequential"
+          ],
+          "path": "detcore/src/tool_local.rs"
+        }
+      ]
+    },
+    "timer_settime": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1956,
+          "hash": "f0890d9ce8779d24",
+          "id": "c1",
+          "last": 1956,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1224,
+          "hash": "9bcb2fdbd4eff3f3",
+          "id": "c10",
+          "last": 1235,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 717,
+          "hash": "26defb17f17452ee",
+          "id": "c11",
+          "last": 732,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 736,
+          "hash": "9e8f79cee9d1b354",
+          "id": "c11",
+          "last": 742,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 1623,
+          "hash": "d21867875bd5bc5b",
+          "id": "c12",
+          "last": 1642,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 65,
+          "hash": "31f653c9c9e6d869",
+          "id": "c13",
+          "last": 67,
+          "path": "detcore/src/scheduler/discarded_at_send.rs"
+        },
+        {
+          "first": 608,
+          "hash": "11c870b1cb77cd38",
+          "id": "c14",
+          "last": 628,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 99,
+          "hash": "4c81d5eab1a828b8",
+          "id": "c15",
+          "last": 101,
+          "path": "detcore/src/scheduler/itimer_coalesce.rs"
+        },
+        {
+          "first": 24914,
+          "hash": "f4c6815d34473f28",
+          "id": "c16",
+          "last": 24939,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 423,
+          "hash": "3e04ec0fef678004",
+          "id": "c17",
+          "last": 432,
+          "path": "detcore/src/cpu_clock.rs"
+        },
+        {
+          "first": 342,
+          "hash": "780fced58222ccbb",
+          "id": "c17",
+          "last": 352,
+          "path": "detcore/src/cpu_clock.rs"
+        },
+        {
+          "first": 1382,
+          "hash": "eac2043e985fc94c",
+          "id": "c18",
+          "last": 1436,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 415,
+          "hash": "1628e125640b56e5",
+          "id": "c18",
+          "last": 446,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 1454,
+          "hash": "3213d9e40927465b",
+          "id": "c18",
+          "last": 1457,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 551,
+          "hash": "f6327a1bc66229dd",
+          "id": "c19",
+          "last": 560,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 681,
+          "hash": "2f357e9dcb372f34",
+          "id": "c19",
+          "last": 695,
+          "path": "detcore/src/scheduler/timed_waiters.rs"
+        },
+        {
+          "first": 8700,
+          "hash": "3b24ee012c54f25c",
+          "id": "c2",
+          "last": 8700,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 280,
+          "hash": "65dba1a676f80f0a",
+          "id": "c20",
+          "last": 334,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 283,
+          "hash": "6d54096ed57c04d0",
+          "id": "c21",
+          "last": 307,
+          "path": "detcore/src/scheduler/posix_timer_coalesce_tests.rs"
+        },
+        {
+          "first": 546,
+          "hash": "d5cf774da6e9164b",
+          "id": "c22",
+          "last": 549,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1312,
+          "hash": "d19ee7b908c7958d",
+          "id": "c23",
+          "last": 1323,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1434,
+          "hash": "802183c317ae38cd",
+          "id": "c24",
+          "last": 1436,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 976,
+          "hash": "556774bd1dbee847",
+          "id": "c25",
+          "last": 993,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 1130,
+          "hash": "5b579e88b2f0f693",
+          "id": "c25",
+          "last": 1137,
+          "path": "detcore/src/scheduler/parked.rs"
+        },
+        {
+          "first": 2462,
+          "hash": "346cac95193e8a4e",
+          "id": "c25",
+          "last": 2474,
+          "path": "detcore/src/scheduler.rs"
+        },
+        {
+          "first": 563,
+          "hash": "b3dfbb5a06df8daf",
+          "id": "c26",
+          "last": 566,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 673,
+          "hash": "bd3e5fa4ff6502d7",
+          "id": "c26",
+          "last": 684,
+          "path": "detcore/src/scheduler/posix_timer_coalesce.rs"
+        },
+        {
+          "first": 1388,
+          "hash": "73ccee1fa4223cf9",
+          "id": "c3",
+          "last": 1392,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 133,
+          "hash": "d55b41da7c0bbbf2",
+          "id": "c4",
+          "last": 137,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1419,
+          "hash": "072d0aa847365316",
+          "id": "c5",
+          "last": 1436,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1438,
+          "hash": "c1493767e96d2337",
+          "id": "c6",
+          "last": 1448,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1450,
+          "hash": "4a4a1baa288ad740",
+          "id": "c7",
+          "last": 1468,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1474,
+          "hash": "8b1e7bd8cfd081f5",
+          "id": "c8",
+          "last": 1497,
+          "path": "detcore/src/syscalls/time.rs"
+        },
+        {
+          "first": 1499,
+          "hash": "c9d47cd2cb283130",
+          "id": "c9",
+          "last": 1505,
+          "path": "detcore/src/syscalls/time.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EFAULT",
+        "EINVAL",
+        "ENOSYS",
+        "ESRCH"
+      ],
+      "tests": [
+        {
+          "names": [
+            "settime_reports_previous_arming_and_remaining_uses_virtual_clock",
+            "periodic_remaining_advances_past_each_deadline"
+          ],
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "names": [
+            "an_absolute_cpu_timer_expiration_is_served_only_once_passed",
+            "timer_settime_on_a_timer_whose_thread_exited_is_esrch"
+          ],
+          "path": "detcore/src/cpu_clock/handler_tests.rs"
+        },
+        {
+          "names": [
+            "a_periodic_timer_waits_for_its_dequeue_and_reports_the_overrun"
+          ],
+          "path": "detcore/src/scheduler/posix_timer_coalesce_tests.rs"
+        }
+      ]
+    },
     "times": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
