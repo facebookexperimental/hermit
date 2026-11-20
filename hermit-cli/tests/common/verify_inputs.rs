@@ -9,6 +9,9 @@
 use std::ffi::CString;
 use std::fs;
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
@@ -172,13 +175,61 @@ fn a_verify_run_binds_the_ld_so_cache_its_holder_sealed() {
     );
 }
 
+/// The seals this kernel gives a sealed shared object: the memfd that
+/// `hermit verify-inputs` makes with MFD_ALLOW_SEALING, after it adds the four
+/// seals every object must carry. Where vm.memfd_noexec is 1 or more, the
+/// kernel also seals against exec every new memfd made with neither MFD_EXEC
+/// nor MFD_NOEXEC_SEAL (F_SEAL_EXEC, mm/memfd.c `memfd_create`), so the object
+/// reads 0x2f rather than 0xf.
+fn sealed_object_seals() -> u32 {
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: memfd_create takes a NUL-terminated name and returns a new
+    // descriptor or -1.
+    let raw = unsafe {
+        libc::memfd_create(
+            c"verify-inputs-test-seals".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(
+        raw >= 0,
+        "memfd_create: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `raw` is the new descriptor, owned by nothing else.
+    let memfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl on a descriptor this function owns.
+    let added = unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, required) };
+    assert_eq!(added, 0, "F_ADD_SEALS: {}", std::io::Error::last_os_error());
+    // SAFETY: fcntl only queries the descriptor.
+    let seals = unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_GET_SEALS) };
+    assert!(
+        seals >= 0,
+        "F_GET_SEALS: {}",
+        std::io::Error::last_os_error()
+    );
+    let noexec = fs::read_to_string("/proc/sys/vm/memfd_noexec").map_or(0, |value| {
+        value
+            .trim()
+            .parse::<u32>()
+            .expect("vm.memfd_noexec is a number")
+    });
+    let exec = if noexec >= 1 { libc::F_SEAL_EXEC } else { 0 };
+    assert_eq!(
+        seals,
+        required | exec,
+        "a sealed memfd's seals with vm.memfd_noexec = {noexec}"
+    );
+    seals as u32
+}
+
 /// How a run refuses an unsealed regular file at `path` in place of a sealed
 /// object. Outside tmpfs, Linux answers F_GET_SEALS on it with EINVAL
 /// (mm/memfd.c `memfd_get_seals`). A tmpfs inode that memfd_create did not
 /// make starts with F_SEAL_SEAL and can take no other seal (mm/shmem.c
 /// `__shmem_get_inode`), so there F_GET_SEALS reports exactly 0x1 and the run
-/// refuses those seals instead.
-fn substituted_refusal(path: &Path) -> &'static str {
+/// refuses those seals, naming the seals the object carries, instead.
+fn substituted_refusal(path: &Path) -> String {
     let name = CString::new(path.as_os_str().as_bytes()).unwrap();
     let mut filesystem = MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `name` is NUL-terminated and statfs fills `filesystem` before
@@ -193,9 +244,9 @@ fn substituted_refusal(path: &Path) -> &'static str {
     );
     // SAFETY: statfs returned 0, so it filled `filesystem`.
     if unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC {
-        "has seals 0x1, not the sealed 0xf"
+        format!("has seals 0x1, not the sealed {:#x}", sealed_object_seals())
     } else {
-        "is not a sealed object"
+        "is not a sealed object".to_owned()
     }
 }
 
@@ -213,6 +264,7 @@ fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
     let object_fd = format!(
         "fd=$(grep -o '\"fd\":[0-9]*' /proc/self/fd/{MANIFEST_FD} | head -1 | cut -d: -f2)"
     );
+    let substituted = substituted_refusal(&other);
     for (label, tamper, expected) in [
         // Hermit's own startup may reuse the freed number before adoption, so
         // the refusal names the descriptor whatever now holds it.
@@ -221,7 +273,7 @@ fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
             "substituted",
             // The same bytes from an unsealed file are not the sealed object.
             &format!("eval \"exec $fd<{}\"", other.display()) as &str,
-            substituted_refusal(&other),
+            substituted.as_str(),
         ),
         (
             "unsealed manifest",
