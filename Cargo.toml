@@ -77,6 +77,7 @@ reverie-inguest = { path = "reverie/reverie-inguest", version = "0.5.7", default
 reverie-kvm = { path = "reverie/reverie-kvm", version = "0.5.7" }
 reverie-liteinst = { path = "reverie/reverie-liteinst", version = "0.5.7", default-features = false }
 reverie-liteinst-artifact = { path = "reverie/reverie-liteinst-artifact", version = "0.5.7", default-features = false }
+reverie-linuxemu-ext-procfs = { path = "reverie/reverie-linuxemu-ext-procfs", version = "0.5.7" }
 reverie-loader = { path = "reverie/reverie-loader", version = "0.5.7" }
 reverie-proc-grammar = { path = "reverie/reverie-proc-grammar", version = "0.5.7" }
 reverie-ptrace = { path = "reverie/reverie-ptrace", version = "0.5.7" }

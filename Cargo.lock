@@ -1103,6 +1103,7 @@ dependencies = [
  "reverie-core",
  "reverie-inguest",
  "reverie-kvm",
+ "reverie-linuxemu-ext-procfs",
  "reverie-liteinst",
  "reverie-liteinst-artifact",
  "reverie-loader",
@@ -1865,6 +1866,17 @@ dependencies = [
  "reverie-kvm-core",
  "reverie-proc-grammar",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "reverie-linuxemu-ext-procfs"
+version = "0.5.7"
+dependencies = [
+ "libc",
+ "reverie-linuxemu",
+ "reverie-proc-grammar",
+ "serde",
  "tracing",
 ]
 

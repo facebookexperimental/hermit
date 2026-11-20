@@ -3600,18 +3600,11 @@ async fn run_kvm(
     // This is the flagged allow-until debt in
     // scripts/linuxemu-graph-deny.txt.
     //
-    // The registration is fbcode-only for now, gated on
-    // `fbcode_build` (supplied by the internal Buck build, and
-    // declared to check-cfg in build.rs; a Cargo feature would
-    // be switched on by --all-features): the exported Cargo
-    // build resolves Reverie at its pin, whose LinuxEmu core
-    // still serves maps itself and has neither the extension
-    // crate nor the backend setter, so it needs no registration.
-    // Every fbcode Buck target that compiles this file links
-    // the extension through LIBHERMIT_DEPS, the release targets
-    // included. At the pin advance that exports the extension,
-    // Cargo gains the dependency and this cfg goes away.
-    #[cfg(fbcode_build)]
+    // Every build links the extension (fbcode Buck through
+    // LIBHERMIT_DEPS, Cargo through the workspace dependency on
+    // reverie-linuxemu-ext-procfs), so registration is unconditional:
+    // without it a KVM guest's `/proc/self/maps` open is refused by
+    // the executor instead of serving the synthetic file.
     backend
         .install_extension_table(reverie_linuxemu_ext_procfs::extension_table())
         .map_err(|error| anyhow!("failed to install the KVM procfs extension: {error}"))?;

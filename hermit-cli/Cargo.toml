@@ -102,6 +102,13 @@ uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "
 
 reverie-loader = { workspace = true, optional = true }
 
+# The procfs extension builds only for x86_64 (reverie-linuxemu is an
+# empty crate off it); its one use is inside the x86_64-gated KVM
+# backend. Gating the dependency the same way keeps an aarch64 host
+# able to build hermit-run.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+reverie-linuxemu-ext-procfs = { workspace = true }
+
 [build-dependencies]
 libc = "0.2.186"
 sha1_smol = "1.0.1"
