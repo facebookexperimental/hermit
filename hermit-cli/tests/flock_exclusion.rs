@@ -868,10 +868,15 @@ fn pipe_fork_then_vfork_runs_at_l2() {
 /// re-issued to the kernel during replay. With the arm reverted to
 /// `handle_simple` the count is 0 and the stdout assertions still pass -- the
 /// silent failure this test exists to catch.
+///
+/// The lock file is this attempt's own, as in
+/// [`replay_refuses_flock_for_a_non_materialized_file`].
 #[test]
 fn replay_reissues_every_flock_for_a_materialized_file() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+    let lock_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the flock lock file's directory");
 
     // `--log=debug` here too: the recording's own injections are the flock
     // calls Detcore's model made on the host (its mirrors), which replay must
@@ -884,7 +889,8 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
         .arg(guest())
-        .arg("exclusion");
+        .arg("exclusion")
+        .arg(lock_dir.path().join("exclusion.lock"));
     let recorded = finish(hermit_test::hermit_output(
         &format!("{record:?}"),
         &mut record,
@@ -1030,10 +1036,18 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
 /// Replay cannot reproduce the lock side effect for an external file that was
 /// not materialized in the replay root. It must fail closed rather than replay
 /// the recorded success while holding no lock.
+///
+/// The external file is this attempt's own, so no concurrent attempt or other
+/// process on the host holds a lock on it, which the recording would refuse by
+/// name.
 #[test]
 fn replay_refuses_flock_for_a_non_materialized_file() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+    let external = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the external flock file's directory");
+    let external_file = external.path().join("external");
+    fs::File::create(&external_file).expect("failed to create the external flock file");
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
@@ -1043,7 +1057,7 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
         .args(["--"])
         .arg(guest())
         .arg("holder")
-        .arg("/etc/hosts");
+        .arg(&external_file);
     let recorded = finish(hermit_test::hermit_output(
         &format!("{record:?}"),
         &mut record,
@@ -1087,11 +1101,14 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
 /// A contended blocking flock waits under record as in a run (Detcore's flock
 /// model), and replay reproduces the wait from the recording: the guest's
 /// output is the same in both. Before the model, record mode refused the
-/// call, as record and replay have no compatibility opt-out.
+/// call, as record and replay have no compatibility opt-out. The lock file is
+/// this attempt's own, as in [`replay_refuses_flock_for_a_non_materialized_file`].
 #[test]
 fn recording_and_replay_wait_for_a_contended_blocking_flock() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+    let lock_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the flock lock file's directory");
 
     let mut record = Command::new("timeout");
     record
@@ -1101,7 +1118,8 @@ fn recording_and_replay_wait_for_a_contended_blocking_flock() {
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
         .arg(guest())
-        .arg("upgrade-waits");
+        .arg("upgrade-waits")
+        .arg(lock_dir.path().join("upgrade-waits.lock"));
     let recorded = finish(hermit_test::hermit_output(
         &format!("{record:?}"),
         &mut record,
