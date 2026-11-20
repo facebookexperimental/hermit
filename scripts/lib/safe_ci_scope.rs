@@ -787,7 +787,7 @@ pub fn resolve_cgroups(
                 }
             }
         }
-        let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
+        let attempt = attempt_scope_reexec(None, None, scope_runtime_s, None);
         return unavailable(
             label,
             false,
@@ -798,7 +798,7 @@ pub fn resolve_cgroups(
         );
     }
 
-    let attempt = attempt_scope_reexec(None, None, None);
+    let attempt = attempt_scope_reexec(None, None, None, None);
     let Some(memory_max) = expected_outer_memory_max_bytes() else {
         return unavailable(
             label,
