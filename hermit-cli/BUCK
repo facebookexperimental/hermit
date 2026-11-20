@@ -118,6 +118,7 @@ LIBHERMIT_TEST_SRCS = {
         "tests/common/readonly_proc.rs",
         "tests/common/test_skip.rs",
         "tests/fixtures/chosen-before-reserved-input.json",
+        "tests/fixtures/dynamic_echo.c",
         "tests/fixtures/ptrace_copy_permission.c",
         "tests/fixtures/random_copy_fatal.c",
     ]
@@ -390,14 +391,24 @@ gated_test(
     # programs and the host `cc`, as Cargo does, and never loads tests/BUCK
     # for it.
     #   HERMIT_RANDOM_FAILURE_GUEST: the real_random cases' guest.
-    #   HERMIT_TEST_DYNAMIC_ECHO: kvm_runs_dynamic_echo_through_detcore's and
-    #   liteinst_public_dispatch_runs_in_guest_detcore's guest.
+    #   HERMIT_TEST_DYNAMIC_ECHO: liteinst_public_dispatch_runs_in_guest_detcore's
+    #   guest, and kvm_runs_dynamic_echo_through_detcore's where no v2 fixture
+    #   (below) is named.
+    #   HERMIT_TEST_V2_ROOTFS: the pinned CentOS 9 loader and C library
+    #   kvm_runs_dynamic_echo_through_detcore compiles and launches its echo
+    #   through, so the guest starts from an x86-64-v2 userland on every
+    #   host image. That one guest is compiled by the test image's host cc
+    #   at run time (its startup objects are the host's; the link binds
+    #   symbol versions from the fixture C library itself), unlike the
+    #   prebuilt guests above: no fbcode toolchain links a dynamic guest
+    #   against an x86-64-v2 glibc.
     #   HERMIT_UNIT_GUEST: the freestanding guest launched in place of the
     #   host's /bin/sh and /bin/echo (crate::unit_guest).
     env = LIBHERMIT_TEST_RUN_ENV
     | {
         "HERMIT_RANDOM_FAILURE_GUEST": "$(location :random-copy-fatal-guest)",
         "HERMIT_TEST_DYNAMIC_ECHO": "$(location :dynamic-echo-guest)",
+        "HERMIT_TEST_V2_ROOTFS": "$(location //hermetic_infra/hermit/fb-only/v2_rootfs:glibc-fixture)",
         "HERMIT_UNIT_GUEST": "$(location //hermetic_infra/hermit/tests:unit_guest)",
     },
     # Match the native Rust test provider: fixtures are project-relative.

@@ -9575,6 +9575,188 @@ mod tests {
         (echo, named.is_some())
     }
 
+    /// The x86-64-v2 guest `kvm_runs_dynamic_echo_through_detcore`
+    /// launches where `HERMIT_TEST_V2_ROOTFS` names the fixture
+    /// directory of `tests/cpu_profile_v2_rootfs.rs` (real CentOS 9
+    /// `ld-linux` and `libc.so.6` under `lib64/`; Buck's
+    /// `fb-only/v2_rootfs:glibc-fixture`): the temp dir to keep alive
+    /// for the launch, and the echo compiled into it, naming the
+    /// fixture loader as its program interpreter, the fixture's
+    /// `lib64` on its rpath, and linked against the fixture
+    /// `libc.so.6` itself (named as a link input, so its symbol
+    /// versions bind from that file). `None` where the variable names
+    /// nothing, which keeps the host userland launch this test has
+    /// always made.
+    ///
+    /// The KVM backend presents an x86-64-v2 CPU, but the loader and
+    /// C library the guest starts from belong to the host image, whose
+    /// glibc may refuse that CPU before the guest runs (ld.so's own
+    /// baseline check: "Fatal glibc error: CPU does not support
+    /// x86-64-v3", exit 127) -- an image fact, not a backend result,
+    /// and on a v2 image the same launch passes.
+    /// `cpu_profile_v2_rootfs.rs` pins its userland with an assembled
+    /// rootfs under `--image`; a library launch applies no chroot
+    /// or mount of its command (see `run_kvm`), so here the same two
+    /// files are pinned by the guest's own ELF: its PT_INTERP names
+    /// the fixture loader and its rpath the fixture's `lib64`, so
+    /// the launch is the ordinary one, loader included. Exec-ing
+    /// the loader directly is not that launch: it also routes
+    /// around reverie-kvm's placement of a PT_INTERP-less image
+    /// (dh-zzlzky). The compile is explicit about every choice that
+    /// decides the binary (the PIE, the interpreter, the rpath, and
+    /// the fixture `libc.so.6` as a named link input, so the symbol
+    /// versions it needs are read from that file); what remains the
+    /// host's is `cc` itself and its startup objects, and a `cc`
+    /// that cannot run fails this setup by name. A fixture that
+    /// declares more than x86-64-v2 is likewise a named setup
+    /// failure, as a v3 echo is.
+    fn v2_fixture_guest() -> Option<(tempfile::TempDir, PathBuf)> {
+        let fixture = PathBuf::from(std::env::var_os("HERMIT_TEST_V2_ROOTFS")?);
+        Some(v2_fixture_guest_in(&fixture))
+    }
+
+    /// [`v2_fixture_guest`] for the fixture directory `fixture`.
+    fn v2_fixture_guest_in(fixture: &Path) -> (tempfile::TempDir, PathBuf) {
+        use detcore::exec_record::IsaNeeds;
+        // The fixture's paths are embedded in the guest (PT_INTERP
+        // and DT_RPATH) and resolved by the kernel and loader at
+        // launch, so they must be absolute: Buck names the fixture
+        // by a project-relative path.
+        let fixture = fs::canonicalize(fixture).unwrap_or_else(|error| {
+            panic!(
+                "HERMIT_TEST_V2_ROOTFS={} cannot be canonicalized: {error}",
+                fixture.display()
+            )
+        });
+        let loader = fixture.join("lib64/ld-linux-x86-64.so.2");
+        let libc = fixture.join("lib64/libc.so.6");
+        for file in [&loader, &libc] {
+            assert!(
+                file.is_file(),
+                "HERMIT_TEST_V2_ROOTFS={} names no fixture file {}",
+                fixture.display(),
+                file.display()
+            );
+            match IsaNeeds::read_path_strict(file) {
+                Some(IsaNeeds::Level(level)) if level > 2 => panic!(
+                    "{} declares that it needs {}, above the x86-64-v2 this fixture exists to pin",
+                    file.display(),
+                    detcore::exec_record::x86_64_level_name(level)
+                ),
+                Some(IsaNeeds::Malformed(why)) => panic!(
+                    "{} declares its x86 ISA level unreadably ({why})",
+                    file.display()
+                ),
+                _ => {}
+            }
+        }
+        let dir = tempfile::tempdir().expect("a temp dir for the v2 fixture guest");
+        let source = dir.path().join("dynamic_echo.c");
+        fs::write(&source, include_bytes!("../tests/fixtures/dynamic_echo.c")).unwrap();
+        // No host startup files: a host crt1.o is built for the host
+        // glibc and can declare x86-64-v3 (CI's does), which would
+        // make the guest resolve to v3 before it starts. This
+        // minimal _start hands the initial stack to the fixture
+        // libc's own __libc_start_main, so every linked object is
+        // the guest source (compiled -march=x86-64-v2 below), this
+        // stub, or the fixture's library and loader.
+        let start = dir.path().join("start.S");
+        fs::write(
+            &start,
+            "    .text\n\
+            \x20   .globl _start\n\
+             _start:\n\
+            \x20   xor %rbp, %rbp\n\
+            \x20   mov %rdx, %r9\n\
+            \x20   pop %rsi\n\
+            \x20   mov %rsp, %rdx\n\
+            \x20   and $-16, %rsp\n\
+            \x20   push %rax\n\
+            \x20   push %rsp\n\
+            \x20   xor %rcx, %rcx\n\
+            \x20   xor %r8, %r8\n\
+            \x20   lea main(%rip), %rdi\n\
+            \x20   call __libc_start_main\n\
+            \x20   hlt\n\
+            \x20   .section .note.GNU-stack,\"\",@progbits\n",
+        )
+        .unwrap();
+        let guest = dir.path().join("dynamic-echo");
+        let lib64 = fixture.join("lib64");
+        let output = std::process::Command::new("cc")
+            .args([
+                "-O1",
+                "-march=x86-64-v2",
+                "-fPIE",
+                "-nostdlib",
+                "-pie",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(format!("-Wl,--dynamic-linker={}", loader.display()))
+            .arg(format!(
+                "-Wl,--disable-new-dtags,-rpath,{}",
+                lib64.display()
+            ))
+            // The fixture libc's own GLIBC_PRIVATE references are to
+            // its matching fixture loader, named just above as the
+            // guest's PT_INTERP, not to the guest: they resolve at
+            // launch from that loader. A linker that checks a shared
+            // library's undefined symbols at link time (CI's does)
+            // would otherwise refuse the named input below for
+            // symbols no guest reference needs resolved here.
+            .arg("-Wl,--allow-shlib-undefined")
+            .arg(&source)
+            .arg(&start)
+            // The fixture C library as a named input, not `-lc`
+            // through a search path: `-L` looks for `libc.so` /
+            // `libc.a`, which the fixture does not hold, and would
+            // silently bind the host's library instead. Naming the
+            // file makes the link read its symbol versions from it;
+            // DT_NEEDED still records its SONAME, `libc.so.6`.
+            .arg(&libc)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("compiling the v2 fixture guest: cc could not run: {error}")
+            });
+        assert!(
+            output.status.success(),
+            "compiling the v2 fixture guest failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        assert_eq!(
+            detcore::exec_record::program_interpreter(&guest),
+            Ok(Some(loader.clone())),
+            "the compiled guest does not name the fixture loader"
+        );
+        (dir, guest)
+    }
+
+    /// The v2 fixture's own setup refusal: a fixture file declaring
+    /// more than x86-64-v2 is refused by name before any launch, as
+    /// a v3 echo is. (The real-fixture case is
+    /// `kvm_runs_dynamic_echo_through_detcore` under
+    /// HERMIT_TEST_V2_ROOTFS; its text-file-libc twin is manual
+    /// only, recorded in that diff's Test Plan.)
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[should_panic(expected = "above the x86-64-v2 this fixture exists to pin")]
+    fn a_v2_fixture_declaring_v3_is_refused_by_name() {
+        use crate::cpu_profile_admission::tests::isa_image;
+        use crate::cpu_profile_admission::tests::put;
+        let directory = tempfile::tempdir().unwrap();
+        let lib = directory.path().join("lib64");
+        put(
+            &lib.join("ld-linux-x86-64.so.2"),
+            &isa_image(None, None, false),
+        );
+        put(&lib.join("libc.so.6"), &isa_image(None, Some(0b111), false));
+        let _ = v2_fixture_guest_in(directory.path());
+    }
+
     #[test]
     fn liteinst_public_dispatch_runs_in_guest_detcore() {
         const TEST: &str = "tests::liteinst_public_dispatch_runs_in_guest_detcore";
@@ -9750,22 +9932,34 @@ mod tests {
             );
         }
 
-        let (echo, named) = dynamic_echo();
+        // Where the v2 fixture is named, the guest is the echo
+        // compiled for it ([`v2_fixture_guest`]), naming the fixture
+        // loader as its program interpreter, so what it starts from
+        // is x86-64-v2 on every host image, through the ordinary
+        // launch. Without it, the host userland launch this test
+        // has always made.
+        let fixture_guest = v2_fixture_guest();
+        let (program, named) = match &fixture_guest {
+            Some((_, guest)) => (guest.clone(), true),
+            None => dynamic_echo(),
+        };
+        let to_host = |path: &Path| Some(path.to_path_buf());
         // What the launch below resolves auto to (resolve_launch_auto reads the
         // same file). The KVM backend runs only x86-64-v2 guests, on every host
         // (refuse_unadmitted_launch), and a v3-built program interpreter
         // refuses to start under the x86-64-v2 CPUID table that Detcore
         // presents, so a guest that declares x86-64-v3 cannot cover this test.
         // That is a setup failure, named here, rather than a skip.
-        let (profile, why) =
-            crate::cpu_profile_admission::resolve_auto(&echo, |path| Some(path.to_path_buf()))
-                .unwrap_or_else(|why| panic!("auto cannot resolve {}: {why}", echo.display()));
+        let (profile, why) = crate::cpu_profile_admission::resolve_auto(&program, to_host)
+            .unwrap_or_else(|why| panic!("auto cannot resolve {}: {why}", program.display()));
         assert_ne!(
             profile,
             detcore::CpuProfile::X86_64V3,
             "{} resolves to x86-64-v3 ({why}), which the KVM backend does not run; {}",
-            echo.display(),
-            if named {
+            program.display(),
+            if fixture_guest.is_some() {
+                "the v2 fixture guest must resolve to x86-64-v2"
+            } else if named {
                 "HERMIT_TEST_DYNAMIC_ECHO must name a dynamically linked x86-64-v2 echo"
             } else {
                 "set HERMIT_TEST_DYNAMIC_ECHO to a dynamically linked x86-64-v2 echo (Buck builds \
@@ -9773,7 +9967,7 @@ mod tests {
             }
         );
 
-        let mut command = super::Command::new(&echo);
+        let mut command = super::Command::new(&program);
         command.arg("hello");
         let mut config = super::DetConfig::parse_from(["hermit-kvm-test"]);
         config.validate();
