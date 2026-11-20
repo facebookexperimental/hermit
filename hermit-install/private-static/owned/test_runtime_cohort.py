@@ -1829,7 +1829,12 @@ class ExportHistorySkip(unittest.TestCase):
                           'FacebookExperimental/hermit', 'facebookexperimental/hermit '):
                 self.assertIsNone(export_history_skip(name, other), other)
         # A commit a test substitutes is not a reviewed one, so it is never skipped.
-        with patch.dict(HISTORICAL_SOURCE_COMMITS, {name: absent}):
+        # The other owner's reviewed commit is held at the live head here, so this
+        # clause does not depend on the export's history holding that commit.
+        live_r = fixture_git(LIVE / 'reverie', 'rev-parse', 'HEAD')
+        with patch.dict(HISTORICAL_SOURCE_COMMITS, {name: dict(absent, R=live_r)}), \
+             patch.dict(REVIEWED_HISTORICAL_COMMITS,
+                        {name: dict(REVIEWED_HISTORICAL_COMMITS[name], R=live_r)}):
             self.assertIsNone(export_history_skip(name, EXPORT_REPOSITORY))
         # Present commits are read even on the export; the live heads stand in for reviewed ones.
         present = {'H': fixture_git(LIVE, 'rev-parse', 'HEAD'),

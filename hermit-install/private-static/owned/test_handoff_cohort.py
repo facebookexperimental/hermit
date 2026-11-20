@@ -7,6 +7,7 @@ carries a literal handoff digest.
 import ast
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -62,6 +63,12 @@ class HandoffCohort(unittest.TestCase):
     def test_historical_identity_is_the_reviewed_object_fixture(self):
         row = next(r for r in fixtures.cohort.CURRENT_SPLIT_RUNTIME if r[:2] == ('R', HANDOFF))
         self.assertEqual(row[3], HISTORICAL)
+        # The reviewed commit lives in the development history, not necessarily in
+        # the export's: on the export, skip exactly as the cohort tests do.
+        reason = fixtures.export_history_skip('current-split-runtime-content-v1',
+                                              os.environ.get('GITHUB_REPOSITORY'))
+        if reason is not None:
+            self.skipTest(reason)
         rev = fixtures.HISTORICAL_SOURCE_COMMITS['current-split-runtime-content-v1']['R']
         raw = fixtures.fixture_git_bytes(fixtures.LIVE / 'reverie', 'cat-file', 'blob', rev + ':' + HANDOFF)
         self.assertEqual((len(raw), hashlib.sha256(raw).hexdigest()), row[2:])
