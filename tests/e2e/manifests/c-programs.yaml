@@ -1522,6 +1522,26 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  # Power/weight 2026-11-20 @ Hermit 7b5809a84133, ptrace chaos/verify,
+  # devbig014 (316-core host): ELEMENTS 65536 -> 16384 and a yield every
+  # 256 -> every 64 iterations, keeping 256 sched_yield points. Validate
+  # profile Hermit: chaos wall/CPU 37.975s/28.40s before (one sample)
+  # -> 28.349s/19.85s after (median of 3; about 1.43x CPU); chaos
+  # distinct outcome classes 8 -> 8 against min_distinct 7. Both mutants
+  # still fail on both guests (constant chaos seed gives distinct 1;
+  # host-seeded random scheduling diverges verify). Verify ptrace and
+  # KVM and replay ptrace are L2 in both phases, with identical compared
+  # INFO counts (ptrace 1269, KVM 1270, replay 1253). Inbound syscalls
+  # from strict ptrace verify run 1 are 342 with the same 25-type set
+  # and every count equal before/after, including sched_yield 256,
+  # clone3 3 and futex 11. Numbers came from `HERMIT_BIN=
+  # target/validate/hermit target/debug/test-harness run --lane portable
+  # --category c-programs --test c-programs/fp-reduction-nondeterminism
+  # --mode <chaos|verify|replay> --backend <ptrace|kvm|dbt> --no-retry`
+  # (replay ptrace only). Hermit coverage line/region sets and a
+  # separate event-class set were not measured. DBT verify returned no
+  # result in either phase; this repository has no DBT backend since
+  # the hermit-dynamorio split, so no DBT pass is recorded here.
   - id: c-programs/fp-reduction-nondeterminism
     description: Strict verification for tests/c/fp_reduction_nondeterminism.c
     lane: portable

@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define ELEMENTS 65536
+/* 16384 elements with a yield every 64 iterations gives 256 sched_yield
+ * points; the chaos outcome spread depends on that yield count. */
+#define ELEMENTS 16384
 
 static uint32_t mix(uint32_t value) {
   value ^= value >> 16;
@@ -57,7 +59,7 @@ int main(int argc, char** argv) {
 
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : sum)
   for (uint32_t i = 0; i < ELEMENTS; ++i) {
-    if ((i & 255u) == 0u) {
+    if ((i & 63u) == 0u) {
       sched_yield();
     }
     variable_work(i);
