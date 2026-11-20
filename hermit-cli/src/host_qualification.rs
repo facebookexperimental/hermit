@@ -19,8 +19,10 @@
 //! inputs miss and measure again. Only verdicts that depend on the host alone
 //! belong here: nothing in the key can tell a chroot or container from the
 //! host, so a check whose answer depends on the caller's sandbox (namespaces,
-//! ptrace, seccomp) must run every time instead. Only a passing verdict is
-//! stored. The cache is best effort: a missing, unreadable, oversized,
+//! ptrace, seccomp) must run every time instead. Each qualification decides
+//! which of its verdicts are stable facts of the key and so may be stored;
+//! a verdict host load or timing can change is never one of them. The cache
+//! is best effort: a missing, unreadable, oversized,
 //! non-regular, corrupt or unwritable file is a miss, never a failure.
 
 use std::fs;

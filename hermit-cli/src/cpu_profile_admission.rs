@@ -1665,17 +1665,27 @@ fn probe_cache_path() -> Option<std::path::PathBuf> {
     crate::host_qualification::default_path(PROBE_CACHE_NAME)
 }
 
-/// The probe's inputs besides the host: its options. XCR0 is checked on the
-/// report itself ([`cached_report_matches`]).
+/// The probe's inputs besides the host: its options, the XCR0 it measured
+/// and the component mask it covered, so a verdict — pass or refusal — is
+/// never reused for a different XCR0 or coverage. `verdict=v2` is the
+/// cached-verdict format token: files written before refusals were cached
+/// (a bare passing report under the old inputs) miss on the inputs alone
+/// and measure again. XCR0 is also checked on the report itself
+/// ([`cached_report_matches`]).
 #[cfg(target_arch = "x86_64")]
-fn probe_cache_inputs() -> String {
-    format!("options={:?}", xstate_probe::ProbeOptions::default())
+fn probe_cache_inputs(xcr0: u64) -> String {
+    format!(
+        "verdict=v2 options={:?} xcr0={xcr0:#x} covered={:#x}",
+        xstate_probe::ProbeOptions::default(),
+        xstate_probe::COVERED_XCR0
+    )
 }
 
-/// The XINUSE probe for [`admit`]: its passing report cached for this host
+/// The XINUSE probe for [`admit`]: its verdict cached for this host
 /// (`crate::host_qualification`), or else a fresh probe, announced to
 /// `announce` (stderr for an explicit x86-64-v3, the log under auto) because
-/// it takes seconds, and cached if it passes. The probe certifies the
+/// it takes seconds, and cached if it passes or refuses deterministically
+/// ([`cacheable_refusal`]). The probe certifies the
 /// CPU's and kernel's XSAVE behavior, which no sandbox changes, so the host
 /// key suffices; the checks that depend on the caller's sandbox run on every
 /// run (<https://github.com/rrnewton/hermit/issues/4515>). Under a hypervisor
@@ -1718,6 +1728,44 @@ fn cached_report_matches(report: &xstate_probe::ProbeReport, xcr0: u64) -> bool 
         && !report.forced_exit
         && report.repetitions == options.repetitions
         && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
+}
+
+/// One XINUSE probe outcome as cached per host: a passing report, or a
+/// deterministic refusal's reason ([`cacheable_refusal`]). A refusal that
+/// host load or timing can change is never stored, so a host that recovers
+/// is re-measured on the next run instead of being refused from cache.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum CachedProbeVerdict {
+    Passed(xstate_probe::ProbeReport),
+    Refused(String),
+}
+
+/// Whether a probe refusal is a fact of this host key, XCR0 and covered
+/// mask — the same answer on every run of one boot — and so may be cached
+/// like a pass. Exactly two families are. The XCR0 coverage and pairing
+/// refusals (`check_xcr0`/`pkru_usable`, which name `XCR0 ...` first) are
+/// arithmetic on the key's own XCR0. The FPU-reload XINUSE instability
+/// (`XINUSE is not stable across a host FPU reload: ...`, the matrix's
+/// reload compare) was measured deterministic — 200 of 200 trials on
+/// both hosts that show it (Skylake-SP and Sapphire Rapids) — so it is a
+/// fact of the host in the same sense. The sibling repetitions
+/// instability is deliberately not cached: nothing has measured that
+/// exact class, and caching it waits for a measurement behind it.
+/// Everything else a probe can refuse on — interrupt-counter
+/// calibration, an inconclusive cell, the wall deadline, a lost PMU
+/// counter, an I/O or peer failure — host load or timing can change, so
+/// it is measured again next run. A refusal the probe itself reused
+/// from another process is never persisted: its text carries that
+/// process's reuse age, and its own one-minute bound already covers the
+/// loop it was measured for.
+#[cfg(target_arch = "x86_64")]
+fn cacheable_refusal(reason: &str) -> bool {
+    if reason.contains("(reused refusal:") {
+        return false;
+    }
+    reason.starts_with("XCR0 ")
+        || reason.starts_with("XINUSE is not stable across a host FPU reload:")
 }
 
 /// The name of the KVM fixed-guest qualification's file in the host
@@ -1849,25 +1897,36 @@ fn cached_probe_at(
         );
         return probe();
     };
-    let inputs = probe_cache_inputs();
-    let cached = || {
-        crate::host_qualification::load::<xstate_probe::ProbeReport>(path, host, &inputs)
-            .filter(|report| cached_report_matches(report, xcr0))
+    let inputs = probe_cache_inputs(xcr0);
+    // A known verdict is read without the probe lock: only a miss queues
+    // behind the process measuring, and a stored deterministic refusal
+    // answers at once like a stored pass. A cached refusal this build
+    // would no longer store (its classifier narrowed) is a miss, never
+    // a refusal: the caller measures for itself.
+    let cached = || -> Option<Result<xstate_probe::ProbeReport, AdmissionRefusal>> {
+        match crate::host_qualification::load::<CachedProbeVerdict>(path, host, &inputs)? {
+            CachedProbeVerdict::Passed(report) => {
+                cached_report_matches(&report, xcr0).then_some(Ok(report))
+            }
+            CachedProbeVerdict::Refused(reason) => {
+                cacheable_refusal(&reason).then_some(Err(reason))
+            }
+        }
     };
-    if let Some(report) = cached() {
-        return Ok(report);
+    if let Some(outcome) = cached() {
+        return outcome;
     }
     // Checked again under the lock: another process that missed at the same
-    // time may have measured and stored a pass while this one waited.
+    // time may have measured and stored its verdict while this one waited.
     crate::host_qualification::locked(path, || {
-        if let Some(report) = cached() {
-            return Ok(report);
+        if let Some(outcome) = cached() {
+            return outcome;
         }
         warn(&if crate::host_qualification::writable(path) {
             format!(
                 "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes \
-                 seconds; a pass is cached in {} until the kernel, CPU, microcode, boot or \
-                 Hermit binary changes.\n",
+                 seconds; a pass or a deterministic refusal is cached in {} until the \
+                 kernel, CPU, microcode, boot or Hermit binary changes.\n",
                 path.display()
             )
         } else {
@@ -1877,9 +1936,28 @@ fn cached_probe_at(
                 path.display()
             )
         });
-        let report = probe()?;
-        crate::host_qualification::store(path, host, &inputs, &report);
-        Ok(report)
+        match probe() {
+            Ok(report) => {
+                crate::host_qualification::store(
+                    path,
+                    host,
+                    &inputs,
+                    &CachedProbeVerdict::Passed(report.clone()),
+                );
+                Ok(report)
+            }
+            Err(reason) => {
+                if cacheable_refusal(&reason) {
+                    crate::host_qualification::store(
+                        path,
+                        host,
+                        &inputs,
+                        &CachedProbeVerdict::Refused(reason.clone()),
+                    );
+                }
+                Err(reason)
+            }
+        }
     })
 }
 
@@ -2081,7 +2159,8 @@ pub(crate) mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// A refusal is not cached, and a different XCR0 measures again.
+    /// A refusal host load or timing can change is not cached, and a
+    /// different XCR0 measures again.
     #[test]
     fn a_refusal_or_a_new_xcr0_measures_again() {
         let directory = tempfile::tempdir().unwrap();
@@ -2094,6 +2173,110 @@ pub(crate) mod tests {
         let (result, ran, _) = probe_through_cache(Some(&path), 0x207, Ok(probe_report(0x207)));
         assert_eq!(result, Ok(probe_report(0x207)));
         assert!(ran, "XCR0 is part of the key");
+    }
+
+    /// A coverage refusal is measured once and then answered from the
+    /// cache without measuring or warning, like a pass; a different
+    /// XCR0 does not reuse it.
+    #[test]
+    fn a_deterministic_refusal_is_measured_once() {
+        const COVERAGE: &str =
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Err(COVERAGE.into()));
+        assert_eq!(result, Err(COVERAGE.into()));
+        assert!(ran);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert_eq!(result, Err(COVERAGE.into()), "the cached refusal answers");
+        assert!(!ran, "a cached coverage refusal must not re-measure");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x207, Ok(probe_report(0x207)));
+        assert_eq!(result, Ok(probe_report(0x207)));
+        assert!(ran, "XCR0 is part of the refusal's key too");
+    }
+
+    /// Only coverage and FPU-reload refusals are answered from the cache
+    /// on a second admission. Every other family — the repetitions
+    /// instability included, until its own follow-up — measures again,
+    /// as do calibration, inconclusive, deadline, counter and reused
+    /// refusals.
+    #[test]
+    fn only_coverage_and_fpu_reload_refusals_are_cached() {
+        for cached in [
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)",
+            "XCR0 0x207 enables only some of the AVX-512 components",
+            "XCR0 0x2e7 enables PKRU but the kernel has not enabled protection keys \
+             (OSPKE is clear)",
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2e5 against 0x2e7",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.json");
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Err(cached.into()));
+            assert_eq!(result, Err(cached.into()), "{cached}");
+            assert!(ran, "{cached}");
+            let (result, ran, _) =
+                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert_eq!(result, Err(cached.into()), "{cached}: second admission");
+            assert!(!ran, "{cached}: second admission re-measured");
+        }
+        for transient in [
+            "XINUSE is not stable across repetitions: the reference image changed",
+            "the interrupt-counter calibration on CPU 3 did not finish",
+            "no Reload trial was certified in 8 attempts; the result is inconclusive",
+            "the XINUSE probe did not finish within 120 seconds, so its result would be inconclusive",
+            "the PMU counter was lost and reopened too many times",
+            "cannot read /proc/stat: permission denied",
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7) \
+             (reused refusal: measured by another Hermit process on this host 3s ago)",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.json");
+            let (result, ran, _) =
+                probe_through_cache(Some(&path), 0x2e7, Err(transient.into()));
+            assert_eq!(result, Err(transient.into()), "{transient}");
+            assert!(ran, "{transient}");
+            let (result, ran, _) =
+                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert_eq!(result, Ok(probe_report(0x2e7)), "{transient}: second admission");
+            assert!(ran, "{transient}: second admission did not measure");
+        }
+    }
+
+    /// The load side re-checks a stored refusal against today's
+    /// classifier: a refusal this build would no longer store is a
+    /// miss and measures, never an answer. Stored coverage and
+    /// FPU-reload refusals are answered without measuring; a stored
+    /// repetitions refusal is not.
+    #[test]
+    fn a_stored_refusal_is_rechecked_on_load() {
+        const COVERAGE: &str =
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)";
+        const RELOAD: &str =
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2e5 against 0x2e7";
+        const REPETITIONS: &str =
+            "XINUSE is not stable across repetitions: the reference image changed";
+        for (stored, want_ran) in [(COVERAGE, false), (RELOAD, false), (REPETITIONS, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.json");
+            crate::host_qualification::store(
+                &path,
+                &cache_host(),
+                &probe_cache_inputs(0x2e7),
+                &CachedProbeVerdict::Refused(stored.into()),
+            );
+            let (result, ran, _) =
+                probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert_eq!(ran, want_ran, "{stored}");
+            if want_ran {
+                assert_eq!(result, Ok(probe_report(0x2e7)), "{stored}");
+            } else {
+                assert_eq!(result, Err(stored.into()), "{stored}");
+            }
+        }
     }
 
     /// A cached report whose recorded fields this host's probe would not
@@ -2114,7 +2297,12 @@ pub(crate) mod tests {
             let path = directory.path().join("probe.json");
             let mut edited = probe_report(0x2e7);
             edit(&mut edited);
-            crate::host_qualification::store(&path, &cache_host(), &probe_cache_inputs(), &edited);
+            crate::host_qualification::store(
+                &path,
+                &cache_host(),
+                &probe_cache_inputs(0x2e7),
+                &CachedProbeVerdict::Passed(edited),
+            );
             let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
             assert!(ran, "{field}: a disagreeing report was reused");
             assert_eq!(result, Ok(probe_report(0x2e7)), "{field}");
@@ -2225,8 +2413,8 @@ pub(crate) mod tests {
                     crate::host_qualification::store(
                         &path,
                         &cache_host(),
-                        &probe_cache_inputs(),
-                        &probe_report(0x2e7),
+                        &probe_cache_inputs(0x2e7),
+                        &CachedProbeVerdict::Passed(probe_report(0x2e7)),
                     );
                 })
             })
