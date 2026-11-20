@@ -220,8 +220,10 @@ struct CorpusRowPolicy {
     cpu_timeout_seconds: u64,
     slow_reason: String,
     /// Further run types of each named row's cell on the corpus backend, added
-    /// to the row's own labels on that cell alone: the scheduled super suite
-    /// runs the heavy rows' ptrace cells, and not their SaBRe cells.
+    /// to the row's own labels on that cell alone: the heavy rows' ptrace
+    /// cells carry the super run type this way, and not their SaBRe cells.
+    /// (Since the 2026-11-04 re-tier the super level does not select their
+    /// pressure-tier node; see the compat.yaml header record.)
     #[serde(default)]
     labels: Vec<String>,
     rows: BTreeMap<String, String>,
@@ -1695,8 +1697,8 @@ mod tests {
     }
 
     /// A row policy's `labels` add run types to each named row's cell on the
-    /// corpus backend alone: the super run type runs the heavy rows' ptrace
-    /// cells, and not their SaBRe cells.
+    /// corpus backend alone: the heavy rows' ptrace cells carry the super
+    /// run type this way, and not their SaBRe cells.
     #[test]
     fn a_heavy_label_marks_only_the_corpus_backend_cell() {
         let corpus = focused_corpus().replace(

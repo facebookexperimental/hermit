@@ -104,12 +104,15 @@ remain checked against the hosted selection. The 139-program record/replay
 ratchet remains a separate step in the manually dispatched full validation
 job.
 
-The `mem_race` family and three nonblocking post-DAG diagnostics run in the
-manually dispatched `super` tier so a known host-sensitive hang cannot consume
-the serialized capability lane unexpectedly. The `super` *level* selects the
-`full` and `super` labels together (the nightly tier runs everything `full`
-runs plus the super-only population; `--inventory --labels full,super` shows
-that union, while `--labels super` alone shows only the super-only part).
+The `mem_race` family and the other diagnostics are pressure-tier since the
+2026-11-04 re-tier, so a known host-sensitive hang cannot consume the
+serialized capability lane unexpectedly: they stay runnable by explicit
+selection, outside the alerting nightly. The `super` *level* selects the
+`full` and `super` labels together and then excludes every pressure-labelled
+step (the nightly tier runs everything `full` runs plus the expected-pass
+super-only population; `--inventory --labels full,super` shows that union
+before the pressure exclusion, while `--labels super` alone shows only the
+super-only part).
 
 The `Validation Levels` workflow does not launch for pull requests, `main`, or a
 schedule. Its quick, privileged, and super levels remain available by manual

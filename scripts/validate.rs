@@ -1845,7 +1845,8 @@ fn usage() -> &'static str {
      \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
      \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
      \x20 full             quick plus the complete suite and DBI/KVM gates.\n\
-     \x20 super            Full suite plus the super-only diagnostics and stress probes (nightly tier).\n\
+     \x20 super            Full+super union, expected-pass nodes only (nightly tier); pressure-tier\n\
+     \x20                  diagnostics, stress probes and heavy compat rows are excluded.\n\
      \x20 --quick          Alias for the quick level.\n\
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
@@ -8695,6 +8696,13 @@ fn super_plan_bracket() -> Result<(), String> {
     }
     if !plan.super_mode {
         return Err("super plan: super_mode must be set so the stress table is printed".into());
+    }
+    // The help text must say what this bracket enforces: expected-pass only,
+    // with the pressure tier (diagnostics, stress probes, heavy compat rows)
+    // excluded — never that super adds those probes.
+    let help = usage();
+    if !help.contains("expected-pass nodes only") || help.contains("plus the super-only") {
+        return Err("super plan: help text does not match the expected-pass selection".into());
     }
     println!(
         "  super plan: {} boxed node(s); union present, pressure tier excluded",
@@ -16912,10 +16920,12 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // state directory is /run-state.
     let run_state = Path::new("/run-state");
     let rows = compat_manifest_argv(root, run_state)?;
-    // The full run's compat rows: the 193 of the portable strict corpus
-    // extracted from validate.sh, the 25 of
-    // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4 = 214). The pkg-config row
+    // The full run's compat rows: the 195 of the portable strict corpus
+    // extracted from validate.sh (193 plus the two net rows of the
+    // 2026-11-05 java/javac split), the 25 of
+    // https://github.com/rrnewton/hermit/issues/4269 (220 in all), less
+    // the six heavy rows, which carry the super label but are uncovered
+    // by full and super (220 - 6 = 214). The pkg-config row
     // deselected with the pinned-image move was promoted to Required by
     // the 2026-11-05 sweep flip, so it no longer subtracts; logger was
     // promoted by the same flip but re-measured red in the pinned root

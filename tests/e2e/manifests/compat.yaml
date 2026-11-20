@@ -17,10 +17,21 @@ bucket: compat
 # 2026-10-13 the `variants` entry repeated every row as a second test,
 # compat/strict-<row>, for a strict run type, while this cell always ran
 # relaxed (https://github.com/rrnewton/hermit/issues/4276).
-# The scheduled super suite runs the heavy rows' ptrace cells (rustc,
-# javac-compile, javac-run, java-compile, java-run, node: the `heavy`
-# section's `labels`) through
-# supercompat.manifest_compat, against the super run type's release Hermit. Lane settings are stated once below and every
+# UNCOVERED by full and super (recorded 2026-11-20): the heavy rows'
+# verify@ptrace cells — compat/rustc, compat/javac-compile, compat/javac-run,
+# compat/java-compile, compat/java-run and compat/node — are selected by
+# neither the full validation nor the scheduled super suite. Their DAG node,
+# supercompat.manifest_compat (against the super run type's release Hermit),
+# has been pressure-tier since the 2026-11-04 re-tier (super is
+# expected-pass only; pressure owns the negative space), and the super plan
+# refuses pressure-labelled steps. Their stated home is the nightly pressure
+# sweep (ci-hub/series/pressure_schedule.py, red part, over the scorecard's
+# red cells, where these six cells are already counted red); that sweep's
+# red part has judged no cell since 2026-11-08 (tracked separately), so no
+# scheduled run currently measures them. The promotion path back into super
+# is the owner's 2026-11-04 rule — pressure greens promote by config flip
+# after overnight evidence — via rewiring supercompat onto the pinned
+# artifact; that follow-up is not implemented here. Lane settings are stated once below and every
 # row is expanded into an ordinary test recipe
 # (ci/manifest-plan/src/manifest_corpus.rs). The rows were moved verbatim from
 # ci/compat/corpus-strict.json (deleted 2026-10-13), which was extracted
@@ -59,12 +70,16 @@ corpus:
       A full compile-link-run or JVM startup workload gets the 600-second
       wall budget the scheduled super suite gave each of these rows; its CPU
       budget stays one second below it
-    # The super run type (scripts/validate.rs super) runs these rows' ptrace
-    # cells through supercompat.manifest_compat. Until 2026-10-13 it ran them
-    # as generated compat.<row> nodes from ci/compat/corpus-strict.json, with
-    # the corpus's two relaxations and Hermit's stripped comparison; now they
-    # run at the host's strictness level under --verify-strict, like every
-    # other compat cell (https://github.com/rrnewton/hermit/issues/4276).
+    # UNCOVERED by full and super (see the header record): these rows' ptrace
+    # verify cells belong to the super run type by this `labels` entry and to
+    # the DAG node supercompat.manifest_compat, but that node has been
+    # pressure-tier since 2026-11-04, so scripts/validate.rs super does not
+    # select it. When the node (or the pressure sweep's red part) does run
+    # them, they run at the host's strictness level under --verify-strict,
+    # like every other compat cell. Until 2026-10-13 the super run type ran
+    # them as generated compat.<row> nodes from ci/compat/corpus-strict.json,
+    # with the corpus's two relaxations and Hermit's stripped comparison
+    # (https://github.com/rrnewton/hermit/issues/4276).
     labels: [super]
     rows:
       rustc: compiles and runs a Rust program
@@ -2158,8 +2173,9 @@ corpus:
     - {label: "cmp", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); printf \"same\\n\" >\"$d/a\"; printf \"same\\n\" >\"$d/b\"; cmp -s \"$d/a\" \"$d/b\"; printf \"cmp-ok\\n\"; rm -rf \"$d\""]}
     - {label: "free", argv: ["/usr/bin/free", "-m"]}
     # Rows only the SaBRe run type runs, on ptrace and on SaBRe: the SaBRe
-    # corpus's programs this corpus lacks, and the four heavy rows, whose
-    # ptrace cells the super run type runs too (the `heavy` section's labels).
+    # corpus's programs this corpus lacks, and the six heavy rows, whose
+    # ptrace verify cells also carry the super label (the `heavy` section's
+    # labels) but are uncovered by full and super (see the header record).
     - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
     # Power/weight 2026-11-05 @ Hermit 1db0a95883, ptrace, 316-core host:
     # java/javac split javac and application execution into parallel cells.
