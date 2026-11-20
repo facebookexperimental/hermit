@@ -32,6 +32,9 @@ pub use reverie_proc_grammar::Status;
 pub use reverie_proc_grammar::StatusLabel;
 pub use reverie_proc_grammar::StatusLine;
 pub use reverie_proc_grammar::StatusValue;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
+pub use reverie_proc_grammar::mountinfo::MOUNT_PEER_PREFIXES;
 pub use reverie_proc_grammar::parse_bitmap_token;
 pub use reverie_proc_grammar::parse_comm_file;
 pub use reverie_proc_grammar::parse_fdinfo;
@@ -49,9 +52,6 @@ pub use reverie_proc_grammar::render_sched;
 pub use reverie_proc_grammar::render_stat;
 pub use reverie_proc_grammar::render_statm;
 pub use reverie_proc_grammar::render_status;
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
-pub use reverie_proc_grammar::mountinfo::MOUNT_PEER_PREFIXES;
 /// The mountinfo grammar lives in `reverie-proc-grammar` (single
 /// grammar owner since Slice 2 S2-R1; this S2-D1 switch ends
 /// detcore-model's last `reverie-procfs` edge). The legacy
@@ -340,9 +340,7 @@ mod tests {
         // unknown numeric optional fields fail closed.
         assert!(parse_mountinfo(b"37 1 8:1 / / rw - ext4 /dev/root rw").is_none());
         assert!(parse_mountinfo(b"037 1 8:1 / / rw - ext4 /dev/root rw\n").is_none());
-        assert!(
-            parse_mountinfo(b"37 1 8:1 / / rw future_peer:19 - ext4 /dev/root rw\n").is_none()
-        );
+        assert!(parse_mountinfo(b"37 1 8:1 / / rw future_peer:19 - ext4 /dev/root rw\n").is_none());
         assert_eq!(parse_fdinfo_mount_id(b"pos:\t0\nmnt_id:\t37\n"), Some(37));
         assert_eq!(parse_fdinfo_mount_id(b"mnt_id:\t37\nmnt_id:\t38\n"), None);
     }

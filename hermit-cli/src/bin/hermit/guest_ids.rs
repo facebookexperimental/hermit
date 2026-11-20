@@ -150,14 +150,14 @@ fn proc_names_own_pid_namespace() -> bool {
     let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") else {
         return false;
     };
-    let Some(levels) = status
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpid:"))
-    else {
+    let Some(levels) = status.lines().find_map(|line| line.strip_prefix("NSpid:")) else {
         return false;
     };
     let mut levels = levels.split_ascii_whitespace();
-    levels.next().is_some_and(|level| level.parse::<i64>() == Ok(me)) && levels.next().is_none()
+    levels
+        .next()
+        .is_some_and(|level| level.parse::<i64>() == Ok(me))
+        && levels.next().is_none()
 }
 
 /// Whether a task with ID `id` exists in this process's PID namespace:

@@ -115,9 +115,7 @@ impl ChildExitPublicationFuture {
             ProtocolFailure::Overflow => reverie::syscalls::Errno::EOVERFLOW,
             // The named unsupported scope, distinct from the generic
             // EINVAL protocol failures below (docs/ERROR_CATALOG.md).
-            ProtocolFailure::MultithreadedForcedChildExit => {
-                reverie::syscalls::Errno::EOPNOTSUPP
-            }
+            ProtocolFailure::MultithreadedForcedChildExit => reverie::syscalls::Errno::EOPNOTSUPP,
             ProtocolFailure::Unsupported | ProtocolFailure::UnexpectedControl => {
                 reverie::syscalls::Errno::ENOSYS
             }
@@ -170,8 +168,7 @@ impl Future for ChildExitPublicationFuture {
                         let wakes = result.as_ref().err().map_or_else(Vec::new, |failure| {
                             // The named scope refusal reports under its own
                             // name, not the generic admission phase.
-                            let phase = if *failure
-                                == ProtocolFailure::MultithreadedForcedChildExit
+                            let phase = if *failure == ProtocolFailure::MultithreadedForcedChildExit
                             {
                                 "forced exit of a multithreaded KVM child is unsupported"
                             } else {

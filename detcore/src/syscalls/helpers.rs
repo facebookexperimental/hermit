@@ -689,10 +689,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let expiry = socket_timeout_expiry(wrapped, connect_family);
             let immediate_expiry = matches!(socket_timeout, Some(ReceiveTimeout::Immediate));
             let maybe_timeout = match socket_timeout {
-                Some(ReceiveTimeout::After(duration)) => Some((
-                    thread_observe_time(guest).await + duration,
-                    Err(expiry),
-                )),
+                Some(ReceiveTimeout::After(duration)) => {
+                    Some((thread_observe_time(guest).await + duration, Err(expiry)))
+                }
                 Some(ReceiveTimeout::Immediate) => {
                     Some((thread_observe_time(guest).await, Err(expiry)))
                 }
@@ -3647,7 +3646,6 @@ fn socket_timeout_expiry(syscall: Syscall, family: Option<u16>) -> Errno {
         _ => Errno::EAGAIN,
     }
 }
-
 
 /// [`interrupt_errno_at_entry`]'s rule: a call that would end with
 /// ERESTARTSYS ends with EINTR when it waits by a socket's finite timeout
@@ -8809,7 +8807,12 @@ mod tests {
         let connect = Syscall::from(syscalls::Connect::new().with_fd(3));
         let sendto = Syscall::from(syscalls::Sendto::new().with_fd(3));
         for (label, syscall, family, expected) in [
-            ("inet", connect, Some(libc::AF_INET as u16), Errno::EINPROGRESS),
+            (
+                "inet",
+                connect,
+                Some(libc::AF_INET as u16),
+                Errno::EINPROGRESS,
+            ),
             (
                 "inet6",
                 connect,
@@ -10568,8 +10571,10 @@ pub(crate) mod kernel_signal_wait_failures {
                 .await
                 .0
         } else if matches!(case, "operand" | "unknown") {
-            retry_nonblocking_syscall_helper(&mut guest, poll_probe, resources, None, None, None, false)
-                .await
+            retry_nonblocking_syscall_helper(
+                &mut guest, poll_probe, resources, None, None, None, false,
+            )
+            .await
         } else {
             retry_nonblocking_syscall_helper(
                 &mut guest,

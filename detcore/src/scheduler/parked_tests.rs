@@ -504,7 +504,11 @@ fn async_exit_completion_refuses_signal_control() {
     assert!(!s.signal_control_installed());
 }
 
-pub(crate) fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
+pub(crate) fn add(
+    s: &mut Scheduler,
+    pid: i32,
+    tid: i32,
+) -> (DetTid, MmId, reverie::CallbackSignalSite) {
     add_with_mm(s, pid, tid, MmId::initial(DetTid::from_raw(pid)))
 }
 fn add_with_mm(
@@ -4282,8 +4286,7 @@ fn run_multithreaded_forced_child_case() {
     event.forced = true;
     let scheduler = Arc::new(Mutex::new(s));
     let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
-        scheduler,
-        event,
+        scheduler, event,
     ));
     let _ = poll_child_exit(&mut publication);
     println!("MULTITHREADED_FORCED_CHILD survived");
@@ -4300,8 +4303,7 @@ fn a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status() {
         run_multithreaded_forced_child_case();
         return;
     }
-    const TEST: &str =
-        "scheduler::parked_tests::a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status";
+    const TEST: &str = "scheduler::parked_tests::a_multithreaded_forced_child_exit_refuses_the_run_with_policy_status";
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
         .env(MULTITHREADED_FORCED_CHILD, "1")

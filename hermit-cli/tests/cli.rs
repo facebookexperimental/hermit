@@ -65231,7 +65231,10 @@ fn auto_names_a_c_library_that_declares_x86_64_v3() {
     assert_eq!(manifest["cpu_profile"]["profile"], profile, "{manifest:#}");
     assert_eq!(manifest["cpu_profile"]["reason"], reason, "{manifest:#}");
     if reason == "qualification-refused" {
-        assert!(manifest["cpu_profile"]["detail"].is_string(), "{manifest:#}");
+        assert!(
+            manifest["cpu_profile"]["detail"].is_string(),
+            "{manifest:#}"
+        );
     }
     assert!(
         stderr.contains(&format!(

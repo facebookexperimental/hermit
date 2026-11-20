@@ -26349,7 +26349,10 @@ mod tests {
             500,
             crate::scheduler::work_span::Arrival::Other,
         );
-        assert_eq!(state.sched.lock().unwrap().work_span_cpu_now(tid), Some(500));
+        assert_eq!(
+            state.sched.lock().unwrap().work_span_cpu_now(tid),
+            Some(500)
+        );
         let name = "rt_sigsuspend (restart code refused: TracerMayBeFiltered)";
         let response = state
             .receive_rpc(
@@ -26361,7 +26364,10 @@ mod tests {
                 ),
             )
             .await;
-        assert_eq!(response, (None, GlobalResponse::ReportUnsupportedSyscall(())));
+        assert_eq!(
+            response,
+            (None, GlobalResponse::ReportUnsupportedSyscall(()))
+        );
         assert!(state.unsupported_syscalls.lock().unwrap().contains(name));
         assert_eq!(
             state.sched.lock().unwrap().work_span_cpu_now(tid),
