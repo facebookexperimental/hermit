@@ -26896,8 +26896,8 @@ backends_disabled:
             (
                 "an x86-64-v3 admission refused for the host's XCR0",
                 "HERMIT_POLICY_REFUSAL class=policy-refusal\nError: --cpu-profile x86-64-v3 \
-                 refused: XCR0 0x2ff enables components the XINUSE probe does not cover (it \
-                 covers 0x2e7)\n     > Hermit refused the run: a fail-closed policy stopped it \
+                 refused: XCR0 0x802ff enables components the XINUSE probe does not cover (it \
+                 covers 0x2ff)\n     > Hermit refused the run: a fail-closed policy stopped it \
                  before completion. This is not a hermit failure; the refusal reason is above.\n"
                     .to_string(),
             ),

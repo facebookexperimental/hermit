@@ -6716,9 +6716,10 @@ fn v3_refusals_follow_the_runners_environment() {
 }
 
 /// The refusal a fake refusing host prints, as `hermit host-capabilities
-/// --cpu-profile x86-64-v3` words it on a Skylake-SP host.
+/// --cpu-profile x86-64-v3` words it on a host whose XCR0 also enables APX
+/// (bit 19), which the probe still does not cover.
 const V3_FAKE_REFUSAL: &str =
-    "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)";
+    "XCR0 0x802ff enables components the XINUSE probe does not cover (it covers 0x2ff)";
 
 /// A v3 run that the profile refuses by name, as `v3_run_or_refusal`'s
 /// `attempt` returns it.
@@ -79828,6 +79829,38 @@ fn host_capabilities_never_touches_the_probe_cache() {
         !cache_home.path().join("hermit").exists(),
         "host-capabilities wrote the cache"
     );
+}
+
+/// Negative control for MPX widening: a still-uncovered XCR0 component
+/// refuses with exit 122 on every host. The refuse-only seam
+/// HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS adds APX (bit 19) to the XCR0
+/// the coverage check sees; the probe itself always measures the real
+/// XCR0, so the seam cannot admit a host. On a host that refuses earlier
+/// fixed checks the control is inapplicable, which the plain run proves.
+#[test]
+fn an_uncovered_xcr0_component_still_refuses_with_exit_122() {
+    let mut command = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3"]);
+    command
+        .env("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS", "0x80000")
+        .stdin(Stdio::null());
+    let output = hermit_test::hermit_output("hermit host-capabilities", &mut command);
+    let text = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{text}\n{}",
+        stderr(&output)
+    );
+    assert!(text.starts_with("x86-64-v3: REFUSED"), "{text}");
+    if text.contains("does not cover") {
+        assert!(text.contains("(it covers 0x2ff)"), "{text}");
+    } else {
+        assert!(
+            cpu_profile_v3_qualification().is_err(),
+            "host qualifies without the seam, so the seam run must refuse \
+             by coverage, not by an earlier check: {text}"
+        );
+    }
 }
 
 static PROCFS_OWN_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();

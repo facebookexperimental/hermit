@@ -75,28 +75,31 @@ pub enum Kind {
 #[repr(C)]
 #[derive(Debug)]
 pub struct ArmCtx {
-    pub kind: u32,          // 0
-    pub component: u32,     // 4
-    pub mxcsr: u32,         // 8
-    pub mode: u32,          // 12
-    pub xcr0: u64,          // 16
-    pub save_area: *mut u8, // 24: XSAVE destination, 64-byte aligned
-    pub image: *const u8,   // 32: XRSTOR/FXRSTOR source, 64-byte aligned
-    pub fd_to_peer: i32,    // 40
-    pub fd_from_peer: i32,  // 44
-    pub tgid: i32,          // 48
-    pub tid: i32,           // 52
-    pub ones: *const u8,    // 56: 64 nonzero bytes, 64-byte aligned
-    pub pkru_out: u32,      // 64
-    pub avx512: u32,        // 68: whether ZMM16-31 and k0-7 exist
-    pub cpuid_cycles: u64,  // 72: the forced exit's CPUID round trip
-    pub seq: u8,            // 80: handshake byte sent
-    pub reply: u8,          // 81: handshake byte received
-    pub pkru: u8,           // 82: nonzero when RDPKRU and WRPKRU may run
-    pub _pad: u8,           // 83
-    pub status: u32,        // 84: an `ArmStatus`
-    pub saved_pkru: u32,    // 88: scratch
-    pub saved_mxcsr: u32,   // 92: scratch
+    pub kind: u32,            // 0
+    pub component: u32,       // 4
+    pub mxcsr: u32,           // 8
+    pub mode: u32,            // 12
+    pub xcr0: u64,            // 16
+    pub save_area: *mut u8,   // 24: XSAVE destination, 64-byte aligned
+    pub image: *const u8,     // 32: XRSTOR/FXRSTOR source, 64-byte aligned
+    pub fd_to_peer: i32,      // 40
+    pub fd_from_peer: i32,    // 44
+    pub tgid: i32,            // 48
+    pub tid: i32,             // 52
+    pub ones: *const u8,      // 56: 64 nonzero bytes, 64-byte aligned
+    pub pkru_out: u32,        // 64
+    pub avx512: u32,          // 68: whether ZMM16-31 and k0-7 exist
+    pub cpuid_cycles: u64,    // 72: the forced exit's CPUID round trip
+    pub seq: u8,              // 80: handshake byte sent
+    pub reply: u8,            // 81: handshake byte received
+    pub pkru: u8,             // 82: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,             // 83
+    pub status: u32,          // 84: an `ArmStatus`
+    pub saved_pkru: u32,      // 88: scratch
+    pub saved_mxcsr: u32,     // 92: scratch
+    pub mpx_image: *const u8, // 96: dirty-MPX XRSTOR source, 64-byte aligned
+    pub mpx: u8,              // 104: nonzero when the MPX dirty XRSTOR may run
+    pub _pad_tail: [u8; 7],   // 105
 }
 
 /// How an arm call ended. Anything but `Ok` voids the trial.
@@ -145,26 +148,29 @@ pub enum PeerState {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PeerCtx {
-    pub state: u32,        // 0: a `PeerState`, set before each handshake
-    pub fd_in: i32,        // 4
-    pub fd_out: i32,       // 8
-    pub avx512: u32,       // 12
-    pub image: *const u8,  // 16: the XRSTOR source for states 2, 3 and 5
-    pub xcr0: u64,         // 24
-    pub ones: *const u8,   // 32
-    pub tgid: i32,         // 40
-    pub tid: i32,          // 44
-    pub expected_cpu: u32, // 48
-    pub wrong_cpu: u32,    // 52: rounds the peer ran on another CPU
-    pub status: u32,       // 56: why the loop ended early, as `ArmStatus`
-    pub rounds: u32,       // 60
-    pub byte: u8,          // 64: received
-    pub reply: u8,         // 65: sent
-    pub pkru: u8,          // 66: nonzero when RDPKRU and WRPKRU may run
-    pub _pad: u8,          // 67
-    pub cpu_out: u32,      // 68: getcpu result
-    pub saved_pkru: u32,   // 72
-    pub saved_mxcsr: u32,  // 76
+    pub state: u32,           // 0: a `PeerState`, set before each handshake
+    pub fd_in: i32,           // 4
+    pub fd_out: i32,          // 8
+    pub avx512: u32,          // 12
+    pub image: *const u8,     // 16: the XRSTOR source for states 2, 3 and 5
+    pub xcr0: u64,            // 24
+    pub ones: *const u8,      // 32
+    pub tgid: i32,            // 40
+    pub tid: i32,             // 44
+    pub expected_cpu: u32,    // 48
+    pub wrong_cpu: u32,       // 52: rounds the peer ran on another CPU
+    pub status: u32,          // 56: why the loop ended early, as `ArmStatus`
+    pub rounds: u32,          // 60
+    pub byte: u8,             // 64: received
+    pub reply: u8,            // 65: sent
+    pub pkru: u8,             // 66: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,             // 67
+    pub cpu_out: u32,         // 68: getcpu result
+    pub saved_pkru: u32,      // 72
+    pub saved_mxcsr: u32,     // 76
+    pub mpx_image: *const u8, // 80: dirty-MPX XRSTOR source, 64-byte aligned
+    pub mpx: u8,              // 88: nonzero when the MPX dirty XRSTOR may run
+    pub _pad_tail: [u8; 7],   // 89
 }
 
 /// The handshake byte that ends the peer loop.
@@ -252,6 +258,19 @@ global_asm!(
     mov r8, [\ctxreg + \imgoff]
     xrstor [r8]
 .endm
+
+// Dirties BND0-3 and BNDCSR from the context's MPX image (RFBM 0x18), only
+// when its MPX byte is set. BND instructions are NOPs while BNDCFGU.EN is
+// clear, so no instruction in XINUSE_DIRTY can dirty these components.
+.macro XINUSE_DIRTY_MPX ctxreg, flagoff, imgoff
+    cmp byte ptr [\ctxreg + \flagoff], 0
+    je 94f
+    mov eax, 0x18
+    xor edx, edx
+    mov r8, [\ctxreg + \imgoff]
+    xrstor [r8]
+94:
+.endm
 "#
 );
 
@@ -270,6 +289,7 @@ hermit_xinuse_arm:
     stmxcsr dword ptr [r12 + 92]
     XINUSE_WRPKRU 0x55555554, r12, 82
     XINUSE_DIRTY r12, 68, 56
+    XINUSE_DIRTY_MPX r12, 104, 96
     ldmxcsr dword ptr [r12 + 8]
 
     mov eax, [r12 + 0]
@@ -487,10 +507,12 @@ hermit_xinuse_peer_loop:
 
 .Lpeer_dirty_differs:
     XINUSE_DIRTY r12, 12, 32
+    XINUSE_DIRTY_MPX r12, 88, 80
     XINUSE_WRPKRU 0x55555550, r12, 66
     jmp .Lpeer_reply
 .Lpeer_dirty_wrpkru:
     XINUSE_DIRTY r12, 12, 32
+    XINUSE_DIRTY_MPX r12, 88, 80
     XINUSE_WRPKRU 0, r12, 66
     jmp .Lpeer_reply
 .Lpeer_xrstor_all:
@@ -500,11 +522,13 @@ hermit_xinuse_peer_loop:
     jmp .Lpeer_reply
 .Lpeer_header_loaded:
     XINUSE_DIRTY r12, 12, 32
+    XINUSE_DIRTY_MPX r12, 88, 80
     mov r13, 0x200
     XINUSE_XRSTOR_MASK r12, 16, r13
     jmp .Lpeer_reply
 .Lpeer_sigreturn:
     XINUSE_DIRTY r12, 12, 32
+    XINUSE_DIRTY_MPX r12, 88, 80
     XINUSE_WRPKRU 0, r12, 66
     mov eax, 234
     movsxd rdi, dword ptr [r12 + 40]
@@ -648,6 +672,8 @@ mod tests {
         assert_eq!(offset_of!(ArmCtx, status), 84);
         assert_eq!(offset_of!(ArmCtx, saved_pkru), 88);
         assert_eq!(offset_of!(ArmCtx, saved_mxcsr), 92);
+        assert_eq!(offset_of!(ArmCtx, mpx_image), 96);
+        assert_eq!(offset_of!(ArmCtx, mpx), 104);
     }
 
     #[test]
@@ -671,5 +697,7 @@ mod tests {
         assert_eq!(offset_of!(PeerCtx, cpu_out), 68);
         assert_eq!(offset_of!(PeerCtx, saved_pkru), 72);
         assert_eq!(offset_of!(PeerCtx, saved_mxcsr), 76);
+        assert_eq!(offset_of!(PeerCtx, mpx_image), 80);
+        assert_eq!(offset_of!(PeerCtx, mpx), 88);
     }
 }

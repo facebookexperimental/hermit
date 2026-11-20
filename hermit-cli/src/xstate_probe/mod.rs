@@ -31,7 +31,9 @@
 //! and the same PKRU, and every repetition must agree. Anything inconclusive
 //! refuses. The probe samples a fixed set of paths; it cannot exclude a CPU or
 //! hypervisor that behaves differently only on others, and that limit is stated
-//! wherever v3 is offered.
+//! wherever v3 is offered. MPX state is covered only with bounds checks
+//! disabled (BNDCFGU.EN clear in every dirty image): a guest that enables
+//! MPX itself takes paths the probe does not sample.
 
 pub mod asm;
 pub mod irq_counter;
@@ -59,10 +61,14 @@ pub const MAX_REPETITIONS: u32 = 4096;
 /// which on a busy machine (load 80 on 316 CPUs) happens often enough that 20
 /// attempts left a cell inconclusive in one of six runs.
 const MAX_ATTEMPTS: u32 = 200;
-/// The XCR0 components the probe covers: x87, SSE, AVX, opmask, ZMM_Hi256,
-/// Hi16_ZMM and PKRU.
-pub const COVERED_XCR0: u64 = 0b10_1110_0111;
+/// The XCR0 components the probe covers: x87, SSE, AVX, MPX BNDREGS, MPX
+/// BNDCSR, opmask, ZMM_Hi256, Hi16_ZMM and PKRU.
+pub const COVERED_XCR0: u64 = 0b10_1111_1111;
 const AVX512_COMPONENTS: u64 = 0b1110_0000;
+/// The MPX components (BNDREGS and BNDCSR), admitted together or not at all.
+const MPX_COMPONENTS: u64 = 0b1_1000;
+const BNDREGS_COMPONENT: u32 = 3;
+const BNDCSR_COMPONENT: u32 = 4;
 const PKRU_COMPONENT: u32 = 9;
 const SIGUSR1: i32 = 10;
 /// The MXCSR values each case runs under: the default, and a legal
@@ -94,9 +100,9 @@ impl Case {
 /// Why the host cannot use the v3 profile, as one sentence for the refusal.
 pub type ProbeRefusal = String;
 
-/// The admitted component sets: x87, SSE and AVX are required by v3; the three
-/// AVX-512 components come together or not at all; PKRU is optional. Any other
-/// bit refuses, over all 64 bits.
+/// The admitted component sets: x87, SSE and AVX are required by v3; the two
+/// MPX components and the three AVX-512 components each come together or not
+/// at all; PKRU is optional. Any other bit refuses, over all 64 bits.
 pub fn check_xcr0(xcr0: u64) -> Result<(), ProbeRefusal> {
     if xcr0 & !COVERED_XCR0 != 0 {
         return Err(format!(
@@ -114,6 +120,49 @@ pub fn check_xcr0(xcr0: u64) -> Result<(), ProbeRefusal> {
         return Err(format!(
             "XCR0 {xcr0:#x} enables only some of the AVX-512 components"
         ));
+    }
+    let mpx = xcr0 & MPX_COMPONENTS;
+    if mpx != 0 && mpx != MPX_COMPONENTS {
+        return Err(format!(
+            "XCR0 {xcr0:#x} enables only some of the MPX components"
+        ));
+    }
+    Ok(())
+}
+
+/// A test-only variable that adds bits to the XCR0 the coverage check sees,
+/// so the still-uncovered refusal (exit 122) runs on every host. The probe
+/// always measures the host's real XCR0; extra bits feed only
+/// [`check_xcr0`], so the seam can only refuse. Unset in every real run.
+pub const XCR0_EXTRA_TEST_ENV: &str = "HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS";
+
+/// What a value of [`XCR0_EXTRA_TEST_ENV`] adds: a bit mask in decimal, or
+/// in hexadecimal with a `0x` prefix. Unset adds nothing.
+fn extra_bits_from(value: Option<&std::ffi::OsStr>) -> Result<u64, ProbeRefusal> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let malformed = || {
+        format!("{XCR0_EXTRA_TEST_ENV}={value:?} is not a bit mask (decimal, or 0x-prefixed hex)")
+    };
+    let text = value.to_str().ok_or_else(malformed)?;
+    let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (text, 10),
+    };
+    if digits.is_empty() {
+        return Err(malformed());
+    }
+    u64::from_str_radix(digits, radix).map_err(|_| malformed())
+}
+
+/// The test seam's refusal for `xcr0`, if the seam is set: `xcr0` with the
+/// seam's extra bits must pass [`check_xcr0`]. With the seam unset this is
+/// no check at all, so no qualification path changes.
+pub fn check_forced_extra_bits(xcr0: u64) -> Result<(), ProbeRefusal> {
+    let extra = extra_bits_from(std::env::var_os(XCR0_EXTRA_TEST_ENV).as_deref())?;
+    if extra != 0 {
+        check_xcr0(xcr0 | extra)?;
     }
     Ok(())
 }
@@ -305,6 +354,74 @@ fn fill_compacted_image(area: &mut Area, mxcsr: u32, xcr0: u64) {
     area.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     area.0[520..528].copy_from_slice(&((1u64 << 63) | xcr0).to_le_bytes());
+}
+
+/// The arm's dirty MPX values (BND0-3 lower bounds and ones'-complement
+/// uppers), as a hardware measurement on a Xeon Gold 6138 (XCR0 0x2ff,
+/// Linux 7.1.3) found them stable across reloads and signals
+/// (<https://github.com/facebookexperimental/hermit/issues/282>). BNDCFGU
+/// keeps EN and BNDPRESERVE clear and the reserved bits 11:2 zero, so
+/// loading it enables no bound checks.
+const ARM_BND: [u64; 8] = [
+    0x0000_1000_0000_1000,
+    !0x0000_1000_0000_2000,
+    0x0000_1000_0000_3000,
+    !0x0000_1000_0000_4000,
+    0x0000_1000_0000_5000,
+    !0x0000_1000_0000_6000,
+    0x0000_1000_0000_7000,
+    !0x0000_1000_0000_8000,
+];
+const ARM_BNDCFGU: u64 = 0x0000_1234_5678_9000;
+const ARM_BNDSTATUS: u64 = 0x1001;
+/// The peer's dirty MPX values: different from the arm's in every word, so a
+/// reload that kept the peer's state cannot compare equal by accident.
+const PEER_BND: [u64; 8] = [
+    0x0000_2000_0000_1000,
+    !0x0000_2000_0000_2000,
+    0x0000_2000_0000_3000,
+    !0x0000_2000_0000_4000,
+    0x0000_2000_0000_5000,
+    !0x0000_2000_0000_6000,
+    0x0000_2000_0000_7000,
+    !0x0000_2000_0000_8000,
+];
+const PEER_BNDCFGU: u64 = 0x0000_6543_2100_0000;
+const PEER_BNDSTATUS: u64 = 0x2002;
+
+/// The standard-format (offset) of each MPX component in `layout`, when both
+/// are present with room for BND0-3 (64 bytes) and BNDCSR (16 bytes used)
+/// inside the save area the probe compares (`layout.size` bytes).
+fn mpx_offsets(layout: &Layout) -> Option<(usize, usize)> {
+    let find = |component: u32, need: usize| {
+        layout
+            .components
+            .iter()
+            .find(|(i, _, size)| *i == component && *size >= need)
+            .map(|(_, offset, _)| *offset)
+            .filter(|offset| offset + need <= layout.size)
+    };
+    Some((find(BNDREGS_COMPONENT, 64)?, find(BNDCSR_COMPONENT, 16)?))
+}
+
+/// Fills `area` as an XRSTOR image (RFBM is the caller's MPX mask) holding
+/// the arm's or the peer's dirty MPX values at `layout`'s offsets. BND
+/// instructions are NOPs while BNDCFGU.EN is clear, so
+/// XRSTOR is the only way to dirty these components. Callers hold
+/// `mpx_offsets(layout).is_some()`.
+fn fill_mpx_dirty_image(area: &mut Area, layout: &Layout, peer: bool) {
+    let (regs, csr) = mpx_offsets(layout).expect("MPX offsets checked by caller");
+    fill_standard_image(area, 0x1f80, MPX_COMPONENTS);
+    let (bnd, cfgu, status) = if peer {
+        (PEER_BND, PEER_BNDCFGU, PEER_BNDSTATUS)
+    } else {
+        (ARM_BND, ARM_BNDCFGU, ARM_BNDSTATUS)
+    };
+    for (i, word) in bnd.iter().enumerate() {
+        area.0[regs + 8 * i..regs + 8 * i + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    area.0[csr..csr + 8].copy_from_slice(&cfgu.to_le_bytes());
+    area.0[csr + 8..csr + 16].copy_from_slice(&status.to_le_bytes());
 }
 
 /// An FXSAVE image of initial x87 and SSE values.
@@ -625,6 +742,13 @@ fn qualify_coordinated(
             options.repetitions
         ));
     }
+    // The refuse-only test seam, before any cached or shared verdict can
+    // stand in for measuring: with it unset nothing here runs.
+    if std::env::var_os(XCR0_EXTRA_TEST_ENV).is_some() {
+        // SAFETY: XGETBV with ECX 0, as in `Layout::host`.
+        let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+        check_forced_extra_bits(xcr0)?;
+    }
     let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
     if hypervisor {
         let _serialized = ProbeLock::acquire(lock_path)?;
@@ -918,6 +1042,13 @@ struct Probe {
     first: Box<Area>,
     image: Box<Area>,
     peer_image: Box<Area>,
+    /// XRSTOR images holding the arm's and the peer's dirty MPX values;
+    /// filled (and used) only when `mpx` holds. The peer's image is read
+    /// only through the raw pointer in its `PeerCtx`; this box keeps it
+    /// alive for the peer thread's lifetime.
+    arm_mpx: Box<Area>,
+    _peer_mpx: Box<Area>,
+    mpx: bool,
     ones: Box<Area>,
     to_peer: [i32; 2],
     from_peer: [i32; 2],
@@ -945,6 +1076,15 @@ impl Probe {
         let cpu = probe_cpu()?;
         pin_to(cpu)?;
         let layout = Layout::host()?;
+        check_forced_extra_bits(layout.xcr0)?;
+        let mpx = layout.xcr0 & MPX_COMPONENTS == MPX_COMPONENTS;
+        if mpx && mpx_offsets(&layout).is_none() {
+            return Err(format!(
+                "XCR0 {:#x} enables MPX but CPUID leaf 0xD leaves no room for \
+                 BNDREGS and BNDCSR in the probe's save area",
+                layout.xcr0
+            ));
+        }
         let pkru = pkru_usable(layout.xcr0, native_ospke())?;
         let cases = case_list(layout.xcr0)?;
         if cases.len() != expected_case_count(layout.xcr0) {
@@ -998,6 +1138,12 @@ impl Probe {
         PROBE_TID.store(tid as u64, Ordering::SeqCst);
         install_signal_counter()?;
         let peer_image = Area::boxed();
+        let mut arm_mpx = Area::boxed();
+        let mut peer_mpx = Area::boxed();
+        if mpx {
+            fill_mpx_dirty_image(&mut arm_mpx, &layout, false);
+            fill_mpx_dirty_image(&mut peer_mpx, &layout, true);
+        }
         let peer = Box::new(PeerCtx {
             state: PeerState::DirtyPkruDiffers as u32,
             fd_in: to_peer[0],
@@ -1019,6 +1165,9 @@ impl Probe {
             cpu_out: 0,
             saved_pkru: 0,
             saved_mxcsr: 0,
+            mpx_image: peer_mpx.0.as_ptr(),
+            mpx: u8::from(mpx),
+            _pad_tail: [0; 7],
         });
         let mut probe = Probe {
             cpu,
@@ -1044,6 +1193,9 @@ impl Probe {
             first: Area::boxed(),
             image: Area::boxed(),
             peer_image,
+            arm_mpx,
+            _peer_mpx: peer_mpx,
+            mpx,
             ones,
             to_peer,
             from_peer,
@@ -1250,6 +1402,9 @@ impl Probe {
                 status: 0,
                 saved_pkru: 0,
                 saved_mxcsr: 0,
+                mpx_image: self.arm_mpx.0.as_ptr(),
+                mpx: u8::from(self.mpx),
+                _pad_tail: [0; 7],
             };
             let probe_signals = PROBE_SIGNALS.load(Ordering::SeqCst);
             let peer_signals = PEER_SIGNALS.load(Ordering::SeqCst);
@@ -2110,6 +2265,9 @@ mod tests {
                 status: 0,
                 saved_pkru: 0,
                 saved_mxcsr: 0,
+                mpx_image: image.0.as_ptr(),
+                mpx: 0,
+                _pad_tail: [0; 7],
             };
             // Keys 0 and 1 stay fully accessible, so this thread's memory, all
             // of it under key 0, stays usable whatever the arm does.
@@ -2204,6 +2362,9 @@ mod tests {
                         cpu_out: 0,
                         saved_pkru: 0,
                         saved_mxcsr: 0,
+                        mpx_image: image.0.as_ptr(),
+                        mpx: 0,
+                        _pad_tail: [0; 7],
                     };
                     // SAFETY: OSPKE is set, so RDPKRU and WRPKRU are enabled.
                     let original = ospke.then(|| unsafe {
@@ -2308,11 +2469,19 @@ mod tests {
 
     #[test]
     fn only_covered_component_sets_are_admitted() {
+        assert_eq!(check_xcr0(0x2ff), Ok(()), "Skylake-SP with MPX");
         assert_eq!(check_xcr0(0x2e7), Ok(()));
+        assert_eq!(check_xcr0(0xff), Ok(()), "MPX and AVX-512 without PKRU");
+        assert_eq!(check_xcr0(0x21f), Ok(()), "MPX and PKRU without AVX-512");
+        assert_eq!(check_xcr0(0x1f), Ok(()), "MPX without AVX-512 or PKRU");
         assert_eq!(check_xcr0(0x207), Ok(()), "AVX2-only host with PKRU");
         assert_eq!(check_xcr0(0x7), Ok(()));
         assert!(check_xcr0(0x3).is_err(), "no AVX");
         assert!(check_xcr0(0x267).is_err(), "partial AVX-512");
+        assert!(check_xcr0(0x2ef).is_err(), "BNDREGS without BNDCSR");
+        assert!(check_xcr0(0x2f7).is_err(), "BNDCSR without BNDREGS");
+        assert!(check_xcr0(0x2ff | (1 << 17)).is_err(), "MPX plus TILECFG");
+        assert!(check_xcr0(0x2ff | (1 << 19)).is_err(), "MPX plus APX");
         // APX (bit 19) and AMX (17, 18) are outside the probe.
         assert!(check_xcr0(0x802e7).is_err());
         assert!(check_xcr0(0x602e7).is_err());
@@ -2324,7 +2493,7 @@ mod tests {
 
     #[test]
     fn the_case_list_matches_its_independent_count() {
-        for xcr0 in [0x2e7u64, 0x207, 0xe7, 0x7] {
+        for xcr0 in [0x2ffu64, 0x2e7, 0xff, 0x21f, 0x1f, 0x207, 0xe7, 0x7] {
             let cases = case_list(xcr0).unwrap();
             assert_eq!(cases.len(), expected_case_count(xcr0), "xcr0 {xcr0:#x}");
             for case in &cases {
@@ -2334,7 +2503,10 @@ mod tests {
                 assert_ne!(case.targets, 0, "{case:?}");
             }
         }
+        assert_eq!(case_list(0x2ff).unwrap().len(), 39);
+        assert_eq!(case_list(0xff).unwrap().len(), 34);
         assert_eq!(case_list(0x2e7).unwrap().len(), 33);
+        assert_eq!(case_list(0x21f).unwrap().len(), 27);
         // AVX2-only hosts get no AVX-512 instruction.
         assert!(case_list(0x207).unwrap().iter().all(|c| !matches!(
             c.kind,
@@ -2349,6 +2521,291 @@ mod tests {
         assert!(parse_schedstat_timeslices(text, 4).is_err());
         assert!(parse_schedstat_timeslices("version 18\ncpu0 0 0 0 0 0 0 1 2 3\n", 0).is_err());
         assert!(parse_schedstat_timeslices("cpu0 0 0 0 0 0 0 1 2 3\n", 0).is_err());
+    }
+
+    /// The 0x2e7 (no-MPX) case set is byte-identical before and after MPX
+    /// widening: this golden list was captured from the pre-widening code.
+    /// A host without MPX must see exactly these cases, in this order.
+    #[test]
+    fn the_2e7_case_list_is_unchanged_by_mpx_widening() {
+        let golden = vec![
+            Case {
+                kind: Kind::XrstorInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 1,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 2,
+                targets: 4,
+                live: 739,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 5,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 6,
+                targets: 64,
+                live: 679,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 7,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::XrstorInit,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::XrstorHeaderSet,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::CompactedXrstorInit,
+                component: 9,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::WrpkruZero,
+                component: 0,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::Sigreturn,
+                component: 0,
+                targets: 512,
+                live: 231,
+            },
+            Case {
+                kind: Kind::Vzeroupper,
+                component: 0,
+                targets: 68,
+                live: 675,
+            },
+            Case {
+                kind: Kind::LegacyPxor,
+                component: 0,
+                targets: 2,
+                live: 741,
+            },
+            Case {
+                kind: Kind::Vex128Zero,
+                component: 0,
+                targets: 70,
+                live: 673,
+            },
+            Case {
+                kind: Kind::Hi16Zero,
+                component: 0,
+                targets: 128,
+                live: 615,
+            },
+            Case {
+                kind: Kind::PxorVzeroupperHi16,
+                component: 0,
+                targets: 198,
+                live: 545,
+            },
+            Case {
+                kind: Kind::OpmaskZero,
+                component: 0,
+                targets: 32,
+                live: 711,
+            },
+            Case {
+                kind: Kind::X87FullInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::X87DirtyFullInit,
+                component: 0,
+                targets: 1,
+                live: 742,
+            },
+            Case {
+                kind: Kind::FxrstorInit,
+                component: 0,
+                targets: 3,
+                live: 740,
+            },
+            Case {
+                kind: Kind::VzeroallAll,
+                component: 0,
+                targets: 198,
+                live: 545,
+            },
+        ];
+        assert_eq!(case_list(0x2e7).unwrap(), golden);
+    }
+
+    #[test]
+    fn extra_bits_parse_decimal_and_hex_and_refuse_the_rest() {
+        use std::ffi::OsStr;
+        assert_eq!(extra_bits_from(None), Ok(0));
+        assert_eq!(extra_bits_from(Some(OsStr::new("0"))), Ok(0));
+        assert_eq!(extra_bits_from(Some(OsStr::new("131072"))), Ok(1 << 17));
+        assert_eq!(extra_bits_from(Some(OsStr::new("0x20000"))), Ok(1 << 17));
+        assert_eq!(extra_bits_from(Some(OsStr::new("0X18"))), Ok(0x18));
+        for bad in ["", "0x", "junk", "0xzz", "-1", "1.5"] {
+            let refusal = extra_bits_from(Some(OsStr::new(bad))).unwrap_err();
+            assert!(refusal.contains(XCR0_EXTRA_TEST_ENV), "{bad:?}: {refusal}");
+        }
+    }
+
+    /// The dirty MPX images hold distinct arm/peer values at the layout's
+    /// offsets, with BNDCFGU's enable and reserved bits clear.
+    #[test]
+    fn mpx_dirty_images_are_distinct_and_keep_bounds_checks_off() {
+        let layout = Layout {
+            xcr0: 0x2ff,
+            size: 2696,
+            components: vec![(2, 576, 256), (3, 960, 64), (4, 1024, 64)],
+        };
+        assert_eq!(mpx_offsets(&layout), Some((960, 1024)));
+        let word =
+            |area: &Area, at: usize| u64::from_le_bytes(area.0[at..at + 8].try_into().unwrap());
+        let (mut arm, mut peer) = (Area::boxed(), Area::boxed());
+        fill_mpx_dirty_image(&mut arm, &layout, false);
+        fill_mpx_dirty_image(&mut peer, &layout, true);
+        assert_eq!(word(&arm, 512), MPX_COMPONENTS);
+        assert_eq!(word(&arm, 960), ARM_BND[0]);
+        assert_eq!(word(&peer, 960), PEER_BND[0]);
+        assert_ne!(arm.0[960..1088], peer.0[960..1088], "arm differs from peer");
+        for area in [&arm, &peer] {
+            let cfgu = word(area, 1024);
+            assert_eq!(cfgu & 0xfff, 0, "EN, PRESERVE, reserved clear");
+            assert_ne!(cfgu, 0, "nonzero bounds-directory base");
+            assert_ne!(word(area, 1032), 0, "nonzero BNDSTATUS");
+        }
+        let no_mpx = Layout {
+            xcr0: 0x2e7,
+            size: 2568,
+            components: vec![(2, 576, 256)],
+        };
+        assert_eq!(mpx_offsets(&no_mpx), None);
+    }
+
+    /// MPX components use the generic initial rule (all-zero values), as
+    /// measured on a Xeon Gold 6138 (0xD.3 64@960, 0xD.4 64@1024, size 2696).
+    #[test]
+    fn mpx_components_are_recognized_initial_or_live() {
+        let layout = Layout {
+            xcr0: 0x2ff,
+            size: 2696,
+            components: vec![
+                (2, 576, 256),
+                (3, 960, 64),
+                (4, 1024, 64),
+                (5, 1088, 64),
+                (6, 1152, 512),
+                (7, 1664, 1024),
+                (9, 2688, 8),
+            ],
+        };
+        let mut image = vec![0u8; 2696];
+        assert!(layout.is_initial(&image, 0, 3), "header bit clear");
+        assert!(layout.is_initial(&image, 0, 4), "header bit clear");
+        image[512..520].copy_from_slice(&0x18u64.to_le_bytes());
+        assert!(layout.is_initial(&image, 0, 3), "zero BNDREGS values");
+        assert!(layout.is_initial(&image, 0, 4), "zero BNDCSR values");
+        image[960] = 1;
+        assert!(!layout.is_initial(&image, 0, 3), "dirty BND0");
+        assert!(layout.is_initial(&image, 0, 4));
+        image[1024] = 1;
+        assert!(!layout.is_initial(&image, 0, 4), "dirty BNDCFGU");
     }
 
     #[test]
