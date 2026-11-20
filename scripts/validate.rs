@@ -2591,7 +2591,9 @@ fn e2e_runner_policy(args: &Args) -> Result<(), String> {
             ));
         }
         if args.buck_release_dotslash.is_some() || args.selected.is_some() {
-            return Err(format!("{flag} runs its own plan; drop --buck-release and --selected"));
+            return Err(format!(
+                "{flag} runs its own plan; drop --buck-release and --selected"
+            ));
         }
         if !args.allow_local_off_the_record_run && !args.show_plan && !args.show_plan_json {
             return Err(format!(
@@ -38859,11 +38861,17 @@ mod scorecard_cutover_tests {
             assert_eq!(focused.profile(), format!("buck-{name}"));
             assert_eq!(format!("--{}", focused.cli_name()), flag);
             e2e_runner_policy(&args).expect("a Buck-only plan needs no off-the-record flag");
-            assert!(matches!(parse_argv(&[flag.into()]), Err(2)), "{flag} without --buck2 is a usage error");
+            assert!(
+                matches!(parse_argv(&[flag.into()]), Err(2)),
+                "{flag} without --buck2 is a usage error"
+            );
             let mut bare = args;
             bare.buck2 = None;
             let error = e2e_runner_policy(&bare).unwrap_err();
-            assert!(error.starts_with(&format!("{flag} needs --buck2 PATH")), "{error}");
+            assert!(
+                error.starts_with(&format!("{flag} needs --buck2 PATH")),
+                "{error}"
+            );
         }
     }
 
@@ -38874,7 +38882,10 @@ mod scorecard_cutover_tests {
         // target/validation lock the writeback below checks for, and a holder of
         // only that lock refuses both runners.
         let sandbox = tempfile::tempdir().unwrap();
-        assert_eq!(validate_runtime::runner_lock_self_test(sandbox.path()), Ok(4));
+        assert_eq!(
+            validate_runtime::runner_lock_self_test(sandbox.path()),
+            Ok(4)
+        );
     }
 
     #[test]

@@ -75,12 +75,39 @@ const FAMILIES: &[(&str, u32, u32)] = &[
 /// `ST64B`, `ST64BV` and `ST64BV0`), and one of each other family a test
 /// names.
 const SEEDS: &[u32] = &[
-    0x05e0_3801, 0x04e1_4401, 0x05e8_a001, 0x05e4_3801, 0x0421_5022, 0x04f0_e3e1,
-    0x4860_7c82, 0x4820_7c82, 0x4820_fc82, 0x4860_fc82, 0x1926_8104, 0x1926_1104,
-    0x1926_3104, 0xf83f_d100, 0xf83f_9100, 0xf82a_b100, 0xf82a_a100, 0x3822_a023,
-    0x6900_8c22, 0xe100_0020, 0xf402_0041, 0xd503_251f, 0xdac1_8bfe, 0xd503_233f,
-    0xd503_211f, 0xd548_8000, 0xd558_2000, 0x4e08_0c20, 0x9e67_0020, 0xd50b_7421,
-    0xd50b_7a21, 0xb348_3c41, 0xfa42_0021,
+    0x05e0_3801,
+    0x04e1_4401,
+    0x05e8_a001,
+    0x05e4_3801,
+    0x0421_5022,
+    0x04f0_e3e1,
+    0x4860_7c82,
+    0x4820_7c82,
+    0x4820_fc82,
+    0x4860_fc82,
+    0x1926_8104,
+    0x1926_1104,
+    0x1926_3104,
+    0xf83f_d100,
+    0xf83f_9100,
+    0xf82a_b100,
+    0xf82a_a100,
+    0x3822_a023,
+    0x6900_8c22,
+    0xe100_0020,
+    0xf402_0041,
+    0xd503_251f,
+    0xdac1_8bfe,
+    0xd503_233f,
+    0xd503_211f,
+    0xd548_8000,
+    0xd558_2000,
+    0x4e08_0c20,
+    0x9e67_0020,
+    0xd50b_7421,
+    0xd50b_7a21,
+    0xb348_3c41,
+    0xfa42_0021,
 ];
 
 /// xorshift64*, from a fixed seed, so a run with the same LLVM writes the
@@ -119,7 +146,12 @@ fn main() {
         })
         .collect();
     let mut child = Command::new(&llvm_mc)
-        .args(["--disassemble", "-triple=aarch64", "-mattr=+all", "--show-encoding"])
+        .args([
+            "--disassemble",
+            "-triple=aarch64",
+            "-mattr=+all",
+            "--show-encoding",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -128,7 +160,10 @@ fn main() {
     let mut stdin = child.stdin.take().expect("llvm-mc's stdin");
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
     let output = child.wait_with_output().expect("llvm-mc's output");
-    writer.join().expect("the writer").expect("writing to llvm-mc");
+    writer
+        .join()
+        .expect("the writer")
+        .expect("writing to llvm-mc");
     let text = String::from_utf8(output.stdout).expect("llvm-mc writes UTF-8");
     let mut listed: BTreeMap<u32, (Vec<u32>, String)> = BTreeMap::new();
     for line in text.lines() {
@@ -174,7 +209,10 @@ fn registers(assembly: &str) -> Vec<u32> {
     while at < bytes.len() {
         let starts = (bytes[at] == b'x' || bytes[at] == b'w')
             && (at == 0 || !bytes[at - 1].is_ascii_alphanumeric());
-        let digits = bytes[at + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let digits = bytes[at + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
         let ends = at + 1 + digits;
         if starts && digits > 0 && (ends == bytes.len() || !bytes[ends].is_ascii_alphanumeric()) {
             let number: u32 = assembly[at + 1..ends].parse().expect("digits");

@@ -20,7 +20,6 @@ mod callback_history_scheduler_tests {
         replayer
     }
 
-
     /// A schedule replay hands a recorded instruction offset to the thread
     /// whose timeslice it belongs to: with the continuing thread's own
     /// timeslice in the consume result, and beside a context switch's
@@ -649,11 +648,7 @@ mod callback_history_scheduler_tests {
         );
         // A fast-forward past a recorded event the replay never ran moves the
         // record's position on by the events it drops.
-        let mut skipping = lenient_replayer([
-            event(t, 7, 70),
-            event(t, 5, 120),
-            event(t, 3, 150),
-        ]);
+        let mut skipping = lenient_replayer([event(t, 7, 70), event(t, 5, 120), event(t, 3, 150)]);
         skipping.observe_event(&event(t, 7, 70));
         skipping.observe_event(&event(t, 3, 150));
         assert_eq!(
@@ -740,8 +735,7 @@ mod callback_history_scheduler_tests {
         };
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.replayer = Some(
-            lenient_replayer(recorded.clone())
-                .with_background_starts(&[start(1, b, 2)], true),
+            lenient_replayer(recorded.clone()).with_background_starts(&[start(1, b, 2)], true),
         );
         let replayer = scheduler.replayer.as_mut().unwrap();
         replayer.observe_event(&recorded[0]);
@@ -1199,10 +1193,7 @@ mod callback_history_scheduler_tests {
         let mut s = Scheduler::new(&Config::default());
         let mut a_post = SchedEvent::syscall(a, Sysno::close, SyscallPhase::Posthook);
         a_post.end_time = Some(LogicalTime::ZERO);
-        s.replayer = Some(lenient_replayer([
-            a_post.clone(),
-            a_post,
-        ]));
+        s.replayer = Some(lenient_replayer([a_post.clone(), a_post]));
         s
     }
 
@@ -1339,12 +1330,10 @@ mod callback_history_scheduler_tests {
             // The writer states its clock identity in an envelope around
             // the record; read the record it carries through the decoder.
             let text = s.preemption_writer.take().unwrap().into_string();
-            let inner = crate::preemptions::boundary_recording::Recording::decode(
-                text.as_bytes(),
-            )
-            .unwrap()
-            .into_legacy("instruction-offset record")
-            .unwrap();
+            let inner = crate::preemptions::boundary_recording::Recording::decode(text.as_bytes())
+                .unwrap()
+                .into_legacy("instruction-offset record")
+                .unwrap();
             let record: serde_json::Value = serde_json::to_value(&inner).unwrap();
             let offsets =
                 record["per_thread"][thread.to_string()]["preemption_instruction_offsets"].clone();
