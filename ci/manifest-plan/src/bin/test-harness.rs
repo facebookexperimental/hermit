@@ -2679,16 +2679,17 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         &fs::read(root.join("ci/portable-shards.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
+    // The nodes the inversion loop below budget-checks: debug_shards only
+    // (ci/check-shard-coverage.sh refuses a non-empty release_shards).
     let sharded = shards["debug_shards"]
         .as_array()
         .into_iter()
         .flatten()
-        .chain(shards["release_shards"].as_array().into_iter().flatten())
         .map(|shard| shard["nodes"].as_array().map_or(0, Vec::len))
         .sum::<usize>();
     if sharded == 0 {
         return Err(
-            "the portable shard map lists no nodes: no sharded portable budget is checked"
+            "the portable shard map lists no debug_shards nodes: no sharded portable budget is checked"
                 .to_string(),
         );
     }
@@ -9620,7 +9621,7 @@ sys.exit(1 if failed else 0)
         let mut json: JsonValue =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         for step in json["steps"].as_array_mut().unwrap() {
-            if let Some(labels) = step["labels"].as_array_mut() {
+            if let Some(labels) = step.get_mut("labels").and_then(JsonValue::as_array_mut) {
                 labels.retain(|label| label.as_str() != Some("hosted-privileged"));
             }
         }
@@ -9632,22 +9633,24 @@ sys.exit(1 if failed else 0)
                 && error.contains("unknown label(s): hosted-privileged"),
             "{error}"
         );
-        // ... and a shard map that lists no nodes, so no sharded portable
-        // budget would be.
+        // ... and a shard map whose debug_shards list no nodes, so no sharded
+        // portable budget would be, even with the nodes moved to
+        // release_shards, which the inversion loop does not visit.
         let unsharded = copy("budget-no-shards", &budget);
         let path = unsharded.join("ci/portable-shards.json");
         let mut json: JsonValue =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        for key in ["debug_shards", "release_shards"] {
-            for shard in json[key].as_array_mut().into_iter().flatten() {
-                shard["nodes"] = JsonValue::Array(Vec::new());
-            }
+        let mut moved = Vec::new();
+        for shard in json["debug_shards"].as_array_mut().unwrap() {
+            moved.append(shard["nodes"].as_array_mut().unwrap());
         }
+        assert!(!moved.is_empty(), "the committed debug_shards list nodes");
+        json["release_shards"] = serde_json::json!([{ "nodes": moved }]);
         fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let error = super::audit_budget_ordering(&unsharded).unwrap_err();
         eprintln!("refused as expected: {error}");
         assert!(
-            error.contains("the portable shard map lists no nodes"),
+            error.contains("the portable shard map lists no debug_shards nodes"),
             "{error}"
         );
 

@@ -20098,8 +20098,9 @@ fn interrupted_by() -> Option<&'static str> {
 mod stop_handler_tests {
     use super::*;
 
-    /// A validation started with SIGINT, SIGTERM and SIGHUP ignored (under
-    /// `nohup`, or with `&` from a non-interactive shell) still starts every
+    /// A validation started with any of SIGINT, SIGTERM and SIGHUP ignored
+    /// (`nohup` ignores SIGHUP; `&` without job control ignores SIGINT and
+    /// SIGQUIT; any parent may hand down SIGTERM ignored) still starts every
     /// child, and so every DAG node's shell, with them at their defaults:
     /// install_stop_handlers replaces the inherited SIG_IGN with a handler, and
     /// exec resets a handled signal to its default, where an ignored one would
