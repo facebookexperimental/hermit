@@ -21,7 +21,9 @@
 //! limit, until a file named after the point exists in
 //! [`RACE_PROBE_HOLD_DIR_ENV`]: a test can then act on a task while it is
 //! known to be at the point, and release it after. A held visit prints one
-//! line to stderr naming the file it waits for.
+//! line to stderr naming the file it waits for. `point=hold-each` holds
+//! every visit the same way and removes the file as it lets the visit go,
+//! so that each visit waits for a release of its own.
 //!
 //! Unset, every point is one read of an initialized `OnceLock` and a branch;
 //! nothing is logged, and no tracing event is emitted.
@@ -54,6 +56,16 @@ pub const RACE_PROBE_HOLD_DIR_ENV: &str = "HERMIT_RACE_PROBE_HOLD_DIR";
 
 /// How often a held visit looks for its release file.
 const HOLD_POLL: Duration = Duration::from_millis(10);
+
+/// The file a hold in Hermit's launcher or a container's init needs in the
+/// hold directory, beside the configuration ([`delay_in_launcher`]). Such a
+/// hold parks the run itself, so an environment a process inherited is not
+/// enough to arm it: the test that holds it makes this file.
+pub const LAUNCHER_HOLD_MARKER: &str = "launcher-holds-armed";
+
+/// How long a hold in Hermit's launcher or a container's init waits for its
+/// release before it fails, naming the point.
+const LAUNCHER_HOLD_LIMIT: Duration = Duration::from_secs(120);
 
 /// An async wait just before a backgrounded blocking call runs.
 pub(crate) const BG_PRE_CALL: &str = "bg_pre_call";
@@ -88,9 +100,16 @@ pub(crate) const EXIT_HOOK_TAIL: &str = "exit_hook_tail";
 /// (`Detcore::record_received_facts`): exited senders' exit hooks run
 /// meanwhile, as they can while a receive's probes wait for the host.
 pub(crate) const RECEIPT_DECISION: &str = "receipt_decision";
+/// A wait in the container's init after its setup made the container's
+/// mounts and before the init records the mount table
+/// (`IdentityGuard::record_plan` in hermit-cli): a host process that renames
+/// a new file or directory over a bind's target meanwhile detaches the bind,
+/// as the host's own timing can, and the record then finds it gone. Waits
+/// through [`delay_in_launcher`].
+pub const SETUP_MOUNTS_MADE: &str = "setup_mounts_made";
 
 /// Every probe point, for validating a configuration.
-const POINTS: [&str; 8] = [
+const POINTS: [&str; 9] = [
     BG_PRE_CALL,
     BG_POST_CALL,
     BG_HARVEST_SKIP,
@@ -99,6 +118,7 @@ const POINTS: [&str; 8] = [
     PROCFS_SPELLING_RESOLVED,
     EXIT_HOOK_TAIL,
     RECEIPT_DECISION,
+    SETUP_MOUNTS_MADE,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -108,6 +128,8 @@ struct Spec {
     probability: f64,
     /// Every visit waits for the point's release file (`point=hold`).
     hold: bool,
+    /// The release is removed as each visit goes on (`point=hold-each`).
+    each: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +147,8 @@ enum Perturbation {
     Wait(Duration),
     /// An async point waits until this file exists.
     Hold(PathBuf),
+    /// As [`Self::Hold`], removing the file as the visit goes on.
+    HoldEach(PathBuf),
 }
 
 fn parse_item(item: &str) -> Result<(String, Spec), String> {
@@ -134,7 +158,7 @@ fn parse_item(item: &str) -> Result<(String, Spec), String> {
     if !POINTS.contains(&name) {
         return Err(format!("unknown point {name:?}; points are {POINTS:?}"));
     }
-    if rest == "hold" {
+    if rest == "hold" || rest == "hold-each" {
         return Ok((
             name.to_owned(),
             Spec {
@@ -142,6 +166,7 @@ fn parse_item(item: &str) -> Result<(String, Spec), String> {
                 hi_ms: 0,
                 probability: 1.0,
                 hold: true,
+                each: rest == "hold-each",
             },
         ));
     }
@@ -176,6 +201,7 @@ fn parse_item(item: &str) -> Result<(String, Spec), String> {
             hi_ms,
             probability,
             hold: false,
+            each: false,
         },
     ))
 }
@@ -187,10 +213,12 @@ impl Probes {
     fn from_settings(
         config: Option<&str>,
         seed: Option<&str>,
-        hold_dir: Option<&str>,
+        hold_dir: Option<&Path>,
     ) -> Option<Self> {
         let config = config?;
-        let hold_dir = hold_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from);
+        let hold_dir = hold_dir
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf);
         // A disabled probe must not create randomized hash state: even an
         // empty HashMap initializes RandomState's thread-local random keys.
         // These few exact names need no hashing, and insert still makes the
@@ -235,7 +263,12 @@ impl Probes {
         let spec = self.points.get(point)?;
         if spec.hold {
             // Configured only with a hold directory (`from_settings`).
-            return Some(Perturbation::Hold(self.hold_dir.as_ref()?.join(point)));
+            let release = self.hold_dir.as_ref()?.join(point);
+            return Some(if spec.each {
+                Perturbation::HoldEach(release)
+            } else {
+                Perturbation::Hold(release)
+            });
         }
         let visit = self.counter.fetch_add(1, Ordering::Relaxed);
         let r = splitmix64(self.seed ^ splitmix64(visit));
@@ -244,13 +277,12 @@ impl Probes {
             return None;
         }
         let span = spec.hi_ms - spec.lo_ms;
-        let ms = spec.lo_ms
-            + if span == 0 {
-                0
-            } else {
-                splitmix64(r) % (span + 1)
-            };
-        Some(Perturbation::Wait(Duration::from_millis(ms)))
+        // One of `span + 1` waits, or of every u64 when the range is all of it.
+        let offset = match span.checked_add(1) {
+            Some(choices) => splitmix64(r) % choices,
+            None => splitmix64(r),
+        };
+        Some(Perturbation::Wait(Duration::from_millis(spec.lo_ms + offset)))
     }
 }
 
@@ -260,9 +292,13 @@ fn probes() -> Option<&'static Probes> {
         .get_or_init(|| {
             let config = std::env::var(RACE_PROBE_ENV).ok()?;
             let seed = std::env::var(RACE_PROBE_SEED_ENV).ok();
-            let hold_dir = std::env::var(RACE_PROBE_HOLD_DIR_ENV).ok();
-            let probes =
-                Probes::from_settings(Some(&config), seed.as_deref(), hold_dir.as_deref())?;
+            // The directory's bytes as the environment gives them.
+            let hold_dir = std::env::var_os(RACE_PROBE_HOLD_DIR_ENV);
+            let probes = Probes::from_settings(
+                Some(&config),
+                seed.as_deref(),
+                hold_dir.as_deref().map(Path::new),
+            )?;
             eprintln!(
                 "race_probe: {RACE_PROBE_ENV}={config} {RACE_PROBE_SEED_ENV}={}",
                 probes.seed
@@ -282,7 +318,8 @@ fn choose(point: &str) -> Option<Perturbation> {
 pub(crate) async fn delay(point: &str) {
     match choose(point) {
         Some(Perturbation::Wait(wait)) if !wait.is_zero() => tokio::time::sleep(wait).await,
-        Some(Perturbation::Hold(release)) => hold(point, &release).await,
+        Some(Perturbation::Hold(release)) => hold(point, &release, false).await,
+        Some(Perturbation::HoldEach(release)) => hold(point, &release, true).await,
         _ => {}
     }
 }
@@ -308,36 +345,176 @@ pub(crate) async fn delay_on_any_backend(point: &str, in_guest: bool) {
         Perturbation::Wait(wait) if wait.is_zero() => {}
         Perturbation::Wait(wait) if on_tokio => tokio::time::sleep(wait).await,
         Perturbation::Wait(wait) => std::thread::sleep(wait),
-        Perturbation::Hold(release) if on_tokio => hold(point, &release).await,
-        Perturbation::Hold(release) => hold_blocking(point, &release),
+        Perturbation::Hold(release) if on_tokio => hold(point, &release, false).await,
+        Perturbation::Hold(release) => hold_blocking(point, &release, false, None),
+        Perturbation::HoldEach(release) if on_tokio => hold(point, &release, true).await,
+        Perturbation::HoldEach(release) => hold_blocking(point, &release, true, None),
     }
 }
 
-/// Waits until `release` exists, saying so on stderr unless it already does.
-async fn hold(point: &str, release: &Path) {
-    if release.exists() {
+/// Waits until the visit is released ([`released`]), saying so on stderr
+/// unless it is at once.
+async fn hold(point: &str, release: &Path, each: bool) {
+    if released(point, release, each) {
         return;
     }
     eprintln!(
         "race_probe: {point} holding until {} exists",
         release.display()
     );
-    while !release.exists() {
+    while !released(point, release, each) {
         tokio::time::sleep(HOLD_POLL).await;
     }
 }
 
-/// [`hold`], blocking the calling thread.
-#[cfg(debug_assertions)]
-fn hold_blocking(point: &str, release: &Path) {
-    if release.exists() {
+/// Whether a held visit may go on: its release file exists (`hold`), or, for
+/// `hold-each`, this visit consumed it by renaming it away. Of two visits that
+/// try to consume one release, one rename succeeds and the other finds the
+/// release gone and goes on waiting, so two visits can never both go on for
+/// one release. (The name it is renamed to need not be unique: in a PID
+/// namespace two processes can share a process ID, and the later rename
+/// simply replaces the earlier consumed file.) A consumption that fails for
+/// any reason but the release being absent fails the visit, naming the point.
+fn released(point: &str, release: &Path, each: bool) -> bool {
+    if !each {
+        return release.exists();
+    }
+    static CONSUMED: AtomicU64 = AtomicU64::new(0);
+    let consumed = release.with_file_name(format!(
+        "{point}.consumed.{}.{}",
+        std::process::id(),
+        CONSUMED.fetch_add(1, Ordering::Relaxed)
+    ));
+    match std::fs::rename(release, &consumed) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!(
+            "race_probe: {point} could not consume {}: {error}",
+            release.display()
+        ),
+    }
+}
+
+/// A hold at `point`, when configured, in Hermit's launcher or a container's
+/// init, outside any guest ([`SETUP_MOUNTS_MADE`]): it blocks the calling
+/// thread. A hold here parks the run itself, so the point is armed only where
+/// [`RACE_PROBE_HOLD_DIR_ENV`] names a directory holding
+/// [`LAUNCHER_HOLD_MARKER`], which only a test makes, and that is decided
+/// first, from that one variable and that one file: an unarmed point reads,
+/// parses and draws nothing else, whatever [`RACE_PROBE_ENV`] says. Armed,
+/// nothing is ignored: [`armed_hold`] must find a complete, valid hold for the
+/// point, or the visit fails, naming the point and why. The hold fails,
+/// naming the point, if it is not released within [`LAUNCHER_HOLD_LIMIT`].
+pub fn delay_in_launcher(point: &str) {
+    launcher_visit(
+        launcher_hold_dir(),
+        || std::env::var_os(RACE_PROBE_ENV),
+        point,
+    );
+}
+
+/// The hold directory that arms launcher points in this process
+/// ([`armed_by`]), or `None` when they are unarmed. Decided once.
+fn launcher_hold_dir() -> Option<&'static Path> {
+    static ARMED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ARMED
+        .get_or_init(|| {
+            std::env::var_os(RACE_PROBE_HOLD_DIR_ENV)
+                .map(PathBuf::from)
+                .filter(|dir| armed_by(Some(dir)))
+        })
+        .as_deref()
+}
+
+/// Whether `hold_dir` holds [`LAUNCHER_HOLD_MARKER`], which arms
+/// [`delay_in_launcher`].
+fn armed_by(hold_dir: Option<&Path>) -> bool {
+    hold_dir.is_some_and(|dir| {
+        !dir.as_os_str().is_empty() && dir.join(LAUNCHER_HOLD_MARKER).exists()
+    })
+}
+
+/// A [`delay_in_launcher`] visit, armed by `hold_dir`: unless armed, it
+/// returns before `config` is read. Armed, the configuration's hold for the
+/// point ([`armed_hold`]) holds the visit, and anything else fails it.
+fn launcher_visit(
+    hold_dir: Option<&Path>,
+    config: impl FnOnce() -> Option<std::ffi::OsString>,
+    point: &str,
+) {
+    let Some(hold_dir) = hold_dir else {
+        return;
+    };
+    let config = config();
+    let hold = match config.as_deref().map(std::ffi::OsStr::to_str) {
+        Some(None) => Err(format!("{RACE_PROBE_ENV} is not UTF-8")),
+        config => armed_hold(config.flatten(), hold_dir, point),
+    };
+    match hold {
+        Ok(hold) => launcher_hold(point, hold),
+        Err(reason) => panic!("race_probe: {point} is armed, and {RACE_PROBE_ENV} is refused there: {reason}"),
+    }
+}
+
+/// The hold an armed launcher point takes under `config`, its release in
+/// `hold_dir`, or why there is none. Nothing is ignored: every item must
+/// parse and name a known point, and the point's own must be `hold` or
+/// `hold-each`; a wait, an item that does not parse, an unknown point, or no
+/// item for the point at all is refused.
+fn armed_hold(config: Option<&str>, hold_dir: &Path, point: &str) -> Result<Perturbation, String> {
+    let config = config.ok_or_else(|| format!("{RACE_PROBE_ENV} is not set"))?;
+    let mut each = None;
+    for item in config.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, spec) = parse_item(item)?;
+        if name == point {
+            if !spec.hold {
+                return Err(format!("{item:?} is not a hold (hold or hold-each)"));
+            }
+            each = Some(spec.each);
+        }
+    }
+    let each = each.ok_or_else(|| format!("{config:?} names no hold for {point}"))?;
+    let release = hold_dir.join(point);
+    Ok(if each {
+        Perturbation::HoldEach(release)
+    } else {
+        Perturbation::Hold(release)
+    })
+}
+
+/// An armed launcher hold, failing after [`LAUNCHER_HOLD_LIMIT`].
+fn launcher_hold(point: &str, hold: Perturbation) {
+    match hold {
+        Perturbation::Hold(release) => {
+            hold_blocking(point, &release, false, Some(LAUNCHER_HOLD_LIMIT))
+        }
+        Perturbation::HoldEach(release) => {
+            hold_blocking(point, &release, true, Some(LAUNCHER_HOLD_LIMIT))
+        }
+        Perturbation::Wait(_) => unreachable!("armed_hold returns holds only"),
+    }
+}
+
+/// [`hold`], blocking the calling thread, and failing, naming the point,
+/// after `limit` if one is given.
+fn hold_blocking(point: &str, release: &Path, each: bool, limit: Option<Duration>) {
+    if released(point, release, each) {
         return;
     }
     eprintln!(
         "race_probe: {point} holding until {} exists",
         release.display()
     );
-    while !release.exists() {
+    let start = std::time::Instant::now();
+    while !released(point, release, each) {
+        if let Some(limit) = limit
+            && start.elapsed() >= limit
+        {
+            panic!(
+                "race_probe: {point} was not released within {limit:?}: {} never appeared",
+                release.display()
+            );
+        }
         std::thread::sleep(HOLD_POLL);
     }
 }
@@ -381,6 +558,7 @@ mod tests {
                     hi_ms: 300,
                     probability: 1.0,
                     hold: false,
+                    each: false,
                 }
             ))
         );
@@ -393,6 +571,7 @@ mod tests {
                     hi_ms: 50,
                     probability: 0.25,
                     hold: false,
+                    each: false,
                 }
             ))
         );
@@ -432,6 +611,7 @@ mod tests {
                 hi_ms: 20,
                 probability: 1.0,
                 hold: false,
+                each: false,
             })
         );
         assert_eq!(
@@ -500,8 +680,28 @@ mod tests {
                     hi_ms: 0,
                     probability: 1.0,
                     hold: true,
+                    each: false,
                 }
             ))
+        );
+        assert_eq!(
+            parse_item("setup_mounts_made=hold-each"),
+            Ok((
+                SETUP_MOUNTS_MADE.to_owned(),
+                Spec {
+                    lo_ms: 0,
+                    hi_ms: 0,
+                    probability: 1.0,
+                    hold: true,
+                    each: true,
+                }
+            ))
+        );
+        let each =
+            Probes::from_settings(Some("setup_mounts_made=hold-each"), None, Some(Path::new("/hold"))).unwrap();
+        assert_eq!(
+            each.choose(SETUP_MOUNTS_MADE),
+            Some(Perturbation::HoldEach(PathBuf::from("/hold/setup_mounts_made")))
         );
         for bad in ["fifo_staging_mapped=hold@0.5", "fifo_staging_mapped=holds"] {
             assert!(parse_item(bad).is_err(), "{bad} parsed");
@@ -514,11 +714,11 @@ mod tests {
         )
         .unwrap();
         assert!(!probes.points.contains_key(FIFO_STAGING_MAPPED));
-        assert!(Probes::from_settings(Some("fifo_staging_mapped=hold"), None, Some("")).is_none());
+        assert!(Probes::from_settings(Some("fifo_staging_mapped=hold"), None, Some(Path::new(""))).is_none());
         // With one, every visit holds on the point's own file, and draws no
         // visit from the seeded sequence of the other points.
         let config = Some("fifo_staging_mapped=hold,fifo_staging_reclaim=hold,bg_pre_call=1-9@0.5");
-        let holding = Probes::from_settings(config, Some("5"), Some("/hold")).unwrap();
+        let holding = Probes::from_settings(config, Some("5"), Some(Path::new("/hold"))).unwrap();
         let direct = Probes::from_settings(Some("bg_pre_call=1-9@0.5"), Some("5"), None).unwrap();
         for _ in 0..100 {
             assert_eq!(
@@ -543,7 +743,7 @@ mod tests {
     async fn a_held_visit_waits_for_its_release_file() {
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join(FIFO_STAGING_MAPPED);
-        let mut held = Box::pin(hold(FIFO_STAGING_MAPPED, &release));
+        let mut held = Box::pin(hold(FIFO_STAGING_MAPPED, &release, false));
         // A minute of (paused, auto-advancing) time does not release it.
         tokio::select! {
             _ = &mut held => panic!("released before its file existed"),
@@ -553,8 +753,151 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), held)
             .await
             .expect("released once its file exists");
-        tokio::time::timeout(Duration::ZERO, hold(FIFO_STAGING_MAPPED, &release))
+        tokio::time::timeout(Duration::ZERO, hold(FIFO_STAGING_MAPPED, &release, false))
             .await
             .expect("an existing file releases at once");
+    }
+
+    /// A `hold-each` visit consumes its release, renaming it away, so the
+    /// next visit waits for a release of its own, and two visits never go on
+    /// for one release; a plain hold leaves it.
+    #[test]
+    fn a_hold_each_visit_consumes_its_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join(SETUP_MOUNTS_MADE);
+        std::fs::write(&release, b"").unwrap();
+        assert!(released(SETUP_MOUNTS_MADE, &release, true));
+        assert!(!release.exists(), "a hold-each visit consumes its release");
+        assert!(
+            !released(SETUP_MOUNTS_MADE, &release, true),
+            "a second visit finds no release to consume"
+        );
+        std::fs::write(&release, b"").unwrap();
+        hold_blocking(SETUP_MOUNTS_MADE, &release, false, None);
+        assert!(release.exists(), "a plain hold leaves its release for later visits");
+    }
+
+    /// A `hold-each` consumption that fails for any reason but an absent
+    /// release fails the visit, naming the point.
+    #[test]
+    #[should_panic(expected = "race_probe: setup_mounts_made could not consume")]
+    fn a_failed_consumption_fails_the_visit() {
+        let dir = tempfile::tempdir().unwrap();
+        // The release's directory is a regular file: the rename fails with
+        // ENOTDIR, not with the release absent.
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"").unwrap();
+        released(SETUP_MOUNTS_MADE, &not_a_directory.join(SETUP_MOUNTS_MADE), true);
+    }
+
+    /// A launcher point is armed only by a hold directory holding the marker
+    /// a test makes: no directory, or one without the marker, arms nothing.
+    #[test]
+    fn a_launcher_point_needs_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!armed_by(None));
+        assert!(!armed_by(Some(Path::new(""))));
+        assert!(!armed_by(Some(dir.path())));
+        std::fs::write(dir.path().join(LAUNCHER_HOLD_MARKER), b"").unwrap();
+        assert!(armed_by(Some(dir.path())));
+    }
+
+    /// An unarmed launcher point reads, parses and draws nothing: it returns
+    /// before its configuration is asked for.
+    #[test]
+    fn an_unarmed_launcher_point_reads_no_settings() {
+        launcher_visit(
+            None,
+            || panic!("an unarmed launcher point asked for its configuration"),
+            SETUP_MOUNTS_MADE,
+        );
+    }
+
+    /// Armed, the point's `hold` or `hold-each` is its hold, its release in
+    /// the hold directory as the environment gives it, UTF-8 or not.
+    #[test]
+    fn an_armed_launcher_point_takes_its_hold() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/hold-\xff"));
+        let release = dir.join(SETUP_MOUNTS_MADE);
+        assert_eq!(
+            armed_hold(Some("setup_mounts_made=hold"), dir, SETUP_MOUNTS_MADE),
+            Ok(Perturbation::Hold(release.clone()))
+        );
+        assert_eq!(
+            armed_hold(
+                Some("bg_pre_call=1-9, setup_mounts_made=hold-each"),
+                dir,
+                SETUP_MOUNTS_MADE
+            ),
+            Ok(Perturbation::HoldEach(release))
+        );
+    }
+
+    /// Armed, nothing is ignored: anything but a complete, valid hold for the
+    /// point is refused, naming why.
+    #[test]
+    fn an_armed_launcher_point_refuses_anything_but_its_hold() {
+        let dir = Path::new("/hold");
+        for (config, reason) in [
+            (None, "HERMIT_RACE_PROBE is not set"),
+            (Some(""), "names no hold for setup_mounts_made"),
+            (Some("setup_mounts_made"), "\"setup_mounts_made\" is not point=LO[-HI][@P]"),
+            (Some("setup_mounts_made="), "is not a number of milliseconds"),
+            (Some("setup_mounts_made=9-1"), "the range is empty"),
+            (Some("setup_mounts_made=1-2@7"), "probability must be in [0, 1]"),
+            (Some("setup_mounts_made=garbage"), "is not a number of milliseconds"),
+            (Some("setup_mounts_made=5"), "is not a hold (hold or hold-each)"),
+            (Some("setup_mounts_made=hold@0.5"), "is not a number of milliseconds"),
+            (Some("setup_mounts_made=hold,no_such_point=hold"), "unknown point \"no_such_point\""),
+            (Some("setup_mounts_made=hold,bg_pre_call=x"), "\"x\" is not a number of milliseconds"),
+            (Some("bg_pre_call=1-9"), "names no hold for setup_mounts_made"),
+        ] {
+            let refused = armed_hold(config, dir, SETUP_MOUNTS_MADE)
+                .expect_err(&format!("{config:?} was taken as a hold"));
+            assert!(refused.contains(reason), "{config:?}: {refused}");
+        }
+    }
+
+    /// An armed launcher point whose configuration is refused fails the
+    /// visit, naming the point and why.
+    #[test]
+    #[should_panic(
+        expected = "race_probe: setup_mounts_made is armed, and HERMIT_RACE_PROBE is refused there: \"setup_mounts_made\" is not point=LO[-HI][@P]"
+    )]
+    fn an_armed_launcher_point_with_a_refused_configuration_fails_by_name() {
+        launcher_visit(
+            Some(Path::new("/hold")),
+            || Some("setup_mounts_made".into()),
+            SETUP_MOUNTS_MADE,
+        );
+    }
+
+    /// A full-width range samples without overflowing.
+    #[test]
+    fn a_full_width_range_samples_without_overflow() {
+        let full = format!("{SETUP_MOUNTS_MADE}=0-{}", u64::MAX);
+        let probes = Probes::from_settings(Some(&full), Some("1"), None).unwrap();
+        for _ in 0..1000 {
+            assert!(matches!(
+                probes.choose(SETUP_MOUNTS_MADE),
+                Some(Perturbation::Wait(_))
+            ));
+        }
+    }
+
+    /// A blocking hold with a limit fails, naming the point, once the limit
+    /// passes without a release.
+    #[test]
+    #[should_panic(expected = "race_probe: setup_mounts_made was not released within")]
+    fn a_limited_hold_fails_after_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join(SETUP_MOUNTS_MADE);
+        hold_blocking(
+            SETUP_MOUNTS_MADE,
+            &release,
+            false,
+            Some(Duration::from_millis(50)),
+        );
     }
 }

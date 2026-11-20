@@ -6,36 +6,50 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A launch whose container setup straddles a host replacement of
-//! `/etc/ld.so.cache` must succeed by retrying setup, never refuse with
-//! exit 125: a package manager's `ldconfig` rename detaches Hermit's
-//! frozen bind in the guest namespace
-//! (https://github.com/rrnewton/hermit/issues/4799, dh-8k6lh4).
+//! Container setup against a host that renames a new file or directory over
+//! a path Hermit binds over while the container is set up.
 //!
-//! The fixture runs hermit inside an outer user+mount namespace whose
-//! `/etc` is a test-owned directory, so the test can rename-replace the
-//! cache Hermit freezes without touching the real `/etc`. A replacer
-//! thread replaces the cache continuously from before the launch until
-//! hermit's own stderr proves a setup attempt was detached and is being
-//! retried; the launch must then complete successfully on a later
-//! attempt. Requiring the retry line keeps the tests from passing
-//! merely because a replacement missed the setup window. The
-//! exhaustion test never stops the replacer: every attempt is detached
-//! and the bound is reached, which only a replacement landing in every
-//! attempt's bind-to-record window can defeat — at a sub-millisecond
-//! replacement period against a multi-millisecond window that race is
-//! not realistically winnable.
+//! The guest's `/etc` is a private stage: Hermit's frozen `/etc/ld.so.cache`
+//! and `/etc/group` are bound over the stage's own entries, so a host rename
+//! of the host's files detaches nothing, and setup neither retries nor lets
+//! the guest see the host's new file. The empty directory Hermit hides the
+//! host's nscd cache behind is still bound over the host's own path: a rename
+//! over it detaches that bind in every namespace, and setup must find the
+//! bind gone when it records the mount table and retry, up to its bound
+//! (https://github.com/rrnewton/hermit/issues/4799).
+//!
+//! The fixture runs hermit inside an outer user+mount namespace whose `/etc`
+//! and `/var/run` (as the host resolves it) are test-owned directories, so
+//! the test renames over them without touching the host's. The race probe
+//! `setup_mounts_made` (docs/RACE_PROBES.md) holds the container's init after
+//! setup made its mounts and before it records the mount table. The renames
+//! occur at that after-mounts hold, once per affected path per held setup
+//! attempt, so every rename lands in the window it means to test, and the
+//! test then lets the init go on. `hold-each` holds every setup attempt.
+//! Hermit runs with neither virtual CPUID nor a preemption timeslice, so no
+//! case needs CPUID faulting or an exact branch counter and none is gated on
+//! either. A host where the fixture cannot be built fails each case, naming
+//! why.
 
-use std::io::Read;
-use std::io::Seek;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+
+/// The end of every retry line of a launch's or a `--verify` leg's setup.
+const RETRY: &str = "retrying with a fresh snapshot";
+
+/// The race probe point the tests hold at.
+const POINT: &str = "setup_mounts_made";
+
+/// What the host renames over the frozen files' paths.
+const NEW_CACHE: &[u8] = b"a replacement cache\n";
+const NEW_GROUP: &[u8] = b"renamedbyhost:x:4242:\n";
+
+/// The start of the failure of a case whose fixture could not be built.
+const UNBUILDABLE_FIXTURE: &str =
+    "setup_retry could not build its fixture, so this case fails instead of passing having run nothing";
 
 fn run(command: &mut Command) -> std::process::Output {
     command
@@ -46,189 +60,332 @@ fn run(command: &mut Command) -> std::process::Output {
         .expect("spawn")
 }
 
-fn stderr_contents(path: &Path) -> String {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return String::new(),
-    };
-    let mut text = String::new();
-    let _ = file.seek(std::io::SeekFrom::Start(0));
-    let _ = file.read_to_string(&mut text);
-    text
+fn read_lossy(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
-/// The test-owned `/etc` and its tempdir, or `None` after printing the
-/// skip reason (no outer namespace, no host cache, or nested hermit
-/// does not run on this host).
+/// The line a held visit to [`POINT`] prints.
+fn hold_line() -> String {
+    format!("race_probe: {POINT} holding until")
+}
+
+/// The test-owned `/etc` and run directory, and the hermit launched over them.
 struct Fixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     etc: PathBuf,
+    run: PathBuf,
+    /// The host's `/var/run`, resolved: the fixture's run directory is bound
+    /// over it, so the guest's `/var/run/nscd` is the fixture's.
+    var_run: PathBuf,
+    /// The bytes Hermit freezes at `/etc/ld.so.cache`.
+    cache: Vec<u8>,
+    hermit: PathBuf,
 }
 
-fn launch(fixture: &Fixture, stderr_path: &Path, extra_args: &str) -> std::process::Child {
-    let hermit = env!("CARGO_BIN_EXE_hermit");
-    let script = format!(
-        "mount --bind {} /etc && exec {} run --strict {} {} -- /bin/sh -c 'cat /etc/ld.so.cache > /dev/null'",
-        fixture.etc.display(),
-        hermit,
-        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
-        extra_args,
-    );
-    let stderr = std::fs::File::create(stderr_path).expect("create stderr file");
-    Command::new("timeout")
-        .args([
-            "--kill-after",
-            "5s",
-            "60s",
-            "unshare",
-            "-rm",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn launch")
+/// The fixture over the hermit under test. A host where it cannot be built
+/// fails the case, naming why.
+fn fixture() -> Fixture {
+    fixture_with(Path::new(env!("CARGO_BIN_EXE_hermit")))
 }
 
-fn fixture() -> Option<Fixture> {
+/// [`fixture`] over `hermit`.
+fn fixture_with(hermit: &Path) -> Fixture {
+    build_fixture(hermit).unwrap_or_else(|reason| panic!("{UNBUILDABLE_FIXTURE}: {reason}"))
+}
+
+/// The fixture, or why it cannot be built: no outer namespace, no host cache,
+/// no `/var/run`, or a nested `hermit` that does not run on this host.
+fn build_fixture(hermit: &Path) -> Result<Fixture, String> {
     let probe = run(Command::new("unshare").args(["-rm", "true"]));
     if !probe.status.success() {
-        eprintln!("skip: unshare -rm unavailable: {probe:?}");
-        return None;
+        return Err(format!("unshare -rm unavailable: {probe:?}"));
     }
-    let cache_bytes = std::fs::read("/etc/ld.so.cache").ok()?;
-    if cache_bytes.is_empty() {
-        eprintln!("skip: host has no /etc/ld.so.cache");
-        return None;
+    let cache = std::fs::read("/etc/ld.so.cache").unwrap_or_default();
+    if cache.is_empty() {
+        return Err("the host has no /etc/ld.so.cache".to_owned());
     }
+    let var_run = std::fs::canonicalize("/var/run")
+        .map_err(|error| format!("the host's /var/run does not resolve: {error}"))?;
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let etc = directory.path().join("etc");
     std::fs::create_dir(&etc).unwrap();
-    std::fs::write(etc.join("ld.so.cache"), &cache_bytes).unwrap();
-    std::fs::write(etc.join("ld.so.cache.next"), &cache_bytes).unwrap();
-    std::fs::write(etc.join("group.next"), []).unwrap();
-    if let Ok(group) = std::fs::read("/etc/group") {
-        std::fs::write(etc.join("group"), &group).unwrap();
-        std::fs::write(etc.join("group.next"), &group).unwrap();
-    }
+    std::fs::write(etc.join("ld.so.cache"), &cache).unwrap();
+    // A group file Hermit freezes, the host's or, where it has none, one of
+    // its own, so that a rename over `/etc/group` always meets a frozen file.
+    let group = std::fs::read("/etc/group").unwrap_or_else(|_| b"root:x:0:\n".to_vec());
+    std::fs::write(etc.join("group"), group).unwrap();
+    let run_dir = directory.path().join("run");
+    std::fs::create_dir_all(run_dir.join("nscd")).unwrap();
     let fixture = Fixture {
-        _directory: directory,
+        directory,
         etc,
+        run: run_dir,
+        var_run,
+        cache,
+        hermit: hermit.to_path_buf(),
     };
-    // Probe: nested hermit must work on this host at all before any
-    // replacement races it.
-    let probe_stderr = fixture.etc.parent().unwrap().join("probe-stderr");
-    let probe = launch(&fixture, &probe_stderr, "")
-        .wait_with_output()
-        .expect("probe launch");
-    if !probe.status.success() {
-        eprintln!(
-            "skip: nested hermit probe failed: {}\n{}",
-            probe.status,
-            stderr_contents(&probe_stderr)
+    let (status, _, stderr) = fixture.launch("probe", "", "true", None).wait();
+    if !status.success() {
+        return Err(format!("nested hermit probe failed: {status}\n{stderr}"));
+    }
+    Ok(fixture)
+}
+
+impl Fixture {
+    /// Launches `hermit run --strict <extra>` of the shell command `guest`
+    /// over the fixture, holding at [`POINT`] in `hold` mode (`hold` or
+    /// `hold-each`) if given. Hermit runs with neither virtual CPUID nor a
+    /// preemption timeslice: the cases test container setup, before any guest
+    /// runs, so they need neither CPUID faulting nor an exact branch counter.
+    /// The CPU profile is named, x86-64-v2, because `auto` reads what the
+    /// host's `/bin/sh` declares: where that is x86-64-v3, as on CentOS Stream
+    /// 10, auto presents x86-64-v3, which a run without virtual CPUID refuses.
+    fn launch(&self, label: &str, extra_args: &str, guest: &str, hold: Option<&str>) -> Held {
+        let probe = hold.map(|mode| format!("{POINT}={mode}"));
+        self.launch_with_probe(label, extra_args, guest, probe.as_deref(), hold.is_some())
+    }
+
+    /// [`Fixture::launch`] with `HERMIT_RACE_PROBE` set to `probe` if given,
+    /// and the hold directory armed for the container's init if `armed`.
+    fn launch_with_probe(
+        &self,
+        label: &str,
+        extra_args: &str,
+        guest: &str,
+        probe: Option<&str>,
+        armed: bool,
+    ) -> Held {
+        let root = self.directory.path();
+        let hold_dir = root.join(format!("{label}-hold"));
+        std::fs::create_dir(&hold_dir).unwrap();
+        let stdout = root.join(format!("{label}-stdout"));
+        let stderr = root.join(format!("{label}-stderr"));
+        let script = format!(
+            "mount --bind {} /etc && mount --bind {} {} && exec {} run --strict --no-virtualize-cpuid --cpu-profile=x86-64-v2 --max-timeslice=disabled {} {} -- /bin/sh -c '{guest}'",
+            self.etc.display(),
+            self.run.display(),
+            self.var_run.display(),
+            self.hermit.display(),
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            extra_args,
         );
-        return None;
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "60s", "unshare", "-rm", "sh", "-c", &script])
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).expect("create stdout file"))
+            .stderr(std::fs::File::create(&stderr).expect("create stderr file"));
+        if armed {
+            // A point in the container's init needs this beside the release.
+            std::fs::write(hold_dir.join("launcher-holds-armed"), b"").unwrap();
+        }
+        if let Some(probe) = probe {
+            command
+                .env("HERMIT_RACE_PROBE", probe)
+                .env("HERMIT_RACE_PROBE_HOLD_DIR", &hold_dir);
+        }
+        Held {
+            child: command.spawn().expect("spawn launch"),
+            stdout,
+            stderr,
+            hold_dir,
+        }
     }
-    Some(fixture)
+
+    /// Renames a new file holding `bytes` over the fixture's `/etc/<name>`.
+    fn rename_over_etc(&self, name: &str, bytes: &[u8]) {
+        let new = self.etc.join(format!("{name}.new"));
+        std::fs::write(&new, bytes).unwrap();
+        std::fs::rename(&new, self.etc.join(name)).unwrap();
+    }
+
+    /// Renames a new directory over the fixture's nscd directory (an empty
+    /// one can be renamed over), holding a file `host-nscd-state` if
+    /// `with_state`, as nscd's own cache would.
+    fn rename_over_nscd(&self, with_state: bool) {
+        let new = self.run.join("nscd.new");
+        std::fs::create_dir(&new).unwrap();
+        if with_state {
+            std::fs::write(new.join("host-nscd-state"), b"").unwrap();
+        }
+        std::fs::rename(&new, self.run.join("nscd")).unwrap();
+    }
+
+    /// Where Hermit binds its empty directory over the fixture's nscd
+    /// directory.
+    fn nscd_target(&self) -> PathBuf {
+        self.var_run.join("nscd")
+    }
 }
 
-fn start_replacer(etc: &Path, stop: &Arc<AtomicBool>, pause: bool) -> std::thread::JoinHandle<()> {
-    let stop = Arc::clone(stop);
-    let etc = etc.to_path_buf();
-    std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            for name in ["ld.so.cache", "group"] {
-                let flip = etc.join(format!("{name}.flip"));
-                if std::fs::copy(etc.join(format!("{name}.next")), &flip).is_ok() {
-                    let _ = std::fs::rename(&flip, etc.join(name));
-                }
-            }
-            if pause {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
-    })
+/// A launch from [`Fixture::launch`].
+struct Held {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    hold_dir: PathBuf,
 }
 
-fn wait_launch(
-    child: &mut std::process::Child,
-    stderr_path: &Path,
-    stop_on_retry: Option<&Arc<AtomicBool>>,
-) -> ExitStatus {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
-    loop {
-        if let Some(stop) = stop_on_retry
-            && stderr_contents(stderr_path).contains("retrying with a fresh snapshot")
-        {
-            stop.store(true, Ordering::Relaxed);
-        }
-        match child.try_wait().expect("poll launch") {
-            Some(status) => return status,
-            None => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "launch never finished\n{}",
-                    stderr_contents(stderr_path)
+impl Held {
+    /// Waits for the `visit`th setup attempt to hold at [`POINT`], does `act`,
+    /// and lets the attempt go on.
+    fn at_hold(&mut self, visit: usize, act: impl FnOnce()) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
+        while read_lossy(&self.stderr).matches(&hold_line()).count() < visit {
+            if let Some(status) = self.child.try_wait().expect("poll launch") {
+                panic!(
+                    "the launch ended ({status}) before setup attempt {visit} held\n{}",
+                    read_lossy(&self.stderr)
                 );
-                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup attempt {visit} never held\n{}",
+                read_lossy(&self.stderr)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        act();
+        std::fs::write(self.hold_dir.join(POINT), b"").unwrap();
+    }
+
+    /// The launch's status, stdout and stderr.
+    fn wait(mut self) -> (ExitStatus, String, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll launch") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch never finished\n{}",
+                read_lossy(&self.stderr)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        (status, read_lossy(&self.stdout), read_lossy(&self.stderr))
     }
 }
 
+/// The guest's `/etc` is a private stage, so the host renaming a new
+/// `/etc/ld.so.cache` and a new `/etc/group` over the frozen ones while setup
+/// holds after its mounts detaches nothing: setup records its mount table at
+/// its first attempt, with no retry, and the guest reads the frozen copies,
+/// not the host's new files.
 #[test]
-fn launches_survive_ld_so_cache_replacement_during_setup() {
-    let Some(fixture) = fixture() else { return };
-    let stop = Arc::new(AtomicBool::new(false));
-    let replacer = start_replacer(&fixture.etc, &stop, true);
-    let stderr_path = fixture.etc.parent().unwrap().join("stderr");
-    let mut child = launch(&fixture, &stderr_path, "");
-    let status = wait_launch(&mut child, &stderr_path, Some(&stop));
-    stop.store(true, Ordering::Relaxed);
-    let _ = replacer.join();
-
-    let stderr = stderr_contents(&stderr_path);
-    assert!(
-        stderr.contains("retrying with a fresh snapshot"),
-        "continuous replacement never detached a setup attempt\n{stderr}"
+fn a_host_rename_over_the_frozen_cache_and_group_during_setup_detaches_nothing() {
+    let fixture = fixture();
+    let mut held = fixture.launch(
+        "staged",
+        "",
+        "wc -c < /etc/ld.so.cache; grep -c renamedbyhost /etc/group || true",
+        Some("hold"),
     );
+    held.at_hold(1, || {
+        fixture.rename_over_etc("ld.so.cache", NEW_CACHE);
+        fixture.rename_over_etc("group", NEW_GROUP);
+    });
+    let (status, stdout, stderr) = held.wait();
+
+    assert_eq!(std::fs::read(fixture.etc.join("ld.so.cache")).unwrap(), NEW_CACHE);
+    assert_eq!(std::fs::read(fixture.etc.join("group")).unwrap(), NEW_GROUP);
+    assert!(status.success(), "launch refused: {status}\n{stderr}");
+    assert!(
+        !stderr.contains(RETRY),
+        "a rename over a staged path must not detach a setup attempt\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(&hold_line()).count(),
+        1,
+        "one setup attempt, held once\n{stderr}"
+    );
+    let cache_size = fixture.cache.len().to_string();
+    assert_eq!(
+        stdout.split_whitespace().collect::<Vec<_>>(),
+        [cache_size.as_str(), "0"],
+        "the guest reads the frozen cache ({cache_size} bytes) and the frozen group \
+         file (no line of the host's new one)\n{stderr}"
+    );
+}
+
+/// The host renaming a new nscd directory over the one Hermit hides once setup
+/// has made its mounts (held there, before setup records its mount table)
+/// detaches Hermit's bind over it: the record finds the bind gone, and the
+/// launch retries setup once and runs. The guest still finds the directory
+/// empty, though the host's new one holds a file. A replacement earlier in
+/// setup, between the bind's lookup and the bind or between the bind and its
+/// read-only remount, is not this case's.
+#[test]
+fn launches_survive_nscd_dir_replacement_once_setup_has_mounted() {
+    let fixture = fixture();
+    let mut held = fixture.launch(
+        "launch",
+        "",
+        "ls -A /var/run/nscd && echo end",
+        Some("hold"),
+    );
+    held.at_hold(1, || fixture.rename_over_nscd(true));
+    let (status, stdout, stderr) = held.wait();
+
     assert!(
         status.success(),
-        "launch refused across a setup replacement: {status}\n{stderr}"
+        "launch refused across an nscd directory replacement: {status}\n{stderr}"
+    );
+    let retries: Vec<&str> = stderr.lines().filter(|line| line.contains(RETRY)).collect();
+    assert_eq!(
+        retries.len(),
+        1,
+        "one replacement during setup, one setup retry\n{stderr}"
+    );
+    assert!(
+        retries[0].contains("hermit: container setup attempt 1 of 5"),
+        "the retry names its attempt: {}\n{stderr}",
+        retries[0]
+    );
+    assert_eq!(
+        stdout.trim(),
+        "end",
+        "the guest finds {} empty\n{stderr}",
+        fixture.nscd_target().display()
     );
 }
 
-/// The same race through `--verify`: each leg's setup retries the same
-/// way (the pair rerun cannot cover a leg that never started), and the
-/// final report verifies with no discarded pair.
+/// The same race through `--verify`, held at the same point: run 1's setup
+/// retries the same way (the pair rerun cannot cover a leg that never
+/// started), and the report verifies with no discarded pair.
 #[test]
-fn verify_legs_survive_ld_so_cache_replacement_during_setup() {
-    let Some(fixture) = fixture() else { return };
-    let stop = Arc::new(AtomicBool::new(false));
-    let replacer = start_replacer(&fixture.etc, &stop, true);
-    let root = fixture.etc.parent().unwrap();
-    let stderr_path = root.join("verify-stderr");
-    let report_path = root.join("verify.json");
+fn verify_legs_survive_nscd_dir_replacement_once_setup_has_mounted() {
+    let fixture = fixture();
+    let report_path = fixture.directory.path().join("verify.json");
     let extra = format!(
         "--verify --verify-strict --verify-json {}",
         report_path.display()
     );
-    let mut child = launch(&fixture, &stderr_path, &extra);
-    let status = wait_launch(&mut child, &stderr_path, Some(&stop));
-    stop.store(true, Ordering::Relaxed);
-    let _ = replacer.join();
-
-    let stderr = stderr_contents(&stderr_path);
-    assert!(
-        stderr.contains("retrying with a fresh snapshot"),
-        "continuous replacement never detached a leg setup attempt\n{stderr}"
+    let mut held = fixture.launch(
+        "verify",
+        &extra,
+        "ls -A /var/run/nscd && echo end",
+        Some("hold"),
     );
+    held.at_hold(1, || fixture.rename_over_nscd(true));
+    let (status, stdout, stderr) = held.wait();
+
     assert!(
         status.success(),
-        "verify launch refused across a setup replacement: {status}\n{stderr}"
+        "verify launch refused across an nscd directory replacement: {status}\n{stderr}"
+    );
+    let retries: Vec<&str> = stderr.lines().filter(|line| line.contains(RETRY)).collect();
+    assert_eq!(
+        retries.len(),
+        1,
+        "one replacement during setup, one setup retry\n{stderr}"
+    );
+    assert!(
+        retries[0].contains("hermit: verification run 1 setup attempt 1 of 5"),
+        "the retry names run 1's attempt: {}\n{stderr}",
+        retries[0]
     );
     let report = hermit::canonical_verdict::VerificationReport::from_current_json_slice(
         &std::fs::read(&report_path).expect("read verify json"),
@@ -237,35 +394,127 @@ fn verify_legs_survive_ld_so_cache_replacement_during_setup() {
     assert!(report.verified, "{stderr}");
     assert!(report.bitwise_parity, "{stderr}");
     assert!(report.discarded_attempts.is_empty(), "{stderr}");
+    assert!(
+        stdout.lines().next().is_some() && stdout.lines().all(|line| line == "end"),
+        "the guest finds {} empty, and the run shows nothing else\n{stdout}\n{stderr}",
+        fixture.nscd_target().display()
+    );
 }
 
-/// The bound itself: with the replacer never stopping, every setup
-/// attempt is detached and the launch refuses, naming the attempts,
-/// instead of retrying forever.
+/// The bound itself: with a new nscd directory renamed over the old one in
+/// every setup attempt, every attempt is detached and the launch refuses,
+/// naming the attempts, instead of retrying forever.
 #[test]
 fn setup_retry_exhaustion_refuses_naming_the_attempts() {
-    let Some(fixture) = fixture() else { return };
-    let stop = Arc::new(AtomicBool::new(false));
-    let replacer = start_replacer(&fixture.etc, &stop, false);
-    let stderr_path = fixture.etc.parent().unwrap().join("exhaustion-stderr");
-    let mut child = launch(&fixture, &stderr_path, "");
-    let status = wait_launch(&mut child, &stderr_path, None);
-    stop.store(true, Ordering::Relaxed);
-    let _ = replacer.join();
+    let fixture = fixture();
+    let mut held = fixture.launch("exhaustion", "", "true", Some("hold-each"));
+    for visit in 1..=5 {
+        held.at_hold(visit, || fixture.rename_over_nscd(false));
+    }
+    let (status, _, stderr) = held.wait();
 
-    let stderr = stderr_contents(&stderr_path);
     assert_eq!(
         status.code(),
         Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
         "{stderr}"
     );
     assert!(
-        stderr.contains("still detached after 5 attempts"),
+        stderr.contains("container setup was still detached after 5 attempts"),
         "exhaustion must name the attempts\n{stderr}"
     );
     assert_eq!(
-        stderr.matches("retrying with a fresh snapshot").count(),
+        stderr.matches(RETRY).count(),
         4,
         "four retries precede the fifth, refusing attempt\n{stderr}"
     );
+    assert_eq!(
+        stderr.matches(&hold_line()).count(),
+        5,
+        "each of the five attempts held once\n{stderr}"
+    );
+}
+
+/// Malformed or extreme `HERMIT_RACE_PROBE` settings for the setup point
+/// (empty, inverted, full-width, out-of-range probability, garbage, a hold),
+/// inherited by a launch whose hold directory is not armed: the setup point
+/// reads none of them, and every launch runs.
+#[test]
+fn an_unarmed_setup_point_ignores_any_race_probe_setting() {
+    let fixture = fixture();
+    let full = format!("{POINT}=0-{}", u64::MAX);
+    let settings = [
+        format!("{POINT}="),
+        format!("{POINT}=9-1"),
+        full.clone(),
+        format!("{full}@0.5"),
+        format!("{POINT}=1-2@7"),
+        format!("{POINT}=garbage"),
+        format!("{POINT}=hold"),
+        format!("{POINT}=hold-each"),
+    ];
+    for (index, setting) in settings.iter().enumerate() {
+        let held = fixture.launch_with_probe(
+            &format!("unarmed-{index}"),
+            "",
+            "true",
+            Some(setting),
+            false,
+        );
+        let (status, _, stderr) = held.wait();
+        assert!(
+            status.success(),
+            "an unarmed launch under HERMIT_RACE_PROBE={setting} refused: {status}\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains(&hold_line()),
+            "an unarmed launch under HERMIT_RACE_PROBE={setting} held or panicked\n{stderr}"
+        );
+    }
+}
+
+/// An armed setup point takes nothing but a complete, valid hold for itself:
+/// a bare point, a trailing `=`, an inverted range, a wait, an unknown point
+/// beside its hold, and garbage each fail the launch, naming the point and
+/// why, instead of letting it run unheld.
+#[test]
+fn an_armed_setup_point_with_a_refused_setting_fails_by_name() {
+    let fixture = fixture();
+    let settings = [
+        (POINT.to_owned(), format!("\"{POINT}\" is not point=LO[-HI][@P]")),
+        (format!("{POINT}="), "is not a number of milliseconds".to_owned()),
+        (format!("{POINT}=9-1"), "the range is empty".to_owned()),
+        (format!("{POINT}=5"), "is not a hold (hold or hold-each)".to_owned()),
+        (format!("{POINT}=hold,no_such_point=hold"), "unknown point \"no_such_point\"".to_owned()),
+        (format!("{POINT}=garbage"), "is not a number of milliseconds".to_owned()),
+    ];
+    for (index, (setting, reason)) in settings.iter().enumerate() {
+        let held = fixture.launch_with_probe(
+            &format!("armed-refused-{index}"),
+            "",
+            "true",
+            Some(setting),
+            true,
+        );
+        let (status, _, stderr) = held.wait();
+        assert!(!status.success(), "the launch under {setting} ran\n{stderr}");
+        let refusal = format!("race_probe: {POINT} is armed, and HERMIT_RACE_PROBE is refused there: ");
+        assert!(
+            stderr.lines().any(|line| line.contains(&refusal) && line.contains(reason.as_str())),
+            "the launch under {setting} did not name its refusal ({reason})\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(&hold_line()),
+            "the launch under {setting} held\n{stderr}"
+        );
+    }
+}
+
+/// A case whose fixture cannot be built fails, naming why, instead of passing
+/// having run nothing: here the nested hermit does not run.
+#[test]
+#[should_panic(
+    expected = "setup_retry could not build its fixture, so this case fails instead of passing having run nothing: nested hermit probe failed"
+)]
+fn an_unbuildable_fixture_fails_the_case_by_name() {
+    fixture_with(Path::new("/bin/false"));
 }

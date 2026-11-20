@@ -31,6 +31,22 @@ HERMIT_RACE_PROBE=bg_harvest_skip=0@0.5 HERMIT_RACE_PROBE_SEED=7 \
   can then act on the task while it is known to be at the point (kill it, for
   example) and create the file to let it go on. A hold without that variable is
   reported and skipped.
+- `point=hold-each` holds every visit the same way, and a visit goes on only by
+  consuming the file, renaming it away: of two visits that try to consume one
+  release, one rename succeeds and the other finds it gone and goes on waiting, so
+  each visit waits for a release of its own and two visits never go on for one. A test
+  can act at the point once per visit (once per container setup attempt, for
+  example). A consumption that fails for any reason but the file being absent fails
+  the visit, naming the point.
+- A point in Hermit's launcher or a container's init (`setup_mounts_made`) parks
+  the run itself, so it is armed only where `HERMIT_RACE_PROBE_HOLD_DIR` names a
+  directory holding a file named `launcher-holds-armed`, which the test makes. That is
+  decided first: an unarmed point reads nothing beyond that variable and that file,
+  so no `HERMIT_RACE_PROBE` value, however malformed, does anything there. Armed,
+  nothing is ignored: `HERMIT_RACE_PROBE` must parse in full, name only known points,
+  and give the point `hold` or `hold-each`; anything else (a wait, a malformed or
+  unknown item, no item for the point) fails the setup attempt, naming the point and
+  why. A hold not released within 120 seconds fails, naming the point.
 - An item naming an unknown point, or one that does not parse, is reported on stderr
   and skipped.
 
@@ -62,6 +78,7 @@ Hermit removes all three from the guest's environment, as it does for its own
 | `procfs_spelling_resolved` | async wait | `detcore/src/syscalls/files.rs`, `handle_openat`, after Detcore names the directory a relative lookup starts from and before the kernel's open | without sequentialized threads, another guest thread can replace that directory's descriptor before the kernel uses it |
 | `exit_hook_tail` | async wait, debug assertions only | `detcore/src/lib.rs`, `on_exit_thread`, after the hook's last call to the global state and before the backend releases the thread's state | the exiting thread's state is released late, as when the backend runs the hook's tail late (KVM runs it after the parent can already wait for the child): a descriptor table Detcore did not let go at the exit (one that more than one thread held, or of a process a signal killed) goes late with it |
 | `receipt_decision` | async wait, debug assertions only | `detcore/src/syscalls/scm_rights.rs`, `record_received_facts`, before the receipt decides how to record a descriptor received over `SCM_RIGHTS` | exited senders' exit hooks finish first, as they can while the receive's probes wait for the host |
+| `setup_mounts_made` | launcher hold, `hold` or `hold-each` only (blocks the container's init; armed only by `launcher-holds-armed`; fails after 120 s) | `hermit-cli/src/bin/hermit/run.rs`, `launch_in_container`, in the container's init after its setup made the mounts and before `IdentityGuard::record_plan` records the mount table | a host rename over a bind's target detaches the bind before the record, which then retries the setup (https://github.com/rrnewton/hermit/issues/4799) |
 
 The waits are `tokio::time::sleep`. They delay only the task that owns the call;
 the scheduler keeps running. A blocking sleep at these points would stall the

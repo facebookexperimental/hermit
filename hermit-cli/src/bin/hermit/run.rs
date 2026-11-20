@@ -17709,6 +17709,11 @@ impl RunOpts {
                 // whether the placeholder directory is still where the guest
                 // path reaches it.
                 if let Some(identity) = identity.as_mut() {
+                    // Off unless armed: the hold directory holds
+                    // `launcher-holds-armed` (docs/RACE_PROBES.md).
+                    detcore::race_probe::delay_in_launcher(
+                        detcore::race_probe::SETUP_MOUNTS_MADE,
+                    );
                     identity.record_plan()?;
                     identity.confirm_directory_placeholder();
                 }
