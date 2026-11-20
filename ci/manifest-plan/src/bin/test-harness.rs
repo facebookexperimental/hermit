@@ -94,6 +94,7 @@ use serde_yaml::Value as YamlValue;
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
 const EXPECTED_PLAN_PATH: &str = "ci/expected-e2e-plan.json";
 const OPTIONAL_CELLS_PATH: &str = "ci/optional-e2e-cells.txt";
+const REQUIRED_CELLS_PATH: &str = "ci/required-e2e-cells.txt";
 const DEFAULT_BUILD_JOBS: usize = 16;
 const DEFAULT_VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
@@ -236,10 +237,11 @@ const SYNC_CELLS_HELP: &str = "\
 Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
 
 Regenerate the manifest-derived files that the scorecard is generated from,
-and the inventory of optional cells:
+and the inventories of optional and required cells:
 
   ci/expected-e2e-plan.json        the required plan, rows in their committed order
   ci/optional-e2e-cells.txt        enabled cells that are not required (ci: false)
+  ci/required-e2e-cells.txt        every required cell, on every execution owner
 
 The parity population needs no file: it is derived from the manifests (every
 test whose ptrace verify cell full validation selects, on every candidate
@@ -247,7 +249,8 @@ backend), and generate-parity-cells snapshots it.
 
 A cell flip makes one existing manifest cell required: its backend joins the
 mode's `backends_enabled` and `ci`, or its `ci: false` becomes true. The diff of
-ci/expected-e2e-plan.json is the record of every change to the required cells.
+ci/required-e2e-cells.txt is the record of every change to the required cells,
+on every owner; ci/expected-e2e-plan.json holds the core owner's rows.
 `test-harness validate` refuses a tree where any of these files differs from
 this output.
 
@@ -1910,20 +1913,43 @@ fn optional_cells_document(manifests: &ManifestSet) -> Result<String, String> {
     let lines = select(Population::Enabled)?
         .into_iter()
         .filter(|cell| !required.contains(&cell.id))
-        .map(|cell| {
-            format!(
-                "{} {} {}\n",
-                cell.id.test,
-                cell.id.mode,
-                cell.id.backend.as_deref().unwrap_or("-")
-            )
-        })
+        .map(|cell| cell_line(&cell.id))
         .collect::<BTreeSet<_>>();
     Ok(format!(
         "# Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.\n\
          # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.\n{}",
         lines.into_iter().collect::<String>()
     ))
+}
+
+/// Every required cell of the default selection, on every execution owner,
+/// one `<test> <mode> <backend>` line each, sorted. ci/expected-e2e-plan.json
+/// lists only the core owner's cells, so this inventory is what makes a
+/// required cell of any owner leaving or joining show up as a diff.
+fn required_cells_document(manifests: &ManifestSet) -> Result<String, String> {
+    let lines = manifests
+        .select(&Selection {
+            population: Some(Population::Required),
+            ..Selection::default()
+        })?
+        .into_iter()
+        .map(|cell| cell_line(&cell.id))
+        .collect::<BTreeSet<_>>();
+    Ok(format!(
+        "# Required E2E cells, on every execution owner: <test> <mode> <backend>.\n\
+         # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.\n{}",
+        lines.into_iter().collect::<String>()
+    ))
+}
+
+/// One cell inventory line: `<test> <mode> <backend>`, `-` for no backend.
+fn cell_line(id: &CellId) -> String {
+    format!(
+        "{} {} {}\n",
+        id.test,
+        id.mode,
+        id.backend.as_deref().unwrap_or("-")
+    )
 }
 
 /// The files `sync-cells` derives, each with the text the manifests now give
@@ -1936,6 +1962,7 @@ fn synced_cell_files(root: &Path) -> Result<Vec<(&'static str, String)>, String>
     Ok(vec![
         (EXPECTED_PLAN_PATH, plan),
         (OPTIONAL_CELLS_PATH, optional_cells_document(&manifests)?),
+        (REQUIRED_CELLS_PATH, required_cells_document(&manifests)?),
     ])
 }
 
@@ -1995,7 +2022,9 @@ fn sync_cells(values: &[String]) -> ExitCode {
         }
     }
     match (stale.is_empty(), write) {
-        (true, _) => println!("sync-cells: the expected plan and optional cells are current"),
+        (true, _) => {
+            println!("sync-cells: the expected plan, optional cells and required cells are current")
+        }
         (false, true) => println!("sync-cells: wrote {}", stale.join(", ")),
         (false, false) => {
             eprintln!(
@@ -14832,10 +14861,21 @@ sys.exit(1 if refused else 0)
         // Not .git: the fixture is no checkout.
         link_except("", &["tests", ".git"]);
         fs::remove_file(fixture.join("ci")).unwrap();
-        link_except("ci", &["expected-e2e-plan.json", "optional-e2e-cells.txt"]);
+        link_except(
+            "ci",
+            &[
+                "expected-e2e-plan.json",
+                "optional-e2e-cells.txt",
+                "required-e2e-cells.txt",
+            ],
+        );
         link_except("tests", &["e2e"]);
         copy_tree(&checkout.join("tests/e2e"), &fixture.join("tests/e2e"));
-        for relative in [super::EXPECTED_PLAN_PATH, super::OPTIONAL_CELLS_PATH] {
+        for relative in [
+            super::EXPECTED_PLAN_PATH,
+            super::OPTIONAL_CELLS_PATH,
+            super::REQUIRED_CELLS_PATH,
+        ] {
             // A missing inventory is copied as missing, and `sync` reports it stale.
             if checkout.join(relative).exists() {
                 fs::copy(checkout.join(relative), fixture.join(relative)).unwrap();
@@ -15065,11 +15105,13 @@ sys.exit(1 if refused else 0)
     /// The subject is the plan's last row because the generator keeps the
     /// committed order and appends new rows, so a re-flipped row returns to the
     /// end of the plan: the order a hand flip by the generator gives too. Only
-    /// the plan changes: the parity population has no file of its own.
+    /// the plan and the required-cell inventory change: the parity population
+    /// has no file of its own.
     #[test]
     fn sync_cells_round_trips_an_unflip_and_reflip_byte_for_byte() {
         let root = sync_cells_fixture("tail");
         let committed_plan = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
+        let committed_required = fs::read(root.join(super::REQUIRED_CELLS_PATH)).unwrap();
         assert!(
             sync(&root).is_empty(),
             "the committed plan is stale; run ci/sync-cell-config.sh"
@@ -15083,7 +15125,10 @@ sys.exit(1 if refused else 0)
         let original = fs::read_to_string(&manifest).unwrap();
 
         fs::write(&manifest, unflip(&original, &test, &mode, &backend)).unwrap();
-        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(
+            sync(&root),
+            [super::EXPECTED_PLAN_PATH, super::REQUIRED_CELLS_PATH]
+        );
         let unflipped: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap())
                 .unwrap();
@@ -15095,10 +15140,51 @@ sys.exit(1 if refused else 0)
         );
 
         fs::write(&manifest, &original).unwrap();
-        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(
+            sync(&root),
+            [super::EXPECTED_PLAN_PATH, super::REQUIRED_CELLS_PATH]
+        );
         assert_eq!(
             fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
             committed_plan
+        );
+        assert_eq!(
+            fs::read(root.join(super::REQUIRED_CELLS_PATH)).unwrap(),
+            committed_required
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A required cell of a non-core execution owner has no row in the core
+    /// plan, so only the required-cell inventory records it leaving; restoring
+    /// it gives the inventory back byte for byte.
+    #[test]
+    fn sync_cells_records_dropping_a_non_core_required_cell() {
+        let root = sync_cells_fixture("non-core");
+        let committed = fs::read_to_string(root.join(super::REQUIRED_CELLS_PATH)).unwrap();
+        let line = "c-programs/acct-refusal-probe verify dbt";
+        assert!(
+            committed.lines().any(|entry| entry == line),
+            "{line} is not required"
+        );
+        let manifest = root.join("tests/e2e/manifests/c-programs.yaml");
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(
+            &manifest,
+            unflip(&original, "c-programs/acct-refusal-probe", "verify", "dbt"),
+        )
+        .unwrap();
+        assert_eq!(sync(&root), [super::REQUIRED_CELLS_PATH]);
+        let dropped = fs::read_to_string(root.join(super::REQUIRED_CELLS_PATH)).unwrap();
+        assert_eq!(dropped.lines().count() + 1, committed.lines().count());
+        assert!(!dropped.lines().any(|entry| entry == line));
+
+        fs::write(&manifest, &original).unwrap();
+        assert_eq!(sync(&root), [super::REQUIRED_CELLS_PATH]);
+        assert_eq!(
+            fs::read_to_string(root.join(super::REQUIRED_CELLS_PATH)).unwrap(),
+            committed
         );
         fs::remove_dir_all(&root).unwrap();
     }

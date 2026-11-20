@@ -13,7 +13,8 @@
 # its `ci: false` becomes true. That manifest edit is the only hand edit. This
 # script then rewrites, in dependency order,
 #
-#   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt
+#   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt,
+#                                ci/required-e2e-cells.txt
 #   generate-parity-cells        ci/compat-envelope/parity-cells/ shards (the parity
 #                                population, derived from the manifests)
 #   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json,
@@ -22,8 +23,9 @@
 #   generate-validation-dag      ci/dag/validate.json
 #   generate-test-footprints     checked only; a flip does not move a footprint
 #
-# The diff of ci/expected-e2e-plan.json is the record of the change to the
-# required cells; validation refuses any of these files that drifts from its
+# The diff of ci/required-e2e-cells.txt is the record of the change to the
+# required cells, on every execution owner (ci/expected-e2e-plan.json holds the
+# core owner's rows); validation refuses any of these files that drifts from its
 # generator (https://github.com/rrnewton/hermit/issues/3606).
 
 set -uo pipefail
@@ -33,8 +35,8 @@ usage() {
 Usage: ci/sync-cell-config.sh [--check]
 
 Regenerate every file derived from the E2E manifests after a cell flip: the
-expected plan, the optional-cell inventory, the parity-cells shards, the scorecard and cell
-table, and the validation DAG. Edit the manifest, run this,
+expected plan, the optional- and required-cell inventories, the parity-cells shards, the
+scorecard and cell table, and the validation DAG. Edit the manifest, run this,
 and commit the manifest with the files it rewrites.
 
 Options:

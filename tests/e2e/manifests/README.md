@@ -698,10 +698,12 @@ To flip a cell (make an existing manifest cell required, or stop requiring it),
 edit only the manifest, then run `ci/sync-cell-config.sh`. It regenerates every
 file derived from the manifests: `ci/expected-e2e-plan.json`,
 `ci/optional-e2e-cells.txt` (the enabled `ci = false` cells),
+`ci/required-e2e-cells.txt` (every required cell, on every execution owner),
 `ci/compat-envelope/parity-cells.json`, `SCORECARD.md`,
 `ci/compat-envelope/cells.json` and `ci/dag/validate.json`.
-Commit them with the manifest; the diff of the expected plan, and of the
-optional-cell inventory for a `ci = false` cell, is the record of the change. `ci/sync-cell-config.sh --check` writes nothing and fails on any
+Commit them with the manifest; the diff of the required-cell inventory, and
+of the optional-cell inventory for a `ci = false` cell, is the record of the
+change. `ci/sync-cell-config.sh --check` writes nothing and fails on any
 drift, and validation runs the same checks
 (https://github.com/rrnewton/hermit/issues/3606).
 

@@ -21449,72 +21449,118 @@ mod nextest_timeout_tests {
             };
             let all = manifests.select(&baseline).unwrap();
             if !all_run_types {
-                // 2600 at the split's base (main eafc446e955); 2958 since the
-                // split was replayed onto main d2e8d2c61f3, whose manifests
-                // gained the cells main enabled meanwhile (the expanded plan's
-                // CI cells: 371 added, 12 removed, 318 of the added replay).
-                // 2971 on the batch6 base fcd62385 (batch6's manifest cells:
-                // 13 added, measured by the full validate at e3e107cd).
-                // 2974 with package K slice K10's three KVM verify cells
-                // (c-programs/thread-self-procfs-handoff,
-                // c-programs/proc-fd-link-aliases and compat/ps). 2976 with R1108's
-                // c-programs/shared-file-threads on ptrace and KVM. 2978
-                // with the java/javac compile+run split of 2026-11-05, which
-                // replaces each combined row with two rows (+2 net replay
-                // cells in this default population).
-                // 2983 with #5154's guard cells: c-programs/madvise-guard-fault
-                // and c-programs/madvise-guard-regions, verify and replay on
-                // ptrace, and madvise-guard-regions verify on KVM. 2984 with
-                // SIGSHARE S2b's KVM verify of
-                // c-programs/sigsuspend-sibling-signal-wake. 2998 with the
-                // 2026-11-05 sweep flip's fourteen required cells (PR #5183,
-                // 2984 + 14, disjoint from the guard/SIGSHARE cells),
-                // recounted by enumeration at the rebase head. 2996 after
-                // logger's two ptrace cells (verify, replay) left again on
-                // 2026-11-06, re-measured red in the merge-queue pinned root
-                // (no /dev/log socket; sweep CLEAN was host-contaminated).
-                // 2993 after pkg-config's three cells (verify ptrace, replay
-                // ptrace, verify KVM) left under dh-jn0hh part 2 (pkg-config
-                // 0.29.2 in the pinned root emits -D before -I).
-                // 2992 after compat/shred verify/KVM left under DROP-6
-                // (unsupported KVM zero-count read on guest fd 3).
-                // 2991 after compat/top verify@kvm was restored by the top-only
-                // flip; compat/sysctl-random-uuid verify/KVM is still left under
-                // DROP-7.
-                // 2994 with the KVM verify cells of compat/pgrep, compat/pkill
-                // and c-programs/flock-lifecycle (3 of 3 strict verify runs
-                // each in the pinned root at 61eac51c).
-                // 2995 with system-utils/ps-proc-table verify/KVM (Detcore renders
-                // /proc/1 of Hermit's init; 3 of 3 strict verify runs in the
-                // pinned root).
-                // 2994 after system-utils/procfs-sanitized-paths verify/KVM
-                // left under dh-9j8ue (this PR; Detcore refuses smaps VmFlags
-                // for file mappings while MappingFact carries none).
-                // 2990 after compat/numactl-hardware and compat/numastat left
-                // liteinst and in-guest-trap (four cells) with the no-NUMA
-                // platform (https://github.com/rrnewton/hermit/issues/5269):
-                // their shell wrappers exec, which the in-guest backends
-                // refuse; ptrace and KVM keep proving the new answers.
-                // 2994 again when the direct utility rows restore those four
-                // cells with no wrapper to exec.
-                // 2995 with c-programs/procfs-identity-agreement verify/KVM
-                // (KVM's memory map lists every mapping since Reverie
-                // ce25725f, so the memfd's maps line agrees with stat).
-                // 2997 with compat/shred and compat/sysctl-random-uuid
-                // verify/KVM back from DROP-6 and DROP-7 (3 of 3 strict
-                // verify runs each in the pinned root at 19b45f66).
-                // 2998 with c-programs/pidfd-waitid-child verify/KVM (KVM opens
-                // a pidfd for another guest process since Reverie 1410, and
-                // Detcore answers waitid(P_PIDFD) from its pidfd model).
-                // 3001 with c-programs/preempt-spin-flag (verify and replay on
-                // ptrace, verify on KVM), a pure-userspace spin that needs
-                // preemption, added as bin-c/preempt-spin-flag and moved to
-                // c-programs the same day. Recounted by enumerating this
-                // selection at both trees: those three cells added, none removed.
+                // A committed census of the full required set, not a pinned
+                // total (no exact test/cell count pins: totals are reported,
+                // never asserted). ci/required-e2e-cells.txt lists every
+                // required cell, on every execution owner, and
+                // ci/sync-cell-config.sh regenerates it, so a required cell of
+                // any owner leaves or joins only as a line of that file's
+                // reviewed diff; one that changes without it fails here, naming
+                // the cell. The core cells must also be the rows of
+                // ci/expected-e2e-plan.json, and every enabled cell that is not
+                // required must be listed in ci/optional-e2e-cells.txt. The
+                // check is tree-local, comparing the manifests with files
+                // generated from them, so the reviewed diff of those files is
+                // the record.
+                use hermit_manifest_plan::runner::CellId;
+                let read = |relative: &str| std::fs::read_to_string(root.join(relative)).unwrap();
+                let inventory = |relative: &str| {
+                    read(relative)
+                        .lines()
+                        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+                        .map(|line| {
+                            let [test, mode, backend] = line.split(' ').collect::<Vec<_>>()[..]
+                            else {
+                                panic!("malformed {relative} line {line:?}");
+                            };
+                            CellId {
+                                test: test.to_string(),
+                                mode: mode.to_string(),
+                                backend: (backend != "-").then(|| backend.to_string()),
+                            }
+                        })
+                        .collect::<BTreeSet<_>>()
+                };
+                let none = Vec::<&CellId>::new();
+                let selected = all
+                    .iter()
+                    .map(|cell| cell.id.clone())
+                    .collect::<BTreeSet<_>>();
+                let listed = inventory("ci/required-e2e-cells.txt");
                 assert_eq!(
+                    listed.difference(&selected).collect::<Vec<_>>(),
+                    none,
+                    "required cells left without a regenerated ci/required-e2e-cells.txt"
+                );
+                assert_eq!(
+                    selected.difference(&listed).collect::<Vec<_>>(),
+                    none,
+                    "required cells added without a regenerated ci/required-e2e-cells.txt"
+                );
+                assert_eq!(
+                    selected, listed,
+                    "the required cells differ from their census"
+                );
+                let core = selected
+                    .iter()
+                    .filter(|id| owners.owner(id.backend.as_deref()).unwrap() == "core")
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let plan =
+                    serde_json::from_str::<serde_json::Value>(&read("ci/expected-e2e-plan.json"))
+                        .unwrap()["cells"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| CellId {
+                            test: row["test"].as_str().unwrap().to_string(),
+                            mode: row["mode"].as_str().unwrap().to_string(),
+                            backend: row["backend"].as_str().map(str::to_string),
+                        })
+                        .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    plan.difference(&core).collect::<Vec<_>>(),
+                    none,
+                    "required core cells left without a regenerated ci/expected-e2e-plan.json"
+                );
+                assert_eq!(
+                    core.difference(&plan).collect::<Vec<_>>(),
+                    none,
+                    "required core cells added without a regenerated ci/expected-e2e-plan.json"
+                );
+                assert_eq!(
+                    core, plan,
+                    "the required core cells differ from their plan record"
+                );
+                let optional = inventory("ci/optional-e2e-cells.txt");
+                let enabled = manifests
+                    .select(&Selection {
+                        population: Some(Population::Enabled),
+                        ..baseline.clone()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .map(|cell| cell.id)
+                    .filter(|id| !selected.contains(id))
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    enabled.difference(&optional).collect::<Vec<_>>(),
+                    none,
+                    "required cells left without a regenerated ci/optional-e2e-cells.txt"
+                );
+                assert_eq!(
+                    optional.difference(&enabled).collect::<Vec<_>>(),
+                    none,
+                    "listed optional cells are required or not enabled; regenerate ci/optional-e2e-cells.txt"
+                );
+                assert_eq!(
+                    enabled, optional,
+                    "the enabled cells that are not required differ from their inventory"
+                );
+                eprintln!(
+                    "all-owner required population: {} cells ({} core), reported, not pinned",
                     all.len(),
-                    3001,
-                    "the original all-owner population is retained"
+                    core.len()
                 );
             }
             let expected = all
