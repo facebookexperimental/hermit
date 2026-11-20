@@ -4115,6 +4115,28 @@ pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
     backend_capabilities(backend).delivers_preemption_timer_events
 }
 
+/// The backend prerequisite of `DetConfig::untrap_passthrough_syscalls`: the
+/// ptrace backend, whose seccomp filter is what leaves the calls untrapped.
+/// KVM's hypercall and the in-guest runtimes' `SIGSYS` trap intercept
+/// syscalls their own way, which the mode has not been checked against.
+/// Detcore's own admission (`detcore::untrap_passthrough_admission`) reads
+/// what a backend can do, never which backend it is, so this is decided here,
+/// where the library sees the built-in backend, by Detcore's rule for a
+/// launch off ptrace (`detcore::untrap_passthrough_off_ptrace`): every launch
+/// reaches it in `dispatch_backend` or `dispatch_output_backend`, before
+/// Detcore's admission and before the guest starts. `hermit run`'s validation
+/// asks it too, and KVM's direct entry, `hermit_run_kvm::run_detcore`, asks
+/// Detcore's rule itself.
+pub fn untrap_passthrough_backend_admission(
+    config: &DetConfig,
+    backend: Backend,
+) -> Result<(), detcore::UntrapPassthroughRefusal> {
+    if backend == Backend::Ptrace {
+        return Ok(());
+    }
+    detcore::untrap_passthrough_off_ptrace(config, backend.as_str())
+}
+
 /// After an in-guest LiteInst run, waits (bounded) until the watcher has
 /// reported every admitted process's physical exit, then releases any exit
 /// barrier still recorded. Release comes only after that drain: an exit still
@@ -4454,6 +4476,7 @@ async fn dispatch_backend(
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     detcore::preemptions::validate_config_replay_inputs(&config)?;
+    untrap_passthrough_backend_admission(&config, backend)?;
     // Do this while the actual Tool type is available, before a DBT/SaBRe
     // launcher erases it to GlobalTool or constructs an RPC server.
     <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
@@ -4853,6 +4876,7 @@ async fn dispatch_output_backend(
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     detcore::preemptions::validate_config_replay_inputs(&config)?;
+    untrap_passthrough_backend_admission(&config, backend)?;
     <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
     // An in-guest LiteInst backend decides its delivery gate below, from the
     // final configuration; every other backend's prepared configuration is
@@ -6114,6 +6138,96 @@ mod tests {
         assert_eq!(detcore::untrap_passthrough_admission(&qualified), Ok(()));
         <detcore::Detcore as reverie::Tool>::facility_admission(&qualified)
             .expect("the mode with RCB time and no record is admitted");
+    }
+
+    /// The mode's prerequisites that `hermit run` used to check alone are
+    /// refused through the library too, before the guest starts, as a policy
+    /// refusal naming `UntrapPassthroughRefusal`: a backend other than ptrace
+    /// (KVM, LiteInst and in-guest-trap, through `run_with_backend` and
+    /// `run_with_output_backend`), refused by
+    /// `untrap_passthrough_backend_admission` in both launch dispatchers, and
+    /// a happens-before program (through `run` and `run_with_output`),
+    /// refused by Detcore's `facility_admission`. The guest's marker file is
+    /// never written. The control, the same configuration on ptrace and
+    /// without the program, is admitted by both checks.
+    #[test]
+    fn the_library_entry_points_refuse_untrapping_off_ptrace_and_with_happens_before() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("guest-started");
+        let guest = crate::unit_guest();
+        let command = || marker_guest_command(guest.as_deref(), &marker);
+        let qualified = DetConfig {
+            untrap_passthrough_syscalls: true,
+            sequentialize_threads: true,
+            max_timeslice: std::num::NonZeroU64::new(10_000),
+            ..Default::default()
+        };
+        let refused = |route: &str, error: Error, refusal: detcore::UntrapPassthroughRefusal| {
+            assert!(
+                error.chain().any(|cause| {
+                    cause.downcast_ref::<detcore::UntrapPassthroughRefusal>() == Some(&refusal)
+                        || matches!(
+                            cause.downcast_ref::<reverie::Error>(),
+                            Some(reverie::Error::Tool(inner))
+                                if inner.downcast_ref::<detcore::UntrapPassthroughRefusal>()
+                                    == Some(&refusal)
+                        )
+                }),
+                "{route}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains(&refusal.to_string()),
+                "{route}: {error:#}"
+            );
+            assert_eq!(
+                SerializableError::from(error).kind(),
+                FailureKind::PolicyRefusal,
+                "{route}"
+            );
+            assert!(!marker.exists(), "{route}: the guest started");
+        };
+        for backend in [Backend::Kvm, Backend::Liteinst, Backend::InGuestTrap] {
+            let refusal = detcore::UntrapPassthroughRefusal::Backend(backend.as_str());
+            assert_eq!(
+                untrap_passthrough_backend_admission(&qualified, backend),
+                Err(refusal)
+            );
+            let error = run_with_backend(command(), qualified.clone(), false, &None, backend)
+                .expect_err("run_with_backend admitted the untrapped calls off ptrace");
+            refused(&format!("run_with_backend {backend:?}"), error, refusal);
+            let error =
+                run_with_output_backend(command(), qualified.clone(), false, &None, backend)
+                    .expect_err("run_with_output_backend admitted the untrapped calls off ptrace");
+            refused(
+                &format!("run_with_output_backend {backend:?}"),
+                error,
+                refusal,
+            );
+        }
+        let ordered = DetConfig {
+            happens_before: Some(detcore_model::happens_before::HappensBeforeProgram {
+                version: 1,
+                anchors: Default::default(),
+                edges: Vec::new(),
+                max_hold_ns: None,
+            }),
+            ..qualified.clone()
+        };
+        let refusal = detcore::UntrapPassthroughRefusal::HappensBefore;
+        let error = run(command(), ordered.clone(), false, &None)
+            .expect_err("run admitted the untrapped calls with a happens-before program");
+        refused("run", error, refusal);
+        let error = run_with_output(command(), ordered, false, &None).expect_err(
+            "run_with_output admitted the untrapped calls with a happens-before program",
+        );
+        refused("run_with_output", error, refusal);
+
+        assert_eq!(
+            untrap_passthrough_backend_admission(&qualified, Backend::Ptrace),
+            Ok(())
+        );
+        <detcore::Detcore as reverie::Tool>::facility_admission(&qualified)
+            .expect("the mode on ptrace with RCB time, no record and no program is admitted");
     }
 
     /// A guest that writes `marker` if it ever runs, for the refusal tests

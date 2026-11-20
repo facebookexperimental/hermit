@@ -202,10 +202,28 @@ pub enum UntrapPassthroughRefusal {
     /// yields, so a loop on the untrapped calls would never yield or let
     /// virtual time advance.
     NoRcbTime,
+    /// The run has a happens-before program (`Config::happens_before`),
+    /// whose syscall anchors count the calls the mode untraps.
+    HappensBefore,
+    /// The run's backend, named here, is not ptrace. Untrapping changes only
+    /// the ptrace backend's seccomp filter; every other backend intercepts
+    /// syscalls its own way, which the mode has not been checked against.
+    /// Detcore reads what a backend can do, never which backend it is, so
+    /// this one is decided by each launcher that runs Detcore on another
+    /// backend ([`untrap_passthrough_off_ptrace`]), never by
+    /// [`untrap_passthrough_admission`].
+    Backend(&'static str),
 }
 
 impl std::fmt::Display for UntrapPassthroughRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Backend(backend) = self {
+            return write!(
+                f,
+                "--untrap-passthrough-syscalls cannot be combined with a backend other than \
+                 ptrace (`{backend}`), whose syscall interception it has not been checked against"
+            );
+        }
         f.write_str(match self {
             Self::PreemptionRecord => {
                 "--untrap-passthrough-syscalls cannot be combined with a preemption record, \
@@ -217,15 +235,47 @@ impl std::fmt::Display for UntrapPassthroughRefusal {
                  performance counters): without them a loop on the calls it untraps would \
                  never yield or let virtual time advance"
             }
+            Self::HappensBefore => {
+                "--untrap-passthrough-syscalls cannot be combined with --happens-before, whose \
+                 syscall anchors count the calls it untraps"
+            }
+            Self::Backend(_) => unreachable!("written above"),
         })
     }
 }
 
 impl std::error::Error for UntrapPassthroughRefusal {}
 
+/// A refusal as a Reverie backend returns it from a tool's admission.
+impl From<UntrapPassthroughRefusal> for reverie::Error {
+    fn from(refusal: UntrapPassthroughRefusal) -> Self {
+        reverie::Error::Tool(anyhow::Error::new(refusal))
+    }
+}
+
+/// The backend prerequisite of `Config::untrap_passthrough_syscalls`, for a
+/// launch of Detcore on BACKEND, a backend other than ptrace: the mode is
+/// refused there. Untrapping changes only the ptrace backend's seccomp
+/// filter, and none of the capabilities a backend declares
+/// (`Config::backend`) says whether a call the tool does not subscribe runs
+/// in the kernel without a stop, so Detcore's own admission cannot decide
+/// it. Every launcher that runs Detcore on another backend asks this before
+/// the guest starts: the hermit library's launch dispatchers
+/// (`hermit::untrap_passthrough_backend_admission`) and KVM's direct entry,
+/// `hermit_run_kvm::run_detcore`.
+pub fn untrap_passthrough_off_ptrace(
+    config: &Config,
+    backend: &'static str,
+) -> Result<(), UntrapPassthroughRefusal> {
+    if config.untrap_passthrough_syscalls {
+        return Err(UntrapPassthroughRefusal::Backend(backend));
+    }
+    Ok(())
+}
+
 /// The prerequisites of `Config::untrap_passthrough_syscalls` that the
 /// configuration itself decides: no preemption record, recorded or
-/// replayed, and RCB time. Every launch reaches it through Detcore's
+/// replayed, no happens-before program, and RCB time. Every launch reaches it through Detcore's
 /// `facility_admission`, the library entry points (`hermit::run`,
 /// `hermit::run_with_output` and the rest) as well as `hermit run`, whose
 /// validation asks it too so that its options are refused by name before
@@ -240,6 +290,9 @@ pub fn untrap_passthrough_admission(config: &Config) -> Result<(), UntrapPassthr
         || config.replay_schedule_from.is_some()
     {
         return Err(UntrapPassthroughRefusal::PreemptionRecord);
+    }
+    if config.happens_before.is_some() {
+        return Err(UntrapPassthroughRefusal::HappensBefore);
     }
     if !config.use_rcb_time() {
         return Err(UntrapPassthroughRefusal::NoRcbTime);
@@ -9993,8 +10046,9 @@ mod subscription_tests {
     }
 
     /// The mode's configuration prerequisites are checked where every launch
-    /// passes (`facility_admission`): without RCB time, or with a preemption
-    /// record recorded or replayed, it is refused before the guest starts;
+    /// passes (`facility_admission`): without RCB time, with a preemption
+    /// record recorded or replayed, or with a happens-before program, it is
+    /// refused before the guest starts;
     /// with RCB time and no record it is admitted, as is any configuration
     /// without the mode.
     #[test]
@@ -10047,9 +10101,21 @@ mod subscription_tests {
         refused(
             Config {
                 replay_schedule_from: Some(std::path::PathBuf::from("/nonexistent")),
-                ..qualified
+                ..qualified.clone()
             },
             UntrapPassthroughRefusal::PreemptionRecord,
+        );
+        refused(
+            Config {
+                happens_before: Some(detcore_model::happens_before::HappensBeforeProgram {
+                    version: 1,
+                    anchors: Default::default(),
+                    edges: Vec::new(),
+                    max_hold_ns: None,
+                }),
+                ..qualified
+            },
+            UntrapPassthroughRefusal::HappensBefore,
         );
     }
 

@@ -1222,6 +1222,9 @@ fn is_outer_policy_refusal(error: &Error) -> bool {
             .downcast_ref::<detcore::ChosenBinaryInputRefusal>()
             .is_some()
         || error
+            .downcast_ref::<detcore::UntrapPassthroughRefusal>()
+            .is_some()
+        || error
             .downcast_ref::<detcore::preemptions::RecordFormatRefusal>()
             .is_some()
         // Tool's transparent forwarding can hide the typed format refusal
@@ -3059,6 +3062,45 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Each refusal of `--untrap-passthrough-syscalls` that `hermit run`'s
+    /// validation returns as Detcore's typed `UntrapPassthroughRefusal` (a
+    /// backend other than ptrace, `--happens-before`, no RCB time, a
+    /// preemption record) is a policy refusal: exit 122 and its class line,
+    /// with or without context. Its words alone are not.
+    #[test]
+    fn untrap_passthrough_refusals_use_the_policy_refusal_exit_and_marker() {
+        use detcore::UntrapPassthroughRefusal;
+        for refusal in [
+            UntrapPassthroughRefusal::Backend("kvm"),
+            UntrapPassthroughRefusal::HappensBefore,
+            UntrapPassthroughRefusal::NoRcbTime,
+            UntrapPassthroughRefusal::PreemptionRecord,
+        ] {
+            for contextual in [false, true] {
+                let mut error = Error::new(refusal);
+                if contextual {
+                    error = error.context("validating hermit run");
+                }
+                assert_eq!(
+                    failure_exit_code(&error),
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                    "{refusal:?}"
+                );
+                assert_eq!(
+                    classify_failure(&error),
+                    "HERMIT_POLICY_REFUSAL class=policy-refusal",
+                    "{refusal:?}"
+                );
+            }
+            let prose = Error::msg(refusal.to_string());
+            assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
+            assert_eq!(
+                classify_failure(&prose),
+                "HERMIT_INTERNAL_FAILURE class=cli-error"
+            );
         }
     }
 
