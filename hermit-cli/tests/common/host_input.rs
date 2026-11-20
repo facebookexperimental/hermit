@@ -483,8 +483,8 @@ pub fn verify_across_attempts(
         .arg(&report_path)
         .args([
             "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
+            "--mount=type=tmpfs,target=/tmp/host-input-workdir",
+            "--workdir=/tmp/host-input-workdir",
             "--",
             "/bin/sh",
             "-c",
