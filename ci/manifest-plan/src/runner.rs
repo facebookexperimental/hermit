@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -11048,9 +11056,14 @@ fn acquire_proc_locks_lease(
     use crate::proc_locks_lease;
     let uid = proc_locks_lease::effective_uid();
     let fallback = PathBuf::from(format!("/run/user/{uid}"));
+    let shared = proc_locks_lease::shared_runtime_directory(uid);
     let acquire = || -> std::io::Result<File> {
-        let directory =
-            proc_locks_lease::validated_runtime_directory(runtime_directory, &fallback, uid)?;
+        let directory = proc_locks_lease::validated_runtime_directory(
+            runtime_directory,
+            &fallback,
+            &shared,
+            uid,
+        )?;
         let file = proc_locks_lease::open_proc_locks_snapshot_lease_file(&directory, uid)?;
         proc_locks_lease::validate_proc_locks_host_identity(&file, host_identity)?;
         proc_locks_lease::lock_until(file, deadline)

@@ -16,6 +16,7 @@ use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
+use std::fs::FileTimes;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -32,6 +33,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use proc_locks_lease::*;
 
@@ -43,12 +45,27 @@ fn acquire_proc_locks_snapshot_lease() -> ProcLocksSnapshotLease {
     let expected_uid = effective_uid();
     let fallback = PathBuf::from(format!("/run/user/{expected_uid}"));
     let configured = env::var_os("XDG_RUNTIME_DIR");
-    let runtime_directory =
-        validated_runtime_directory(configured.as_deref(), &fallback, expected_uid)
-            .expect("validate proc-locks runtime directory");
-    let file = open_proc_locks_snapshot_lease_file(&runtime_directory, expected_uid)
+    let runtime_directory = validated_runtime_directory(
+        configured.as_deref(),
+        &fallback,
+        &shared_runtime_directory(expected_uid),
+        expected_uid,
+    )
+    .expect("validate proc-locks runtime directory");
+    let host_identity = env::var_os("HERMIT_PROC_LOCKS_LEASE_ID");
+    proc_locks_snapshot_lease_in(&runtime_directory, expected_uid, host_identity.as_deref())
+}
+
+/// The fixture's lease in `runtime_directory`, bound to `host_identity` when
+/// the pinned launcher recorded one, held with a blocking flock.
+fn proc_locks_snapshot_lease_in(
+    runtime_directory: &Path,
+    expected_uid: u32,
+    host_identity: Option<&OsStr>,
+) -> ProcLocksSnapshotLease {
+    let file = open_proc_locks_snapshot_lease_file(runtime_directory, expected_uid)
         .expect("open proc-locks snapshot lease");
-    validate_proc_locks_host_identity(&file, env::var_os("HERMIT_PROC_LOCKS_LEASE_ID").as_deref())
+    validate_proc_locks_host_identity(&file, host_identity)
         .expect("bind proc-locks snapshot lease to the host inode");
     loop {
         // SAFETY: `file` owns this valid descriptor and remains alive in the
@@ -61,6 +78,7 @@ fn acquire_proc_locks_snapshot_lease() -> ProcLocksSnapshotLease {
             panic!("acquire proc-locks snapshot lease: {error}");
         }
     }
+    refresh_lease_times(&file).expect("refresh the proc-locks snapshot lease's times");
     ProcLocksSnapshotLease { _file: file }
 }
 
@@ -76,37 +94,60 @@ fn proc_locks_snapshot_lease_rejects_unsafe_paths() {
     fs::set_permissions(&safe, fs::Permissions::from_mode(0o700))
         .expect("make runtime directory private");
 
+    // Never created by these assertions: each finds an existing candidate first.
+    let unused_shared = root.path().join("unused-shared");
     assert_eq!(
-        validated_runtime_directory(Some(safe.as_os_str()), &safe, expected_uid)
+        validated_runtime_directory(Some(safe.as_os_str()), &safe, &unused_shared, expected_uid)
             .expect("accept safe runtime directory"),
         safe
     );
     for configured in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
         assert_eq!(
-            validated_runtime_directory(configured, &safe, expected_uid)
+            validated_runtime_directory(configured, &safe, &unused_shared, expected_uid)
                 .expect("fall back from an absent or non-absolute runtime directory"),
             safe
         );
     }
+    // A relative fallback refuses before any lookup, whether or not it exists.
+    assert_eq!(
+        validated_runtime_directory(None, Path::new("relative"), &unused_shared, expected_uid)
+            .expect_err("reject a relative fallback runtime directory")
+            .kind(),
+        ErrorKind::InvalidInput
+    );
 
     let unsafe_directory = root.path().join("unsafe");
     fs::create_dir(&unsafe_directory).expect("create unsafe runtime directory");
     fs::set_permissions(&unsafe_directory, fs::Permissions::from_mode(0o755))
         .expect("make runtime directory unsafe");
     assert_eq!(
-        validated_runtime_directory(Some(unsafe_directory.as_os_str()), &safe, expected_uid)
-            .expect_err("reject group/world-accessible runtime directory")
-            .kind(),
+        validated_runtime_directory(
+            Some(unsafe_directory.as_os_str()),
+            &safe,
+            &unused_shared,
+            expected_uid
+        )
+        .expect_err("reject group/world-accessible runtime directory")
+        .kind(),
         ErrorKind::PermissionDenied
     );
 
     let runtime_symlink = root.path().join("runtime-symlink");
     unix_fs::symlink(&safe, &runtime_symlink).expect("create runtime-directory symlink fixture");
     assert_eq!(
-        validated_runtime_directory(Some(runtime_symlink.as_os_str()), &safe, expected_uid)
-            .expect_err("reject symlink runtime directory")
-            .kind(),
+        validated_runtime_directory(
+            Some(runtime_symlink.as_os_str()),
+            &safe,
+            &unused_shared,
+            expected_uid
+        )
+        .expect_err("reject symlink runtime directory")
+        .kind(),
         ErrorKind::InvalidInput
+    );
+    assert!(
+        !unused_shared.exists(),
+        "an existing candidate came first every time"
     );
 
     let safe_file = open_proc_locks_snapshot_lease_file(&safe, expected_uid)
@@ -196,6 +237,244 @@ fn proc_locks_snapshot_lease_rejects_unsafe_paths() {
     );
     let released = lock_until(open(), Instant::now() + Duration::from_secs(1)).unwrap();
     drop(released);
+}
+
+// The fbsource sudo lanes run as root and forward XDG_RUNTIME_DIR=/run/user/0,
+// which root, with no login session, never has: every proc-locks cell there
+// failed "proc-locks snapshot lease: No such file or directory" before its
+// guest ran. A runtime directory that does not exist is unusable; with no
+// /run/user/<uid> either, the lease lives in the one shared per-user directory,
+// created owner-only, and is never skipped.
+#[test]
+fn proc_locks_lease_falls_back_from_missing_runtime_directories() {
+    let expected_uid = effective_uid();
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-lease-fallback-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create proc-locks lease fallback directory");
+    let stale = root.path().join("run-user-0");
+    let missing_fallback = root.path().join("no-run-user");
+    let shared = root.path().join("shared");
+
+    // A stale configured directory and no fallback: the shared one, created
+    // owner-only, holds the lease.
+    assert_eq!(
+        validated_runtime_directory(
+            Some(stale.as_os_str()),
+            &missing_fallback,
+            &shared,
+            expected_uid
+        )
+        .expect("fall back from a stale runtime directory to the shared one"),
+        shared
+    );
+    let metadata = fs::symlink_metadata(&shared).expect("stat created shared directory");
+    assert!(metadata.file_type().is_dir());
+    assert_eq!(metadata.uid(), expected_uid);
+    assert_eq!(metadata.mode() & 0o077, 0);
+    assert!(
+        !stale.exists(),
+        "a stale configured directory is never created"
+    );
+
+    // A stale configured directory and an existing fallback: the fallback.
+    let fallback = root.path().join("run-user");
+    fs::create_dir(&fallback).expect("create fallback runtime directory");
+    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700))
+        .expect("make fallback runtime directory private");
+    assert_eq!(
+        validated_runtime_directory(Some(stale.as_os_str()), &fallback, &shared, expected_uid)
+            .expect("fall back from a stale runtime directory to /run/user/<uid>"),
+        fallback
+    );
+
+    // Only a candidate that does not exist is skipped. Any other lookup error
+    // refuses, as on base: here ENOTDIR, a path through a regular file, which
+    // holds for root too. Nothing falls through to the shared directory.
+    let regular = root.path().join("regular-file");
+    fs::write(&regular, b"").expect("create regular-file fixture");
+    let below_file = regular.join("run-user");
+    let untouched_shared = root.path().join("untouched-shared");
+    assert_eq!(
+        validated_runtime_directory(
+            Some(below_file.as_os_str()),
+            &fallback,
+            &untouched_shared,
+            expected_uid
+        )
+        .expect_err("refuse a configured runtime directory below a regular file")
+        .kind(),
+        ErrorKind::NotADirectory
+    );
+    assert_eq!(
+        validated_runtime_directory(None, &below_file, &untouched_shared, expected_uid)
+            .expect_err("refuse a fallback runtime directory below a regular file")
+            .kind(),
+        ErrorKind::NotADirectory
+    );
+    assert!(
+        !untouched_shared.exists(),
+        "a refused lookup never falls through to the shared directory"
+    );
+
+    // Two acquirers in the shared directory serialize: the second times out
+    // while the first holds the lease, and takes it once the first drops it.
+    let open = || open_proc_locks_snapshot_lease_file(&shared, expected_uid).expect("open lease");
+    let first = lock_until(open(), Instant::now() + Duration::from_secs(5)).expect("first lease");
+    assert_eq!(
+        lock_until(open(), Instant::now() + Duration::from_millis(200))
+            .expect_err("a second acquirer must wait for the first")
+            .kind(),
+        ErrorKind::TimedOut
+    );
+    drop(first);
+    lock_until(open(), Instant::now() + Duration::from_secs(5))
+        .expect("the second acquirer takes the released lease");
+
+    // An existing shared directory that is not owner-only, or is a symlink,
+    // refuses: the fallback is validated exactly like the other candidates.
+    let unsafe_shared = root.path().join("unsafe-shared");
+    fs::create_dir(&unsafe_shared).expect("create unsafe shared directory");
+    fs::set_permissions(&unsafe_shared, fs::Permissions::from_mode(0o755))
+        .expect("make shared directory unsafe");
+    assert_eq!(
+        validated_runtime_directory(None, &missing_fallback, &unsafe_shared, expected_uid)
+            .expect_err("reject group/world-accessible shared directory")
+            .kind(),
+        ErrorKind::PermissionDenied
+    );
+    let shared_symlink = root.path().join("shared-symlink");
+    unix_fs::symlink(&shared, &shared_symlink).expect("create shared-directory symlink fixture");
+    assert_eq!(
+        validated_runtime_directory(None, &missing_fallback, &shared_symlink, expected_uid)
+            .expect_err("reject symlink shared directory")
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        validated_runtime_directory(None, &missing_fallback, Path::new("relative"), expected_uid)
+            .expect_err("reject a relative shared directory")
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    // The production path is one fixed host path per user.
+    assert_eq!(
+        shared_runtime_directory(expected_uid),
+        PathBuf::from(format!("/tmp/hermit-proc-locks-{expected_uid}"))
+    );
+}
+
+// Periodic /tmp cleaners delete files left untouched for days, so taking the
+// lease refreshes the lease file's access and modification times: a lease file
+// in use never looks stale.
+#[test]
+fn proc_locks_lease_refreshes_its_times_on_acquisition() {
+    let expected_uid = effective_uid();
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-lease-times-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create proc-locks lease times directory");
+    let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+    let age_the_lease_file = || {
+        let file =
+            open_proc_locks_snapshot_lease_file(root.path(), expected_uid).expect("open lease");
+        file.set_times(FileTimes::new().set_accessed(stale).set_modified(stale))
+            .expect("age the lease file");
+        file
+    };
+    let assert_refreshed = |who: &str| {
+        let metadata =
+            fs::metadata(root.path().join(PROC_LOCKS_LEASE_NAME)).expect("stat the lease file");
+        for (name, time) in [
+            ("modification", metadata.modified()),
+            ("access", metadata.accessed()),
+        ] {
+            let time = time.expect("read a lease file time");
+            let age = SystemTime::now().duration_since(time).unwrap_or_default();
+            assert!(
+                time > stale && age < Duration::from_secs(60),
+                "{who} taking the lease refreshes its {name} time"
+            );
+        }
+    };
+
+    // The runner's path: lock_until.
+    let held = lock_until(
+        age_the_lease_file(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .expect("take the lease");
+    assert_refreshed("the runner");
+    drop(held);
+
+    // The integration fixture's path: its own blocking flock.
+    drop(age_the_lease_file());
+    let held = proc_locks_snapshot_lease_in(root.path(), expected_uid, None);
+    assert_refreshed("the fixture");
+    drop(held);
+}
+
+// A refusal names what it refused; the operating system's own errors name no
+// path.
+#[test]
+fn proc_locks_lease_refusals_name_the_refused_path() {
+    let expected_uid = effective_uid();
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-lease-refusals-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create proc-locks lease refusals directory");
+    let unused_shared = root.path().join("unused-shared");
+
+    let unsafe_directory = root.path().join("unsafe");
+    fs::create_dir(&unsafe_directory).expect("create unsafe runtime directory");
+    fs::set_permissions(&unsafe_directory, fs::Permissions::from_mode(0o755))
+        .expect("make runtime directory unsafe");
+    let message = validated_runtime_directory(
+        Some(unsafe_directory.as_os_str()),
+        &unused_shared,
+        &unused_shared,
+        expected_uid,
+    )
+    .expect_err("reject group/world-accessible runtime directory")
+    .to_string();
+    assert!(
+        message.contains(&unsafe_directory.display().to_string()) && message.contains("0755"),
+        "the refusal names the directory and its mode: {message}"
+    );
+
+    let regular = root.path().join("regular-file");
+    fs::write(&regular, b"").expect("create regular-file fixture");
+    let below_file = regular.join("run-user");
+    let message = validated_runtime_directory(
+        Some(below_file.as_os_str()),
+        &unused_shared,
+        &unused_shared,
+        expected_uid,
+    )
+    .expect_err("refuse a runtime directory below a regular file")
+    .to_string();
+    assert!(
+        message.contains(&below_file.display().to_string()),
+        "the operating system's refusal names the path: {message}"
+    );
+    assert!(
+        !unused_shared.exists(),
+        "no refusal reached the shared directory"
+    );
+
+    let lease_directory = root.path().join("lease");
+    fs::create_dir(&lease_directory).expect("create lease directory");
+    let target = lease_directory.join("target");
+    fs::write(&target, b"").expect("create symlink target");
+    let lease = lease_directory.join(PROC_LOCKS_LEASE_NAME);
+    unix_fs::symlink(&target, &lease).expect("create lease-file symlink fixture");
+    let message = open_proc_locks_snapshot_lease_file(&lease_directory, expected_uid)
+        .expect_err("refuse a symlinked lease file")
+        .to_string();
+    assert!(
+        message.contains(&lease.display().to_string()),
+        "the refusal names the lease file: {message}"
+    );
 }
 
 fn build_guest(repository: &Path, build_root: &Path, name: &str, api: &str) -> std::path::PathBuf {
