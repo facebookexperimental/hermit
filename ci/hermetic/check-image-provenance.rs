@@ -528,9 +528,19 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
         string(reatt, "current_flake_sha256", "flake_reattestation")?,
         "flake_reattestation.current_flake_sha256",
     )?;
+    if string(reatt, "current_flake_sha256", "flake_reattestation")?
+        != "b0ac537cbbf3978e03c7ff2b1980945ec2f677821fcc902fe1d7eb05f53f5393"
+    {
+        return Err(
+            "flake_reattestation.current_flake_sha256 must pin the evaluated b0ac537c flake; a later flake needs a new evaluation"
+                .into(),
+        );
+    }
     let evaluated_commit = string(reatt, "evaluated_commit", "flake_reattestation")?;
-    if evaluated_commit.len() != 40 || !evaluated_commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("flake_reattestation.evaluated_commit must be a full commit hash".into());
+    if !is_lower_hex(evaluated_commit, 40) {
+        return Err(
+            "flake_reattestation.evaluated_commit must be a full lowercase commit hash".into(),
+        );
     }
     if unsigned(root, "schema_version", "provenance")? != 1 {
         return Err("provenance.schema_version must be 1".into());
@@ -693,6 +703,11 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     )?;
     if !derivation_path.ends_with(".drv") || unsigned(nix, "output_nar_size_bytes", "nix")? == 0 {
         return Err("nix derivation and output identities are incomplete".into());
+    }
+    if string(reatt, "evaluated_drv_path", "flake_reattestation")? != derivation_path {
+        return Err(
+            "flake_reattestation.evaluated_drv_path must equal the receipt derivation".into(),
+        );
     }
     validate_locked_inputs(field(nix, "locked_inputs", "nix")?)?;
     validate_realized_inputs(field(nix, "realized_inputs", "nix")?)?;
@@ -1419,6 +1434,54 @@ mod tests {
     #[test]
     fn accepts_two_distinct_equal_builds() {
         validate_semantics(&record()).unwrap();
+    }
+
+    #[test]
+    fn rejects_edited_flake_reattestation() {
+        for (pointer, value, needle) in [
+            (
+                "/flake_reattestation/current_flake_sha256",
+                Value::String("a".repeat(64)),
+                "must pin the evaluated b0ac537c flake",
+            ),
+            (
+                "/flake_reattestation/evaluated_drv_path",
+                Value::String(
+                    "/nix/store/00000000000000000000000000000000-hermit-hermetic-validate.tar.gz.drv"
+                        .into(),
+                ),
+                "must record the abort-stub evaluation exactly",
+            ),
+            (
+                "/flake_reattestation/stub_text",
+                Value::String("throw \"other\"\n".into()),
+                "must record the abort-stub evaluation exactly",
+            ),
+            (
+                "/flake_reattestation/evaluated_commit",
+                Value::String("1234".into()),
+                "full lowercase commit hash",
+            ),
+        ] {
+            let mut wrong = record();
+            *mutate(&mut wrong, pointer) = value;
+            assert!(
+                validate_semantics(&wrong).unwrap_err().contains(needle),
+                "{pointer}: want {needle:?}"
+            );
+        }
+        // A syntactically valid but different drv on the receipt side
+        // fails the equality with the re-attested evaluation.
+        let mut wrong = record();
+        *mutate(&mut wrong, "/nix/derivation_path") = Value::String(
+            "/nix/store/11111111111111111111111111111111-hermit-hermetic-validate.tar.gz.drv"
+                .into(),
+        );
+        assert!(
+            validate_semantics(&wrong)
+                .unwrap_err()
+                .contains("must equal the receipt derivation")
+        );
     }
 
     #[test]
