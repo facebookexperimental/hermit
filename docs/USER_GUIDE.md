@@ -1451,8 +1451,9 @@ the default equal-priority policy.
 ### The Pinned CPU
 
 A run with a timeslice (or `--pin-threads`) pins its tracer and guest threads to
-one host CPU, chosen from the tracer's allowed set, and reserves that CPU
-against other Hermit runs for its lifetime through two channels:
+one host CPU, unless it passes `--no-pin-threads`. It chooses that CPU from the
+tracer's allowed set and reserves it against other Hermit runs for its lifetime
+through two channels:
 
 - an abstract Unix socket named `hermit-pinned-core:<cpu>`, which runs in the
   same network namespace see;
@@ -1462,6 +1463,20 @@ against other Hermit runs for its lifetime through two channels:
 
 The kernel drops both when the run's processes exit, however they exit, so no
 reservation is ever left behind. A CPU either channel holds counts as held.
+
+`--no-pin-threads` turns pinning off for a run with a timeslice: Linux places
+the tracer and guest threads and may migrate them, and no CPU is reserved. It
+is for measuring whether a run stays deterministic unpinned. Hermit refuses it
+beside `--pin-threads`, beside an explicit `--pinned-cpu`, the policy only a
+pinned run reads, and beside `--cpu-profile host-no-rdrand`, which pins the
+tracer, and with it the guest, to the CPU it verified CPUID faulting on.
+`--pinned-cpu-dir` and `--pinned-cpu-notice` stay accepted with it and have
+no effect.
+
+`hermit record start` pins the recording, and the replays it runs for
+`--verify` and `--verify-run`, the same way, with or without a timeslice; it
+too takes `--no-pin-threads`, which leaves all of them unpinned. `hermit
+replay` is always pinned.
 
 `--pinned-cpu-dir=PATH` names another lock directory; `hermit run`,
 `hermit record start` and `hermit replay` all take it, and

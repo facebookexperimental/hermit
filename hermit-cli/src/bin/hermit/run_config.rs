@@ -1648,6 +1648,7 @@ mod tests {
         ("no-sequentialize-threads", &["--no-sequentialize-threads"]),
         ("no-deterministic-io", &["--no-deterministic-io"]),
         ("pin-threads", &["--pin-threads"]),
+        ("no-pin-threads", &["--no-pin-threads"]),
         ("pinned-cpu", &["--pinned-cpu=wait:30"]),
         (
             "pinned-cpu-dir",

@@ -2088,14 +2088,25 @@ pub struct RunOpts {
 
     /// Pin all guest threads to one or more cores, so that they do not migrate
     /// during execution. This is off by default, but it is implied by setting
-    /// `max_timeslice` which requires stable RCB counters. RCB counters are
-    /// not maintained consistently when Linux migrates a thread between cores.
+    /// `max_timeslice` which requires stable RCB counters, unless
+    /// `--no-pin-threads`. RCB counters are not maintained consistently when
+    /// Linux migrates a thread between cores.
     #[clap(long)]
     pin_threads: bool,
 
-    /// What a pinned run (one with a timeslice, or `--pin-threads`) does when
-    /// it cannot keep every other Hermit run off its CPU: every allowed CPU is
-    /// held by another run (cpu-shared), the reservation cannot be made
+    /// Do not pin the tracer and guest threads to a CPU, even where a
+    /// timeslice implies it: Linux places them and may migrate them. For
+    /// measuring whether a run stays deterministic unpinned. Cannot be
+    /// combined with `--pin-threads`, with `--pinned-cpu`, which only a pinned
+    /// run reads, or with `--cpu-profile host-no-rdrand`, which pins the
+    /// tracer to the CPU it verified CPUID faulting on.
+    #[clap(long, conflicts_with_all = ["pin_threads", "pinned_cpu"])]
+    no_pin_threads: bool,
+
+    /// What a pinned run (one with a timeslice and without `--no-pin-threads`,
+    /// or `--pin-threads`) does when it cannot keep every other Hermit run off
+    /// its CPU: every allowed CPU is held by another run (cpu-shared), the
+    /// reservation cannot be made
     /// (cpu-unreserved), or it can be made only against runs in this network
     /// namespace (cpu-netns-only: the lock directory, `--pinned-cpu-dir`, is
     /// unusable). `share` runs anyway and prints a named `hermit: warning:`
@@ -2105,7 +2116,8 @@ pub struct RunOpts {
     /// `--timeout` too, then refuses. The wait comes before the run's own
     /// `--timeout` starts, so a wait and the run together can take up to twice
     /// `--timeout`. The CPU is host placement only:
-    /// guest-visible behavior is the same under every value.
+    /// guest-visible behavior is the same under every value. Refused with
+    /// `--no-pin-threads`, under which no run is pinned.
     #[clap(
         long,
         value_name = "share|refuse|wait[:SECONDS]",
@@ -11292,6 +11304,108 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     );
 }
 
+/// A run with the default timeslice and sequentialized threads is pinned;
+/// `--no-pin-threads` keeps it unpinned and changes nothing else about the
+/// run: the timeslice, sequentialization and the rendered command stay.
+#[test]
+fn no_pin_threads_keeps_a_timesliced_run_unpinned() {
+    let resolve = |extra: &[&str]| {
+        let mut args = vec!["fakehermit"];
+        args.extend_from_slice(extra);
+        args.push("fakeprog");
+        let mut opts = RunOpts::parse_from(args);
+        opts.validate_args_with_perf_support(true).unwrap();
+        opts
+    };
+    let pinned = resolve(&[]);
+    let unpinned = resolve(&["--no-pin-threads"]);
+    assert!(pinned.pin_threads);
+    assert!(!unpinned.pin_threads);
+    for opts in [&pinned, &unpinned] {
+        let config = &opts.det_opts.det_config;
+        assert!(config.max_timeslice.is_some());
+        assert!(config.sequentialize_threads);
+    }
+    assert_eq!(
+        pinned.det_opts.det_config.max_timeslice,
+        unpinned.det_opts.det_config.max_timeslice
+    );
+    // Host placement only, like `--pin-threads` and `--pinned-cpu`: not part
+    // of the reproducer command.
+    assert_eq!(format!("{pinned}"), format!("{unpinned}"));
+}
+
+/// `--no-pin-threads` refuses the flags that would pin the run anyway, and
+/// names the remedy.
+#[test]
+fn no_pin_threads_refuses_what_would_pin_the_run() {
+    let error = RunOpts::try_parse_from([
+        "fakehermit",
+        "--pin-threads",
+        "--no-pin-threads",
+        "fakeprog",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let text = error.to_string();
+    assert!(text.contains("--pin-threads"), "{text}");
+    assert!(text.contains("--no-pin-threads"), "{text}");
+
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--cpu-profile=host-no-rdrand",
+        "--no-pin-threads",
+        "fakeprog",
+    ]);
+    let error = format!("{:#}", opts.admit_cpu_profile().unwrap_err());
+    assert!(
+        error.contains("drop --no-pin-threads, or choose another --cpu-profile"),
+        "{error}"
+    );
+    // Refused before host admission, which would record a source CPU.
+    assert_eq!(opts.det_opts.det_config.cpu_profile_source, None);
+}
+
+/// `--no-pin-threads` refuses an explicit `--pinned-cpu` policy, which only a
+/// pinned run reads and which would otherwise be silently inert. The default
+/// policy is not explicit and is not refused. The placement settings
+/// `--pinned-cpu-dir` and `--pinned-cpu-notice` (and their environment
+/// fallbacks, which no flag parser sees) are not policy, and stay accepted.
+#[test]
+fn no_pin_threads_refuses_an_explicit_pinned_cpu_policy() {
+    for policy in [
+        "--pinned-cpu=share",
+        "--pinned-cpu=refuse",
+        "--pinned-cpu=wait",
+        "--pinned-cpu=wait:30",
+    ] {
+        let error = RunOpts::try_parse_from(["fakehermit", "--no-pin-threads", policy, "fakeprog"])
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{policy}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("--pinned-cpu"), "{text}");
+        assert!(text.contains("--no-pin-threads"), "{text}");
+    }
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--no-pin-threads",
+        "--pinned-cpu-dir=/srv/hermit-cpu-locks",
+        "--pinned-cpu-notice=off",
+        "fakeprog",
+    ]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(!opts.pin_threads);
+    assert_eq!(
+        opts.pinned_cpu,
+        super::pinned_cpu::PinnedCpuPolicy::Share,
+        "the default policy is not explicit"
+    );
+}
+
 #[test]
 fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
     // The default (ptrace) backend does launch through Reverie's `Container`,
@@ -13511,6 +13625,18 @@ impl RunOpts {
         {
             return Ok(());
         }
+        // The launch guard pins the tracer to the admitted source CPU, and the
+        // guest inherits it, so such a run would be pinned regardless.
+        if config.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand
+            && self.no_pin_threads
+        {
+            anyhow::bail!(
+                "--no-pin-threads leaves threads free to move between CPUs, but \
+                 --cpu-profile host-no-rdrand pins the tracer, and with it the guest, to the \
+                 CPU it verified CPUID faulting on; drop --no-pin-threads, or choose another \
+                 --cpu-profile"
+            );
+        }
         let request = self.cpu_profile_request();
         if config.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand {
             // Network traces, like syscall recordings, do not bind this
@@ -15522,7 +15648,8 @@ impl RunOpts {
 
         // Deterministic RCB counts requires thread pinning.  But this only matters if
         // we're expecting full determinstic execution (sequentialize_threads).
-        if config.max_timeslice.is_some() && config.sequentialize_threads {
+        // `--no-pin-threads` opts out, to measure whether that holds.
+        if config.max_timeslice.is_some() && config.sequentialize_threads && !self.no_pin_threads {
             self.pin_threads = true;
         }
 

@@ -7,6 +7,13 @@ branches from 0.5.0.
 
 ## Unreleased
 
+- `hermit run --no-pin-threads` keeps a run with a timeslice unpinned: Linux
+  places the tracer and guest threads and may migrate them, and no CPU is
+  reserved. It is for measuring whether a run stays deterministic unpinned.
+  Hermit refuses it beside `--pin-threads`, an explicit `--pinned-cpu`, and
+  `--cpu-profile host-no-rdrand`. `hermit record start --no-pin-threads` does
+  the same for a recording and the replays it runs for `--verify` and
+  `--verify-run`.
 - Determinism loss: a run that claims determinism (Hermit's default thread
   sequentialization, with or without `--strict`) and records a determinism
   loss is now refused with exit 122, after the guest's output, which is

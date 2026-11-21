@@ -917,9 +917,10 @@ and an `lsl` of that segment, or RDPID where the CPU has it, reads them back
 (`vdso_read_cpunode`, arch/x86/include/asm/segment.h). Neither instruction
 traps, so code that runs one itself sees the host CPU. That differs between
 runs: a run that pins its threads (`--pin-threads`, implied by a maximum
-timeslice with sequentialized threads) is pinned to a randomly chosen core of
-the tracer's allowed set, and an unpinned one can migrate. glibc and the
-dynamic loader do not run them; they reach the CPU number through `getcpu`.
+timeslice with sequentialized threads unless `--no-pin-threads`) is pinned to
+a randomly chosen core of the tracer's allowed set, and an unpinned one can
+migrate. glibc and the dynamic loader do not run them; they reach the CPU
+number through `getcpu`.
 Closing it needs the instruction rewritten before it runs (e9patch
 preprocessing) or a backend that owns the guest's segment table and `TSC_AUX`
 (KVM). Memory blocks under `/sys/devices/system/memory` that belong to other
