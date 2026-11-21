@@ -91,6 +91,9 @@ mod validate_admission;
 #[path = "lib/validate_pinned_image.rs"]
 mod validate_pinned_image;
 
+#[path = "lib/validate_host_tools.rs"]
+mod validate_host_tools;
+
 #[path = "lib/exec_safe_fs.rs"]
 mod exec_safe_fs;
 
@@ -8212,8 +8215,10 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     // dangling pinned-root edge. `--only` intentionally drops unrelated build
     // dependencies, but both the host and pinned-root manifest commands invoke
     // target/debug/test-harness. A fresh checkout must therefore retain the
-    // canonical host producer and add its in-image twin without restoring
-    // gate.manifest.
+    // canonical host producer of the test harness and the in-image guest
+    // build without restoring gate.manifest. Since dh-63c2n3 the portable
+    // lane has no host guest build: the public name build.manifest_guests
+    // resolves to its pinned-root twin, and the host copy must not run.
     let manifest_args = parse_argv(&[
         ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
         "--only".into(),
@@ -8235,7 +8240,6 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .map(|step| step.tag())
         .collect();
     for required in [
-        "build.manifest_guests",
         "setup.manifest_plan",
         "setup.manifest_plan_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
@@ -8249,25 +8253,15 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    if manifest_tags.contains("build.manifest_guests") {
+        return Err(format!(
+            "only bracket: focused portable manifest selection runs the host guest build build.manifest_guests, which the portable lane no longer has: {manifest_tags:?}"
+        ));
+    }
     if manifest_tags.contains("gate.manifest") || manifest_tags.contains("lint.clippy") {
         return Err(format!(
             "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
         ));
-    }
-    let manifest_build = manifest_plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == "build.manifest_guests")
-        .ok_or("only bracket: focused manifest selection lost build.manifest_guests")?;
-    if !manifest_build
-        .deps
-        .iter()
-        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-    {
-        return Err(
-            "only bracket: host manifest build does not wait for setup.manifest_plan".into(),
-        );
     }
     let pinned_manifest_build = manifest_plan
         .cfg
@@ -8355,9 +8349,108 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                     "only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"
                 ));
             }
+            // The host guest build waits for the manifest-plan producer that
+            // builds its test-harness. This edge was checked on the portable
+            // lane's host copy until dh-63c2n3 retired that copy from portable;
+            // the hosted lanes keep their host copies, so it is checked here.
+            let host_build = hosted
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == target)
+                .ok_or_else(|| format!("only bracket: {lane} focused selection lost {target}"))?;
+            if !host_build
+                .deps
+                .iter()
+                .any(|dependency| dependency == producer)
+            {
+                return Err(format!(
+                    "only bracket: {lane} host manifest build {target} does not wait for {producer} (off_record={off_record}): deps={:?}",
+                    host_build.deps
+                ));
+            }
             if !dagrun::model::graph_structure_violations(&hosted.cfg).is_empty() {
                 return Err(format!(
                     "only bracket: {lane} focused host preparation is not dependency-closed"
+                ));
+            }
+        }
+    }
+
+    // The old privileged public name build.manifest_guests resolves to one
+    // committed node per label (dh-63c2n3): the pinned-root twin under
+    // privileged, the hosted copy under hosted-privileged, and never the
+    // retired host copy privileged-build.manifest_guests.
+    for (lane, expected) in [
+        (
+            "privileged",
+            "privileged-build.manifest_guests_in_pinned_root",
+        ),
+        (
+            "hosted-privileged",
+            "privileged-build.manifest_guests_on_host",
+        ),
+    ] {
+        let args = parse_argv(&[
+            "--only".into(),
+            lane.into(),
+            "build.manifest_guests".into(),
+            "--no-label-pr".into(),
+        ])
+        .map_err(|code| format!("only bracket: {lane} public guest build parser exit {code}"))?;
+        let plan = build_plan(root, &args, &std::env::temp_dir())?;
+        let tags = plan
+            .cfg
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        if !tags.contains(expected)
+            || tags.contains("build.manifest_guests")
+            || tags.contains("privileged-build.manifest_guests")
+        {
+            return Err(format!(
+                "only bracket: {lane} public build.manifest_guests did not resolve to exactly {expected}: {tags:?}"
+            ));
+        }
+    }
+    let unselected = privileged_public_tag_errors(&committed, &PRIVILEGED_PUBLIC_TAGS)?;
+    if !unselected.is_empty() {
+        return Err(format!(
+            "only bracket: privileged public names map to nodes their label does not select: {unselected:?}"
+        ));
+    }
+    // The retired host copy itself, named exactly, refuses in every lane
+    // (dh-63c2n3 v5): no lane holds it, the committed-DAG fallback must not
+    // run it, since its committed edges no longer wait for
+    // setup.manifest_plan, and a lane holding its twin must not swap the twin
+    // in unasked. The refusal names both live replacements.
+    for lane in ["privileged", "hosted-privileged", "portable", "full"] {
+        let args = parse_argv(&[
+            "--only".into(),
+            lane.into(),
+            "privileged-build.manifest_guests".into(),
+            "--no-label-pr".into(),
+        ])
+        .map_err(|code| format!("only bracket: {lane} retired guest build parser exit {code}"))?;
+        let error = match build_plan(root, &args, &std::env::temp_dir()) {
+            Ok(plan) => {
+                return Err(format!(
+                    "only bracket: {lane} planned the retired privileged-build.manifest_guests: {:?}",
+                    plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>()
+                ));
+            }
+            Err(error) => error,
+        };
+        for expected in [
+            "retired node(s)",
+            "privileged-build.manifest_guests: select",
+            "privileged-build.manifest_guests_in_pinned_root (full, privileged)",
+            "privileged-build.manifest_guests_on_host (hosted-privileged)",
+        ] {
+            if !error.contains(expected) {
+                return Err(format!(
+                    "only bracket: {lane} refusal of the retired guest build lacks {expected:?}: {error}"
                 ));
             }
         }
@@ -8411,6 +8504,111 @@ mod focused_only_tests {
     #[test]
     fn actual_focused_selection_keeps_exact_producers_and_all_refusals() {
         only_plan_bracket(&test_source_root()).unwrap();
+    }
+
+    /// dh-63c2n3 v5: `--only <lane> privileged-build.manifest_guests`, the
+    /// retired host guest build named exactly, refuses by name in every lane
+    /// and points to the two live guest builds. In v4 a lane without the
+    /// pinned-root twin fell back to the committed DAG and planned the retired
+    /// node with no edge to a manifest-plan producer (portable: only
+    /// gate.manifest; hosted-privileged: no edge at all); a lane with the twin
+    /// (privileged, full) swapped the twin in.
+    #[test]
+    fn only_refuses_the_retired_host_guest_build_by_name() {
+        let root = test_source_root();
+        let expected = "focused selection names retired node(s) that no label runs, whose committed dependencies are no longer maintained, so they cannot run: privileged-build.manifest_guests: select privileged-build.manifest_guests_in_pinned_root (full, privileged) or privileged-build.manifest_guests_on_host (hosted-privileged) instead";
+        let mut wrong = Vec::new();
+        for lane in ["portable", "hosted-privileged", "privileged", "full"] {
+            let args = parse_argv(&[
+                "--only".to_string(),
+                lane.to_string(),
+                "privileged-build.manifest_guests".to_string(),
+                "--no-label-pr".to_string(),
+            ])
+            .unwrap();
+            match build_plan(&root, &args, &std::env::temp_dir()) {
+                Ok(plan) => {
+                    let retired = plan
+                        .cfg
+                        .steps
+                        .iter()
+                        .find(|step| step.tag() == "privileged-build.manifest_guests");
+                    wrong.push(format!(
+                        "{lane}: planned {:?}; the retired node's planned deps: {:?}",
+                        plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+                        retired.map(|step| &step.deps)
+                    ));
+                }
+                Err(error) if error == expected => {}
+                Err(error) => wrong.push(format!("{lane}: refused otherwise: {error}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        // --tests checks the node names it is given the same way.
+        let args = parse_argv(&[
+            "--tests".to_string(),
+            "privileged-build.manifest_guests::case".to_string(),
+        ])
+        .unwrap();
+        match build_plan(&root, &args, &std::env::temp_dir()) {
+            Ok(_) => panic!("--tests planned the retired host guest build"),
+            Err(error) => assert_eq!(error, expected),
+        }
+
+        // GREEN CONTROL: a node from another lane still takes the fallback
+        // (a failed-set rerun), and a live replacement plans.
+        for (lane, node) in [
+            ("portable", "privileged-pmu.preemption"),
+            (
+                "privileged",
+                "privileged-build.manifest_guests_in_pinned_root",
+            ),
+            (
+                "portable",
+                "privileged-build.manifest_guests_in_pinned_root",
+            ),
+        ] {
+            let args = parse_argv(&[
+                "--only".to_string(),
+                lane.to_string(),
+                node.to_string(),
+                "--no-label-pr".to_string(),
+            ])
+            .unwrap();
+            let plan = build_plan(&root, &args, &std::env::temp_dir())
+                .unwrap_or_else(|error| panic!("{lane} {node}: {error}"));
+            assert!(
+                plan.cfg.steps.iter().any(|step| step.tag() == node),
+                "{lane} {node}"
+            );
+        }
+    }
+
+    /// The retired-node refusal is a property, not a name: over the whole
+    /// committed DAG it names exactly the nodes no label runs, today the two
+    /// retired host copies, and passes every label selection and any name the
+    /// committed DAG does not hold.
+    #[test]
+    fn retired_node_refusal_names_exactly_the_nodes_no_label_runs() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        let error =
+            refuse_retired_nodes(&committed, committed.steps.iter().map(Step::tag)).unwrap_err();
+        assert_eq!(
+            error,
+            "focused selection names retired node(s) that no label runs, whose committed dependencies are no longer maintained, so they cannot run: privileged-build.manifest_guests: select privileged-build.manifest_guests_in_pinned_root (full, privileged) or privileged-build.manifest_guests_on_host (hosted-privileged) instead; compatprep.fixtures: select compatprep.fixtures_in_pinned_root (full, portable) or compatprep.fixtures_on_host (hosted-portable) instead"
+        );
+        for label in ["full", "portable", "privileged", "hosted-privileged"] {
+            let selection =
+                dagrun::select_steps_by_labels(&committed, &[label.to_string()]).unwrap();
+            refuse_retired_nodes(&committed, selection.steps.iter().map(Step::tag))
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        refuse_retired_nodes(
+            &committed,
+            ["build.manifest_guests", "cpuid.faulting", "no.such_node"].map(String::from),
+        )
+        .unwrap();
     }
 }
 
@@ -15061,35 +15259,81 @@ fn requested_step_ids(raw: &str, option: &str) -> Result<BTreeSet<String>, Strin
     }
 }
 
-const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 13] = [
-    ("build.rust_scripts", "build.rust_scripts"),
-    ("check.reverie_pin", "pre.reverie_pin"),
+/// The old privileged public node names and the committed node each maps to,
+/// ONE TARGET PER LABEL: `(public, under privileged, under hosted-privileged)`.
+///
+/// Until dh-63c2n3 the hosted name was derived by appending `_on_host` to the
+/// local one. `build.manifest_guests` then mapped to
+/// `privileged-build.manifest_guests` under `privileged`, the host copy that
+/// change retires; it now maps to the pinned-root twin the privileged buckets
+/// read, and keeps `privileged-build.manifest_guests_on_host` under
+/// `hosted-privileged`. `build.privileged_tests` had the same defect since the
+/// one-build change of 2026-09-30 retired the local
+/// `privileged-only-build.privileged_tests`; it maps to that node's pinned-root
+/// twin. `privileged_public_tags_name_nodes_their_label_selects` holds every
+/// target to the selection of the label it is used under.
+const PRIVILEGED_PUBLIC_TAGS: [(&str, &str, &str); 13] = [
+    (
+        "build.rust_scripts",
+        "build.rust_scripts",
+        "build.rust_scripts_on_host",
+    ),
+    (
+        "check.reverie_pin",
+        "pre.reverie_pin",
+        "pre.reverie_pin_on_host",
+    ),
     (
         "build.privileged_tests",
-        "privileged-only-build.privileged_tests",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "privileged-only-build.privileged_tests_on_host",
     ),
-    ("cpuid.faulting", "privileged-only-cpuid.faulting"),
-    ("pmu.preemption", "privileged-only-pmu.preemption"),
+    (
+        "cpuid.faulting",
+        "privileged-only-cpuid.faulting",
+        "privileged-only-cpuid.faulting_on_host",
+    ),
+    (
+        "pmu.preemption",
+        "privileged-only-pmu.preemption",
+        "privileged-only-pmu.preemption_on_host",
+    ),
     (
         "test.pmu_buck_chaos_cases",
         "privileged-only-test.pmu_buck_chaos_cases",
+        "privileged-only-test.pmu_buck_chaos_cases_on_host",
     ),
-    ("setup.manifest_plan", "setup.manifest_plan"),
-    ("e2e.metadata", "gate.manifest"),
-    ("build.manifest_guests", "privileged-build.manifest_guests"),
+    (
+        "setup.manifest_plan",
+        "setup.manifest_plan",
+        "setup.manifest_plan_on_host",
+    ),
+    ("e2e.metadata", "gate.manifest", "gate.manifest_on_host"),
+    (
+        "build.manifest_guests",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-build.manifest_guests_on_host",
+    ),
     (
         "e2e.manifest_applications",
         "privileged-only-e2e.manifest_applications",
+        "privileged-only-e2e.manifest_applications_on_host",
     ),
     (
         "e2e.manifest_c_programs",
         "privileged-only-e2e.manifest_c_programs",
+        "privileged-only-e2e.manifest_c_programs_on_host",
     ),
     (
         "e2e.manifest_system_utils",
         "privileged-only-e2e.manifest_system_utils",
+        "privileged-only-e2e.manifest_system_utils_on_host",
     ),
-    ("test.cli_kvm", "privileged-only-test.cli_kvm"),
+    (
+        "test.cli_kvm",
+        "privileged-only-test.cli_kvm",
+        "privileged-only-test.cli_kvm_on_host",
+    ),
 ];
 
 fn map_privileged_public_tags(tags: &mut BTreeSet<String>, label: &str) {
@@ -15097,12 +15341,12 @@ fn map_privileged_public_tags(tags: &mut BTreeSet<String>, label: &str) {
     if label != "privileged" && !hosted {
         return;
     }
-    for (public, committed_local) in PRIVILEGED_PUBLIC_TAGS {
+    for (public, committed_local, committed_hosted) in PRIVILEGED_PUBLIC_TAGS {
         if !tags.remove(public) {
             continue;
         }
         let committed = if hosted {
-            format!("{committed_local}_on_host")
+            committed_hosted.to_string()
         } else {
             committed_local.to_string()
         };
@@ -15132,6 +15376,106 @@ fn map_hosted_portable_tags(cfg: &DagConfig, tags: &mut BTreeSet<String>, label:
             tag.clone()
         }
     }).collect();
+}
+
+/// Every committed node the privileged public names map to, under the label
+/// it is used under, must be one that label's selection runs: it carries the
+/// label, or it is a dependency of a node that does. A node merely present in
+/// the committed DAG is not enough: a retired node left there with no labels
+/// (as dh-63c2n3 leaves privileged-build.manifest_guests) is in no selection.
+fn privileged_public_tag_errors(
+    committed: &DagConfig,
+    table: &[(&str, &str, &str)],
+) -> Result<Vec<String>, String> {
+    let mut errors = Vec::new();
+    for (label, column) in [("privileged", 1usize), ("hosted-privileged", 2)] {
+        let selected = dagrun::select_steps_by_labels(committed, &[label.to_string()])?
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        for row in table {
+            let target = match column {
+                1 => row.1,
+                _ => row.2,
+            };
+            if !selected.contains(target) {
+                errors.push(format!(
+                    "{label}: public {} maps to {target}, which the {label} selection does not run",
+                    row.0
+                ));
+            }
+        }
+    }
+    Ok(errors)
+}
+
+#[cfg(test)]
+mod privileged_public_tag_tests {
+    use super::*;
+
+    #[test]
+    fn privileged_public_tags_name_nodes_their_label_selects() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        let errors = privileged_public_tag_errors(&committed, &PRIVILEGED_PUBLIC_TAGS).unwrap();
+        assert!(errors.is_empty(), "{errors:#?}");
+        // Each label resolves the guest build to its own node.
+        let mut tags = BTreeSet::from(["build.manifest_guests".to_string()]);
+        map_privileged_public_tags(&mut tags, "privileged");
+        assert_eq!(
+            tags,
+            BTreeSet::from(["privileged-build.manifest_guests_in_pinned_root".to_string()])
+        );
+        let mut tags = BTreeSet::from(["build.manifest_guests".to_string()]);
+        map_privileged_public_tags(&mut tags, "hosted-privileged");
+        assert_eq!(
+            tags,
+            BTreeSet::from(["privileged-build.manifest_guests_on_host".to_string()])
+        );
+
+        // RED CONTROL: the pre-dh-63c2n3 target, the retired host copy. It is
+        // still in the committed DAG, so an "exists in the committed DAG"
+        // check would pass it; the selection check must refuse it.
+        assert!(
+            committed
+                .steps
+                .iter()
+                .any(|step| step.tag() == "privileged-build.manifest_guests"),
+            "the retired host copy stays in the committed DAG"
+        );
+        let stale = PRIVILEGED_PUBLIC_TAGS.map(|row| {
+            if row.0 == "build.manifest_guests" {
+                (row.0, "privileged-build.manifest_guests", row.2)
+            } else {
+                row
+            }
+        });
+        let errors = privileged_public_tag_errors(&committed, &stale).unwrap();
+        assert_eq!(
+            errors,
+            [
+                "privileged: public build.manifest_guests maps to privileged-build.manifest_guests, which the privileged selection does not run"
+            ],
+        );
+        // And the old derived hosted name for it does not exist at all.
+        let derived = PRIVILEGED_PUBLIC_TAGS.map(|row| {
+            if row.0 == "build.manifest_guests" {
+                (
+                    row.0,
+                    row.1,
+                    "privileged-build.manifest_guests_in_pinned_root_on_host",
+                )
+            } else {
+                row
+            }
+        });
+        assert_eq!(
+            privileged_public_tag_errors(&committed, &derived)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 fn requalification_identity_field<'a>(
@@ -15197,6 +15541,48 @@ fn privileged_dbt_buckets_from_cells(cells: &[serde_json::Value]) -> BTreeSet<St
         .collect()
 }
 
+/// The named nodes each backend adds to a selective scope that declares the
+/// privileged lane, by backend. Selective validation selects from the `full`
+/// label and drops any name that selection lacks, so a stale name here is
+/// silently inert: until dh-63c2n3 v5 the kvm row still named
+/// `privileged-build.manifest_guests`, which v4 had retired from `full` (the
+/// privileged buckets read its pinned-root twin, which their own dependencies
+/// already bring in). `privileged_scope_names_are_full_label_nodes` holds
+/// every name to the `full` selection.
+const PRIVILEGED_SCOPE_NODES: [(&str, &[&str]); 5] = [
+    (
+        "kvm",
+        &[
+            "privileged-test.cli_kvm",
+            "privileged-test.deadline_slice_cap_kvm",
+            "privileged-test.isolation_matrix_kvm",
+            "privileged-e2e.manifest_applications",
+            "privileged-e2e.manifest_c_programs",
+            "privileged-e2e.manifest_system_utils",
+        ],
+    ),
+    (
+        "ptrace",
+        &[
+            "privileged-test.pmu_ptrace_completion_cases",
+            "privileged-test.pmu_detcore_time_cases",
+            "privileged-test.pmu_cli_cases",
+            "privileged-pmu.preemption",
+            "privileged-cpuid.cpu_profile_v3",
+            "privileged-cpuid.faulting",
+        ],
+    ),
+    ("dbt", &["test.isolation_matrix_dbt_in_guest"]),
+    (
+        "liteinst",
+        &["test.liteinst_allocator", "test.liteinst_stacks"],
+    ),
+    (
+        "in-guest-trap",
+        &["test.liteinst_allocator", "test.liteinst_stacks"],
+    ),
+];
+
 fn privileged_nodes_for_scope(
     scope: &SelectiveScope,
     base: &DagConfig,
@@ -15208,35 +15594,17 @@ fn privileged_nodes_for_scope(
     let available: BTreeSet<String> = base.steps.iter().map(Step::tag).collect();
     let mut wanted: Vec<&str> = Vec::new();
     for backend in &scope.backends {
-        match backend.as_str() {
-            "kvm" => wanted.extend([
-                "privileged-test.cli_kvm",
-                "privileged-test.deadline_slice_cap_kvm",
-                "privileged-test.isolation_matrix_kvm",
-                "privileged-e2e.manifest_applications",
-                "privileged-e2e.manifest_c_programs",
-                "privileged-e2e.manifest_system_utils",
-                "privileged-build.manifest_guests",
-            ]),
-            "ptrace" => wanted.extend([
-                "privileged-test.pmu_ptrace_completion_cases",
-                "privileged-test.pmu_detcore_time_cases",
-                "privileged-test.pmu_cli_cases",
-                "privileged-pmu.preemption",
-                "privileged-cpuid.cpu_profile_v3",
-                "privileged-cpuid.faulting",
-            ]),
-            "dbt" => {
-                wanted.extend(["test.isolation_matrix_dbt_in_guest"]);
-                // Derived from cells, not enumerated from available tags:
-                // only privileged buckets that contain a DBT cell (today
-                // c-programs) are added.
-                wanted.extend(privileged_dbt_buckets.iter().map(String::as_str));
-            }
-            "liteinst" | "in-guest-trap" => {
-                wanted.extend(["test.liteinst_allocator", "test.liteinst_stacks"])
-            }
-            _ => {}
+        if let Some((_, nodes)) = PRIVILEGED_SCOPE_NODES
+            .iter()
+            .find(|(name, _)| *name == backend.as_str())
+        {
+            wanted.extend(nodes.iter().copied());
+        }
+        if backend == "dbt" {
+            // Derived from cells, not enumerated from available tags:
+            // only privileged buckets that contain a DBT cell (today
+            // c-programs) are added.
+            wanted.extend(privileged_dbt_buckets.iter().map(String::as_str));
         }
     }
     wanted
@@ -15244,6 +15612,80 @@ fn privileged_nodes_for_scope(
         .filter(|tag| available.contains(*tag))
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod privileged_scope_tests {
+    use super::*;
+
+    /// Every name in `table` that the committed `full` label selection does
+    /// not run, as `backend: name`. Empty when every name is live.
+    fn privileged_scope_names_outside_full(
+        committed: &DagConfig,
+        table: &[(&str, &[&str])],
+    ) -> Result<Vec<String>, String> {
+        let full = dagrun::select_steps_by_labels(committed, &["full".to_string()])?
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        Ok(table
+            .iter()
+            .flat_map(|(backend, nodes)| {
+                nodes
+                    .iter()
+                    .filter(|node| !full.contains(**node))
+                    .map(move |node| format!("{backend}: {node}"))
+            })
+            .collect())
+    }
+
+    /// dh-63c2n3 v5: every name a backend adds to a privileged selective
+    /// scope is a node the `full` label runs, so none is silently inert.
+    #[test]
+    fn privileged_scope_names_are_full_label_nodes() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        let errors =
+            privileged_scope_names_outside_full(&committed, &PRIVILEGED_SCOPE_NODES).unwrap();
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        // RED CONTROL: the kvm row as v4 left it, still naming the retired
+        // host guest build. That node is in the committed DAG, so a check
+        // that it merely exists would pass it; the full selection does not
+        // run it.
+        let mut stale_kvm = PRIVILEGED_SCOPE_NODES[0].1.to_vec();
+        stale_kvm.push("privileged-build.manifest_guests");
+        let stale = [("kvm", stale_kvm.as_slice())];
+        assert!(
+            committed
+                .steps
+                .iter()
+                .any(|step| step.tag() == "privileged-build.manifest_guests")
+        );
+        assert_eq!(
+            privileged_scope_names_outside_full(&committed, &stale).unwrap(),
+            ["kvm: privileged-build.manifest_guests"]
+        );
+
+        // Over the full selection, the scope adds exactly the table's names,
+        // in table order, for a scope naming every backend.
+        let scope = SelectiveScope {
+            backends: PRIVILEGED_SCOPE_NODES
+                .iter()
+                .map(|(backend, _)| backend.to_string())
+                .collect(),
+            backend_lanes: vec!["privileged".into()],
+            ..Default::default()
+        };
+        let full = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        assert_eq!(
+            privileged_nodes_for_scope(&scope, &full, &BTreeSet::new()),
+            PRIVILEGED_SCOPE_NODES
+                .iter()
+                .flat_map(|(_, nodes)| nodes.iter().map(|node| node.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 fn select_from_committed_decision(
@@ -15372,14 +15814,30 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
             }
         }
     }
-    let twins = cfg
-        .steps
+    // A requested guest build resolves to its pinned-root twin. Since
+    // dh-63c2n3 the host copy is not in the local lanes at all (only the
+    // hosted lanes keep it), so the public name `build.manifest_guests`
+    // selects the twin in its place; a lane that still has the host copy
+    // keeps it and gains the twin beside it.
+    let requested_guest_builds = tags
         .iter()
-        .filter(|step| step.job == "manifest_guests" && tags.contains(&step.tag()))
-        .map(|step| format!("{}_in_pinned_root", step.tag()))
-        .filter(|twin| available.contains(twin))
+        .filter(|tag| {
+            tag.split_once('.')
+                .is_some_and(|(_, job)| job == "manifest_guests")
+        })
+        .cloned()
         .collect::<Vec<_>>();
-    tags.extend(twins);
+    for host in requested_guest_builds {
+        let twin = format!("{host}_in_pinned_root");
+        if !available.contains(&twin) {
+            continue;
+        }
+        if !available.contains(&host) {
+            println!("Focused validation: guest build {host} maps to committed node {twin}");
+            tags.remove(&host);
+        }
+        tags.insert(twin);
+    }
     let required_producer = |tag: &str| {
         let tag = tag.strip_prefix("quick-super-").unwrap_or(tag);
         let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
@@ -15459,8 +15917,85 @@ fn select_focused_steps(
 ) -> Result<DagConfig, String> {
     match dagrun::select_steps_by_tags(lane_cfg, tags, true) {
         Ok(cfg) => Ok(cfg),
-        Err(_) => dagrun::select_steps_by_tags(committed, tags, true),
+        Err(_) => {
+            let cfg = dagrun::select_steps_by_tags(committed, tags, true)?;
+            // Backstop: the requests were checked before any mapping, and a
+            // live node's dependencies are live, so this never fires today.
+            refuse_retired_nodes(committed, cfg.steps.iter().map(Step::tag))?;
+            Ok(cfg)
+        }
     }
+}
+
+/// Refuse, by name, any of `tags` that is a retired node: a committed node
+/// that no label's selection runs. Generation keeps a retired node in the
+/// frozen source population (issue 4997 retired `compatprep.fixtures` this
+/// way, and dh-63c2n3 `privileged-build.manifest_guests`) but no longer
+/// maintains its edges: the retired guest build waits only on
+/// `gate.manifest`, so it could start before `setup.manifest_plan` builds the
+/// test-harness it runs. `--only` and `--tests` check the names they are
+/// given, before any public-name or guest-build mapping, so a retired name is
+/// neither run through the committed-DAG fallback of
+/// [`select_focused_steps`] nor quietly swapped for another node. A name the
+/// committed DAG does not hold is not retired; it is left to the selection's
+/// own unknown-name refusal. The refusal names each live replacement: the
+/// node's pinned-root twin and hosted variant, with the labels each carries.
+fn refuse_retired_nodes(
+    committed: &DagConfig,
+    tags: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    let labels = committed
+        .steps
+        .iter()
+        .flat_map(|step| step.labels.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut live = BTreeSet::new();
+    for label in &labels {
+        live.extend(
+            dagrun::select_steps_by_labels(committed, std::slice::from_ref(label))?
+                .steps
+                .iter()
+                .map(Step::tag),
+        );
+    }
+    let by_tag = committed
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut refusals = Vec::new();
+    for tag in tags {
+        if !by_tag.contains_key(&tag) || live.contains(&tag) {
+            continue;
+        }
+        let mut replacements = Vec::new();
+        for suffix in ["_in_pinned_root", HOSTED_VARIANT_SUFFIX] {
+            let replacement = format!("{tag}{suffix}");
+            let Some(step) = by_tag
+                .get(&replacement)
+                .filter(|_| live.contains(&replacement))
+            else {
+                continue;
+            };
+            replacements.push(if step.labels.is_empty() {
+                replacement
+            } else {
+                format!("{replacement} ({})", step.labels.join(", "))
+            });
+        }
+        refusals.push(if replacements.is_empty() {
+            format!("{tag} (no live replacement)")
+        } else {
+            format!("{tag}: select {} instead", replacements.join(" or "))
+        });
+    }
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "focused selection names retired node(s) that no label runs, whose committed dependencies are no longer maintained, so they cannot run: {}",
+        refusals.join("; ")
+    ))
 }
 
 /// Runtime plan boundary: every executable path is a selection from the one
@@ -15476,6 +16011,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&lane))?;
         let nodes = cases.keys().cloned().collect::<Vec<_>>().join(",");
         let mut tags = requested_step_ids(&nodes, "--tests")?;
+        refuse_retired_nodes(&committed, tags.iter().cloned())?;
         // No gate.manifest in a case-focused plan: the gate is a verdict
         // audit (manifest correspondence, footprint freshness), not a
         // producer of anything the selected cases consume. A --tests run
@@ -15563,6 +16099,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
         let mut tags = requested_step_ids(nodes, "--only")?;
+        refuse_retired_nodes(&committed, tags.iter().cloned())?;
         map_privileged_public_tags(&mut tags, lane);
         map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
         let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
@@ -32517,8 +33054,19 @@ fn run(
     }
 
     // This is the actual bound executable selection, after plan-only/cache
-    // returns and before any graph execution. A failed read-only image probe is
-    // an admission refusal, not a completed-node failure or a passing receipt.
+    // returns and before any graph execution. A selected host node that
+    // prepares guests and lacks a tool it needs refuses by name here
+    // (dh-63c2n3), never later inside the node and never as a pass.
+    if let Err(summary) = validate_host_tools::admit(
+        &root,
+        &execution_plan.cfg,
+        execution_plan.second.as_ref(),
+        &plan.profile,
+    ) {
+        return *summary;
+    }
+    // A failed read-only image probe is an admission refusal, not a
+    // completed-node failure or a passing receipt.
     if let Err(summary) = validate_pinned_image::admit(&root, &execution_plan, &plan.profile) {
         return *summary;
     }

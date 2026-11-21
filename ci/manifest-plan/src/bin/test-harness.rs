@@ -2347,9 +2347,308 @@ fn command_runs_exactly(command: &str, inner: &str) -> bool {
     unique.len() == pairs.len() && quoted_inner == shell_quote_one(&expected)
 }
 
+/// The inner command of a lane's guest build, host or pinned-root.
+fn guest_build_command(lane: &str) -> String {
+    format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty")
+}
+
+/// One expected guest build: its lane, its tag, and whether it runs in the
+/// pinned root.
+type GuestBuild = (&'static str, &'static str, bool);
+
+/// The guest-build node each audited label selection runs, by identity: per
+/// lane, its tag and whether it runs in the pinned root.
+///
+/// Since dh-63c2n3 the local `portable`, `privileged` and `full` selections
+/// run exactly the pinned-root twin per lane and no host `test-harness build`
+/// node: every local bucket reads the guests the twin prepares. Here `full` is
+/// the `full` LABEL selection (label plus dependency ancestry), not the Buck
+/// full composition, which replaces both twins by design
+/// (`BUCK_REPLACED_PRODUCERS`) and keeps its own checks
+/// (`assert_buck_e2e_selection`). The hosted selections run exactly their host
+/// copies, which their buckets consume. Until dh-63c2n3 this audit required
+/// two matching commands per lane in `portable` and `privileged` (the host
+/// copy and the twin), counted by command alone.
+const AUDITED_GUEST_BUILDS: [(&str, &[GuestBuild]); 5] = [
+    (
+        "portable",
+        &[("portable", "build.manifest_guests_in_pinned_root", true)],
+    ),
+    (
+        "privileged",
+        &[(
+            "privileged",
+            "privileged-build.manifest_guests_in_pinned_root",
+            true,
+        )],
+    ),
+    (
+        "full",
+        &[
+            ("portable", "build.manifest_guests_in_pinned_root", true),
+            (
+                "privileged",
+                "privileged-build.manifest_guests_in_pinned_root",
+                true,
+            ),
+        ],
+    ),
+    (
+        "hosted-portable",
+        &[("portable", "build.manifest_guests", false)],
+    ),
+    (
+        "hosted-privileged",
+        &[(
+            "privileged",
+            "privileged-build.manifest_guests_on_host",
+            false,
+        )],
+    ),
+];
+
+/// Every audited selection runs exactly its [`AUDITED_GUEST_BUILDS`], by tag
+/// and wrapper, and a local selection runs no host `test-harness build`.
+fn audit_guest_builds(committed: &dagrun::DagConfig) -> Result<(), String> {
+    for (label, expected) in AUDITED_GUEST_BUILDS {
+        let dag = dagrun::select_steps_by_labels(committed, &[label.to_string()])
+            .map_err(|error| format!("cannot select label {label}: {error}"))?;
+        let local = expected.iter().all(|(_, _, pinned)| *pinned);
+        if local {
+            let host = dag
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.cmd.contains("test-harness build")
+                        && !step.cmd.starts_with(PINNED_COMMAND_PREFIX)
+                })
+                .map(dagrun::Step::tag)
+                .collect::<Vec<_>>();
+            if !host.is_empty() {
+                return Err(format!(
+                    "the {label} selection runs host guest build(s) {host:?}; it must prepare guests only in the pinned root"
+                ));
+            }
+        }
+        let mut actual = BTreeSet::new();
+        for lane in ["portable", "privileged"] {
+            let inner = guest_build_command(lane);
+            for step in dag
+                .steps
+                .iter()
+                .filter(|step| command_runs_exactly(&step.cmd, &inner))
+            {
+                actual.insert((
+                    lane.to_string(),
+                    step.tag(),
+                    step.cmd.starts_with(PINNED_COMMAND_PREFIX),
+                ));
+            }
+        }
+        let wanted = expected
+            .iter()
+            .map(|(lane, tag, pinned)| (lane.to_string(), tag.to_string(), *pinned))
+            .collect::<BTreeSet<_>>();
+        if actual != wanted {
+            let describe = |set: &BTreeSet<(String, String, bool)>| {
+                set.iter()
+                    .map(|(lane, tag, pinned)| {
+                        format!(
+                            "{lane}: {tag} ({})",
+                            if *pinned { "pinned root" } else { "host" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            return Err(format!(
+                "the {label} selection must run exactly the guest build(s) {:?}; it runs {:?}",
+                describe(&wanted),
+                describe(&actual)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why the consumer-coverage rule does not apply to a `test-harness run` node.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CoverageExclusion {
+    /// (a) Its command puts the harness in Buck import mode
+    /// (`E2E_IMPORT_RESULTS=`), which executes no cell.
+    BuckImport,
+    /// (c) It does not pass `--prebuilt`, so it prepares its own guests.
+    NotPrebuilt,
+    /// (b) None of the cells it selects has a prepared program (plain
+    /// commands, or no selected cell at all), so `--prebuilt` reads nothing.
+    NoPreparedProgram,
+}
+
+impl CoverageExclusion {
+    fn reason(self) -> &'static str {
+        match self {
+            CoverageExclusion::BuckImport => "(a) Buck import command form",
+            CoverageExclusion::NotPrebuilt => "(c) no --prebuilt",
+            CoverageExclusion::NoPreparedProgram => "(b) selects no prepared-program cell",
+        }
+    }
+}
+
+/// What the consumer-coverage rule checked and what it excluded, and why.
+#[derive(Debug, Default)]
+struct CoverageReport {
+    checked: Vec<String>,
+    excluded: Vec<(String, CoverageExclusion)>,
+}
+
+/// The consumer-coverage rule (dh-63c2n3), defined by a checkable property and
+/// never by a list of node names. A `test-harness run` node is in scope when
+/// (a) its command is not the Buck import form, (b) at least one cell it
+/// selects has a prepared program, judged by the manifest corpus, and (c) it
+/// passes `--prebuilt`, the runtime condition under which a cell copies its
+/// prepared fixtures (runner.rs, `prepare_test_until`). Every in-scope node
+/// depends directly on a guest build for its lane, and under each audited
+/// label it carries, on that selection's build ([`AUDITED_GUEST_BUILDS`]).
+///
+/// `prepared_cells` counts the cells with a prepared program that a parsed
+/// `run` selects; production passes the harness's own selection.
+fn audit_prebuilt_consumers(
+    committed: &dagrun::DagConfig,
+    prepared_cells: &dyn Fn(&Args) -> Result<usize, String>,
+) -> Result<CoverageReport, String> {
+    let by_tag = committed
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let import_form = format!(
+        "{}target/debug/test-harness run ",
+        hermit_manifest_plan::validation_dag::BUCK_IMPORT_ASSIGNMENT
+    );
+    let mut report = CoverageReport::default();
+    for step in &committed.steps {
+        let Some(values) = harness_run_args(&step.cmd) else {
+            continue;
+        };
+        let tag = step.tag();
+        if step.cmd.contains(&import_form) {
+            report.excluded.push((tag, CoverageExclusion::BuckImport));
+            continue;
+        }
+        let args = parse(values.into_iter());
+        if !args.prebuilt {
+            report.excluded.push((tag, CoverageExclusion::NotPrebuilt));
+            continue;
+        }
+        let prepared = prepared_cells(&args).map_err(|error| format!("{tag}: {error}"))?;
+        if prepared == 0 {
+            report
+                .excluded
+                .push((tag, CoverageExclusion::NoPreparedProgram));
+            continue;
+        }
+        let lane = args.selection.lane.as_deref().ok_or_else(|| {
+            format!("{tag} reads {prepared} prepared-program cell(s) but names no --lane")
+        })?;
+        let inner = guest_build_command(lane);
+        let builds = step
+            .deps
+            .iter()
+            .filter(|dependency| {
+                by_tag
+                    .get(*dependency)
+                    .is_some_and(|producer| command_runs_exactly(&producer.cmd, &inner))
+            })
+            .collect::<Vec<_>>();
+        if builds.is_empty() {
+            return Err(format!(
+                "{tag} passes --prebuilt and selects {prepared} {lane} cell(s) with a prepared program, but depends directly on no {lane} guest build"
+            ));
+        }
+        for label in &step.labels {
+            let Some((_, expected)) = AUDITED_GUEST_BUILDS
+                .iter()
+                .find(|(audited, _)| audited == label)
+            else {
+                continue;
+            };
+            if let Some((_, build, _)) = expected
+                .iter()
+                .find(|(build_lane, _, _)| *build_lane == lane)
+            {
+                if !step.deps.iter().any(|dependency| dependency == build) {
+                    return Err(format!(
+                        "{tag} reads prepared {lane} guests in the {label} selection but does not depend on that selection's guest build {build} (it depends on {builds:?})"
+                    ));
+                }
+            }
+        }
+        report.checked.push(tag);
+    }
+    if report.checked.is_empty() {
+        return Err(
+            "consumer coverage checked no run node: the rule that every --prebuilt reader of prepared programs depends on its guest build is vacuous"
+                .into(),
+        );
+    }
+    Ok(report)
+}
+
+/// The number of prepared-program cells a parsed `run` selects, as the
+/// harness's own `run` selects them.
+fn prepared_program_cells(manifests: &ManifestSet, args: &Args) -> Result<usize, String> {
+    Ok(run_cells(manifests, args)?
+        .iter()
+        .filter(|cell| cell.test.program.is_some())
+        .count())
+}
+
+fn print_coverage_report(report: &CoverageReport) {
+    let mut by_reason = BTreeMap::<CoverageExclusion, Vec<&str>>::new();
+    for (tag, exclusion) in &report.excluded {
+        by_reason.entry(*exclusion).or_default().push(tag);
+    }
+    let excluded = by_reason
+        .iter()
+        .map(|(exclusion, tags)| match exclusion {
+            CoverageExclusion::BuckImport => format!("{} {}", tags.len(), exclusion.reason()),
+            _ => format!(
+                "{} {} ({})",
+                tags.len(),
+                exclusion.reason(),
+                tags.join(", ")
+            ),
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "Consumer coverage: {} --prebuilt run node(s) that read prepared programs depend directly on their guest build; {} excluded: {}",
+        report.checked.len(),
+        report.excluded.len(),
+        excluded.join("; ")
+    );
+}
+
+/// The `test-harness run` arguments of a committed DAG step up to its output
+/// paths, or `None` when the step runs no harness.
+fn harness_run_args(cmd: &str) -> Option<Vec<String>> {
+    let (_, rest) = cmd.split_once("test-harness run ")?;
+    let mut args = Vec::new();
+    for word in rest.split_whitespace() {
+        if matches!(word, "--results" | "--junit") {
+            break;
+        }
+        args.push(word.trim_end_matches('\'').to_string());
+        if word.ends_with('\'') {
+            break;
+        }
+    }
+    Some(args)
+}
+
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
     let committed_path = root.join("ci/dag/validate.json");
     let committed = read_dag(&committed_path)?;
+    audit_guest_builds(&committed)
+        .map_err(|error| format!("{}: {error}", committed_path.display()))?;
     let (mut nodes, mut buckets) = (0, 0);
     for lane in ["portable", "privileged"] {
         let path = &committed_path;
@@ -2397,20 +2696,8 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                 path.display()
             ));
         }
-        let build =
-            format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-        if dag
-            .steps
-            .iter()
-            .filter(|step| command_runs_exactly(&step.cmd, &build))
-            .count()
-            != 2
-        {
-            return Err(format!(
-                "{} must contain exactly the host and pinned-root Rust manifest build nodes",
-                path.display()
-            ));
-        }
+        // The lane's guest build is audited by identity above
+        // (audit_guest_builds): exactly the pinned-root twin.
         let expected = manifests
             .documents
             .iter()
@@ -2499,6 +2786,10 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
     println!(
         "DAG correspondence: {nodes} portable and privileged nodes and {buckets} manifest buckets checked against the manifests"
     );
+    let coverage =
+        audit_prebuilt_consumers(&committed, &|args| prepared_program_cells(manifests, args))
+            .map_err(|error| format!("{}: {error}", committed_path.display()))?;
+    print_coverage_report(&coverage);
     Ok(())
 }
 
@@ -5588,7 +5879,9 @@ mod tests {
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::AUDITED_GUEST_BUILDS;
     use super::CellResult;
+    use super::CoverageExclusion;
     use super::DEFAULT_BUILD_JOBS;
     use super::DEFAULT_VALIDATE_AUDIT_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
@@ -5603,6 +5896,8 @@ mod tests {
     use super::TestResults;
     use super::YamlValue;
     use super::accumulate_cell_cpu_usage;
+    use super::audit_guest_builds;
+    use super::audit_prebuilt_consumers;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
     use super::audit_validation_levels_policy;
@@ -5616,10 +5911,13 @@ mod tests {
     use super::excused_diagnostic;
     use super::expected_plan_document;
     use super::for_each_parallel;
+    use super::guest_build_command;
+    use super::harness_run_args;
     use super::host_inapplicable_reason;
     use super::parity_plan;
     use super::parse;
     use super::planned_verify;
+    use super::prepared_program_cells;
     use super::print_best_effort;
     use super::required_plan_rows;
     use super::run_cells;
@@ -9414,23 +9712,6 @@ sys.exit(1 if failed else 0)
         assert!(config.imported_logs.is_none());
         assert!(configured(serde_json::json!({"imported": {"root": "import"}})).is_err());
         fs::remove_dir_all(&artifacts).unwrap();
-    }
-
-    /// The `test-harness run` arguments of a committed DAG step up to its
-    /// output paths, or `None` when the step runs no harness.
-    fn harness_run_args(cmd: &str) -> Option<Vec<String>> {
-        let (_, rest) = cmd.split_once("test-harness run ")?;
-        let mut args = Vec::new();
-        for word in rest.split_whitespace() {
-            if matches!(word, "--results" | "--junit") {
-                break;
-            }
-            args.push(word.trim_end_matches('\'').to_string());
-            if word.ends_with('\'') {
-                break;
-            }
-        }
-        Some(args)
     }
 
     /// Every committed hosted-portable `test-harness run` command parses and
@@ -14760,49 +15041,277 @@ sys.exit(1 if refused else 0)
             inner
         ));
 
+        // Restated for dh-63c2n3: until then the local portable and
+        // privileged selections each ran two matching build commands, the
+        // host copy and the pinned-root twin. Now each local selection runs
+        // exactly the twin, and the exact host command is matched from the
+        // hosted selections, which run exactly their host copies.
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("the committed validation DAG must parse");
-        for lane in ["portable", "privileged"] {
-            let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).unwrap();
-            let inner =
-                format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-            let matches = dag
-                .steps
-                .iter()
-                .filter(|step| command_runs_exactly(&step.cmd, &inner))
-                .collect::<Vec<_>>();
-            assert_eq!(matches.len(), 2, "{lane}: host and pinned build commands");
-            let pinned = matches
-                .iter()
-                .find(|step| step.cmd.starts_with(PINNED_COMMAND_PREFIX))
-                .expect("the generated pinned command must match");
-            for malformed in [
-                pinned
-                    .cmd
-                    .replace("/src/ci/hermetic/assert-no-network.sh && ", ""),
-                pinned
-                    .cmd
-                    .replace("/src/ci/hermetic/assert-build-dependencies.sh && ", ""),
-                pinned
-                    .cmd
-                    .replace("hermit_payload=$1", "hermit_payload=true"),
-                format!("{} --unexpected", pinned.cmd),
-                pinned.cmd.replace(
-                    "--env E2E_RESULT_ROOT ",
-                    "--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT ",
-                ),
-                pinned
-                    .cmd
-                    .replace("--env E2E_RESULT_ROOT ", "--env lowercase "),
-                pinned.cmd.replace(&inner, &format!("{inner} --jobs 2")),
-            ] {
-                assert_ne!(malformed, pinned.cmd, "control must alter the command");
-                assert!(
-                    !command_runs_exactly(&malformed, &inner),
-                    "accepted malformed or nonmatching command: {malformed}"
+        let mut pinned_checked = 0;
+        let mut host_checked = 0;
+        for (label, builds) in AUDITED_GUEST_BUILDS {
+            let dag = dagrun::select_steps_by_labels(&committed, &[label.to_string()]).unwrap();
+            for (lane, tag, expect_pinned) in builds.iter() {
+                let inner = guest_build_command(lane);
+                let matches = dag
+                    .steps
+                    .iter()
+                    .filter(|step| command_runs_exactly(&step.cmd, &inner))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.iter().map(|step| step.tag()).collect::<Vec<_>>(),
+                    [tag.to_string()],
+                    "{label}/{lane}: exactly one build command, by identity"
                 );
+                let build = matches[0];
+                assert_eq!(
+                    build.cmd.starts_with(PINNED_COMMAND_PREFIX),
+                    *expect_pinned,
+                    "{label}/{lane}: {tag}"
+                );
+                if !expect_pinned {
+                    // The exact host command, from a hosted selection.
+                    assert_eq!(build.cmd, format!("{PREBUILT_COMMAND_PREFIX}{inner}"));
+                    for malformed in [
+                        format!("{} --unexpected", build.cmd),
+                        build.cmd.replace(&inner, &format!("{inner} --jobs 2")),
+                        build
+                            .cmd
+                            .replace(PREBUILT_COMMAND_PREFIX, "export PATH=\"$PWD/bin:$PATH\"; "),
+                    ] {
+                        assert_ne!(malformed, build.cmd, "control must alter the command");
+                        assert!(
+                            !command_runs_exactly(&malformed, &inner),
+                            "accepted malformed or nonmatching host command: {malformed}"
+                        );
+                    }
+                    host_checked += 1;
+                    continue;
+                }
+                pinned_checked += 1;
+                let pinned = build;
+                for malformed in [
+                    pinned
+                        .cmd
+                        .replace("/src/ci/hermetic/assert-no-network.sh && ", ""),
+                    pinned
+                        .cmd
+                        .replace("/src/ci/hermetic/assert-build-dependencies.sh && ", ""),
+                    pinned
+                        .cmd
+                        .replace("hermit_payload=$1", "hermit_payload=true"),
+                    format!("{} --unexpected", pinned.cmd),
+                    pinned.cmd.replace(
+                        "--env E2E_RESULT_ROOT ",
+                        "--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT ",
+                    ),
+                    pinned
+                        .cmd
+                        .replace("--env E2E_RESULT_ROOT ", "--env lowercase "),
+                    pinned.cmd.replace(&inner, &format!("{inner} --jobs 2")),
+                ] {
+                    assert_ne!(malformed, pinned.cmd, "control must alter the command");
+                    assert!(
+                        !command_runs_exactly(&malformed, &inner),
+                        "accepted malformed or nonmatching command: {malformed}"
+                    );
+                }
             }
         }
+        // portable, privileged and full's two lanes; the two hosted copies.
+        assert_eq!((pinned_checked, host_checked), (4, 2));
+    }
+
+    /// A committed DAG with `edit` applied to the step `tag`.
+    fn committed_with(tag: &str, edit: impl FnOnce(&mut dagrun::Step)) -> dagrun::DagConfig {
+        let mut cfg = dagrun::dag_from_json(include_str!("../../../dag/validate.json")).unwrap();
+        edit(
+            cfg.steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("committed DAG lost {tag}")),
+        );
+        cfg
+    }
+
+    /// dh-63c2n3: each audited selection runs exactly its guest build by
+    /// identity. The old shape (host copy and twin together, two per lane)
+    /// now fails, so reverting the audit to "two per lane" fails this test on
+    /// the committed DAG.
+    #[test]
+    fn guest_build_audit_requires_exactly_the_pinned_twin_per_local_selection() {
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json")).unwrap();
+        audit_guest_builds(&committed).unwrap();
+
+        // The pre-dh-63c2n3 shape: the host copy back in portable and full,
+        // beside the twin.
+        let two_per_lane = committed_with("build.manifest_guests", |step| {
+            step.labels = vec!["full".into(), "hosted-portable".into(), "portable".into()];
+        });
+        let error = audit_guest_builds(&two_per_lane).unwrap_err();
+        assert!(error.contains("runs host guest build"), "{error}");
+
+        // A portable selection whose only build is the host copy.
+        let mut host_only = two_per_lane.clone();
+        host_only
+            .steps
+            .retain(|step| step.tag() != "build.manifest_guests_in_pinned_root");
+        for step in &mut host_only.steps {
+            for dependency in &mut step.deps {
+                if dependency == "build.manifest_guests_in_pinned_root" {
+                    *dependency = "build.manifest_guests".into();
+                }
+            }
+        }
+        let error = audit_guest_builds(&host_only).unwrap_err();
+        assert!(
+            error.contains("runs host guest build") && error.contains("build.manifest_guests"),
+            "{error}"
+        );
+
+        // A selection with no guest build at all.
+        let mut no_build = committed.clone();
+        no_build
+            .steps
+            .retain(|step| step.tag() != "privileged-build.manifest_guests_in_pinned_root");
+        for step in &mut no_build.steps {
+            step.deps.retain(|dependency| {
+                dependency != "privileged-build.manifest_guests_in_pinned_root"
+            });
+        }
+        let error = audit_guest_builds(&no_build).unwrap_err();
+        assert!(
+            error.contains("the privileged selection must run exactly the guest build(s)"),
+            "{error}"
+        );
+
+        // A hosted selection that runs the pinned twin instead of its copy.
+        let hosted_pinned = committed_with("build.manifest_guests_in_pinned_root", |step| {
+            step.labels.push("hosted-portable".into());
+        });
+        let error = audit_guest_builds(&hosted_pinned).unwrap_err();
+        assert!(
+            error.contains("the hosted-portable selection must run exactly"),
+            "{error}"
+        );
+
+        // A host build whose flags differ, so the exact-command matcher does
+        // not see it, is still a host test-harness build in a local selection.
+        let mut variant = committed.clone();
+        let mut extra = variant
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.manifest_guests")
+            .unwrap()
+            .clone();
+        extra.job = "manifest_guests_variant".into();
+        extra.labels = vec!["full".into()];
+        extra.cmd = format!(
+            "{PREBUILT_COMMAND_PREFIX}target/debug/test-harness build --lane portable --ci-only"
+        );
+        variant.steps.push(extra);
+        let error = audit_guest_builds(&variant).unwrap_err();
+        assert!(error.contains("build.manifest_guests_variant"), "{error}");
+    }
+
+    /// dh-63c2n3: the consumer-coverage rule is a live property of the
+    /// committed DAG and the manifests, not a static exemption list. It prints
+    /// what it checked and excluded (never pinned), checks more than zero
+    /// nodes, and gives every exclusion a named reason.
+    #[test]
+    fn prebuilt_consumer_coverage_is_a_live_property() {
+        let root = super::root(None);
+        let manifests = ManifestSet::load(&root).unwrap();
+        let oracle = |args: &super::Args| prepared_program_cells(&manifests, args);
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json")).unwrap();
+        let report = audit_prebuilt_consumers(&committed, &oracle).unwrap();
+        super::print_coverage_report(&report);
+        assert!(!report.checked.is_empty());
+        for (tag, exclusion) in &report.excluded {
+            assert!(
+                matches!(
+                    exclusion,
+                    CoverageExclusion::BuckImport
+                        | CoverageExclusion::NotPrebuilt
+                        | CoverageExclusion::NoPreparedProgram
+                ),
+                "{tag}"
+            );
+            assert!(!exclusion.reason().is_empty(), "{tag}");
+        }
+        // Every run node is either checked or excluded with its reason.
+        let runs = committed
+            .steps
+            .iter()
+            .filter(|step| harness_run_args(&step.cmd).is_some())
+            .count();
+        assert_eq!(report.checked.len() + report.excluded.len(), runs);
+
+        // A --prebuilt reader of prepared programs without its build edge.
+        let unbuilt = committed_with("e2e.manifest_language_runtimes", |step| {
+            step.deps
+                .retain(|dependency| dependency != "build.manifest_guests_in_pinned_root");
+        });
+        let error = audit_prebuilt_consumers(&unbuilt, &oracle).unwrap_err();
+        assert!(
+            error.contains("e2e.manifest_language_runtimes")
+                && error.contains("depends directly on no portable guest build"),
+            "{error}"
+        );
+
+        // A local reader that depends on the host copy instead of its
+        // selection's twin.
+        let host_edge = committed_with("e2e.manifest_language_runtimes", |step| {
+            for dependency in &mut step.deps {
+                if dependency == "build.manifest_guests_in_pinned_root" {
+                    *dependency = "build.manifest_guests".into();
+                }
+            }
+        });
+        let error = audit_prebuilt_consumers(&host_edge, &oracle).unwrap_err();
+        assert!(
+            error.contains("does not depend on that selection's guest build build.manifest_guests_in_pinned_root"),
+            "{error}"
+        );
+
+        // A compat run that GAINS a prepared-program cell, with no build
+        // edge, fails: the property is evaluated, not exempted by name.
+        assert!(
+            report
+                .excluded
+                .iter()
+                .any(|(tag, why)| tag == "e2e.manifest_compat"
+                    && *why == CoverageExclusion::NoPreparedProgram),
+            "{:?}",
+            report.excluded
+        );
+        let gained = |args: &super::Args| {
+            if args.selection.category.as_deref() == Some("compat") {
+                Ok(1)
+            } else {
+                prepared_program_cells(&manifests, args)
+            }
+        };
+        let error = audit_prebuilt_consumers(&committed, &gained).unwrap_err();
+        assert!(
+            error.contains("compat")
+                && error.contains("depends directly on no portable guest build"),
+            "{error}"
+        );
+
+        // A Buck import node whose command form changes, so it runs the
+        // prepared programs itself, fails: it has no build edge.
+        let import = hermit_manifest_plan::validation_dag::BUCK_IMPORT_ASSIGNMENT;
+        let running = committed_with("e2e.manifest_language_runtimes_buck", |step| {
+            assert_eq!(step.cmd.matches(import).count(), 1);
+            step.cmd = step.cmd.replacen(import, "", 1);
+        });
+        let error = audit_prebuilt_consumers(&running, &oracle).unwrap_err();
+        assert!(
+            error.contains("e2e.manifest_language_runtimes_buck"),
+            "{error}"
+        );
     }
 
     #[test]

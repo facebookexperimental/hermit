@@ -81,8 +81,10 @@ independent source and refuses any command, dependency, or cap drift in the
 committed artifact. `--write` updates this same file; there is no secondary
 runnable DAG.
 
-The local privileged selection contains 19 nodes (20 until the one-build change
-of 2026-09-30 retired the unconsumed host copy of
+The local privileged selection contains 19 nodes (20 from the arrival of
+`privileged-test.binder_cli_cases` until dh-63c2n3 retired the unconsumed host
+guest build `privileged-build.manifest_guests` on 2026-11-20; also 20 until the
+one-build change of 2026-09-30 retired the unconsumed host copy of
 `privileged-only-build.privileged_tests`, which compiled Hermit on the host)
 with a 5160-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
@@ -284,8 +286,18 @@ on the compile node, so none starts before preparation has finished.
 `build.e2e_artifact_in_pinned_root` publishes the one binary at
 `target/ci/hermit` and as the E2E bundle. Consumers name `target/ci/hermit`
 or the bundle, never a per-profile path. The host keeps only tooling builds
-(`build.rust_scripts`, `setup.manifest_plan`, `build.manifest_guests`) for
-host-side checks; the strict
+(`build.rust_scripts`, `setup.manifest_plan`) for host-side checks. The host
+copies of the guest builds, `build.manifest_guests` and
+`privileged-build.manifest_guests`, left `full`, `portable` and `privileged`
+on 2026-11-20 (dh-63c2n3): no local node consumed what they prepared, since
+every local bucket reads the guests `build.manifest_guests_in_pinned_root` and
+`privileged-build.manifest_guests_in_pinned_root` prepare in the pinned root,
+and a host package gap (no Lua or Ruby on the validation host) stopped `full`
+there. The hosted selections keep their host copies, which their buckets
+consume, and the opt-in Buck route still prepares guests on the host
+(`e2e.buck_stage`). Before any node runs, `scripts/validate.rs` refuses by name
+a selection whose host guest-preparing node lacks a tool it needs
+(`scripts/lib/validate_host_tools.rs`). The strict
 compatibility rows, which run host-installed programs the image does not
 carry, reach the pinned-root binary through `build.host_hermit_link`.
 `lint.clippy`, `doc.rustdoc` and `doc.doctests` stay in the dev profile: in the
@@ -304,7 +316,10 @@ The centralized manifests use an explicit build barrier before execution:
    plus the dereferenced `install_pkg` resource tree, then atomically
    publishes a content-addressed bundle. Every later shared-target Cargo
    writer waits on this barrier.
-3. `build.manifest_guests` prepares every `ci=true` program once. One
+3. `build.manifest_guests_in_pinned_root` prepares every `ci=true` portable
+   program once, in the pinned root (`privileged-build.manifest_guests_in_pinned_root`
+   the privileged ones; the hosted selections prepare on the host with
+   `build.manifest_guests` and `privileged-build.manifest_guests_on_host`). One
    `e2e.manifest_<bucket>` node per YAML bucket declares both producers and runs
    through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo

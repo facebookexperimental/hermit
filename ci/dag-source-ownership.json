@@ -306,9 +306,7 @@
     "build.manifest_guests": {
       "owner": "core",
       "labels": [
-        "full",
-        "hosted-portable",
-        "portable"
+        "hosted-portable"
       ],
       "deps": [
         "gate.manifest",
@@ -1185,14 +1183,9 @@
     },
     "privileged-build.manifest_guests": {
       "owner": "core",
-      "labels": [
-        "full",
-        "privileged"
-      ],
+      "labels": [],
       "deps": [
-        "gate.manifest",
-        "pre.reverie_pin",
-        "setup.manifest_plan"
+        "gate.manifest"
       ]
     },
     "privileged-e2e.manifest_applications": {

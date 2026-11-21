@@ -1001,9 +1001,7 @@
       "desc": "Prepare every CI-enabled portable manifest guest",
       "description": "The harness used to prepare every distinct guest in one serial loop. On 2026-09-03 at Hermit a58e9ecf, three paired runs of the 158-test c-programs bucket measured --jobs 1 at 10.04/9.64/9.75s wall and 8.34/8.17/8.06s CPU, versus --jobs 16 at 1.29/1.29/1.29s wall and 8.12/8.31/8.15s CPU. Width 32 saved only another 0.15s in one sweep while doubling requested capacity, so 16 is the measured useful width. Host load averages were 22.6-25.9 (1m), 34.4-35.1 (5m), and 41.7-42.2 (15m); paired order and stable CPU cost limit that contamination. The implementation keeps one output directory per test and prints results in manifest order after all workers finish.",
       "labels": [
-        "full",
-        "hosted-portable",
-        "portable"
+        "hosted-portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane portable --ci-only --allow-empty",
       "result_manifests": [],
@@ -27793,16 +27791,10 @@
       "job": "manifest_guests",
       "desc": "Prepare every CI-enabled privileged manifest guest",
       "description": "Prepares the privileged lane's CI test programs once each under $E2E_BUILD_ROOT/<test-id>: `test-harness build --lane privileged --ci-only` compiles tests/c/cpuid_probe.c with -Werror and runs the shell programs' --prepare steps (sysfs-sanitized-prefixes.sh runs its fixture self-test there). The privileged-e2e and privileged-only-e2e buckets run with --prebuilt and depend on the _in_pinned_root copy, which runs this command in the pinned root; the host copy has no dependents. A new compiler warning in cpuid_probe.c, or a failing --prepare self-test, stops it.",
-      "labels": [
-        "full",
-        "privileged"
-      ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane privileged --ci-only --allow-empty",
       "result_manifests": [],
       "deps": [
-        "gate.manifest",
-        "pre.reverie_pin",
-        "setup.manifest_plan"
+        "gate.manifest"
       ],
       "env": {},
       "networkonly": false,

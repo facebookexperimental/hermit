@@ -821,17 +821,25 @@ const PROFILES: [Profile; 11] = [
         // on KVM held to its gap ledger, adds one full-only node: 102/103
         // before.
         // build.reverie_buck (M2) is a post-split extension node: these
-        // counts stay the frozen lineage (103/104); the node joins through
+        // counts stay the frozen lineage; the node joins through
         // POST_SPLIT_CORE_NODES, not this table.
+        // 101/102 since the host copies of the guest builds,
+        // build.manifest_guests and privileged-build.manifest_guests, left
+        // full: their pinned-root twins prepare every guest a local bucket
+        // reads, and nothing in full consumed either host copy (dh-63c2n3):
+        // 103/104 before.
         label: "full",
-        direct_steps: 103,
-        selected_steps: 104,
+        direct_steps: 101,
+        selected_steps: 102,
     },
     Profile {
         // 81/82 with the same host-fixtures retirement: 82/83 before.
+        // 80/81 since build.manifest_guests, the host copy of the guest
+        // build, left portable with the same retirement (dh-63c2n3): 81/82
+        // before.
         label: "portable",
-        direct_steps: 81,
-        selected_steps: 82,
+        direct_steps: 80,
+        selected_steps: 81,
     },
     Profile {
         label: "quick",
@@ -850,9 +858,14 @@ const PROFILES: [Profile; 11] = [
     Profile {
         // 12/20 since privileged-test.binder_cli_cases joined the
         // privileged lane (PR 4742): 11/19 before.
+        // 11/19 since privileged-build.manifest_guests, the host copy of the
+        // privileged guest build, left privileged: the privileged buckets
+        // read only its pinned-root twin's guests, and hosted-privileged
+        // keeps its own privileged-build.manifest_guests_on_host
+        // (dh-63c2n3): 12/20 before.
         label: "privileged",
-        direct_steps: 12,
-        selected_steps: 20,
+        direct_steps: 11,
+        selected_steps: 19,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -1346,7 +1359,11 @@ fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), Strin
 
 /// A pinned-root producer that compiles or publishes Hermit itself, as opposed
 /// to the host tooling producers (rust scripts, the manifest plan, the manifest
-/// guests) whose host and pinned-root copies test-harness validate requires.
+/// guests). The host copies of the rust scripts and the manifest plan serve
+/// host-side checks and keep their labels; the host copies of the manifest
+/// guests leave every local label their twin serves
+/// ([`retire_host_guest_builds_when_twin_present`]), and test-harness validate
+/// requires exactly the twin there.
 fn builds_hermit(step: &Step) -> bool {
     matches!(
         step.tag().as_str(),
@@ -3329,6 +3346,9 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
 /// it, so the same cell saw different inputs across runs. When the twin
 /// exists, retire the host copy from the local profiles; the authored
 /// hosted variant (compatprep.fixtures_on_host) is a separate step.
+///
+/// The same class holds the host copies of the guest builds
+/// ([`retire_host_guest_builds_when_twin_present`], dh-63c2n3).
 fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig) {
     // Called after the twins are pushed into cfg, so the twin is visible
     // in cfg.steps.
@@ -3336,15 +3356,97 @@ fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig) {
         .steps
         .iter()
         .any(|step| step.tag() == "compatprep.fixtures_in_pinned_root");
-    if !twin_present {
-        return;
-    }
-    for step in &mut cfg.steps {
-        if step.tag() == "compatprep.fixtures" {
-            step.labels
-                .retain(|label| label != "full" && label != "portable");
+    if twin_present {
+        for step in &mut cfg.steps {
+            if step.tag() == "compatprep.fixtures" {
+                step.labels
+                    .retain(|label| label != "full" && label != "portable");
+            }
         }
     }
+    retire_host_guest_builds_when_twin_present(cfg);
+}
+
+/// The steps a dagrun label selection runs: every step carrying `label`, and
+/// its dependency ancestry within `cfg`. Computed here rather than with
+/// dagrun's selector because generation calls it before every edge is final.
+fn label_closure(cfg: &DagConfig, label: &str) -> BTreeSet<String> {
+    let by_tag = cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = BTreeSet::new();
+    let mut pending = cfg
+        .steps
+        .iter()
+        .filter(|step| step.labels.iter().any(|value| value == label))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    while let Some(tag) = pending.pop() {
+        if !selected.insert(tag.clone()) {
+            continue;
+        }
+        if let Some(step) = by_tag.get(&tag) {
+            pending.extend(step.deps.iter().cloned());
+        }
+    }
+    selected
+}
+
+/// Retire the host copies of the guest builds from every local label their
+/// pinned-root twin serves (dh-63c2n3), and return what each copy lost.
+///
+/// `build.manifest_guests` and `privileged-build.manifest_guests` run
+/// `test-harness build` on the validation host. Since the 2026-09-03
+/// pinned-root rewrite every local bucket reads the guests its twin prepares
+/// in the pinned root (`--prebuilt` from `/src/target/e2e-build`), so in the
+/// `full`, `portable` and `privileged` selections the host copies prepared
+/// guests nothing consumed, and a host package gap (no Lua or Ruby on the
+/// validation host) could stop those runs. The hosted selections keep their
+/// host copies, which their buckets consume.
+///
+/// Decided per label: a host copy loses label `L` only when its twin is in
+/// `L`'s selection and no other step in that selection depends on the copy.
+/// `hosted-portable` is therefore never stripped: no twin exists there. Only
+/// a host copy (not a twin, not a hosted variant) of a pinned-root producer
+/// whose job is `manifest_guests` is in the class; a leaf check with no
+/// consumers and a pinned twin is never retired here.
+fn retire_host_guest_builds_when_twin_present(cfg: &mut DagConfig) -> Vec<(String, Vec<String>)> {
+    let mut decisions = Vec::new();
+    for step in cfg.steps.iter().filter(|step| {
+        is_pinned_root_producer(step)
+            && step.job == "manifest_guests"
+            && !is_hosted_variant(step)
+            && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+    }) {
+        let tag = step.tag();
+        let twin = pinned_root_twin_tag(&tag);
+        let mut lost = Vec::new();
+        for label in &step.labels {
+            let selection = label_closure(cfg, label);
+            let consumed = cfg.steps.iter().any(|other| {
+                other.tag() != tag
+                    && selection.contains(&other.tag())
+                    && other.deps.iter().any(|dependency| dependency == &tag)
+            });
+            if selection.contains(&twin) && !consumed {
+                lost.push(label.clone());
+            }
+        }
+        if !lost.is_empty() {
+            decisions.push((tag, lost));
+        }
+    }
+    for (tag, lost) in &decisions {
+        let step = cfg
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == *tag)
+            .expect("decided on a step of this cfg");
+        step.labels.retain(|label| !lost.contains(label));
+    }
+    decisions
 }
 
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
@@ -7532,6 +7634,263 @@ sys.exit(37)
         assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
     }
 
+    fn labelled_step(tag: &str, labels: &[&str], deps: &[&str]) -> Step {
+        let (group, job) = tag.split_once('.').unwrap();
+        let text = format!(
+            r#"{{"description":"","steps":[{{"group":"{group}","job":"{job}","cmd":"true","labels":{},"timeout":1,"cpu_timeout":1,"hint":{{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}}}]}}"#,
+            serde_json::to_string(labels).unwrap()
+        );
+        let mut step = dag_from_json(&text).unwrap().steps.remove(0);
+        // Set after parsing: a one-step DAG refuses a dependency it lacks.
+        step.deps = deps
+            .iter()
+            .map(|dependency| dependency.to_string())
+            .collect();
+        step
+    }
+
+    fn labels_of<'a>(cfg: &'a DagConfig, tag: &str) -> &'a [String] {
+        &cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .unwrap_or_else(|| panic!("{tag} is missing"))
+            .labels
+    }
+
+    /// dh-63c2n3: a host copy of a guest build leaves exactly the local labels
+    /// its pinned-root twin serves without a consumer of the copy, label by
+    /// label, and nothing outside that class is retired.
+    #[test]
+    fn host_guest_builds_retire_per_label_only_where_the_twin_serves() {
+        // No twin: the host copy is the only producer and keeps every label.
+        let mut alone = DagConfig {
+            steps: vec![labelled_step(
+                "build.manifest_guests",
+                &["full", "hosted-portable", "portable"],
+                &[],
+            )],
+            ..Default::default()
+        };
+        assert!(retire_host_guest_builds_when_twin_present(&mut alone).is_empty());
+        assert_eq!(
+            labels_of(&alone, "build.manifest_guests"),
+            ["full", "hosted-portable", "portable"]
+        );
+
+        // The committed shape: the twin serves full and portable, only hosted
+        // buckets consume the host copy, and a leaf check with a twin-named
+        // sibling and no consumers sits beside them.
+        let committed_shape = || DagConfig {
+            steps: vec![
+                labelled_step(
+                    "build.manifest_guests",
+                    &["full", "hosted-portable", "portable"],
+                    &[],
+                ),
+                labelled_step(
+                    "build.manifest_guests_in_pinned_root",
+                    &["full", "portable"],
+                    &[],
+                ),
+                labelled_step(
+                    "e2e.manifest_x",
+                    &["full", "portable"],
+                    &["build.manifest_guests_in_pinned_root"],
+                ),
+                labelled_step(
+                    "e2e.manifest_x_on_host",
+                    &["hosted-portable"],
+                    &["build.manifest_guests"],
+                ),
+                labelled_step(
+                    "privileged-build.manifest_guests",
+                    &["full", "privileged"],
+                    &[],
+                ),
+                labelled_step(
+                    "privileged-build.manifest_guests_in_pinned_root",
+                    &["full", "privileged"],
+                    &[],
+                ),
+                labelled_step("check.leaf", &["full", "portable"], &[]),
+                labelled_step("check.leaf_in_pinned_root", &["full", "portable"], &[]),
+            ],
+            ..Default::default()
+        };
+        let mut cfg = committed_shape();
+        let lost = retire_host_guest_builds_when_twin_present(&mut cfg)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            lost,
+            BTreeMap::from([
+                (
+                    "build.manifest_guests".to_string(),
+                    vec!["full".to_string(), "portable".to_string()]
+                ),
+                (
+                    "privileged-build.manifest_guests".to_string(),
+                    vec!["full".to_string(), "privileged".to_string()]
+                ),
+            ])
+        );
+        // hosted-portable is never stripped: no twin exists in that selection.
+        assert_eq!(
+            labels_of(&cfg, "build.manifest_guests"),
+            ["hosted-portable"]
+        );
+        // Retired, not removed: the frozen source population keeps the node.
+        assert!(labels_of(&cfg, "privileged-build.manifest_guests").is_empty());
+        // RED CONTROL: a leaf check with no consumers and a twin-named
+        // sibling is outside the class and keeps every label.
+        assert_eq!(labels_of(&cfg, "check.leaf"), ["full", "portable"]);
+        assert_eq!(
+            labels_of(&cfg, "build.manifest_guests_in_pinned_root"),
+            ["full", "portable"]
+        );
+
+        // Per label: a portable consumer of the host copy keeps portable, and
+        // full, where nothing consumes the copy, is still left.
+        let mut consumed = committed_shape();
+        consumed.steps.push(labelled_step(
+            "check.reads_host_guests",
+            &["portable"],
+            &["build.manifest_guests"],
+        ));
+        let lost = retire_host_guest_builds_when_twin_present(&mut consumed);
+        assert!(
+            lost.contains(&(
+                "build.manifest_guests".to_string(),
+                vec!["full".to_string()]
+            )),
+            "{lost:?}"
+        );
+        assert_eq!(
+            labels_of(&consumed, "build.manifest_guests"),
+            ["hosted-portable", "portable"]
+        );
+    }
+
+    /// dh-63c2n3, by name: on the committed DAG, the guest-build retirement
+    /// strips exactly build.manifest_guests of full and portable and
+    /// privileged-build.manifest_guests of full and privileged. A change to
+    /// the class cannot swap in a different node at the same count. The
+    /// issue-4997 fixtures retirement is pinned separately
+    /// (host_fixtures_retire_only_when_pinned_twin_present).
+    #[test]
+    fn committed_host_guest_builds_lose_exactly_the_pinned_labels() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        // The committed labels after generation.
+        for (tag, labels) in [
+            ("build.manifest_guests", &["hosted-portable"][..]),
+            ("privileged-build.manifest_guests", &[][..]),
+            (
+                "build.manifest_guests_in_pinned_root",
+                &["full", "portable"][..],
+            ),
+            (
+                "privileged-build.manifest_guests_in_pinned_root",
+                &["full", "privileged"][..],
+            ),
+            (
+                "privileged-build.manifest_guests_on_host",
+                &["hosted-privileged"][..],
+            ),
+        ] {
+            assert_eq!(labels_of(&committed, tag), labels, "{tag}");
+        }
+        // Restore every host copy of a pinned-root producer to its authored
+        // labels, then retire again: exactly the pinned set comes back.
+        let authored = crate::validation_dag_static::config()
+            .steps
+            .into_iter()
+            .map(|step| (step.tag(), step.labels))
+            .collect::<BTreeMap<_, _>>();
+        let tags = committed
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        let mut restored = committed.clone();
+        let mut restored_copies = 0;
+        for step in &mut restored.steps {
+            let tag = step.tag();
+            if is_hosted_variant(step)
+                || step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+                || !tags.contains(&pinned_root_twin_tag(&tag))
+            {
+                continue;
+            }
+            if let Some(labels) = authored.get(&tag) {
+                step.labels = labels.clone();
+                restored_copies += 1;
+            }
+        }
+        assert!(restored_copies > 0, "no host copy was restored");
+        let lost = retire_host_guest_builds_when_twin_present(&mut restored)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let expected = BTreeMap::from([
+            (
+                "build.manifest_guests".to_string(),
+                vec!["full".to_string(), "portable".to_string()],
+            ),
+            (
+                "privileged-build.manifest_guests".to_string(),
+                vec!["full".to_string(), "privileged".to_string()],
+            ),
+        ]);
+        assert_eq!(lost, expected);
+        assert_eq!(
+            labels_of(&restored, "build.manifest_guests"),
+            ["hosted-portable"]
+        );
+    }
+
+    /// Closure criterion 1 of dh-63c2n3: the cargo `full`, `portable` and
+    /// `privileged` label selections run no host `test-harness build` node,
+    /// and each lane's one build there is its pinned-root twin.
+    #[test]
+    fn local_label_selections_build_guests_only_in_the_pinned_root() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        for (label, lanes) in [
+            ("full", &["portable", "privileged"][..]),
+            ("portable", &["portable"][..]),
+            ("privileged", &["privileged"][..]),
+        ] {
+            let selected = select_steps_by_labels(&committed, &[label.to_string()]).unwrap();
+            let host_builds = selected
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.cmd.contains("test-harness build")
+                        && !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                })
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            assert!(
+                host_builds.is_empty(),
+                "{label} runs host guest builds {host_builds:?}"
+            );
+            let mut builds = selected
+                .steps
+                .iter()
+                .filter(|step| step.cmd.contains("test-harness build --lane "))
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            builds.sort();
+            let mut expected = lanes
+                .iter()
+                .map(|lane| match *lane {
+                    "portable" => "build.manifest_guests_in_pinned_root".to_string(),
+                    _ => "privileged-build.manifest_guests_in_pinned_root".to_string(),
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(builds, expected, "{label}");
+        }
+    }
+
     #[test]
     fn pressure_labels_mark_exactly_the_named_super_nodes() {
         // Synthetic: every named node present and super-labelled is
@@ -9906,6 +10265,10 @@ sys.exit(37)
         // and 101 since the host fixtures route through build.host_hermit_link
         // and the retired base producers stay retired (104 full nodes), and
         // 102 with privileged-test.deadline_slice_cap_kvm (105 full nodes).
+        // 100 since the host copies of the guest builds, build.manifest_guests
+        // and privileged-build.manifest_guests, left full (103 full nodes;
+        // dh-63c2n3): the Buck selection never replaced them, so it loses
+        // the same two nodes full does.
         // build.reverie_buck (M2) is a post-split extension node, not a
         // frozen core tag, so it is filtered from `expected` by is_core and
         // must not appear in the Buck selection population either.
@@ -9921,7 +10284,7 @@ sys.exit(37)
             .cloned()
             .chain(original_buck)
             .collect::<BTreeSet<_>>();
-        assert_eq!(original.len(), 102);
+        assert_eq!(original.len(), 100);
         let mut expected = original
             .into_iter()
             .filter(|tag| crate::dag_source_ownership::is_core(tag))
