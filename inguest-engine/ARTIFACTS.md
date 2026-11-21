@@ -26,7 +26,7 @@ install` with all of these required arguments:
 | Argument | Required input |
 | --- | --- |
 | `--hermit-revision` | The current committed 40-character core Hermit HEAD |
-| `--reverie-revision` | Its exact Reverie gitlink and all four engine dependency revisions |
+| `--reverie-revision` | Its exact Reverie gitlink; the four workspace Reverie dependencies resolve by path inside that submodule |
 | `--cargo-events` | The completed normal build's raw Cargo JSON stream |
 | `--cargo-metadata` | Completed locked/offline metadata for that source and target |
 | `--target-dir` | The same declared target directory used by both Cargo commands |
@@ -61,7 +61,8 @@ TLS ownership and genuine loader behavior. A different DSO per generic backend
 does not satisfy the common-engine boundary. Private initial/successor/native
 issuers and measured-source finalizers remain separate and unqualified here.
 
-`tests/test_artifact.py` contains seven authored producer format/custody controls.
+`tests/test_artifact.py` contains ten authored producer format/custody controls,
+run by `make lint-check-engine-artifact-producer` (part of `lint-checks`).
 They do not compile or load their small file fixtures. The seven Rust
 `loader_state` controls and the four core Reverie root-dispatch controls also
 require actual execution at final signed source revisions. None has been run

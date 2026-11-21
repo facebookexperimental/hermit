@@ -255,6 +255,7 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
     lint-check-guest-preload-gate \
+    lint-check-engine-artifact-producer \
     lint-check-core-build \
     lint-check-conformance-test-counts \
     lint-check-recount-pins \
@@ -461,6 +462,9 @@ lint-check-buck-e2e-stages:
 lint-check-guest-preload-gate:
 	python3 ./ci/test_guest_preload_gate.py
 	python3 ./ci/test_packaged_detcore.py
+
+lint-check-engine-artifact-producer:
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s inguest-engine/tests -p 'test_*.py'
 
 lint-check-core-build:
 	./ci/run-with-core-build-test.sh

@@ -127,6 +127,56 @@ def one(rows: list, message: str):
     return rows[0]
 
 
+# The engine's Reverie dependencies after the path-depend change: the
+# engine manifest selects them with workspace=true, and the workspace
+# root resolves each to a path inside the reverie submodule. There is
+# no rev key anywhere; the gitlink check in install() pins the tree.
+REVERIE_WORKSPACE_DEPS = {
+    "reverie-core": "reverie/reverie",
+    "reverie-inguest": "reverie/reverie-inguest",
+    "reverie-liteinst": "reverie/reverie-liteinst",
+    "reverie-rpc-transport": "reverie/reverie-rpc-transport",
+}
+
+
+def require_compiled_path_dependency(dependency: dict, name: str, root: Path) -> Path:
+    """Require one compiled Reverie package to be the exact submodule path.
+
+    Path dependencies carry no registry/git source; provenance is the
+    compiled package's manifest being exactly the workspace-declared
+    path inside the reverie submodule (whose gitlink and committed
+    tree `install` checks against the requested revision). A manifest
+    merely somewhere under the submodule is not the declared package.
+    """
+    require(dependency.get("source") is None,
+            f"compiled core package is not a path dependency: {name}")
+    manifest = Path(dependency["manifest_path"]).resolve()
+    expected = (root / REVERIE_WORKSPACE_DEPS[name] / "Cargo.toml").resolve()
+    require(manifest == expected,
+            f"compiled core package manifest is not its submodule path: {name}")
+    return manifest.parent
+
+
+def require_workspace_reverie_deps(engine_manifest: dict, workspace_manifest: dict) -> None:
+    """Require the workspace/path dependency layout for Reverie.
+
+    The engine manifest must select each dependency through the
+    workspace, and the workspace must resolve it to its path inside
+    the reverie submodule. Anything else (a rev/git pin, a renamed
+    path, a direct dependency) is a different provenance than the
+    gitlink the installer checks.
+    """
+    workspace_deps = workspace_manifest.get("workspace", {}).get("dependencies", {})
+    for name, path in REVERIE_WORKSPACE_DEPS.items():
+        selected = engine_manifest.get("dependencies", {}).get(name)
+        require(isinstance(selected, dict) and selected.get("workspace") is True,
+                f"engine dependency is not workspace-selected: {name}")
+        resolved = workspace_deps.get(name)
+        require(isinstance(resolved, dict) and resolved.get("path") == path
+                and "rev" not in resolved and "git" not in resolved,
+                f"engine dependency pin mismatch: {name}")
+
+
 def select_engine(records: list[dict], metadata: dict, root: Path) -> tuple[dict, dict]:
     package = one([p for p in metadata["packages"]
                    if p["name"] == "hermit-inguest-engine"
@@ -197,11 +247,17 @@ def install(args) -> None:
             "uncommitted engine package sources cannot be labelled with HEAD")
     require(git(root, "rev-parse", "HEAD:reverie") == r,
             "core Reverie gitlink differs from requested engine source")
+    # Tracked-byte checks (git diff) do not see untracked files, which
+    # Cargo would happily compile: refuse them inside the submodule.
+    # Only committed per-directory .gitignore rules may hide a file;
+    # local excludes (info/exclude, global) may not.
+    require(not git(root / "reverie", "ls-files", "--others",
+                    "--exclude-per-directory=.gitignore", "--"),
+            "uncommitted Reverie submodule sources cannot be labelled with HEAD")
     manifest_path = root / "inguest-engine/Cargo.toml"
     source_manifest = tomllib.loads(manifest_path.read_text())
-    for name in ("reverie", "reverie-inguest", "reverie-liteinst"):
-        require(source_manifest["dependencies"][name]["rev"] == r,
-                f"engine dependency pin mismatch: {name}")
+    workspace_manifest = tomllib.loads((root / "Cargo.toml").read_text())
+    require_workspace_reverie_deps(source_manifest, workspace_manifest)
     metadata_path = Path(args.cargo_metadata).resolve(strict=True)
     event_path = Path(args.cargo_events).resolve(strict=True)
     metadata_bytes = read_record(metadata_path)
@@ -221,12 +277,10 @@ def install(args) -> None:
                   "engine build must contain one concrete Detcore package")
     require(Path(detcore["manifest_path"]).resolve() == root / "detcore/Cargo.toml",
             "Detcore is not the same source workspace as the engine")
-    for name in ("reverie-core", "reverie-inguest", "reverie-liteinst"):
+    for name in REVERIE_WORKSPACE_DEPS:
         dependency = one([packages[p] for p in ids if packages[p]["name"] == name],
                          f"engine build must contain one {name} package")
-        require((dependency.get("source") or "").endswith("#" + r),
-                f"actual compiled core revision mismatch: {name}")
-        dependency_root = Path(dependency["manifest_path"]).resolve().parent
+        dependency_root = require_compiled_path_dependency(dependency, name, root)
         committed_source(dependency_root, r)
     target = Path(args.target_dir).resolve(strict=True)
     require(Path(metadata["target_directory"]).resolve() == target,
