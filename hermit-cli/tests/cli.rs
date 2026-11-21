@@ -341,6 +341,7 @@ static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SELFCHECK_SYSCALL_DENSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SYSCALL_SLICE_END_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3673,6 +3674,36 @@ fn replay_epoch_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "replay-epoch probe compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Three threads issuing short syscalls in a tight loop; see
+/// `tests/c/selfcheck_syscall_dense.c`.
+fn selfcheck_syscall_dense_guest() -> &'static Path {
+    SELFCHECK_SYSCALL_DENSE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("selfcheck-syscall-dense");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create selfcheck-syscall-dense build directory");
+        let guest = build_root.join("selfcheck_syscall_dense");
+        let output = Command::new("cc")
+            .args([
+                "-O1", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            ])
+            .arg(repository.join("tests/c/selfcheck_syscall_dense.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the selfcheck syscall-dense guest");
+        assert!(
+            output.status.success(),
+            "selfcheck syscall-dense guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -31592,6 +31623,177 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
             .filter(|line| line.starts_with("sample "))
             .count(),
         8
+    );
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4496>: `analyze --selfcheck`
+/// aborted with "Log differences found" on a faithful preemption replay,
+/// because slice ends the recording took at syscall post-hooks manifested
+/// as precise-timer stops in the replay, each logging an extra
+/// (pre)/(post) register pair. Callback-checkpoint replay ends each
+/// slice at the callback the recording ended it at, so this
+/// record/replay pair — selfcheck's own two steps, with selfcheck's own
+/// comparison, on a syscall-dense guest whose recording ends slices at
+/// syscall post-hooks — agrees, while a replay of a genuinely different
+/// execution still diffs.
+///
+/// PMU SUBJECT: like the recorded-epoch case above, chaos preemption
+/// points come from the PMU timer, so without a PMU the recording has
+/// none and this case proves nothing; it belongs with the PMU cli cases.
+#[test]
+fn run_chaos_preemption_replay_selfcheck_log_diff_agrees() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("selfcheck-preemptions.json");
+    let guest = selfcheck_syscall_dense_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+
+    // Each run writes its compared log with --log-file: stderr also
+    // carries hermit's untagged notices, which log-diff refuses.
+    let run = |label: &str, mode_args: &[&str], log_file: &Path, iterations: &str| {
+        let mut args: Vec<String> = [
+            "--log=debug".to_string(),
+            format!("--log-file={}", log_file.display()),
+            "run".to_string(),
+            "--base-env=minimal".to_string(),
+            "--chaos".to_string(),
+            "--seed=5".to_string(),
+            "--max-timeslice=10000".to_string(),
+            "--epoch=2000-12-31T23:59:59.123456789Z".to_string(),
+        ]
+        .to_vec();
+        args.extend(mode_args.iter().map(|arg| arg.to_string()));
+        args.push("--".to_string());
+        args.push(guest.to_string());
+        args.push(iterations.to_string());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = hermit_test::hermit_output(
+            label,
+            hermit_command(&arg_refs)
+                .env_remove("HERMIT_EPOCH")
+                .stdin(Stdio::null()),
+        );
+        (args, output)
+    };
+    fn arg_refs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    let recording_log = directory.path().join("recording.log");
+    let (recording_args, recorded) = run("selfcheck record", &[&record_arg], &recording_log, "300");
+    assert_success(&recorded, &arg_refs(&recording_args));
+
+    // The premise: real preemption points to replay.
+    let json = hermit_test::recorded_preemption_json(&record);
+    let ends: usize = json["per_thread"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|thread| thread["prio_changes"].as_array().unwrap().len())
+        .sum();
+    assert!(
+        ends > 0,
+        "the chaos recording has no preemption points, so this case cannot \
+         reach the replayed-timeslice path: {json}"
+    );
+
+    // The premise: the recording ended slices at syscall post-hooks,
+    // the shape whose replay used to stop on the timer instead and log
+    // an extra register pair per end.
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    let checkpoints = &raw["rcb_history"]["recording"]["callback_checkpoints"];
+    let posthook_ends = checkpoints
+        .as_object()
+        .map(|threads| {
+            threads
+                .values()
+                .flat_map(|points| points.as_array().unwrap())
+                .filter(|point| {
+                    point["origin"]["site"] == "Posthook"
+                        && point["origin"]["callback"].get("Syscall").is_some()
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        posthook_ends > 0,
+        "the recording ended no slice at a syscall post-hook, so this case \
+         cannot reach the reported shape: {raw}"
+    );
+
+    // Like selfcheck, the replay re-records its preemptions so the
+    // fixed point can be checked below.
+    let rerecorded = directory.path().join("selfcheck-preemptions-replayed.json");
+    let rerecord_arg = format!("--record-preemptions-to={}", rerecorded.display());
+    let replay_log = directory.path().join("replay.log");
+    let (replay_args, replayed) = run(
+        "selfcheck replay",
+        &[&replay_arg, &rerecord_arg],
+        &replay_log,
+        "300",
+    );
+    assert_success(&replayed, &arg_refs(&replay_args));
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+
+    // Selfcheck's fixed point: the replay re-recorded the preemptions
+    // it followed.
+    let replayed_json = hermit_test::recorded_preemption_json(&rerecorded);
+    for (tid, thread) in json["per_thread"].as_object().unwrap() {
+        let replayed_thread = &replayed_json["per_thread"][tid];
+        assert_eq!(
+            thread["prio_changes"], replayed_thread["prio_changes"],
+            "thread {tid} priority changes differ after replay"
+        );
+        assert_eq!(
+            thread["preemption_rcbs"], replayed_thread["preemption_rcbs"],
+            "thread {tid} preemption branch counts differ after replay"
+        );
+    }
+
+    let recording_log = recording_log.to_str().unwrap();
+    let replay_log = replay_log.to_str().unwrap();
+
+    // Selfcheck's own comparison: deterministic subset, seed lines ignored.
+    let faithful_args = [
+        "log-diff",
+        "--ignore-lines=CHAOSRAND",
+        "--ignore-lines=SCHEDRAND",
+        recording_log,
+        replay_log,
+    ];
+    let faithful = hermit_test::hermit_output(
+        "selfcheck log-diff faithful",
+        hermit_command(&faithful_args).stdin(Stdio::null()),
+    );
+    assert_success(&faithful, &faithful_args);
+
+    // The bar stays: replaying the record against a different execution
+    // (one more iteration per thread) still diffs.
+    let diverged_log = directory.path().join("diverged.log");
+    let (_diverged_args, _diverged) = run(
+        "selfcheck diverged replay",
+        &[&replay_arg],
+        &diverged_log,
+        "301",
+    );
+    let diverged_log = diverged_log.to_str().unwrap();
+    let diverged_args = [
+        "log-diff",
+        "--ignore-lines=CHAOSRAND",
+        "--ignore-lines=SCHEDRAND",
+        recording_log,
+        diverged_log,
+    ];
+    let diverged_diff = hermit_test::hermit_output(
+        "selfcheck log-diff diverged",
+        hermit_command(&diverged_args).stdin(Stdio::null()),
+    );
+    assert_eq!(
+        diverged_diff.status.code(),
+        Some(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT),
+        "a diverged replay must still fail the comparison:\n{}",
+        stderr(&diverged_diff)
     );
 }
 

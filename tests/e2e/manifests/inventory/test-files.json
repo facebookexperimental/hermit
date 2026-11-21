@@ -2881,6 +2881,12 @@
       "why": "tests/c/self_signal_death_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of processes that end themselves with a signal they send themselves (abort, raise, kill, tgkill and tkill of their own process or thread), requires both in-guest LiteInst backends to verify the forking mode with Linux's output and no recorded determinism loss, and requires a root that aborts to end the run with its own status; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts."
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/selfcheck_syscall_dense.c",
+      "runner": "cargo test -p hermit-run --test cli",
+      "why": "tests/c/selfcheck_syscall_dense.c is compiled and exercised by hermit-cli/tests/cli.rs: run_chaos_preemption_replay_selfcheck_log_diff_agrees records this syscall-dense three-thread guest under --chaos, requires slice ends taken at syscall post-hooks among its callback checkpoints, replays the record, and requires hermit analyze --selfcheck's own log comparison to agree while a replay of a different iteration count still diffs; it is the regression guard for the faithful-replay \"Log differences found\" abort (https://github.com/rrnewton/hermit/issues/4496), fixed at the source by callback-checkpoint replay, and a manifest cell cannot express the record/replay/log-diff sequence (PMU hosts, privileged-test.pmu_cli_cases)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/sendfile_copy.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -3088,6 +3088,48 @@ mod test {
         Ok(())
     }
 
+    /// Selfcheck's bar, pinned at the comparator: a replay that stops
+    /// on its timer where the recording took the slice end at a syscall
+    /// post-hook logs an extra register pair, and the deterministic
+    /// comparison must keep reporting that as a difference. Relaxing
+    /// the comparison to ignore such records (the refused fix for
+    /// rrnewton/hermit issue 4496) turns this test red.
+    #[test]
+    fn deterministic_comparison_reports_an_extra_register_pair() -> std::io::Result<()> {
+        let syscall = |second: usize| {
+            structured_record(
+                second,
+                "DETLOG [syscall] finish syscall #1: write = Ok(1)",
+                DetLogEvent::SyscallResult {
+                    finished_syscall_number: 1,
+                },
+            )
+        };
+        let recording = syscall(1);
+        let replay = format!(
+            "{}{}{}",
+            structured_record(
+                1,
+                "DETLOG (pre) registers [dtid 2][rcbs 10]. rax=0",
+                DetLogEvent::Other,
+            ),
+            syscall(2),
+            structured_record(
+                3,
+                "DETLOG (post) registers [dtid 2][rcbs 10]. rax=0",
+                DetLogEvent::Other,
+            ),
+        );
+        let summary = super::log_diff_summary_from_strs(
+            recording,
+            replay,
+            &super::LogDiffOpts::default(),
+            &mut Vec::new(),
+        )?;
+        assert!(summary.diff_found, "{summary:?}");
+        Ok(())
+    }
+
     #[test]
     fn current_verification_refuses_a_missing_structured_record_by_name() {
         let options = super::LogDiffOpts {

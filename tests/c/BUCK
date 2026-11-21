@@ -151,6 +151,12 @@ cpp_binary(
 )
 
 cpp_binary(
+    name = "selfcheck_syscall_dense",
+    srcs = ["selfcheck_syscall_dense.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
     name = "fair_continuation",
     srcs = ["fair_continuation.c"],
     labels = ["autodeps2_generated"],
