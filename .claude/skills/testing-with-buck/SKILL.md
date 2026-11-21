@@ -3,7 +3,7 @@ name: testing-with-buck
 description: "Apply testing-principles in Buck terms: timeouts that say wall or CPU, capped parallelism, memory-boxed steps and host admission, load-abort guard, local versus remote execution, third-party version sync with Cargo. Use when defining or reviewing Buck test targets or CI that runs them. The principles are testing-principles; Buck command mechanics belong to the platform docs."
 ---
 
-<!-- Generated from agent-utils c5fc623db64cecc2cd3ea949a6a70fa216ad896f skills/testing-with-buck/SKILL.md; do not edit. Change it in agent-utils, then run scripts/import-agent-utils-skills.rs. -->
+<!-- Generated from agent-utils 2ef1a9e49bfd9b6c3f1cb6001bdf8af35776790a skills/testing-with-buck/SKILL.md; do not edit. Change it in agent-utils, then run scripts/import-agent-utils-skills.rs. -->
 
 # Testing with Buck
 

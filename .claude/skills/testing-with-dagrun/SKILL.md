@@ -3,7 +3,7 @@ name: testing-with-dagrun
 description: "Apply testing-principles with dagrun: per-step CPU budgets and wall backstops, memory boxing and admission caps, named resources and innermost retries, reading results by test id, plus the Cargo/nextest profile settings (CPU caps, retries=2 with FLAKY recording, fail-fast, build boxing). Use when defining or reviewing a dagrun validation graph or a nextest profile. How to run DAGs is the dagrun skill; the principles are testing-principles."
 ---
 
-<!-- Generated from agent-utils c5fc623db64cecc2cd3ea949a6a70fa216ad896f skills/testing-with-dagrun/SKILL.md; do not edit. Change it in agent-utils, then run scripts/import-agent-utils-skills.rs. -->
+<!-- Generated from agent-utils 2ef1a9e49bfd9b6c3f1cb6001bdf8af35776790a skills/testing-with-dagrun/SKILL.md; do not edit. Change it in agent-utils, then run scripts/import-agent-utils-skills.rs. -->
 
 # Testing with dagrun
 
