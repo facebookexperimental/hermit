@@ -3269,6 +3269,205 @@
         }
       ]
     },
+    "mmap": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1783,
+          "hash": "9ba3cb0215d1a900",
+          "id": "c1",
+          "last": 1783,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 300,
+          "hash": "96c3201b9ad6b7b1",
+          "id": "c10",
+          "last": 339,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 347,
+          "hash": "afe5ae8855f12cff",
+          "id": "c10",
+          "last": 376,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 8607,
+          "hash": "09fe6fd9f19ff909",
+          "id": "c11",
+          "last": 8668,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 6409,
+          "hash": "c47afc9febed6193",
+          "id": "c12",
+          "last": 6448,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 6528,
+          "hash": "bac18f0a286992b9",
+          "id": "c13",
+          "last": 6558,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 6326,
+          "hash": "ef25f6dc02dbcf58",
+          "id": "c14",
+          "last": 6358,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 989,
+          "hash": "a333e4d685da6afa",
+          "id": "c15",
+          "last": 1001,
+          "path": "detcore/src/syscalls/files/flock_model.rs"
+        },
+        {
+          "first": 890,
+          "hash": "dbdd2cec965f760a",
+          "id": "c16",
+          "last": 926,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 1536,
+          "hash": "374ab6c0291202c5",
+          "id": "c18",
+          "last": 1565,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1284,
+          "hash": "019329870b1fb330",
+          "id": "c19",
+          "last": 1293,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 8175,
+          "hash": "475efc87e4ac643a",
+          "id": "c2",
+          "last": 8175,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 274,
+          "hash": "633df41bd0e3dd3e",
+          "id": "c20",
+          "last": 297,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 20,
+          "hash": "c1a24d0561d0e16b",
+          "id": "c21",
+          "last": 29,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 679,
+          "hash": "955eb4fdd2177c91",
+          "id": "c22",
+          "last": 690,
+          "path": "detcore/src/syscalls/network_trace.rs"
+        },
+        {
+          "first": 1009,
+          "hash": "1a62ebbe38a5d3f8",
+          "id": "c22",
+          "last": 1019,
+          "path": "detcore/src/syscalls/network_trace.rs"
+        },
+        {
+          "first": 2089,
+          "hash": "a12c16f751491cae",
+          "id": "c22",
+          "last": 2112,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 7582,
+          "hash": "a1b2d802cfbacd53",
+          "id": "c22",
+          "last": 7584,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 13072,
+          "hash": "a8bcddf08d2a031b",
+          "id": "c3",
+          "last": 13096,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 13097,
+          "hash": "9d470d3d03726547",
+          "id": "c4",
+          "last": 13104,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 13105,
+          "hash": "afb310f01ab8b8ca",
+          "id": "c5",
+          "last": 13121,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 13122,
+          "hash": "40dec1230f74b498",
+          "id": "c6",
+          "last": 13128,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 196,
+          "hash": "b68f14b37346fca5",
+          "id": "c7",
+          "last": 209,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 211,
+          "hash": "32e253a8ed6daadb",
+          "id": "c8",
+          "last": 239,
+          "path": "detcore/src/memory.rs"
+        },
+        {
+          "first": 259,
+          "hash": "6c8ba16f9fb68256",
+          "id": "c9",
+          "last": 272,
+          "path": "detcore/src/memory.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EBADF",
+        "EINVAL",
+        "ENOSYS",
+        "EOPNOTSUPP",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "file_mappings_alias_by_backing_offset",
+            "a_store_shares_backing_unless_its_page_is_proven_private",
+            "forked_anonymous_mapping_retains_identity",
+            "unmap_and_remap_preserve_only_live_aliases",
+            "a_dontunmap_remap_keeps_both_aliases_of_the_object"
+          ],
+          "path": "detcore/src/memory.rs"
+        }
+      ]
+    },
     "mprotect": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
