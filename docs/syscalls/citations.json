@@ -5686,6 +5686,240 @@
         }
       ]
     },
+    "recvmsg": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1863,
+          "hash": "a6ddc832cf3bb217",
+          "id": "c1",
+          "last": 1863,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1729,
+          "hash": "a871c952f5f74aed",
+          "id": "c10",
+          "last": 1745,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 1869,
+          "hash": "b74f37b83fb07342",
+          "id": "c11",
+          "last": 1935,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 1105,
+          "hash": "c1889f533f94d449",
+          "id": "c12",
+          "last": 1133,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 1134,
+          "hash": "03286d1ec627e93c",
+          "id": "c13",
+          "last": 1180,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 6385,
+          "hash": "39600bef7be32b8b",
+          "id": "c14",
+          "last": 6405,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 4771,
+          "hash": "ab2c4ee67470b41c",
+          "id": "c15",
+          "last": 4830,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 5995,
+          "hash": "34e13aec297c022e",
+          "id": "c16",
+          "last": 6005,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 3199,
+          "hash": "82f5318c4015d8e2",
+          "id": "c17",
+          "last": 3215,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 660,
+          "hash": "03c32e94cef27a75",
+          "id": "c18",
+          "last": 685,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 620,
+          "hash": "4027219d1155fa8f",
+          "id": "c19",
+          "last": 712,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 8539,
+          "hash": "181d07c7ac66177e",
+          "id": "c2",
+          "last": 8541,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 4550,
+          "hash": "2a6623828c5cc366",
+          "id": "c20",
+          "last": 4700,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2997,
+          "hash": "122090ff111df191",
+          "id": "c21",
+          "last": 3060,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 9,
+          "hash": "90d35975e50ca9eb",
+          "id": "c22",
+          "last": 60,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 6273,
+          "hash": "e63a895fe2dcb13f",
+          "id": "c23",
+          "last": 6330,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 581,
+          "hash": "8cdeed5a9af16c74",
+          "id": "c24",
+          "last": 593,
+          "path": "detcore/src/sigalrm_phase1.rs"
+        },
+        {
+          "first": 626,
+          "hash": "435669c28b3eba05",
+          "id": "c25",
+          "last": 637,
+          "path": "detcore/src/syscalls/network_trace.rs"
+        },
+        {
+          "first": 529,
+          "hash": "d97c63a34dd3d716",
+          "id": "c26",
+          "last": 557,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 3125,
+          "hash": "d3fea88a8cd03b40",
+          "id": "c27",
+          "last": 3174,
+          "path": "detcore/src/syscalls/scm_rights.rs"
+        },
+        {
+          "first": 856,
+          "hash": "7ce5282bcdd9456c",
+          "id": "c28",
+          "last": 885,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 5924,
+          "hash": "89683d1d476eb66c",
+          "id": "c3",
+          "last": 5990,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 6032,
+          "hash": "2d874dcbafcc7fd5",
+          "id": "c4",
+          "last": 6100,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 6101,
+          "hash": "776bde37d7df5ac7",
+          "id": "c5",
+          "last": 6120,
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "first": 538,
+          "hash": "4d0ae6c00c05ce9f",
+          "id": "c6",
+          "last": 620,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 2823,
+          "hash": "bd657246a0c61b08",
+          "id": "c7",
+          "last": 2847,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 4217,
+          "hash": "d2de3a125cbf66e8",
+          "id": "c8",
+          "last": 4280,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 1538,
+          "hash": "49c50ff4eed6ce14",
+          "id": "c9",
+          "last": 1610,
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EAGAIN",
+        "EBADF",
+        "EFAULT",
+        "EINPROGRESS",
+        "EINTR",
+        "EINVAL",
+        "EOPNOTSUPP",
+        "ERESTARTSYS",
+        "ERRQUEUE",
+        "EWOULDBLOCK",
+        "EXCLUDED",
+        "EXTERNAL"
+      ],
+      "tests": [
+        {
+          "names": [
+            "socket_timestamp_control_messages_use_logical_time",
+            "timestamps_are_canonicalized_only_in_the_control_bytes_written",
+            "truncated_timestamp_payload_prefix_is_rewritten",
+            "timestamping_preserves_populated_source_slots"
+          ],
+          "path": "detcore/src/syscalls/io.rs"
+        },
+        {
+          "names": [
+            "only_msg_dontwait_keeps_a_socket_call_from_waiting",
+            "msg_errqueue_marks_only_a_receive_as_an_error_queue_read",
+            "msg_dontwait_runs_a_call_once_on_a_socket_the_guest_left_blocking"
+          ],
+          "path": "detcore/src/syscalls/helpers.rs"
+        }
+      ]
+    },
     "restart_syscall": {
       "based_on": "7ac736d54e14d3eb8e190ae1849481e5ff41ea1a",
       "citations": [
