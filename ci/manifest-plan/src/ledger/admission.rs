@@ -22,6 +22,24 @@ pub const ADMISSION_CONTEXT_MAX_BYTES: usize = 1024 * 1024;
 /// observed at admission by.
 pub const DISJOINT_MAIN_MAX_DELTA_COMMITS: u64 = 12;
 
+/// The validation-DAG pin nodes an admission context may record a floor
+/// binding for: the nodes that judge the Reverie pin's monotonicity against the
+/// admitted floor. A binding naming any other node is refused.
+///
+/// `check.reverie_pin_bindings` is accepted ahead of the change that creates it
+/// (dh-vb7d73): that change splits the pin check into the safety gate
+/// `pre.reverie_pin` and this bindings leaf and moves the floor to the leaf,
+/// and every reader of admitted rows (this one, built into ci-hub from
+/// dev-hermit's hermit gitlink) must accept the leaf's binding before any run
+/// records one. `pre.reverie_pin` stays accepted for the contexts recorded
+/// before that change.
+pub const ADMISSION_PIN_NODES: [&str; 4] = [
+    "pre.reverie_pin",
+    "pre.reverie_pin_on_host",
+    "check.lint_checks",
+    "check.reverie_pin_bindings",
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionFloorV1 {
@@ -910,10 +928,8 @@ impl AdmissionIdentity<'_> {
         }
         let mut nodes = BTreeSet::new();
         for binding in self.pin_bindings {
-            if !matches!(
-                binding.node.as_str(),
-                "pre.reverie_pin" | "pre.reverie_pin_on_host" | "check.lint_checks"
-            ) || !nodes.insert(&binding.node)
+            if !ADMISSION_PIN_NODES.contains(&binding.node.as_str())
+                || !nodes.insert(&binding.node)
                 || binding.base_sha != f.sha
                 || !admission_hex(&binding.canonical_command_sha256, 64)
                 || !admission_hex(&binding.execution_command_sha256, 64)
@@ -1328,6 +1344,52 @@ mod tests {
             "tree":c.target_tree,"host":c.host,"run_id":c.run_id,"started_at":c.started_at,
             "log_file":"/home/example/work/ignored/validate/exact-run.log",
             "log_identity":c.log_identity,"admission_floor_evidence":e})
+    }
+
+    /// dh-vb7d73, consumer first: a context may bind its floor into exactly the
+    /// floor-bound pin nodes, now including the bindings leaf
+    /// `check.reverie_pin_bindings` that the pin split moves the floor to, in
+    /// both context versions and through the ledger row reader; any other node,
+    /// or a node bound twice, is refused.
+    #[test]
+    fn pin_bindings_name_only_the_floor_bound_pin_nodes() {
+        for node in [
+            "check.reverie_pin_bindings",
+            "pre.reverie_pin",
+            "pre.reverie_pin_on_host",
+            "check.lint_checks",
+        ] {
+            let mut c = context();
+            c.pin_bindings[0].node = node.into();
+            c.validate()
+                .unwrap_or_else(|error| panic!("{node}: {error}"));
+            let mut v2 = context_v2();
+            v2.pin_bindings[0].node = node.into();
+            v2.validate()
+                .unwrap_or_else(|error| panic!("{node} (v2): {error}"));
+            let e = evidence_v2(v2);
+            let row: HistoryRow = serde_json::from_value(row_v2(&e))
+                .unwrap_or_else(|error| panic!("{node} (row): {error}"));
+            assert_eq!(
+                row.admission_evidence()
+                    .unwrap_or_else(|error| panic!("{node} (row evidence): {error}")),
+                Some(AdmissionEvidence::V2(e))
+            );
+        }
+        assert_eq!(
+            ADMISSION_PIN_NODES.len(),
+            4,
+            "a new floor-bound pin node is a reader change of its own"
+        );
+        for node in ["test.other", "check.reverie_pin_bindings_on_host", ""] {
+            let mut other = context();
+            other.pin_bindings[0].node = node.into();
+            assert!(other.validate().is_err(), "{node:?}");
+        }
+        let mut twice = context();
+        twice.pin_bindings[0].node = "check.reverie_pin_bindings".into();
+        twice.pin_bindings.push(twice.pin_bindings[0].clone());
+        assert!(twice.validate().is_err());
     }
 
     #[test]
