@@ -1506,6 +1506,335 @@
         }
       ]
     },
+    "fcntl": {
+      "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
+      "citations": [
+        {
+          "first": 1680,
+          "hash": "68bec0725fb46eaf",
+          "id": "c1",
+          "last": 1680,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 1536,
+          "hash": "374ab6c0291202c5",
+          "id": "c10",
+          "last": 1565,
+          "path": "detcore/src/syscall_classification.rs"
+        },
+        {
+          "first": 471,
+          "hash": "a8f8201e3ba1b826",
+          "id": "c15",
+          "last": 500,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 497,
+          "hash": "1f7d5505581db978",
+          "id": "c16",
+          "last": 500,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 657,
+          "hash": "ada5ab4714beeeae",
+          "id": "c17",
+          "last": 667,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 2202,
+          "hash": "81ad33c00c2299f5",
+          "id": "c18",
+          "last": 2216,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14039,
+          "hash": "1ad071722a9b83ef",
+          "id": "c19",
+          "last": 14058,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8198,
+          "hash": "eaf689c9cdb579d7",
+          "id": "c2",
+          "last": 8198,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 15157,
+          "hash": "2e070497b238ce11",
+          "id": "c20",
+          "last": 15210,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 15447,
+          "hash": "fc197b24e672cbf3",
+          "id": "c21",
+          "last": 15495,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 15253,
+          "hash": "7db1cd85736e5125",
+          "id": "c22",
+          "last": 15300,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 15125,
+          "hash": "79c37dd7b84ca366",
+          "id": "c23",
+          "last": 15150,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 15649,
+          "hash": "0bbaabdc4bbbc0bc",
+          "id": "c24",
+          "last": 15665,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14324,
+          "hash": "c3abb836cf34ebf9",
+          "id": "c25",
+          "last": 14331,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14334,
+          "hash": "91cd1378d37e80e9",
+          "id": "c26",
+          "last": 14370,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14760,
+          "hash": "eb422d8dadeeaef2",
+          "id": "c27",
+          "last": 14768,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8086,
+          "hash": "29377978273b081d",
+          "id": "c28",
+          "last": 8093,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8105,
+          "hash": "b67f70675cf5f054",
+          "id": "c28",
+          "last": 8112,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8232,
+          "hash": "9c57c19c25472beb",
+          "id": "c28",
+          "last": 8240,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8329,
+          "hash": "161f13a050e04099",
+          "id": "c28",
+          "last": 8341,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 7469,
+          "hash": "1f43050270141ba1",
+          "id": "c29",
+          "last": 7475,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 87,
+          "hash": "d938a6ccec41a97c",
+          "id": "c29",
+          "last": 93,
+          "path": "detcore/src/sigalrm_phase1.rs"
+        },
+        {
+          "first": 587,
+          "hash": "a57f669c1f312558",
+          "id": "c29",
+          "last": 593,
+          "path": "detcore/src/sigalrm_phase1.rs"
+        },
+        {
+          "first": 14059,
+          "hash": "d8e16e581f44af58",
+          "id": "c3",
+          "last": 14128,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 7502,
+          "hash": "8577dafdc887f65b",
+          "id": "c30",
+          "last": 7505,
+          "path": "detcore/src/lib.rs"
+        },
+        {
+          "first": 999,
+          "hash": "b3fc40bd2b52a9c6",
+          "id": "c30",
+          "last": 1008,
+          "path": "detcore/src/syscalls/files/descriptor_directory.rs"
+        },
+        {
+          "first": 4554,
+          "hash": "67243e4e4b9603fc",
+          "id": "c31",
+          "last": 4565,
+          "path": "detcore/src/syscalls/files/descriptor_directory.rs"
+        },
+        {
+          "first": 4672,
+          "hash": "429a8d108ca84d81",
+          "id": "c31",
+          "last": 4684,
+          "path": "detcore/src/syscalls/files/descriptor_directory.rs"
+        },
+        {
+          "first": 4709,
+          "hash": "8147889afcbc36fa",
+          "id": "c31",
+          "last": 4710,
+          "path": "detcore/src/syscalls/files/descriptor_directory.rs"
+        },
+        {
+          "first": 8305,
+          "hash": "3bfaec4a8b48d2e9",
+          "id": "c32",
+          "last": 8330,
+          "path": "detcore/src/syscalls/files/rendered_procfs.rs"
+        },
+        {
+          "first": 7565,
+          "hash": "a296794ac43afb0b",
+          "id": "c32",
+          "last": 7627,
+          "path": "detcore/src/syscalls/files/rendered_procfs.rs"
+        },
+        {
+          "first": 6338,
+          "hash": "eafbc4d65f9a0e77",
+          "id": "c33",
+          "last": 6365,
+          "path": "detcore/src/syscalls/helpers.rs"
+        },
+        {
+          "first": 8956,
+          "hash": "092073967935083d",
+          "id": "c34",
+          "last": 8967,
+          "path": "detcore/src/tool_local.rs"
+        },
+        {
+          "first": 14395,
+          "hash": "19245f33130100e1",
+          "id": "c34",
+          "last": 14400,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 8138,
+          "hash": "e096702e15580283",
+          "id": "c35",
+          "last": 8165,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 4700,
+          "hash": "9f7496d8cea709d2",
+          "id": "c36",
+          "last": 4709,
+          "path": "detcore/src/syscalls/signal.rs"
+        },
+        {
+          "first": 14129,
+          "hash": "7f4ae6658b8ea6c6",
+          "id": "c4",
+          "last": 14167,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14168,
+          "hash": "cc2be474e9fecbc9",
+          "id": "c5",
+          "last": 14203,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14204,
+          "hash": "ebdff9273758266b",
+          "id": "c6",
+          "last": 14252,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14253,
+          "hash": "a93e47030358582e",
+          "id": "c7",
+          "last": 14276,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14277,
+          "hash": "874f1b19c6822ec3",
+          "id": "c8",
+          "last": 14292,
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "first": 14283,
+          "hash": "b97e37733367e6cf",
+          "id": "c9",
+          "last": 14323,
+          "path": "detcore/src/syscalls/files.rs"
+        }
+      ],
+      "cited_errnos": [
+        "EACCES",
+        "EBADF",
+        "EFAULT",
+        "EINVAL",
+        "ENOLCK",
+        "ENOTDIR",
+        "EOPNOTSUPP",
+        "EPERM",
+        "ESRCH",
+        "EVENTS",
+        "EXIT"
+      ],
+      "tests": [
+        {
+          "names": [
+            "the_pipe_ceiling_admits_exactly_the_pinned_capacity",
+            "host_ceilings_are_refused_identically_on_any_host",
+            "shrinking_is_never_refused_by_the_ceiling",
+            "a_host_pipe_capacity_reads_no_larger_than_the_ceiling"
+          ],
+          "path": "detcore/src/syscalls/files.rs"
+        },
+        {
+          "names": [
+            "async_io_arming_calls_name_their_host_timed_signals"
+          ],
+          "path": "detcore/src/syscalls/files.rs"
+        }
+      ]
+    },
     "fstat": {
       "based_on": "403e350e9e82ee540529f097daccae6a60832d07",
       "citations": [
