@@ -194,8 +194,14 @@ jobs:
         git worktree prune
         git worktree add --detach _pin_source "$pin"
         [[ $(git -C _pin_source rev-parse 'HEAD^{commit}') == "$pin" ]]
+        # Since 22eee878 (2026-11-15) the Hermit workspace path-depends on its
+        # reverie submodule, so cargo doc in the pin needs it checked out.
+        git -C _pin_source submodule update --init --depth 1 -- reverie
     - name: Initialize dagrun submodule
       run: git submodule update --init --depth 1 -- agent-utils
+    - name: Initialize the Reverie submodule
+      # cargo doc on the dispatched commit resolves Reverie path dependencies.
+      run: git submodule update --init --depth 1 -- reverie
     - name: Check nightly source access and pins
       id: website-source
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
@@ -312,6 +318,9 @@ jobs:
         # second into the rebuild step, on the first restored repository.
         git -C _website_source/hermit_test_ledger checkout --quiet --force --detach "$ledger_commit"
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
+        # manifest-metadata resolves the Hermit workspace, whose Reverie crates
+        # are path dependencies in this submodule since 22eee878.
+        git -C _website_source/hermit submodule update --init --depth 1 -- reverie
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
@@ -563,6 +572,10 @@ jobs:
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html
         install -m 0644 docs/site/site.css target/doc/site.css
+        # The per-syscall pages the landing page links as syscalls/
+        # (rendered by scripts/syscall-pages.rs render).
+        rm -rf target/doc/syscalls
+        cp -R docs/site/syscalls target/doc/syscalls
     - name: Add reviewed compatibility website
       # Release assets are checksum-bound handoffs from separately reviewed
       # real-ledger builds. Reconstruct every retained content-addressed path and
