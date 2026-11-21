@@ -404,9 +404,9 @@ fn released(point: &str, release: &Path, each: bool) -> bool {
 /// [`LAUNCHER_HOLD_MARKER`], which only a test makes, and that is decided
 /// first, from that one variable and that one file: an unarmed point reads,
 /// parses and draws nothing else, whatever [`RACE_PROBE_ENV`] says. Armed,
-/// nothing is ignored: [`armed_hold`] must find a complete, valid hold for the
+/// nothing is ignored: `armed_hold` must find a complete, valid hold for the
 /// point, or the visit fails, naming the point and why. The hold fails,
-/// naming the point, if it is not released within [`LAUNCHER_HOLD_LIMIT`].
+/// naming the point, if it is not released within `LAUNCHER_HOLD_LIMIT`.
 pub fn delay_in_launcher(point: &str) {
     launcher_visit(
         launcher_hold_dir(),
