@@ -12,7 +12,7 @@
 //
 // rustc's rule is `UnstableFeatures::from_environment_value` in
 // `compiler/rustc_feature/src/lib.rs` (lines 62-85 at be8e82435e, the
-// commit of the pinned formatter toolchain nightly-2026-07-12):
+// commit of nightly-2026-07-12):
 // - `1`, or a comma-separated list with a token equal to the crate's name,
 //   allows them. Tokens are compared as they are, never trimmed, so
 //   `"other, detcore_testutils"` does not name this crate.

@@ -13,5 +13,13 @@
 # script refuses any other formatter, and its tests check that identity and
 # channel agree (a nightly build, from a commit dated the channel's date or the
 # day before), so bumping one without the other fails in that test.
-channel = "nightly-2026-07-12"
-identity = "rustfmt 1.9.0-nightly (be8e82435e 2026-07-11)"
+#
+# This rustfmt, commit c397dae808, is the build Meta's internal toolchain ships.
+# The internal tree does not format these sources (its rustfmt lint skips them),
+# so this gate is what keeps them formatted; pinning the same build keeps the two
+# sides from disagreeing if the internal tree starts formatting them.
+# nightly-2026-07-03 is the first nightly that ships it (nightly-2026-07-02 ships
+# 4c9d2bfe4). When the internal toolchain's rustfmt moves, move this pin to a
+# nightly that ships the same rustfmt commit.
+channel = "nightly-2026-07-03"
+identity = "rustfmt 1.9.0-nightly (c397dae808 2026-07-02)"
