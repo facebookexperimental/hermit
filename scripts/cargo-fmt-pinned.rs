@@ -46,7 +46,8 @@
 //! Before formatting, the list must parse (each entry a repository-relative
 //! `.rs` path, listed once, with the reason `sha256-pinned in FILE[ and
 //! FILE...]`), every listed path must be a file whose sha256 each FILE
-//! contains (an entry nothing pins is refused: format that file instead),
+//! contains (an entry nothing pins is refused: format that file instead; no
+//! FILE may be the list itself or a listed file, by path or by inode),
 //! `rustfmt.toml` must set no `ignore` of its own, and the `ignore` list read
 //! back from the written file must be exactly the list; any failure exits 2
 //! before anything is formatted.
@@ -81,6 +82,7 @@ mod rust_script_prelude;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -111,6 +113,8 @@ const PINNED_IN: &str = "sha256-pinned in ";
 /// One `ci/rustfmt-exclusions.txt` entry.
 #[derive(Debug, PartialEq, Eq)]
 struct Exclusion {
+    /// Its line in the list, from 1.
+    line: usize,
     /// Repository-relative path of a `.rs` file.
     path: String,
     /// The repository-relative files its reason names, each of which must
@@ -123,9 +127,10 @@ struct Exclusion {
 /// REASON the rest of the line, trimmed. Each PATH is a repository-relative
 /// `.rs` path, listed once, and REASON is exactly `sha256-pinned in FILE[ and
 /// FILE...]`; [`load_exclusions`] then requires each FILE to contain PATH's
-/// sha256. A line with a tab is refused, comment lines included: fbsource's
-/// linter refuses tabs in text files, so the list separates its fields with
-/// spaces.
+/// sha256. No FILE may be the list itself or a listed file: the list would
+/// then vouch for its own entries (a comment holding a digest is enough). A
+/// line with a tab is refused, comment lines included: fbsource's linter
+/// refuses tabs in text files, so the list separates its fields with spaces.
 fn parse_exclusions(text: &str) -> Result<Vec<Exclusion>, String> {
     let mut list: Vec<Exclusion> = Vec::new();
     for (number, line) in text.lines().enumerate() {
@@ -158,10 +163,30 @@ fn parse_exclusions(text: &str) -> Result<Vec<Exclusion>, String> {
         }
         let pinned_in = pinning_files(reason.trim())
             .map_err(|problem| format!("{at}: `{path}`'s reason `{}` {problem}", reason.trim()))?;
+        if pinned_in.iter().any(|file| file == EXCLUSIONS_FILE) {
+            return Err(format!(
+                "{at}: `{path}`'s reason names {EXCLUSIONS_FILE}, the list itself; the list \
+                 cannot vouch for its own entries"
+            ));
+        }
         list.push(Exclusion {
+            line: number + 1,
             path: path.to_string(),
             pinned_in,
         });
+    }
+    for entry in &list {
+        if let Some(file) = entry
+            .pinned_in
+            .iter()
+            .find(|file| list.iter().any(|other| other.path == **file))
+        {
+            return Err(format!(
+                "{EXCLUSIONS_FILE}:{}: `{}`'s reason names `{file}`, which is itself listed; a \
+                 listed file cannot pin an entry",
+                entry.line, entry.path
+            ));
+        }
     }
     Ok(list)
 }
@@ -225,30 +250,56 @@ fn load_exclusions(root: &Path) -> Result<Vec<Exclusion>, String> {
     let path = root.join(EXCLUSIONS_FILE);
     let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let list = parse_exclusions(&text)?;
+    // The list and the listed files by identity, so that a FILE hard-linked to
+    // one of them is refused like the path itself (a symbolic link is already
+    // refused: every FILE must be a regular file).
+    let mut vouchers = vec![(EXCLUSIONS_FILE.to_string(), file_identity(&path))];
     for entry in &list {
+        vouchers.push((entry.path.clone(), file_identity(&root.join(&entry.path))));
+    }
+    for entry in &list {
+        let at = format!("{EXCLUSIONS_FILE}:{}", entry.line);
         let bytes = regular_file(root, &entry.path)
-            .map_err(|problem| format!("{EXCLUSIONS_FILE}: `{}` {problem}", entry.path))?;
+            .map_err(|problem| format!("{at}: `{}` {problem}", entry.path))?;
         let digest = sha256_hex(&bytes);
         for file in &entry.pinned_in {
             let pins = regular_file(root, file).map_err(|problem| {
                 format!(
-                    "{EXCLUSIONS_FILE}: `{}`'s reason names `{file}`, which {problem}",
+                    "{at}: `{}`'s reason names `{file}`, which {problem}",
                     entry.path
                 )
             })?;
+            let identity = file_identity(&root.join(file));
+            if let Some((same, _)) = vouchers
+                .iter()
+                .find(|(_, other)| identity.is_some() && *other == identity)
+            {
+                return Err(format!(
+                    "{at}: `{}`'s reason names `{file}`, which is the same file as `{same}`; \
+                     neither the list nor a listed file can pin an entry",
+                    entry.path
+                ));
+            }
             let found = pins
                 .windows(digest.len())
                 .any(|window| window == digest.as_bytes());
             if !found {
                 return Err(format!(
-                    "{EXCLUSIONS_FILE}: `{}`'s sha256 {digest} is not in `{file}`, so its reason \
-                     does not hold; format the file and delete its entry instead",
+                    "{at}: `{}`'s sha256 {digest} is not in `{file}`, so its reason does not \
+                     hold; format the file and delete its entry instead",
                     entry.path
                 ));
             }
         }
     }
     Ok(list)
+}
+
+/// The device and inode of the file at `path`, if it exists.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// The bytes of the regular file at `relative` under `root`, or why not.
@@ -1551,10 +1602,12 @@ mod tests {
             parse_exclusions(good),
             Ok(vec![
                 Exclusion {
+                    line: 3,
                     path: "a/b.rs".into(),
                     pinned_in: vec!["c.json".into()],
                 },
                 Exclusion {
+                    line: 4,
                     path: "c/d.rs".into(),
                     pinned_in: vec!["e/f.json".into(), "g.py".into()],
                 },
@@ -1594,6 +1647,27 @@ mod tests {
                 "a/b.rs sha256-pinned in c.json, d.json\n",
                 "not a repository-relative path",
             ),
+            (
+                "a/b.rs sha256-pinned in ci/rustfmt-exclusions.txt\n",
+                ":1: `a/b.rs`'s reason names ci/rustfmt-exclusions.txt, the list itself",
+            ),
+            (
+                "a/b.rs sha256-pinned in c.json and ci/rustfmt-exclusions.txt\n",
+                "the list itself",
+            ),
+            (
+                "a/b.rs sha256-pinned in ./ci/rustfmt-exclusions.txt\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in ci/../ci/rustfmt-exclusions.txt\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in c/d.rs\nc/d.rs sha256-pinned in e.json\n",
+                ":1: `a/b.rs`'s reason names `c/d.rs`, which is itself listed",
+            ),
+            ("a/b.rs sha256-pinned in a/b.rs\n", "which is itself listed"),
             (
                 "a/b.rs sha256-pinned in c.json\na/b.rs sha256-pinned in c.json\n",
                 "listed twice",
@@ -1738,6 +1812,75 @@ mod tests {
         let path = config.path.clone();
         drop(config);
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The list cannot vouch for itself: the review's repro (the listed file's
+    /// digest in a list comment, an entry citing the list) is refused, and so
+    /// is a FILE that is the list or a listed file under another name (a hard
+    /// link) or a symbolic link to the list.
+    #[test]
+    fn the_list_and_listed_files_cannot_pin_an_entry() {
+        use std::os::unix::fs::symlink;
+        let root = env::temp_dir().join(format!("cargo-fmt-pinned-vouch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ci")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(ROOT_CONFIG), "edition = \"2024\"\n").unwrap();
+        fs::write(root.join("src/a.rs"), "fn  a() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "fn  b() {}\n").unwrap();
+        let digest = sha256_hex(b"fn  a() {}\n");
+        let list = |entry: &str| format!("# {digest}\n{entry}\n");
+        let cases = [
+            (
+                list("src/a.rs sha256-pinned in ci/rustfmt-exclusions.txt"),
+                None,
+                "ci/rustfmt-exclusions.txt:2: `src/a.rs`'s reason names ci/rustfmt-exclusions.txt, \
+                 the list itself",
+            ),
+            (
+                list("src/a.rs sha256-pinned in ci/pins.txt"),
+                Some("hard"),
+                ":2: `src/a.rs`'s reason names `ci/pins.txt`, which is the same file as \
+                 `ci/rustfmt-exclusions.txt`",
+            ),
+            (
+                list("src/a.rs sha256-pinned in ci/pins.txt"),
+                Some("soft"),
+                ":2: `src/a.rs`'s reason names `ci/pins.txt`, which is not a regular file",
+            ),
+        ];
+        for (text, link, expected) in cases {
+            fs::write(root.join(EXCLUSIONS_FILE), &text).unwrap();
+            let _ = fs::remove_file(root.join("ci/pins.txt"));
+            match link {
+                Some("hard") => {
+                    fs::hard_link(root.join(EXCLUSIONS_FILE), root.join("ci/pins.txt")).unwrap()
+                }
+                Some(_) => symlink("rustfmt-exclusions.txt", root.join("ci/pins.txt")).unwrap(),
+                None => {}
+            }
+            let error = write_gate_config(&root).err().unwrap();
+            assert!(error.contains(expected), "{text:?} {link:?}: {error}");
+        }
+        // A listed file under another name: src/c.rs hard-linked to listed src/b.rs.
+        let _ = fs::remove_file(root.join("ci/pins.txt"));
+        fs::write(root.join("src/b.rs"), format!("// {digest}\n")).unwrap();
+        fs::hard_link(root.join("src/b.rs"), root.join("src/c.rs")).unwrap();
+        let b_digest = sha256_hex(format!("// {digest}\n").as_bytes());
+        fs::write(root.join("pins.json"), format!("{b_digest}\n")).unwrap();
+        fs::write(
+            root.join(EXCLUSIONS_FILE),
+            "src/a.rs sha256-pinned in src/c.rs\nsrc/b.rs sha256-pinned in pins.json\n",
+        )
+        .unwrap();
+        let error = write_gate_config(&root).err().unwrap();
+        assert!(
+            error.contains(
+                ":1: `src/a.rs`'s reason names `src/c.rs`, which is the same file as `src/b.rs`"
+            ),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
