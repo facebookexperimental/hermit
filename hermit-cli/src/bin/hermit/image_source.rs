@@ -1337,14 +1337,23 @@ fn set_mtime_fd(file: &std::fs::File, sec: u64, nsec: u32, shown: &Path) -> Resu
     Ok(())
 }
 
-/// Reduce a tar entry path to a rootfs-relative path, refusing absolute
-/// paths and `..` traversal by name. An empty result is the root itself.
+/// Reduce a tar entry path to a rootfs-relative path, refusing `..`
+/// traversal by name. A single leading `/` is the image root itself
+/// (docker layer convention, and what the Nix streamer emits), so it
+/// is skipped while rebuilding from normal components; the result is
+/// never handed to `Path::join` unreduced, where an absolute path
+/// would discard the rootfs base. An empty result is the root itself.
+/// Symlink targets do not pass through here: they stay verbatim
+/// absolute guest paths. Hardlink targets stay strict in
+/// [`normalize_hardlink_target`].
 fn normalize_entry_path(path: &Path, origin: &str) -> Result<PathBuf, Error> {
     let mut out = PathBuf::new();
+    let mut first = true;
     for component in path.components() {
         match component {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
+            Component::RootDir if first => {}
             Component::ParentDir => {
                 return Err(Error::msg(format!(
                     "path traversal in {origin}: entry {path:?} contains \
@@ -1360,6 +1369,7 @@ fn normalize_entry_path(path: &Path, origin: &str) -> Result<PathBuf, Error> {
                 )));
             }
         }
+        first = false;
     }
     Ok(out)
 }
@@ -1821,7 +1831,19 @@ fn apply_layer_stream<R: Read>(
 }
 
 /// A hardlink target must be an in-root relative path with no escape.
+/// Unlike entry names, targets stay strict: an absolute target is
+/// refused here even though entry paths map a leading `/` to the root.
 fn normalize_hardlink_target(target: &Path, rel: &Path, origin: &str) -> Result<PathBuf, Error> {
+    if matches!(
+        target.components().next(),
+        Some(Component::RootDir | Component::Prefix(_))
+    ) {
+        return Err(Error::msg(format!(
+            "escaping hardlink {rel:?} in {origin}: target {target:?} is not \
+             an in-root relative path. Only hardlinks to files inside the \
+             image root are supported; re-export the image without it."
+        )));
+    }
     match normalize_entry_path(target, origin) {
         Ok(p) if !p.as_os_str().is_empty() => Ok(p),
         _ => Err(Error::msg(format!(
@@ -2219,41 +2241,192 @@ mod tests {
     }
 
     #[test]
-    fn applier_refuses_traversal_absolute_and_symlink_ancestors() {
-        for (entries, patch, needle) in [
-            (
-                vec![file_entry("zz/evil", "x")],
-                Some(("zz/evil", "../evil")),
-                "path traversal",
-            ),
-            (
-                vec![file_entry("zabs/evil", "x")],
-                Some(("zabs/evil", "/abs/evil")),
-                "absolute path",
-            ),
-            (
-                vec![
-                    {
-                        let mut e = file_entry("link", "");
-                        e.kind = tar::EntryType::Symlink;
-                        e.link = Some("/etc".to_string());
-                        e
-                    },
-                    file_entry("link/pwn", "x"),
-                ],
-                None,
-                "symlink ancestor",
-            ),
+    fn applier_refuses_traversal_and_symlink_ancestors() {
+        for (placeholder, target) in [
+            ("zz/evil", "../evil"),
+            ("zzz/evil", "/../evil"),
+            ("za/zz/b", "/a/../b"),
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
             let rootfs = tmp.path().join("rootfs");
             std::fs::create_dir_all(&rootfs).unwrap();
-            let mut layer = build_layer(&entries);
+            let mut layer = build_layer(&[file_entry(placeholder, "x")]);
+            patch_entry_name(&mut layer, placeholder, target);
+            let err = apply_to(&rootfs, &layer).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("path traversal"),
+                "{target}: {err:#}"
+            );
+            assert!(std::fs::read_dir(&rootfs).unwrap().next().is_none());
+        }
+        // Symlink ancestors point at a tempdir canary, never host /etc:
+        // a regression here must not write host files even as root.
+        for patch in [None, Some(("zlink/pwn", "/link/pwn"))] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let rootfs = tmp.path().join("rootfs");
+            std::fs::create_dir_all(&rootfs).unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("secret"), "host-secret").unwrap();
+            let mut link = file_entry("link", "");
+            link.kind = tar::EntryType::Symlink;
+            link.link = Some(outside.to_str().unwrap().to_string());
+            let child = if patch.is_some() {
+                "zlink/pwn"
+            } else {
+                "link/pwn"
+            };
+            let mut layer = build_layer(&[link, file_entry(child, "x")]);
             if let Some((placeholder, target)) = patch {
                 patch_entry_name(&mut layer, placeholder, target);
             }
             let err = apply_to(&rootfs, &layer).unwrap_err();
-            assert!(format!("{err:#}").contains(needle), "{needle}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("symlink ancestor"),
+                "symlink ancestor: {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside.join("secret")).unwrap(),
+                "host-secret"
+            );
+            assert!(!outside.join("pwn").exists());
+        }
+    }
+
+    #[test]
+    fn applier_maps_absolute_entries_under_rootfs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut layer = build_layer(&[file_entry("zabs/evil", "x")]);
+        patch_entry_name(&mut layer, "zabs/evil", "/abs/evil");
+        apply_to(&rootfs, &layer).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("abs/evil")).unwrap(),
+            "x"
+        );
+        // Double-slash spelling maps the same way.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut layer = build_layer(&[file_entry("zzabs/evil", "x")]);
+        patch_entry_name(&mut layer, "zzabs/evil", "//abs/evil");
+        apply_to(&rootfs, &layer).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("abs/evil")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn applier_absolute_host_path_lands_under_rootfs_not_on_host() {
+        // Canary: the absolute name is a host path this test can write,
+        // so a loader that accepts absolute names without confining
+        // them would succeed on the host and only this check catches it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "host-secret").unwrap();
+        std::fs::write(tmp.path().join("sentinel.txt"), "host-sentinel").unwrap();
+        let host_target = outside.join("evil");
+        let name = host_target.to_str().unwrap().to_string();
+        assert!(name.len() <= 100, "raw name must fit the tar name field");
+        let placeholder = "z".repeat(name.len());
+        let mut layer = build_layer(&[file_entry(&placeholder, "x")]);
+        patch_entry_name(&mut layer, &placeholder, &name);
+        apply_to(&rootfs, &layer).unwrap();
+        assert!(!host_target.exists(), "host path written: {name}");
+        let mapped = rootfs.join(host_target.strip_prefix("/").unwrap());
+        assert_eq!(std::fs::read_to_string(&mapped).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).unwrap(),
+            "host-secret"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sentinel.txt")).unwrap(),
+            "host-sentinel"
+        );
+    }
+
+    #[test]
+    fn applier_absolute_whiteouts_are_confined() {
+        // (a) Plain whiteout with an absolute name deletes in-root only.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "host-secret").unwrap();
+        let lower = build_layer(&[file_entry("gone.txt", "g"), file_entry("keep.txt", "k")]);
+        let mut upper = build_layer(&[file_entry("z.wh.gone.txt", "")]);
+        patch_entry_name(&mut upper, "z.wh.gone.txt", "/.wh.gone.txt");
+        apply_many(&rootfs, &[lower, upper]).unwrap();
+        assert!(!rootfs.join("gone.txt").exists());
+        assert!(rootfs.join("keep.txt").exists());
+        assert!(!rootfs.join(".wh.gone.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).unwrap(),
+            "host-secret"
+        );
+        // (b) Nested opaque whiteout with absolute names.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let lower = build_layer(&[
+            dir_entry("d", 0o755, 1_700_000_000),
+            file_entry("d/old.txt", "o"),
+        ]);
+        let mut upper = build_layer(&[
+            file_entry("zd/.wh..wh..opq", ""),
+            file_entry("zd/new.txt", "n"),
+        ]);
+        patch_entry_name(&mut upper, "zd/.wh..wh..opq", "/d/.wh..wh..opq");
+        patch_entry_name(&mut upper, "zd/new.txt", "/d/new.txt");
+        apply_many(&rootfs, &[lower, upper]).unwrap();
+        assert!(!rootfs.join("d/old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("d/new.txt")).unwrap(),
+            "n"
+        );
+        // (c) Root opaque whiteout clears only rootfs children; the
+        // sentinel beside the rootfs survives.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(tmp.path().join("sentinel.txt"), "host-sentinel").unwrap();
+        let lower = build_layer(&[
+            file_entry("a", "a"),
+            dir_entry("b", 0o755, 1_700_000_000),
+            file_entry("b/c", "c"),
+        ]);
+        let mut upper = build_layer(&[file_entry("z.wh..wh..opq", "")]);
+        patch_entry_name(&mut upper, "z.wh..wh..opq", "/.wh..wh..opq");
+        apply_many(&rootfs, &[lower, upper]).unwrap();
+        assert!(std::fs::read_dir(&rootfs).unwrap().next().is_none());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sentinel.txt")).unwrap(),
+            "host-sentinel"
+        );
+        // (d) Dot and dotdot whiteout targets stay refused, nothing removed.
+        for (placeholder, target) in [("z.wh..", "/.wh.."), ("z.wh...", "/.wh...")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let rootfs = tmp.path().join("rootfs");
+            std::fs::create_dir_all(rootfs.join("sub")).unwrap();
+            std::fs::write(rootfs.join("sub/keep.txt"), "keep").unwrap();
+            let mut layer = build_layer(&[file_entry(placeholder, "")]);
+            patch_entry_name(&mut layer, placeholder, target);
+            let err = apply_to(&rootfs, &layer).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("refusing whiteout"),
+                "{target}: {err:#}"
+            );
+            assert_eq!(
+                std::fs::read(rootfs.join("sub/keep.txt")).unwrap(),
+                b"keep",
+                "{target}"
+            );
         }
     }
 
@@ -2277,6 +2450,34 @@ mod tests {
         let layer = build_layer(&[hardlink]);
         let err = apply_to(&rootfs, &layer).unwrap_err();
         assert!(format!("{err:#}").contains("escaping hardlink"), "{err:#}");
+
+        // Policy, not existence: an absolute hardlink target is refused
+        // even when the in-root target file exists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut hardlink = file_entry("x", "");
+        hardlink.kind = tar::EntryType::Link;
+        hardlink.link = Some("/etc/passwd".to_string());
+        let layer = build_layer(&[file_entry("etc/passwd", "p"), hardlink]);
+        let err = apply_to(&rootfs, &layer).unwrap_err();
+        assert!(format!("{err:#}").contains("escaping hardlink"), "{err:#}");
+        assert!(!rootfs.join("x").exists());
+
+        // The same target spelled relative is accepted and shares the
+        // in-root inode, including under an absolute entry name.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut hardlink = file_entry("zx", "");
+        hardlink.kind = tar::EntryType::Link;
+        hardlink.link = Some("etc/passwd".to_string());
+        let mut layer = build_layer(&[file_entry("etc/passwd", "p"), hardlink]);
+        patch_entry_name(&mut layer, "zx", "/x");
+        apply_to(&rootfs, &layer).unwrap();
+        let a = std::fs::metadata(rootfs.join("x")).unwrap();
+        let b = std::fs::metadata(rootfs.join("etc/passwd")).unwrap();
+        assert_eq!(a.ino(), b.ino());
     }
 
     #[test]
