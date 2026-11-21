@@ -51,6 +51,12 @@
 //! back from the written file must be exactly the list; any failure exits 2
 //! before anything is formatted.
 //!
+//! `--workspace-members` also formats, file by file and with the same
+//! configuration (`rustfmt --unstable-features --skip-children`, as Meta's
+//! internal tree runs it), every tracked `.rs` file (`git ls-files`) the
+//! members pass did not reach: rust-scripts, include! targets and sources
+//! outside any member's module tree, except the listed exclusions.
+//!
 //! Usage, from anywhere in the repository:
 //!   scripts/cargo-fmt-pinned.rs --workspace-members [-- --check]
 //!                                                    format exactly the root
@@ -80,6 +86,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -632,6 +639,173 @@ fn run_cargo_fmt(resolved: &Resolved, args: &[OsString], dir: &Path) -> Result<i
     Ok(status.code().unwrap_or(1))
 }
 
+/// The line rustfmt's `-v` prints for each file it formats.
+const FORMATTING_PREFIX: &[u8] = b"Formatting ";
+
+/// The `--workspace-members` run: cargo fmt over the members, then rustfmt
+/// file by file (`--skip-children`) over every tracked `.rs` file that pass
+/// did not reach, such as rust-scripts, include! targets and sources outside
+/// any member's module tree; listed exclusions are skipped by both. The
+/// members pass runs with rustfmt's `-v`, whose per-file `Formatting` lines
+/// name what it reached; those and the other `-v`-only lines are left out of
+/// what it prints, so its output reads as without `-v`. Returns the first
+/// nonzero status, else 0.
+fn run_workspace_members(
+    resolved: &Resolved,
+    root: &Path,
+    scoped: Vec<OsString>,
+    config: &GateConfig,
+) -> Result<i32, String> {
+    let rustfmt_args: Vec<OsString> = match scoped.iter().position(|arg| arg == "--") {
+        Some(separator) => scoped[separator + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    let mut cargo_args = with_gate_config(scoped, &config.path)?;
+    cargo_args.push("-v".into());
+    let output = cargo_fmt_in(resolved, &cargo_args, root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", resolved.cargo_fmt.display()))?;
+    let members_code = output.status.code().unwrap_or(1);
+    let reached = reached_files(&output.stdout, root, &mut std::io::stdout())?;
+    if reached.is_empty() {
+        return Err(
+            "the workspace members pass printed no `Formatting` line, so what it reached is \
+             unknown; refusing rather than reporting the per-file pass"
+                .to_string(),
+        );
+    }
+    let listed: Vec<String> = load_exclusions(root)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    let tracked = tracked_rust_files(root)?;
+    let remaining = per_file_targets(&tracked, &reached, &listed);
+    eprintln!(
+        "cargo-fmt-pinned: per-file pass over {} of the {} tracked .rs files; the workspace \
+         members pass reached {}, and {} are listed in {EXCLUSIONS_FILE}, left alone",
+        remaining.len(),
+        tracked.len(),
+        tracked.iter().filter(|path| reached.contains(path)).count(),
+        tracked.iter().filter(|path| listed.contains(path)).count()
+    );
+    let mut files_code = 0;
+    if !remaining.is_empty() {
+        let status = Command::new(&resolved.rustfmt)
+            .args(&rustfmt_args)
+            .arg("--config-path")
+            .arg(&config.path)
+            .args(["--unstable-features", "--skip-children"])
+            .args(&remaining)
+            .current_dir(root)
+            .status()
+            .map_err(|error| format!("cannot run {}: {error}", resolved.rustfmt.display()))?;
+        files_code = status.code().unwrap_or(1);
+    }
+    Ok(if members_code != 0 {
+        members_code
+    } else {
+        files_code
+    })
+}
+
+/// Writes `stdout` of a `-v` formatting run to `out` without its
+/// `-v`-only lines, and returns the repository-relative paths its
+/// `Formatting` lines name. `-v` also marks each diff line's end with `⏎`,
+/// which is removed.
+fn reached_files(
+    stdout: &[u8],
+    root: &Path,
+    out: &mut dyn std::io::Write,
+) -> Result<Vec<String>, String> {
+    let mut reached = Vec::new();
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        if let Some(path) = text.strip_prefix(FORMATTING_PREFIX) {
+            let path = Path::new(std::str::from_utf8(path).map_err(|_| {
+                format!(
+                    "a non-UTF-8 `Formatting` line: {}",
+                    String::from_utf8_lossy(text)
+                )
+            })?);
+            let relative = normalize(&root.join(path))
+                .strip_prefix(normalize(root))
+                .map(|relative| relative.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            reached.push(relative);
+            continue;
+        }
+        if text.starts_with(b"Spent ") || text.starts_with(b"Using rustfmt config file ") {
+            continue;
+        }
+        let shown = text.strip_suffix("⏎".as_bytes()).unwrap_or(text);
+        let newline: &[u8] = if line.ends_with(b"\n") { b"\n" } else { b"" };
+        out.write_all(shown)
+            .and_then(|()| out.write_all(newline))
+            .map_err(|error| format!("writing the formatter's output: {error}"))?;
+    }
+    Ok(reached)
+}
+
+/// `path` with `.` and `..` components resolved lexically, as git names files.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other.as_os_str()),
+        }
+    }
+    normal
+}
+
+/// The repository's tracked `.rs` files (`git ls-files`), relative to `root`.
+/// No git checkout, or no tracked file, is refused: the per-file pass would
+/// check nothing and look like a pass.
+fn tracked_rust_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z", "--", "*.rs"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run git ls-files: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git ls-files -- '*.rs'` failed in {} ({}): {}; the per-file pass needs a git \
+             checkout",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let files: Vec<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    if files.is_empty() {
+        return Err(format!(
+            "`git ls-files -- '*.rs'` lists no file in {}",
+            root.display()
+        ));
+    }
+    Ok(files)
+}
+
+/// The tracked files the per-file pass checks: neither reached by the
+/// members pass nor listed.
+fn per_file_targets(tracked: &[String], reached: &[String], listed: &[String]) -> Vec<String> {
+    tracked
+        .iter()
+        .filter(|path| !reached.contains(path) && !listed.contains(path))
+        .cloned()
+        .collect()
+}
+
 /// Picks the formatter: the toolchain root in `toolchain`, else rustup. With
 /// neither it refuses: the pinned validation image is that case today, and its
 /// only rustfmt is the stable compiler pin's, which ignores the nightly-only
@@ -929,7 +1103,7 @@ fn run() -> Result<ExitCode, String> {
             }
             scoped.extend(args.into_iter().skip(1));
             let config = write_gate_config(&root)?;
-            let code = run_cargo_fmt(&resolved, &with_gate_config(scoped, &config.path)?, &root)?;
+            let code = run_workspace_members(&resolved, &root, scoped, &config)?;
             Ok(ExitCode::from(code.clamp(0, 255) as u8))
         }
         _ => {
@@ -1605,5 +1779,63 @@ mod tests {
             .map(|entry| entry.path)
             .collect();
         assert_eq!(config_ignore_entries(&written).unwrap(), listed);
+    }
+
+    /// The members pass's `-v` output: `Formatting` lines become the reached
+    /// set (normalized, relative to the root) and are not printed, nor are
+    /// the other `-v`-only lines; diff lines print without `-v`'s `⏎`.
+    #[test]
+    fn the_members_pass_output_names_what_it_reached() {
+        let stdout = "Using rustfmt config file /r/.tmp-rustfmt-gate-1.toml\n\
+                      Formatting /r/a/src/lib.rs\n\
+                      Formatting /r/a/src/../../scripts/x.rs\n\
+                      Diff in /r/a/src/lib.rs:1:\n\
+                      -fn f( ) {}⏎\n\
+                      +fn f() {}⏎\n\
+                      Spent 0.001 secs in the parsing phase, and 0.000 secs in the formatting phase\n";
+        let mut shown = Vec::new();
+        let reached = reached_files(stdout.as_bytes(), Path::new("/r"), &mut shown).unwrap();
+        assert_eq!(reached, ["a/src/lib.rs", "scripts/x.rs"]);
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            "Diff in /r/a/src/lib.rs:1:\n-fn f( ) {}\n+fn f() {}\n"
+        );
+    }
+
+    /// The per-file pass takes every tracked file neither reached nor listed.
+    #[test]
+    fn the_per_file_pass_takes_what_the_members_pass_left() {
+        let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tracked = strings(&["a/src/lib.rs", "scripts/x.rs", "scripts/y.rs", "pinned.rs"]);
+        assert_eq!(
+            per_file_targets(
+                &tracked,
+                &strings(&["a/src/lib.rs"]),
+                &strings(&["pinned.rs"])
+            ),
+            ["scripts/x.rs", "scripts/y.rs"]
+        );
+        assert_eq!(
+            normalize(Path::new("/r/a/./b/../c.rs")),
+            PathBuf::from("/r/a/c.rs")
+        );
+    }
+
+    /// The per-file pass reads the tracked files from git and refuses a
+    /// directory that is not a checkout.
+    #[test]
+    fn the_per_file_pass_needs_a_git_checkout() {
+        let dir = env::temp_dir().join(format!("cargo-fmt-pinned-nogit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let error = tracked_rust_files(&dir).unwrap_err();
+        assert!(error.contains("needs a git checkout"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+        let tracked = tracked_rust_files(&test_root()).unwrap();
+        assert!(
+            tracked
+                .iter()
+                .any(|path| path == "scripts/cargo-fmt-pinned.rs")
+        );
     }
 }

@@ -15,3 +15,12 @@
 # Only files the format check reaches belong here. Formatting a listed file
 # means re-deriving whatever pins its bytes in the same change, then deleting
 # its line.
+hermit-install/private-static/owned/archive/main.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/main.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/factory_controls.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json and hermit-install/private-static/owned/prepare.py
+hermit-install/private-static/owned/native_leaf_controls.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/optional_controls.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/ordinary_controls.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/structural_observation.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/terminal_observation.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json
+hermit-install/private-static/owned/view_leaf_controls.rs  sha256-pinned in hermit-install/private-static/owned/source-files.json

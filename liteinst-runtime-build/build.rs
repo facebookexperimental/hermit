@@ -130,13 +130,12 @@ fn main() {
     // always runs for a real checkout. The layout selects that proof
     // and the recorded inventory only; the factory observes the
     // manifest spelling from fresh metadata itself.
-    let layout = if path_sourced
-        && !artifact::reverie_root_has_git_metadata(&source_root.join("reverie"))
-    {
-        qualifier::CompiledSourceLayout::PathCheckout
-    } else {
-        qualifier::CompiledSourceLayout::GitlinkCheckout
-    };
+    let layout =
+        if path_sourced && !artifact::reverie_root_has_git_metadata(&source_root.join("reverie")) {
+            qualifier::CompiledSourceLayout::PathCheckout
+        } else {
+            qualifier::CompiledSourceLayout::GitlinkCheckout
+        };
     let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content_with_repository(
         &qualifier::CompiledSourceExpectation {
             layout,
@@ -225,7 +224,9 @@ fn main() {
         );
         assert_eq!(
             package_id,
-            format!("git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-preload@{version}")
+            format!(
+                "git+{REVERIE_GIT_REPOSITORY}?rev={revision}#reverie-liteinst-preload@{version}"
+            )
         );
     } else {
         let leaf_dir = source_root.join("reverie/reverie-liteinst-preload");

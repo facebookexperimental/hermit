@@ -178,11 +178,9 @@ pub(crate) fn constructor_qualifier_source(
         && helper["id"].as_str().is_some_and(|id| {
             let helper_manifest = helper["manifest_path"].as_str();
             id.strip_prefix("path+file://").is_some_and(|rest| {
-                let directory = rest
-                    .strip_suffix(&format!("#{version}"))
-                    .or_else(|| {
-                        rest.strip_suffix(&format!("#reverie-liteinst-artifact@{version}"))
-                    });
+                let directory = rest.strip_suffix(&format!("#{version}")).or_else(|| {
+                    rest.strip_suffix(&format!("#reverie-liteinst-artifact@{version}"))
+                });
                 directory.is_some_and(|dir| {
                     dir.ends_with("/reverie-liteinst-artifact")
                         && helper_manifest == Some(format!("{dir}/Cargo.toml").as_str())
@@ -702,7 +700,8 @@ mod tests {
         let mut wrong_path_id = path_helper.clone();
         wrong_path_id["id"] = serde_json::json!(format!(
             "path+file://{}#0.4.1",
-            root.join("other-checkout/reverie-liteinst-artifact").display()
+            root.join("other-checkout/reverie-liteinst-artifact")
+                .display()
         ));
         assert!(bind(vec![wrong_path_id]).is_err());
         let mut alias = helper.clone();
@@ -1364,8 +1363,8 @@ pub(crate) mod native {
         // Leaf identity follows the resolved layout: the exact git source
         // string for git-sourced manifests, source-null (bound by the
         // content factory above) for path-sourced ones.
-        let expected_source = (!path_sourced)
-            .then(|| format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}"));
+        let expected_source =
+            (!path_sourced).then(|| format!("git+{REVERIE_GIT_REPOSITORY}?rev={pin}#{pin}"));
         assert_eq!(rv_package["source"].as_str(), expected_source.as_deref());
         let rv_manifest = fs::canonicalize(rv_package["manifest_path"].as_str().unwrap()).unwrap();
         let rv = rv_manifest.parent().unwrap().parent().unwrap();
