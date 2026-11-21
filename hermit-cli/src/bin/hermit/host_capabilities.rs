@@ -19,7 +19,8 @@ use reverie_ptrace::PmuValidationError;
 
 #[derive(Debug, Args)]
 pub struct HostCapabilitiesOpts {
-    /// Emit the complete producer-owned capability record as one JSON object.
+    /// Emit JSON: the complete producer-owned capability record, or with
+    /// `--cpu-profile` that profile's qualification verdict, as one object.
     #[clap(long)]
     json: bool,
 
@@ -33,7 +34,7 @@ pub struct HostCapabilitiesOpts {
 impl HostCapabilitiesOpts {
     pub fn main(&self) -> Result<ExitStatus, Error> {
         if let Some(profile) = self.cpu_profile {
-            return qualify_cpu_profile(profile);
+            return qualify_cpu_profile(profile, self.json);
         }
         let report = HostCapabilitiesReport::probe(exact_branch_counter_verdict());
         report.validate().map_err(Error::msg)?;
@@ -198,11 +199,57 @@ fn cpu_identity_from(cpuinfo: &str) -> String {
     )
 }
 
+/// The schema version of the `--cpu-profile --json` verdict object.
+const PROFILE_QUALIFICATION_VERDICT_SCHEMA: u32 = 1;
+
+/// The `--cpu-profile --json` verdict: one JSON object on stdout, with the
+/// text form's exit status (0 qualified, 122 refused), so a consumer reads
+/// the verdict without parsing prose. `probe` carries the XINUSE probe
+/// report on a qualified x86-64-v3 verdict; its field set is
+/// informational and outside the schema guarantee, which covers the
+/// top-level verdict fields. For `--cpu-profile auto`, the verdict says
+/// whether this host qualifies for x86-64-v3; it does not say which
+/// profile an auto run presents. The verdict deliberately carries no
+/// run/skip classification: a consumer applies its own policy to
+/// `qualified` and the refusal reason.
+#[derive(serde::Serialize)]
+struct ProfileQualificationVerdict {
+    schema: u32,
+    profile: String,
+    qualified: bool,
+    refusal: Option<String>,
+    probe: Option<serde_json::Value>,
+}
+
+fn write_verdict_json(
+    stdout: &mut impl Write,
+    profile: CpuProfile,
+    qualified: bool,
+    refusal: Option<String>,
+    probe: Option<serde_json::Value>,
+) -> Result<(), Error> {
+    let verdict = ProfileQualificationVerdict {
+        schema: PROFILE_QUALIFICATION_VERDICT_SCHEMA,
+        profile: profile.to_string(),
+        qualified,
+        refusal,
+        probe,
+    };
+    serde_json::to_writer(&mut *stdout, &verdict)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
 /// `hermit host-capabilities --cpu-profile`: the profile's startup
-/// qualification, as text (<https://github.com/rrnewton/hermit/issues/4243>).
-fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
+/// qualification, as text (<https://github.com/rrnewton/hermit/issues/4243>),
+/// or as one JSON verdict object with `--json`.
+fn qualify_cpu_profile(profile: CpuProfile, json: bool) -> Result<ExitStatus, Error> {
     let mut stdout = std::io::stdout().lock();
     if profile.is_default() {
+        if json {
+            write_verdict_json(&mut stdout, profile, true, None, None)?;
+            return Ok(ExitStatus::Exited(0));
+        }
         writeln!(
             stdout,
             "{profile}: QUALIFIED — x86-64-v2 needs no qualification"
@@ -211,6 +258,10 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
     }
     if profile == CpuProfile::HostNoRdrand {
         return match hermit::cpu_profile_admission::qualify_host_no_rdrand() {
+            Ok(()) if json => {
+                write_verdict_json(&mut stdout, profile, true, None, None)?;
+                Ok(ExitStatus::Exited(0))
+            }
             Ok(()) => {
                 writeln!(
                     stdout,
@@ -224,6 +275,12 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
                 )?;
                 Ok(ExitStatus::Exited(0))
             }
+            Err(refusal) if json => {
+                write_verdict_json(&mut stdout, profile, false, Some(refusal), None)?;
+                Ok(ExitStatus::Exited(
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                ))
+            }
             Err(refusal) => {
                 writeln!(stdout, "{profile}: REFUSED — {refusal}")?;
                 Ok(ExitStatus::Exited(
@@ -234,6 +291,14 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
     }
     // The whole host qualification a v3 run admits with, not the probe alone.
     match hermit::cpu_profile_admission::qualify_host() {
+        Ok((report, _host)) if json => {
+            #[cfg(target_arch = "x86_64")]
+            let probe = serde_json::to_value(&report)?;
+            #[cfg(not(target_arch = "x86_64"))]
+            let probe = match report {};
+            write_verdict_json(&mut stdout, profile, true, None, Some(probe))?;
+            Ok(ExitStatus::Exited(0))
+        }
         Ok((report, _host)) => {
             writeln!(
                 stdout,
@@ -255,6 +320,12 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
             }
             writeln!(stdout, "{}", detcore_model::cpu_profile::V3_RESIDUAL)?;
             Ok(ExitStatus::Exited(0))
+        }
+        Err(refusal) if json => {
+            write_verdict_json(&mut stdout, profile, false, Some(refusal), None)?;
+            Ok(ExitStatus::Exited(
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            ))
         }
         Err(refusal) => {
             writeln!(stdout, "{profile}: REFUSED — {refusal}")?;
@@ -303,6 +374,31 @@ fn v3_qualification(report: &std::convert::Infallible) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_json_verdict_carries_the_verdict_not_prose() {
+        let mut out = Vec::new();
+        write_verdict_json(
+            &mut out,
+            CpuProfile::X86_64V3,
+            false,
+            Some("XCR0 0x802e7 enables components the XINUSE probe does not cover (it covers 0x2ff)".into()),
+            None,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["profile"], "x86-64-v3");
+        assert_eq!(value["qualified"], false);
+        assert!(value["refusal"].as_str().unwrap().starts_with("XCR0 0x802e7"));
+        assert_eq!(value["probe"], serde_json::Value::Null);
+
+        let mut out = Vec::new();
+        write_verdict_json(&mut out, CpuProfile::X86_64V3, true, None, None).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["qualified"], true);
+        assert_eq!(value["refusal"], serde_json::Value::Null);
+    }
 
     #[test]
     fn only_a_failed_validation_of_an_armed_counter_is_inexact() {

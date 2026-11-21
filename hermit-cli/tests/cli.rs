@@ -2558,6 +2558,124 @@ fn cpu_profile_v3_qualification() -> Result<(), String> {
     }
 }
 
+/// The JSON form of the same verdict: one schema-1 object whose
+/// `qualified` field and refusal agree with the text form's exit status
+/// on every profile, so a consumer need not parse prose.
+#[test]
+fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
+    let _guard = hermit_run_guard();
+    for profile in [
+        "x86-64-v2",
+        "x86-64-v2-legacy",
+        "x86-64-v3",
+        "host-no-rdrand",
+        "auto",
+    ] {
+        let output = hermit_test::hermit_output(
+            "hermit host-capabilities",
+            hermit_command(&["host-capabilities", "--cpu-profile", profile, "--json"])
+                .stdin(Stdio::null()),
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{profile} JSON verdict is not JSON: {error}: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        assert_eq!(verdict["schema"], 1, "{profile}: {verdict}");
+        assert_eq!(verdict["profile"], profile, "{profile}: {verdict}");
+        let mut keys: Vec<&str> = verdict
+            .as_object()
+            .unwrap_or_else(|| panic!("{profile} JSON verdict is not an object: {verdict}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["probe", "profile", "qualified", "refusal", "schema"],
+            "{profile}: {verdict}"
+        );
+        match output.status.code() {
+            Some(0) => {
+                assert_eq!(verdict["qualified"], true, "{profile}: {verdict}");
+                assert_eq!(verdict["refusal"], serde_json::Value::Null, "{profile}: {verdict}");
+            }
+            Some(code) if code == HERMIT_POLICY_REFUSAL_EXIT => {
+                assert_eq!(verdict["qualified"], false, "{profile}: {verdict}");
+                assert!(
+                    !verdict["refusal"].as_str().unwrap_or_default().is_empty(),
+                    "{profile}: {verdict}"
+                );
+                assert_eq!(verdict["probe"], serde_json::Value::Null, "{profile}: {verdict}");
+            }
+            other => panic!("{profile} JSON verdict exited {other:?}: {verdict}"),
+        }
+        if profile == "x86-64-v3" && verdict["qualified"] == true {
+            assert!(verdict["probe"].is_object(), "{profile}: {verdict}");
+            assert!(verdict["probe"]["xcr0"].as_u64().unwrap_or(0) > 0, "{profile}: {verdict}");
+        }
+        if profile == "x86-64-v2" {
+            assert_eq!(output.status.code(), Some(0), "{profile}: {verdict}");
+            assert_eq!(verdict["probe"], serde_json::Value::Null, "{profile}: {verdict}");
+        }
+    }
+}
+
+/// The JSON refusal arm, forced on every host by the XCR0 test seam:
+/// exit 122 with `qualified: false`, the coverage refusal and no probe.
+/// On a host that refuses an earlier fixed check the seam is never
+/// reached, which the plain run proves, as in the text control
+/// (`an_uncovered_xcr0_component_still_refuses_with_exit_122`).
+#[test]
+fn host_capabilities_cpu_profile_json_refusal_exits_122_under_xcr0_seam() {
+    let _guard = hermit_run_guard();
+    let mut command = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3", "--json"]);
+    command
+        .env("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS", "0x80000")
+        .stdin(Stdio::null());
+    let output = hermit_test::hermit_output("hermit host-capabilities", &mut command);
+    let text = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{text}\n{}",
+        stderr(&output)
+    );
+    let verdict: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("JSON refusal verdict is not JSON: {error}: {text}"));
+    let mut keys: Vec<&str> = verdict
+        .as_object()
+        .unwrap_or_else(|| panic!("JSON refusal verdict is not an object: {verdict}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["probe", "profile", "qualified", "refusal", "schema"],
+        "{verdict}"
+    );
+    assert_eq!(verdict["schema"], 1, "{verdict}");
+    assert_eq!(verdict["profile"], "x86-64-v3", "{verdict}");
+    assert_eq!(verdict["qualified"], false, "{verdict}");
+    assert_eq!(verdict["probe"], serde_json::Value::Null, "{verdict}");
+    let refusal = verdict["refusal"]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON refusal has no refusal string: {verdict}"));
+    if refusal.contains("does not cover") {
+        assert!(refusal.starts_with("XCR0 0x"), "{verdict}");
+        assert!(refusal.contains("(it covers 0x2ff)"), "{verdict}");
+    } else {
+        assert!(
+            cpu_profile_v3_qualification().is_err(),
+            "host qualifies without the seam, so the seam run must refuse \
+             by coverage, not by an earlier check: {verdict}"
+        );
+    }
+}
+
 /// The fixed start of the reason a test records (`record_test_skip`) when
 /// `hermit host-capabilities --cpu-profile x86-64-v3` refuses this host; the
 /// refusal's own reason follows it.

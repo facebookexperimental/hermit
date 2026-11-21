@@ -1716,8 +1716,13 @@ TSX and AVX-512 stay hidden (<https://github.com/rrnewton/hermit/issues/4243>).
 With XSAVE, a guest can read processor state the host kernel saves and
 restores at moments Hermit does not control. So v3 is offered only where that
 is checked. `hermit host-capabilities --cpu-profile x86-64-v3` runs the check on
-its own and prints QUALIFIED, or REFUSED with the reason. A v3 run is refused
-by name (exit 122), and never falls back to v2:
+its own and prints QUALIFIED, or REFUSED with the reason. Adding `--json`
+instead prints one schema-1 verdict object (`profile`, `qualified`,
+`refusal`, and on a qualified v3 verdict the `probe` report), with the
+same exit status, for consumers that should not parse the prose form.
+For `--cpu-profile auto --json`, `qualified` says whether this host
+qualifies for x86-64-v3, not which profile an auto run presents. A v3
+run is refused by name (exit 122), and never falls back to v2:
 - on any backend but ptrace;
 - with `--no-virtualize-cpuid` or `--gdbserver`;
 - on Linux before 5.16;
