@@ -208,12 +208,7 @@ fn sealed_object_seals() -> u32 {
         "F_GET_SEALS: {}",
         std::io::Error::last_os_error()
     );
-    let noexec = fs::read_to_string("/proc/sys/vm/memfd_noexec").map_or(0, |value| {
-        value
-            .trim()
-            .parse::<u32>()
-            .expect("vm.memfd_noexec is a number")
-    });
+    let noexec = memfd_noexec(fs::read_to_string("/proc/sys/vm/memfd_noexec"));
     let exec = if noexec >= 1 { libc::F_SEAL_EXEC } else { 0 };
     assert_eq!(
         seals,
@@ -248,6 +243,53 @@ fn substituted_refusal(path: &Path) -> String {
     } else {
         "is not a sealed object".to_owned()
     }
+}
+
+/// vm.memfd_noexec from the result of reading its sysctl file. A missing
+/// file means 0: no such sysctl, so the kernel adds no exec seal (kernels
+/// before 6.3). Any other read error fails by name, never as 0.
+fn memfd_noexec(read: std::io::Result<String>) -> u32 {
+    match read {
+        Ok(value) => value
+            .trim()
+            .parse::<u32>()
+            .expect("vm.memfd_noexec is a number"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("reading vm.memfd_noexec: {error}"),
+    }
+}
+
+#[test]
+fn memfd_noexec_reads_the_sysctls_value() {
+    assert_eq!(
+        memfd_noexec(Ok("1\n".to_owned())),
+        1,
+        "the sysctl's own value"
+    );
+    assert_eq!(
+        memfd_noexec(Ok("0\n".to_owned())),
+        0,
+        "the sysctl's own value"
+    );
+}
+
+#[test]
+fn memfd_noexec_is_0_where_the_sysctl_is_absent() {
+    // What fs::read_to_string returns for a missing file.
+    let absent = std::io::Error::from_raw_os_error(libc::ENOENT);
+    assert_eq!(memfd_noexec(Err(absent)), 0, "no sysctl adds no exec seal");
+}
+
+#[test]
+#[should_panic(expected = "reading vm.memfd_noexec: Permission denied (os error 13)")]
+fn memfd_noexec_fails_by_name_when_the_sysctl_cannot_be_read() {
+    memfd_noexec(Err(std::io::Error::from_raw_os_error(libc::EACCES)));
+}
+
+#[test]
+#[should_panic(expected = "reading vm.memfd_noexec: Input/output error (os error 5)")]
+fn memfd_noexec_fails_by_name_on_an_io_error() {
+    memfd_noexec(Err(std::io::Error::from_raw_os_error(libc::EIO)));
 }
 
 #[test]
