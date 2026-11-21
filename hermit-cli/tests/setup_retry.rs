@@ -48,8 +48,7 @@ const NEW_CACHE: &[u8] = b"a replacement cache\n";
 const NEW_GROUP: &[u8] = b"renamedbyhost:x:4242:\n";
 
 /// The start of the failure of a case whose fixture could not be built.
-const UNBUILDABLE_FIXTURE: &str =
-    "setup_retry could not build its fixture, so this case fails instead of passing having run nothing";
+const UNBUILDABLE_FIXTURE: &str = "setup_retry could not build its fixture, so this case fails instead of passing having run nothing";
 
 fn run(command: &mut Command) -> std::process::Output {
     command
@@ -173,7 +172,16 @@ impl Fixture {
         );
         let mut command = Command::new("timeout");
         command
-            .args(["--kill-after", "5s", "60s", "unshare", "-rm", "sh", "-c", &script])
+            .args([
+                "--kill-after",
+                "5s",
+                "60s",
+                "unshare",
+                "-rm",
+                "sh",
+                "-c",
+                &script,
+            ])
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&stdout).expect("create stdout file"))
             .stderr(std::fs::File::create(&stderr).expect("create stderr file"));
@@ -289,7 +297,10 @@ fn a_host_rename_over_the_frozen_cache_and_group_during_setup_detaches_nothing()
     });
     let (status, stdout, stderr) = held.wait();
 
-    assert_eq!(std::fs::read(fixture.etc.join("ld.so.cache")).unwrap(), NEW_CACHE);
+    assert_eq!(
+        std::fs::read(fixture.etc.join("ld.so.cache")).unwrap(),
+        NEW_CACHE
+    );
     assert_eq!(std::fs::read(fixture.etc.join("group")).unwrap(), NEW_GROUP);
     assert!(status.success(), "launch refused: {status}\n{stderr}");
     assert!(
@@ -480,12 +491,27 @@ fn an_unarmed_setup_point_ignores_any_race_probe_setting() {
 fn an_armed_setup_point_with_a_refused_setting_fails_by_name() {
     let fixture = fixture();
     let settings = [
-        (POINT.to_owned(), format!("\"{POINT}\" is not point=LO[-HI][@P]")),
-        (format!("{POINT}="), "is not a number of milliseconds".to_owned()),
+        (
+            POINT.to_owned(),
+            format!("\"{POINT}\" is not point=LO[-HI][@P]"),
+        ),
+        (
+            format!("{POINT}="),
+            "is not a number of milliseconds".to_owned(),
+        ),
         (format!("{POINT}=9-1"), "the range is empty".to_owned()),
-        (format!("{POINT}=5"), "is not a hold (hold or hold-each)".to_owned()),
-        (format!("{POINT}=hold,no_such_point=hold"), "unknown point \"no_such_point\"".to_owned()),
-        (format!("{POINT}=garbage"), "is not a number of milliseconds".to_owned()),
+        (
+            format!("{POINT}=5"),
+            "is not a hold (hold or hold-each)".to_owned(),
+        ),
+        (
+            format!("{POINT}=hold,no_such_point=hold"),
+            "unknown point \"no_such_point\"".to_owned(),
+        ),
+        (
+            format!("{POINT}=garbage"),
+            "is not a number of milliseconds".to_owned(),
+        ),
     ];
     for (index, (setting, reason)) in settings.iter().enumerate() {
         let held = fixture.launch_with_probe(
@@ -496,10 +522,16 @@ fn an_armed_setup_point_with_a_refused_setting_fails_by_name() {
             true,
         );
         let (status, _, stderr) = held.wait();
-        assert!(!status.success(), "the launch under {setting} ran\n{stderr}");
-        let refusal = format!("race_probe: {POINT} is armed, and HERMIT_RACE_PROBE is refused there: ");
         assert!(
-            stderr.lines().any(|line| line.contains(&refusal) && line.contains(reason.as_str())),
+            !status.success(),
+            "the launch under {setting} ran\n{stderr}"
+        );
+        let refusal =
+            format!("race_probe: {POINT} is armed, and HERMIT_RACE_PROBE is refused there: ");
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains(&refusal) && line.contains(reason.as_str())),
             "the launch under {setting} did not name its refusal ({reason})\n{stderr}"
         );
         assert!(

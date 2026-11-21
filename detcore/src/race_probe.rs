@@ -282,7 +282,9 @@ impl Probes {
             Some(choices) => splitmix64(r) % choices,
             None => splitmix64(r),
         };
-        Some(Perturbation::Wait(Duration::from_millis(spec.lo_ms + offset)))
+        Some(Perturbation::Wait(Duration::from_millis(
+            spec.lo_ms + offset,
+        )))
     }
 }
 
@@ -429,9 +431,8 @@ fn launcher_hold_dir() -> Option<&'static Path> {
 /// Whether `hold_dir` holds [`LAUNCHER_HOLD_MARKER`], which arms
 /// [`delay_in_launcher`].
 fn armed_by(hold_dir: Option<&Path>) -> bool {
-    hold_dir.is_some_and(|dir| {
-        !dir.as_os_str().is_empty() && dir.join(LAUNCHER_HOLD_MARKER).exists()
-    })
+    hold_dir
+        .is_some_and(|dir| !dir.as_os_str().is_empty() && dir.join(LAUNCHER_HOLD_MARKER).exists())
 }
 
 /// A [`delay_in_launcher`] visit, armed by `hold_dir`: unless armed, it
@@ -452,7 +453,9 @@ fn launcher_visit(
     };
     match hold {
         Ok(hold) => launcher_hold(point, hold),
-        Err(reason) => panic!("race_probe: {point} is armed, and {RACE_PROBE_ENV} is refused there: {reason}"),
+        Err(reason) => {
+            panic!("race_probe: {point} is armed, and {RACE_PROBE_ENV} is refused there: {reason}")
+        }
     }
 }
 
@@ -697,11 +700,17 @@ mod tests {
                 }
             ))
         );
-        let each =
-            Probes::from_settings(Some("setup_mounts_made=hold-each"), None, Some(Path::new("/hold"))).unwrap();
+        let each = Probes::from_settings(
+            Some("setup_mounts_made=hold-each"),
+            None,
+            Some(Path::new("/hold")),
+        )
+        .unwrap();
         assert_eq!(
             each.choose(SETUP_MOUNTS_MADE),
-            Some(Perturbation::HoldEach(PathBuf::from("/hold/setup_mounts_made")))
+            Some(Perturbation::HoldEach(PathBuf::from(
+                "/hold/setup_mounts_made"
+            )))
         );
         for bad in ["fifo_staging_mapped=hold@0.5", "fifo_staging_mapped=holds"] {
             assert!(parse_item(bad).is_err(), "{bad} parsed");
@@ -714,7 +723,10 @@ mod tests {
         )
         .unwrap();
         assert!(!probes.points.contains_key(FIFO_STAGING_MAPPED));
-        assert!(Probes::from_settings(Some("fifo_staging_mapped=hold"), None, Some(Path::new(""))).is_none());
+        assert!(
+            Probes::from_settings(Some("fifo_staging_mapped=hold"), None, Some(Path::new("")))
+                .is_none()
+        );
         // With one, every visit holds on the point's own file, and draws no
         // visit from the seeded sequence of the other points.
         let config = Some("fifo_staging_mapped=hold,fifo_staging_reclaim=hold,bg_pre_call=1-9@0.5");
@@ -774,7 +786,10 @@ mod tests {
         );
         std::fs::write(&release, b"").unwrap();
         hold_blocking(SETUP_MOUNTS_MADE, &release, false, None);
-        assert!(release.exists(), "a plain hold leaves its release for later visits");
+        assert!(
+            release.exists(),
+            "a plain hold leaves its release for later visits"
+        );
     }
 
     /// A `hold-each` consumption that fails for any reason but an absent
@@ -787,7 +802,11 @@ mod tests {
         // ENOTDIR, not with the release absent.
         let not_a_directory = dir.path().join("not-a-directory");
         std::fs::write(&not_a_directory, b"").unwrap();
-        released(SETUP_MOUNTS_MADE, &not_a_directory.join(SETUP_MOUNTS_MADE), true);
+        released(
+            SETUP_MOUNTS_MADE,
+            &not_a_directory.join(SETUP_MOUNTS_MADE),
+            true,
+        );
     }
 
     /// A launcher point is armed only by a hold directory holding the marker
@@ -842,16 +861,43 @@ mod tests {
         for (config, reason) in [
             (None, "HERMIT_RACE_PROBE is not set"),
             (Some(""), "names no hold for setup_mounts_made"),
-            (Some("setup_mounts_made"), "\"setup_mounts_made\" is not point=LO[-HI][@P]"),
-            (Some("setup_mounts_made="), "is not a number of milliseconds"),
+            (
+                Some("setup_mounts_made"),
+                "\"setup_mounts_made\" is not point=LO[-HI][@P]",
+            ),
+            (
+                Some("setup_mounts_made="),
+                "is not a number of milliseconds",
+            ),
             (Some("setup_mounts_made=9-1"), "the range is empty"),
-            (Some("setup_mounts_made=1-2@7"), "probability must be in [0, 1]"),
-            (Some("setup_mounts_made=garbage"), "is not a number of milliseconds"),
-            (Some("setup_mounts_made=5"), "is not a hold (hold or hold-each)"),
-            (Some("setup_mounts_made=hold@0.5"), "is not a number of milliseconds"),
-            (Some("setup_mounts_made=hold,no_such_point=hold"), "unknown point \"no_such_point\""),
-            (Some("setup_mounts_made=hold,bg_pre_call=x"), "\"x\" is not a number of milliseconds"),
-            (Some("bg_pre_call=1-9"), "names no hold for setup_mounts_made"),
+            (
+                Some("setup_mounts_made=1-2@7"),
+                "probability must be in [0, 1]",
+            ),
+            (
+                Some("setup_mounts_made=garbage"),
+                "is not a number of milliseconds",
+            ),
+            (
+                Some("setup_mounts_made=5"),
+                "is not a hold (hold or hold-each)",
+            ),
+            (
+                Some("setup_mounts_made=hold@0.5"),
+                "is not a number of milliseconds",
+            ),
+            (
+                Some("setup_mounts_made=hold,no_such_point=hold"),
+                "unknown point \"no_such_point\"",
+            ),
+            (
+                Some("setup_mounts_made=hold,bg_pre_call=x"),
+                "\"x\" is not a number of milliseconds",
+            ),
+            (
+                Some("bg_pre_call=1-9"),
+                "names no hold for setup_mounts_made",
+            ),
         ] {
             let refused = armed_hold(config, dir, SETUP_MOUNTS_MADE)
                 .expect_err(&format!("{config:?} was taken as a hold"));
