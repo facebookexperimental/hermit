@@ -35,6 +35,22 @@
 //! rustfmt, until <https://github.com/rrnewton/hermit/issues/5397> packages
 //! the pinned formatter in the image.
 //!
+//! Files whose bytes cannot change yet (another file pins their sha256) are
+//! listed in `ci/rustfmt-exclusions.txt`, one `PATH REASON` per
+//! line (spaces, never a tab), and formatting skips exactly those. rustfmt
+//! takes `ignore` only from a configuration file and resolves its entries
+//! against that file's directory, so every formatting run writes a
+//! configuration into the repository root (`.tmp-rustfmt-gate-PID.toml`, which
+//! `.tmp*` keeps out of git, removed afterwards): `rustfmt.toml` unchanged plus
+//! an `ignore` list of the listed paths, and passes it as `--config-path`.
+//! Before formatting, the list must parse (each entry a repository-relative
+//! `.rs` path, listed once, with the reason `sha256-pinned in FILE[ and
+//! FILE...]`), every listed path must be a file whose sha256 each FILE
+//! contains (an entry nothing pins is refused: format that file instead),
+//! `rustfmt.toml` must set no `ignore` of its own, and the `ignore` list read
+//! back from the written file must be exactly the list; any failure exits 2
+//! before anything is formatted.
+//!
 //! Usage, from anywhere in the repository:
 //!   scripts/cargo-fmt-pinned.rs --workspace-members [-- --check]
 //!                                                    format exactly the root
@@ -49,6 +65,9 @@
 //!                                                    reject a brace import (exit 1) and
 //!                                                    accept its fixed form (exit 0)
 //!   scripts/cargo-fmt-pinned.rs --show               print the selected formatter
+//!   scripts/cargo-fmt-pinned.rs --check-exclusions   check ci/rustfmt-exclusions.txt
+//!                                                    and the configuration built
+//!                                                    from it, without a formatter
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -73,6 +92,392 @@ const IMAGE_FOLLOW_UP: &str = "https://github.com/rrnewton/hermit/issues/5397";
 /// The self-test fixtures' package: standalone, so no enclosing workspace claims it.
 const SELF_TEST_MANIFEST: &str =
     "[package]\nname = \"fmt-self-test\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n";
+/// The files formatting leaves alone, relative to the repository root.
+const EXCLUSIONS_FILE: &str = "ci/rustfmt-exclusions.txt";
+/// The repository's rustfmt configuration, which the generated one extends.
+const ROOT_CONFIG: &str = "rustfmt.toml";
+/// The generated configuration's name in the repository root, before the PID.
+const GATE_CONFIG_PREFIX: &str = ".tmp-rustfmt-gate-";
+/// The one reason an entry may give, followed by `FILE[ and FILE...]`.
+const PINNED_IN: &str = "sha256-pinned in ";
+
+/// One `ci/rustfmt-exclusions.txt` entry.
+#[derive(Debug, PartialEq, Eq)]
+struct Exclusion {
+    /// Repository-relative path of a `.rs` file.
+    path: String,
+    /// The repository-relative files its reason names, each of which must
+    /// contain the file's sha256: that pin is why its bytes cannot change.
+    pinned_in: Vec<String>,
+}
+
+/// Reads the exclusion list: `PATH REASON` lines, with `#` comment lines and
+/// blank lines skipped. PATH is the first whitespace-delimited field and
+/// REASON the rest of the line, trimmed. Each PATH is a repository-relative
+/// `.rs` path, listed once, and REASON is exactly `sha256-pinned in FILE[ and
+/// FILE...]`; [`load_exclusions`] then requires each FILE to contain PATH's
+/// sha256. A line with a tab is refused, comment lines included: fbsource's
+/// linter refuses tabs in text files, so the list separates its fields with
+/// spaces.
+fn parse_exclusions(text: &str) -> Result<Vec<Exclusion>, String> {
+    let mut list: Vec<Exclusion> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let at = format!("{EXCLUSIONS_FILE}:{}", number + 1);
+        if line.contains('\t') {
+            return Err(format!(
+                "{at}: has a tab; separate PATH and REASON with spaces (fbsource's linter \
+                 refuses tabs in text files)"
+            ));
+        }
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            return Err(format!(
+                "{at}: starts with whitespace (expected `PATH REASON`)"
+            ));
+        }
+        let (path, reason) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        if reason.trim().is_empty() {
+            return Err(format!(
+                "{at}: `{path}` has no reason (expected `PATH REASON`)"
+            ));
+        }
+        if let Some(problem) = exclusion_path_problem(path) {
+            return Err(format!("{at}: `{path}` {problem}"));
+        }
+        if list.iter().any(|seen| seen.path == path) {
+            return Err(format!("{at}: `{path}` is listed twice"));
+        }
+        let pinned_in = pinning_files(reason.trim())
+            .map_err(|problem| format!("{at}: `{path}`'s reason `{}` {problem}", reason.trim()))?;
+        list.push(Exclusion {
+            path: path.to_string(),
+            pinned_in,
+        });
+    }
+    Ok(list)
+}
+
+/// The files a reason names: it must read `sha256-pinned in FILE[ and
+/// FILE...]`, each FILE a repository-relative path.
+fn pinning_files(reason: &str) -> Result<Vec<String>, &'static str> {
+    let Some(files) = reason.strip_prefix(PINNED_IN) else {
+        return Err("is not `sha256-pinned in FILE[ and FILE...]`");
+    };
+    files
+        .split(" and ")
+        .map(|file| {
+            let relative = !file.is_empty()
+                && !file.starts_with('/')
+                && !file.contains(char::is_whitespace)
+                && file
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..");
+            if relative {
+                Ok(file.to_string())
+            } else {
+                Err("names a FILE that is not a repository-relative path")
+            }
+        })
+        .collect()
+}
+
+/// Why `path` cannot be an entry, if it cannot. rustfmt reads `ignore`
+/// entries as gitignore patterns, so a pattern character, or a path with no
+/// `/` (which gitignore matches by name in every directory), would exclude
+/// more than the one file.
+fn exclusion_path_problem(path: &str) -> Option<&'static str> {
+    if !path.ends_with(".rs") {
+        Some("is not a .rs path")
+    } else if !path.contains('/') {
+        Some("has no `/`; rustfmt would read it as a pattern matching that name in every directory")
+    } else if path.starts_with('/') {
+        Some("is not relative to the repository root")
+    } else if path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        Some("has an empty, `.` or `..` component")
+    } else if path
+        .chars()
+        .any(|c| c.is_whitespace() || "*?[]!\\#\"".contains(c))
+    {
+        Some("has whitespace or a gitignore pattern character")
+    } else {
+        None
+    }
+}
+
+/// The list in the checkout at `root`, every entry naming a regular file (an
+/// entry left behind by a move or a deletion excludes nothing, or excludes
+/// the next file to take its name) whose sha256, as lowercase hex, every file
+/// its reason names contains: an entry nothing pins is refused, since that
+/// file can simply be formatted.
+fn load_exclusions(root: &Path) -> Result<Vec<Exclusion>, String> {
+    let path = root.join(EXCLUSIONS_FILE);
+    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let list = parse_exclusions(&text)?;
+    for entry in &list {
+        let bytes = regular_file(root, &entry.path)
+            .map_err(|problem| format!("{EXCLUSIONS_FILE}: `{}` {problem}", entry.path))?;
+        let digest = sha256_hex(&bytes);
+        for file in &entry.pinned_in {
+            let pins = regular_file(root, file).map_err(|problem| {
+                format!(
+                    "{EXCLUSIONS_FILE}: `{}`'s reason names `{file}`, which {problem}",
+                    entry.path
+                )
+            })?;
+            let found = pins
+                .windows(digest.len())
+                .any(|window| window == digest.as_bytes());
+            if !found {
+                return Err(format!(
+                    "{EXCLUSIONS_FILE}: `{}`'s sha256 {digest} is not in `{file}`, so its reason \
+                     does not hold; format the file and delete its entry instead",
+                    entry.path
+                ));
+            }
+        }
+    }
+    Ok(list)
+}
+
+/// The bytes of the regular file at `relative` under `root`, or why not.
+fn regular_file(root: &Path, relative: &str) -> Result<Vec<u8>, String> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            fs::read(&path).map_err(|error| format!("cannot be read: {error}"))
+        }
+        Ok(_) => Err("is not a regular file".to_string()),
+        Err(error) => Err(format!("is missing: {error}")),
+    }
+}
+
+/// SHA-256 of `data` as lowercase hex (std only, as scripts/syscall-pages.rs
+/// computes it).
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut message = Vec::with_capacity(data.len() + 72);
+    message.extend_from_slice(data);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+    let mut w = [0u32; 64];
+    for chunk in message.chunks_exact(64) {
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    h.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+/// The formatting configuration: `root_config` unchanged, plus an `ignore`
+/// list of exactly the listed paths. A `root_config` that sets `ignore`
+/// itself is refused: formatting would then skip files the list does not name.
+fn gate_config(root_config: &str, list: &[Exclusion]) -> Result<String, String> {
+    let sets_ignore = root_config.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("ignore")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    if sets_ignore {
+        return Err(format!(
+            "{ROOT_CONFIG} sets `ignore`; the only files formatting may skip are \
+             {EXCLUSIONS_FILE}'s"
+        ));
+    }
+    let mut text = root_config.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n# Generated by scripts/cargo-fmt-pinned.rs from {EXCLUSIONS_FILE}.\nignore = [\n"
+    ));
+    for entry in list {
+        text.push_str(&format!("    \"{}\",\n", entry.path));
+    }
+    text.push_str("]\n");
+    Ok(text)
+}
+
+/// The `ignore` entries of a generated configuration, read back from its text
+/// rather than taken from [`gate_config`]'s input.
+fn config_ignore_entries(config: &str) -> Result<Vec<String>, String> {
+    let mut entries: Option<Vec<String>> = None;
+    let mut collecting = false;
+    for line in config.lines().map(str::trim) {
+        if collecting {
+            if line == "]" {
+                collecting = false;
+                continue;
+            }
+            let entry = line
+                .strip_suffix(',')
+                .and_then(|line| line.strip_prefix('"'))
+                .and_then(|line| line.strip_suffix('"'))
+                .ok_or_else(|| format!("unexpected line in the `ignore` list: `{line}`"))?;
+            entries
+                .as_mut()
+                .expect("collecting")
+                .push(entry.to_string());
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("ignore") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if entries.is_some() {
+            return Err("`ignore` is set twice".to_string());
+        }
+        if value.trim() != "[" {
+            return Err(format!("unexpected `ignore` line: `{line}`"));
+        }
+        entries = Some(Vec::new());
+        collecting = true;
+    }
+    if collecting {
+        return Err("the `ignore` list is not closed".to_string());
+    }
+    entries.ok_or_else(|| "no `ignore` list".to_string())
+}
+
+/// The generated configuration file, removed when dropped.
+struct GateConfig {
+    path: PathBuf,
+    excluded: usize,
+}
+
+impl Drop for GateConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Writes the formatting configuration into the repository root (see the
+/// module documentation for why there) and checks it: its `ignore` list, read
+/// back from the written file, must be exactly the exclusion list, and the
+/// rest of it must be `rustfmt.toml` unchanged.
+fn write_gate_config(root: &Path) -> Result<GateConfig, String> {
+    let list = load_exclusions(root)?;
+    let root_config_path = root.join(ROOT_CONFIG);
+    let root_config = fs::read_to_string(&root_config_path)
+        .map_err(|error| format!("{}: {error}", root_config_path.display()))?;
+    let text = gate_config(&root_config, &list)?;
+    let config = GateConfig {
+        path: root.join(format!("{GATE_CONFIG_PREFIX}{}.toml", std::process::id())),
+        excluded: list.len(),
+    };
+    fs::write(&config.path, &text)
+        .map_err(|error| format!("{}: {error}", config.path.display()))?;
+    let written = fs::read_to_string(&config.path)
+        .map_err(|error| format!("{}: {error}", config.path.display()))?;
+    let ignored = config_ignore_entries(&written)
+        .map_err(|error| format!("{}: {error}", config.path.display()))?;
+    let listed: Vec<&str> = list.iter().map(|entry| entry.path.as_str()).collect();
+    if ignored != listed {
+        return Err(format!(
+            "{} ignores {ignored:?}, but {EXCLUSIONS_FILE} lists {listed:?}",
+            config.path.display()
+        ));
+    }
+    if !written.starts_with(&root_config) {
+        return Err(format!(
+            "{} does not start with {ROOT_CONFIG} unchanged",
+            config.path.display()
+        ));
+    }
+    Ok(config)
+}
+
+/// `args` for cargo fmt with `--config-path config` added to the rustfmt
+/// arguments (after `--`). An explicit `--config-path` is refused: it would
+/// replace the configuration that carries the exclusions.
+fn with_gate_config(args: Vec<OsString>, config: &Path) -> Result<Vec<OsString>, String> {
+    let separator = args.iter().position(|arg| arg == "--");
+    if let Some(separator) = separator {
+        let explicit = args[separator + 1..].iter().any(|arg| {
+            arg.to_str()
+                .is_some_and(|arg| arg == "--config-path" || arg.starts_with("--config-path="))
+        });
+        if explicit {
+            return Err(format!(
+                "--config-path is set by this script (rustfmt.toml plus {EXCLUSIONS_FILE}); \
+                 do not pass one"
+            ));
+        }
+    }
+    let mut with = args;
+    let at = match separator {
+        Some(separator) => separator + 1,
+        None => {
+            with.push("--".into());
+            with.len()
+        }
+    };
+    with.splice(
+        at..at,
+        [
+            OsString::from("--config-path"),
+            config.as_os_str().to_owned(),
+        ],
+    );
+    Ok(with)
+}
 
 /// What `ci/rustfmt-toolchain.toml` pins.
 #[derive(Debug, PartialEq, Eq)]
@@ -467,6 +872,16 @@ fn path_rustfmt_version() -> Option<String> {
 
 fn run() -> Result<ExitCode, String> {
     let root = repository_root()?;
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--check-exclusions") {
+        let config = write_gate_config(&root)?;
+        println!(
+            "cargo-fmt-pinned: {EXCLUSIONS_FILE} is consistent: {} excluded file(s), each a \
+             file with a reason, and exactly those in the generated `ignore` list",
+            config.excluded
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let pin_path = root.join(PIN_FILE);
     let text = fs::read_to_string(&pin_path)
         .map_err(|error| format!("{}: {error}", pin_path.display()))?;
@@ -481,7 +896,6 @@ fn run() -> Result<ExitCode, String> {
     let formatter = select(&pin, toolchain, rustup, path_rustfmt.as_deref())?;
     let resolved = formatter.resolve()?;
     check_identity(&resolved.version()?, &pin, &formatter)?;
-    let args: Vec<OsString> = env::args_os().skip(1).collect();
     match args.first().and_then(|arg| arg.to_str()) {
         Some("--show") => {
             println!(
@@ -514,11 +928,13 @@ fn run() -> Result<ExitCode, String> {
                 scoped.push(package.into());
             }
             scoped.extend(args.into_iter().skip(1));
-            let code = run_cargo_fmt(&resolved, &scoped, &root)?;
+            let config = write_gate_config(&root)?;
+            let code = run_cargo_fmt(&resolved, &with_gate_config(scoped, &config.path)?, &root)?;
             Ok(ExitCode::from(code.clamp(0, 255) as u8))
         }
         _ => {
-            let code = run_cargo_fmt(&resolved, &args, &root)?;
+            let config = write_gate_config(&root)?;
+            let code = run_cargo_fmt(&resolved, &with_gate_config(args, &config.path)?, &root)?;
             Ok(ExitCode::from(code.clamp(0, 255) as u8))
         }
     }
@@ -947,5 +1363,247 @@ mod tests {
             "{error}"
         );
         fs::remove_dir_all(toolchain).unwrap();
+    }
+
+    /// Every malformed entry is refused by line: a tab anywhere, no reason, a
+    /// reason not of the one form, a duplicate, and paths that are not one
+    /// repository-relative `.rs` file. Any run of spaces separates PATH from
+    /// REASON, which is trimmed.
+    #[test]
+    fn the_exclusion_list_refuses_malformed_entries() {
+        let good = "# comment\n\na/b.rs sha256-pinned in c.json\n\
+                    c/d.rs     sha256-pinned in e/f.json and g.py   \n";
+        assert_eq!(
+            parse_exclusions(good),
+            Ok(vec![
+                Exclusion {
+                    path: "a/b.rs".into(),
+                    pinned_in: vec!["c.json".into()],
+                },
+                Exclusion {
+                    path: "c/d.rs".into(),
+                    pinned_in: vec!["e/f.json".into(), "g.py".into()],
+                },
+            ])
+        );
+        for (text, expected) in [
+            ("a/b.rs\tsha256-pinned in c.json\n", ":1: has a tab"),
+            (
+                "a/b.rs sha256-pinned in c.json\n# a\tcomment\n",
+                ":2: has a tab",
+            ),
+            ("a/b.rs\n", "has no reason (expected `PATH REASON`)"),
+            ("a/b.rs \n", "has no reason"),
+            ("a/b.rs    \n", "has no reason"),
+            (
+                " a/b.rs sha256-pinned in c.json\n",
+                "starts with whitespace",
+            ),
+            (
+                "a/b.rs embedded by c.rs\n",
+                "reason `embedded by c.rs` is not `sha256-pinned in FILE[ and FILE...]`",
+            ),
+            ("a/b.rs sha256-pinned in\n", "is not `sha256-pinned in"),
+            (
+                "a/b.rs sha256-pinned in /c.json\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in c/../d.json\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in c.json and\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in c.json, d.json\n",
+                "not a repository-relative path",
+            ),
+            (
+                "a/b.rs sha256-pinned in c.json\na/b.rs sha256-pinned in c.json\n",
+                "listed twice",
+            ),
+            (
+                "d.rs sha256-pinned in c.json\n",
+                "has no `/`; rustfmt would read it as a pattern matching that name in every \
+                 directory",
+            ),
+            ("/a/b.rs sha256-pinned in c.json\n", "not relative"),
+            ("a/../b.rs sha256-pinned in c.json\n", "`..` component"),
+            ("a//b.rs sha256-pinned in c.json\n", "empty"),
+            ("a/*.rs sha256-pinned in c.json\n", "pattern character"),
+            ("a/b.txt sha256-pinned in c.json\n", "not a .rs path"),
+        ] {
+            let error = parse_exclusions(text).unwrap_err();
+            assert!(error.contains(expected), "{text:?}: {error}");
+            assert!(error.starts_with(EXCLUSIONS_FILE), "{error}");
+        }
+        assert_eq!(
+            exclusion_path_problem("a/b c.rs"),
+            Some("has whitespace or a gitignore pattern character")
+        );
+    }
+
+    /// The generated configuration is the repository's unchanged plus exactly
+    /// the listed paths, read back the same; a repository configuration with
+    /// its own `ignore` is refused.
+    #[test]
+    fn the_generated_configuration_ignores_exactly_the_list() {
+        let list =
+            parse_exclusions("a/b.rs sha256-pinned in p.json\nc/d.rs sha256-pinned in p.json\n")
+                .unwrap();
+        let root_config = "edition = \"2024\"\nmerge_derives = false\n";
+        let text = gate_config(root_config, &list).unwrap();
+        assert!(text.starts_with(root_config), "{text}");
+        assert_eq!(config_ignore_entries(&text).unwrap(), ["a/b.rs", "c/d.rs"]);
+        let empty = gate_config(root_config, &[]).unwrap();
+        assert_eq!(config_ignore_entries(&empty).unwrap(), Vec::<String>::new());
+        let error = gate_config("ignore = [\"z.rs\"]\n", &list).unwrap_err();
+        assert!(error.contains("sets `ignore`"), "{error}");
+        assert!(
+            config_ignore_entries(&format!("{text}ignore = [\n]\n"))
+                .unwrap_err()
+                .contains("set twice")
+        );
+        assert!(
+            config_ignore_entries("ignore = [\n    \"a.rs\",\n")
+                .unwrap_err()
+                .contains("not closed")
+        );
+        assert!(
+            config_ignore_entries(root_config)
+                .unwrap_err()
+                .contains("no `ignore`")
+        );
+    }
+
+    /// `--config-path` goes after `--`, which is added when absent, and an
+    /// explicit one is refused.
+    #[test]
+    fn the_configuration_is_passed_to_rustfmt() {
+        let config = Path::new("/r/.tmp-rustfmt-gate-1.toml");
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            with_gate_config(args(&["-p", "a", "--", "--check"]), config).unwrap(),
+            args(&[
+                "-p",
+                "a",
+                "--",
+                "--config-path",
+                "/r/.tmp-rustfmt-gate-1.toml",
+                "--check"
+            ])
+        );
+        assert_eq!(
+            with_gate_config(args(&["-p", "a"]), config).unwrap(),
+            args(&[
+                "-p",
+                "a",
+                "--",
+                "--config-path",
+                "/r/.tmp-rustfmt-gate-1.toml"
+            ])
+        );
+        for explicit in ["--config-path", "--config-path=x.toml"] {
+            let error = with_gate_config(args(&["--all", "--", explicit]), config).unwrap_err();
+            assert!(error.contains("do not pass one"), "{error}");
+        }
+    }
+
+    /// In a checkout: a listed path that is missing is refused, and so is an
+    /// entry whose reason names a missing file or a file without its sha256;
+    /// the written configuration matches the list, and it is removed when
+    /// dropped.
+    #[test]
+    fn the_configuration_is_written_into_the_root_and_removed() {
+        let root = env::temp_dir().join(format!("cargo-fmt-pinned-gate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ci")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(ROOT_CONFIG), "edition = \"2024\"\n").unwrap();
+        fs::write(root.join("src/pinned.rs"), "fn  f() {}\n").unwrap();
+        let digest = sha256_hex(b"fn  f() {}\n");
+        fs::write(
+            root.join("pins.json"),
+            format!("{{\"src/pinned.rs\": \"{digest}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(root.join("other.json"), "{}\n").unwrap();
+        for (list, expected) in [
+            (
+                "src/gone.rs sha256-pinned in pins.json\n",
+                "`src/gone.rs` is missing",
+            ),
+            (
+                "src/pinned.rs sha256-pinned in gone.json\n",
+                "`src/pinned.rs`'s reason names `gone.json`, which is missing",
+            ),
+            (
+                "src/pinned.rs sha256-pinned in other.json\n",
+                "is not in `other.json`, so its reason does not hold",
+            ),
+            (
+                "src/pinned.rs sha256-pinned in pins.json and other.json\n",
+                "is not in `other.json`",
+            ),
+        ] {
+            fs::write(root.join(EXCLUSIONS_FILE), list).unwrap();
+            let error = write_gate_config(&root).err().unwrap();
+            assert!(error.contains(expected), "{list:?}: {error}");
+        }
+        fs::write(
+            root.join(EXCLUSIONS_FILE),
+            "src/pinned.rs sha256-pinned in pins.json\n",
+        )
+        .unwrap();
+        let config = write_gate_config(&root).unwrap();
+        assert_eq!(config.path.parent(), Some(root.as_path()));
+        let written = fs::read_to_string(&config.path).unwrap();
+        assert_eq!(config_ignore_entries(&written).unwrap(), ["src/pinned.rs"]);
+        let path = config.path.clone();
+        drop(config);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The digest is SHA-256: the FIPS 180-2 vectors, including a multi-block
+    /// message.
+    #[test]
+    fn the_digest_is_sha256() {
+        for (data, hex) in [
+            (
+                b"".as_slice(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".as_slice(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".as_slice(),
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ] {
+            assert_eq!(sha256_hex(data), hex);
+        }
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    /// The checked-in list is consistent with this checkout.
+    #[test]
+    fn the_checked_in_exclusion_list_is_consistent() {
+        let root = test_root();
+        let config = write_gate_config(&root).unwrap();
+        let written = fs::read_to_string(&config.path).unwrap();
+        let listed: Vec<String> = load_exclusions(&root)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(config_ignore_entries(&written).unwrap(), listed);
     }
 }

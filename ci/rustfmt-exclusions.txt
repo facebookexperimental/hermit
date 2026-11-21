@@ -1,0 +1,17 @@
+# Files formatting leaves alone, one per line: PATH REASON.
+#
+# PATH is a repository-relative .rs path containing a `/`, written up to the
+# first space. REASON, the rest of the line, must read `sha256-pinned in FILE[
+# and FILE...]`, each FILE a repository-relative path that contains PATH's
+# sha256 as lowercase hex: a hash pin is the only reason a file's bytes cannot
+# change, and a file nothing pins is formatted instead. Separate the fields with
+# spaces, never a tab. Formatting with scripts/cargo-fmt-pinned.rs (the
+# lint.rustfmt step and `make fmt`) passes exactly these paths to rustfmt as its
+# `ignore` list, and refuses to run (exit 2) when a line has a tab, an entry has
+# no reason or another reason, a named FILE lacks the sha256, a path is listed
+# twice or names no file, or the generated `ignore` list differs from this file.
+# `--check-exclusions` runs those checks alone.
+#
+# Only files the format check reaches belong here. Formatting a listed file
+# means re-deriving whatever pins its bytes in the same change, then deleting
+# its line.
