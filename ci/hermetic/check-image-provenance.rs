@@ -454,23 +454,26 @@ fn validate_artifact(artifact: &Value, context: &str) -> Result<(), String> {
             ));
         }
     }
-    // The recorded manifest length must be the length of the compact
-    // Docker-v2 manifest those descriptors reconstruct to; a nonzero
-    // length alone once let a wrong 391 stand for the real 598.
+    // The recorded manifest must be the compact Docker-v2 manifest those
+    // descriptors reconstruct to, in Podman's stored descriptor key
+    // order (mediaType, size, digest): both its length and its digest
+    // are asserted. Length alone once let a wrong 391 stand for the
+    // real 598, and the same 598 bytes in (mediaType, digest, size)
+    // order hash to a different digest than the pin (dh-bca16a).
     let mut reconstructed = format!(
-        "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[",
+        "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"{}\"}},\"layers\":[",
         string(artifact, "manifest_media_type", context)?,
-        string(artifact, "config_digest", context)?,
         unsigned(artifact, "config_size_bytes", context)?,
+        string(artifact, "config_digest", context)?,
     );
     for (index, layer) in layers.iter().enumerate() {
         if index > 0 {
             reconstructed.push(',');
         }
         reconstructed.push_str(&format!(
-            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"digest\":\"{}\",\"size\":{}}}",
-            string(layer, "digest", &format!("{context}.layers[{index}]"))?,
+            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"{}\"}}",
             unsigned(layer, "size_bytes", &format!("{context}.layers[{index}]"))?,
+            string(layer, "digest", &format!("{context}.layers[{index}]"))?,
         ));
     }
     reconstructed.push_str("]}");
@@ -478,6 +481,12 @@ fn validate_artifact(artifact: &Value, context: &str) -> Result<(), String> {
         return Err(format!(
             "{context}.manifest_size_bytes does not equal the reconstructed manifest length {}",
             reconstructed.len()
+        ));
+    }
+    let reconstructed_digest = format!("sha256:{}", sha256(reconstructed.as_bytes()));
+    if reconstructed_digest != manifest {
+        return Err(format!(
+            "{context}.manifest_digest does not equal the reconstructed manifest digest {reconstructed_digest}"
         ));
     }
     Ok(())
@@ -1001,6 +1010,73 @@ mod tests {
             validate_semantics(&wrong)
                 .unwrap_err()
                 .contains("does not equal the reconstructed manifest length")
+        );
+    }
+
+    #[test]
+    fn rejects_a_manifest_digest_that_is_not_the_reconstructed_digest() {
+        // Red control A: both runs record the digest of the same 598
+        // bytes serialized in the wrong descriptor key order
+        // (mediaType, digest, size). Length, run equality and shape
+        // checks all pass; only the reconstructed-digest assert fails.
+        let wrong_order = "sha256:4d02d3a7cd7a53bbe2692e675bfc9331cf942b558eb7cf7e99436c5936e16bd6";
+        let mut altered_digest = record();
+        for run in 0..2 {
+            *mutate(
+                &mut altered_digest,
+                &format!("/runs/{run}/artifact/manifest_digest"),
+            ) = Value::String(wrong_order.into());
+            *mutate(
+                &mut altered_digest,
+                &format!("/runs/{run}/artifact/loaded_reference"),
+            ) = Value::String(format!("localhost/hermit-hermetic-validate@{wrong_order}"));
+        }
+        *mutate(&mut altered_digest, "/repin/replacement_reference") =
+            Value::String(format!("localhost/hermit-hermetic-validate@{wrong_order}"));
+        assert!(
+            validate_semantics(&altered_digest)
+                .unwrap_err()
+                .contains("does not equal the reconstructed manifest digest")
+        );
+
+        // Red control B: reordered layer descriptors (same length,
+        // same multiset) in both runs.
+        let base = record();
+        let layer0 = base.pointer("/runs/0/artifact/layers/0").unwrap().clone();
+        let layer1 = base.pointer("/runs/0/artifact/layers/1").unwrap().clone();
+        let mut reordered = record();
+        for run in 0..2 {
+            *mutate(&mut reordered, &format!("/runs/{run}/artifact/layers/0")) = layer1.clone();
+            *mutate(&mut reordered, &format!("/runs/{run}/artifact/layers/1")) = layer0.clone();
+            *mutate(&mut reordered, &format!("/runs/{run}/artifact/diff_ids/0")) =
+                layer1.pointer("/digest").unwrap().clone();
+            *mutate(&mut reordered, &format!("/runs/{run}/artifact/diff_ids/1")) =
+                layer0.pointer("/digest").unwrap().clone();
+        }
+        assert!(
+            validate_semantics(&reordered)
+                .unwrap_err()
+                .contains("does not equal the reconstructed manifest digest")
+        );
+
+        // Red control C: an altered descriptor size with the same
+        // digit count, so the reconstructed length is unchanged.
+        let config_size = base
+            .pointer("/runs/0/artifact/config_size_bytes")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        let mut altered_size = record();
+        for run in 0..2 {
+            *mutate(
+                &mut altered_size,
+                &format!("/runs/{run}/artifact/config_size_bytes"),
+            ) = Value::from(config_size + 1);
+        }
+        assert!(
+            validate_semantics(&altered_size)
+                .unwrap_err()
+                .contains("does not equal the reconstructed manifest digest")
         );
     }
 
