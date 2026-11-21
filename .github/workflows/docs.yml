@@ -197,10 +197,17 @@ jobs:
         # Since 22eee878 (2026-11-15) the Hermit workspace path-depends on its
         # reverie submodule, so cargo doc in the pin needs it checked out.
         git -C _pin_source submodule update --init --depth 1 -- reverie
+        # Fail here, within this step's bound, not an hour later in cargo.
+        [[ -f _pin_source/reverie/reverie/Cargo.toml ]] || {
+          echo '::error::Reverie is missing from the pin worktree (_pin_source/reverie/reverie/Cargo.toml)'
+          exit 1
+        }
     - name: Initialize dagrun submodule
       run: git submodule update --init --depth 1 -- agent-utils
     - name: Initialize the Reverie submodule
-      # cargo doc on the dispatched commit resolves Reverie path dependencies.
+      # Every run: cargo doc on a non-rebuild run builds the dispatched commit,
+      # whose workspace path-depends on Reverie. Rebuild runs build in
+      # _pin_source, which initializes its own copy; this step is harmless there.
       run: git submodule update --init --depth 1 -- reverie
     - name: Check nightly source access and pins
       id: website-source
@@ -281,7 +288,8 @@ jobs:
       run: |
         set -euo pipefail
         # H history is required for source ancestry/depth. Do not recursively
-        # initialize unrelated Reverie, rr, backend, or parent submodules.
+        # initialize the parent's other submodules (rr, backends); Hermit's own
+        # agent-utils and reverie are initialized explicitly below.
         git -C _website_source submodule update --init -- hermit
         # The builder reads the cell ledger at one commit, so it needs no
         # ledger history here; the rebuild fetches the captured commit and
@@ -321,6 +329,11 @@ jobs:
         # manifest-metadata resolves the Hermit workspace, whose Reverie crates
         # are path dependencies in this submodule since 22eee878.
         git -C _website_source/hermit submodule update --init --depth 1 -- reverie
+        # Fail here, within this step's bound, not in manifest metadata.
+        [[ -f _website_source/hermit/reverie/reverie/Cargo.toml ]] || {
+          echo '::error::Reverie is missing from the website source (_website_source/hermit/reverie/reverie/Cargo.toml)'
+          exit 1
+        }
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
