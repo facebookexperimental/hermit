@@ -54,7 +54,16 @@ exact check, so a missing image fails at the run and nothing is fetched.
 `image.provenance.json`. Run `check-image-provenance.rs` after checkout changes
 and before proposing a pin change. The checker validates the tracked receipt's
 strict schema and internal agreement, exact recorded build/store identities and
-results, the four enumerated live image-input files, and live pin. The recorded
+results, the four enumerated live image-input files, and live pin. It also
+validates every composed-image receipt under `images/` (strict per-image
+schema, reconstructed manifest digests, the four bound input files including
+`groups.nix`, one flake lock, complete parent chains, and group-digest
+bijections); a missing or extra receipt file fails closed. The monolith
+receipt's `flake_reattestation` records that its current flake.nix input was
+re-attested by abort-stub evaluation at the same derivation, not rebuilt;
+composed receipts carry their own evidence limitations (local two-store
+method) and must not be selected by any consumer until repin-grade builds
+replace them. The recorded
 build-source commit, tree, and archive are historical evidence: review binds
 those identities and the external bytes and logs to the receipt. Rebases can
 rewrite commit ancestry, so live equivalence is deliberately limited to those

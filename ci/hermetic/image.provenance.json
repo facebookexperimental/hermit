@@ -32,8 +32,8 @@
             },
             {
                 "path": "ci/hermetic/flake.nix",
-                "sha256": "663f05a959d1c741729e0b79a8dc39a7bf55503c98df758a54f3976f99469a53",
-                "size_bytes": 16798
+                "sha256": "b0ac537cbbf3978e03c7ff2b1980945ec2f677821fcc902fe1d7eb05f53f5393",
+                "size_bytes": 17305
             },
             {
                 "path": "ci/hermetic/guest-paths.txt",
@@ -83,13 +83,22 @@
             }
         ]
     },
+    "flake_reattestation": {
+        "built_flake_sha256": "663f05a959d1c741729e0b79a8dc39a7bf55503c98df758a54f3976f99469a53",
+        "current_flake_sha256": "b0ac537cbbf3978e03c7ff2b1980945ec2f677821fcc902fe1d7eb05f53f5393",
+        "stub_text": "throw \"groups.nix evaluated: monolith depends on groups\"\n",
+        "evaluated_drv_path": "/nix/store/0am28327vyciiq0s4ahlz03d2kfc2rbk-hermit-hermetic-validate.tar.gz.drv",
+        "nix_version": "nix (Nix) 2.36.0",
+        "evaluated_commit": "efacb97b0a46744b774fe3fcc191ec44fbf8fd0f"
+    },
     "evidence_limitations": [
         "Each service ran under systemd-run with only PATH and NIX_SSL_CERT_FILE set explicitly; fetches went through the host forward proxy (with-proxy). Only variable names were recorded, not their values.",
         "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
         "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
         "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
         "The superseded 4e1605ec archive was not rebuilt for this receipt; its df1f0dd4 SHA-256 is carried from the prior receipt that produced the replaced pin.",
-        "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive."
+        "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
+        "The flake.nix input was re-attested by evaluation, not by rebuild: the builds below used flake.nix 663f05a9; the current file is b0ac537c, accepted only because the pinned derivation re-evaluates identically with groups.nix aborting (flake_reattestation)."
     ],
     "runs": [
         {

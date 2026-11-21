@@ -1,0 +1,112 @@
+{
+    "schema_version": 1,
+    "method": "two-store-same-host-v1",
+    "claim_scope": {
+        "same_host_reproducible": true,
+        "cross_host_reproducible": false,
+        "note": "Two same-host stores (default and one fresh isolated store, sandbox on, cache.nixos.org substitution only in the isolated store) produced byte-identical archives. This does not establish cross-host reproducibility."
+    },
+    "image": {
+        "name": "hermit-hermetic-mini-runner",
+        "flake_output": "hermeticImages.x86_64-linux.mini-runner",
+        "reference": "localhost/hermit-hermetic-mini-runner@sha256:3ebe71b2f9772a41390f18ad78cf8be8f74b12ecfa042e2c718066c079eee553",
+        "manifest_digest": "sha256:3ebe71b2f9772a41390f18ad78cf8be8f74b12ecfa042e2c718066c079eee553",
+        "config_digest": "sha256:42177c2f1b8869abc3fa836a016cd82873eaa24d19820e59fdab0c07dd159baa",
+        "config_size_bytes": 4685,
+        "parents": [
+            "mini"
+        ],
+        "layers": [
+            {
+                "digest": "sha256:caed1ab74684249bd195b251ef1283ec6266b4309a29f5b52940b1490a2959d3",
+                "size_bytes": 223334400,
+                "group": "mini-store",
+                "runner_only": false
+            },
+            {
+                "digest": "sha256:8ef0e002df0b4e6e597cd8ebb1d219a8b793f2393ac9e3c3d0acb2b7a71be986",
+                "size_bytes": 1720320,
+                "group": "mini-customisation",
+                "runner_only": false
+            },
+            {
+                "digest": "sha256:8c76e76d7cd41879f13cd8cee20a352eb29295c228b984f7b477379bb6a908d8",
+                "size_bytes": 381532160,
+                "group": "runner-store",
+                "runner_only": true
+            },
+            {
+                "digest": "sha256:1665a669b0efb9183737c14a8036421276f1f6b6c830c93c748113ef4749250e",
+                "size_bytes": 5048320,
+                "group": "runner-customisation",
+                "runner_only": true
+            }
+        ]
+    },
+    "source": {
+        "repository": "https://github.com/rrnewton/hermit",
+        "definition_commit": "efacb97b0a46744b774fe3fcc191ec44fbf8fd0f",
+        "inputs": [
+            {
+                "path": "ci/hermetic/groups.nix",
+                "sha256": "16c05f8714dd806b3ce4ed5e67e1f91d7fc77157407ca5a2f18946fd94faeaa2",
+                "size_bytes": 3906
+            },
+            {
+                "path": "ci/hermetic/flake.nix",
+                "sha256": "b0ac537cbbf3978e03c7ff2b1980945ec2f677821fcc902fe1d7eb05f53f5393",
+                "size_bytes": 17305
+            },
+            {
+                "path": "ci/hermetic/flake.lock",
+                "sha256": "4dd3d1f5e3eb8162627729bef5e334895671eda44f94bab2cf5d80a28c0cf8e0",
+                "size_bytes": 1193
+            },
+            {
+                "path": "ci/hermetic/guest-paths.txt",
+                "sha256": "dd25c539b55c157fbe476e036cf85425a5d03e809f689f1b227783c67811a2ca",
+                "size_bytes": 2703
+            }
+        ]
+    },
+    "nix": {
+        "version": "nix (Nix) 2.36.0",
+        "system": "x86_64-linux",
+        "derivation_path": "/nix/store/bcq1ja7ld3wxizybbxapk5rs2qzxr5kg-hermit-hermetic-mini-runner.tar.gz.drv",
+        "output_path": "/nix/store/8gxsd1x9fg5ys816mbb6avn2zfxy0yz8-hermit-hermetic-mini-runner.tar.gz",
+        "output_nar_hash": "sha256-pB4E3Cnngu9HpBc635qC+5UneGZzWl5tFa+Ov2hLdVQ=",
+        "output_nar_size_bytes": 220556600,
+        "locked_inputs": [
+            {
+                "name": "nixpkgs",
+                "revision": "56c02bc00adcf003215cc4bd996d6efaf4cff188",
+                "nar_hash": "sha256-9i/VTdusq/+NM/tz+J1Re+ojkMB8MBf0QshnYfzHz30="
+            },
+            {
+                "name": "rust-overlay",
+                "revision": "ab450d47a3f906d19de1b332915bfc6e5b29c853",
+                "nar_hash": "sha256-48/4bbmK3W3Av3YPnrFb/tVQXPvBwU6kyM3Pb13VVD8="
+            }
+        ]
+    },
+    "artifact": {
+        "archive_sha256": "ca258871bd8ef0ce000e7ebdad364acee507b7359949001ead100ac90c53d854",
+        "archive_size_bytes": 220556483
+    },
+    "runs": [
+        {
+            "store": "default",
+            "archive_sha256": "ca258871bd8ef0ce000e7ebdad364acee507b7359949001ead100ac90c53d854"
+        },
+        {
+            "store": "isolated",
+            "archive_sha256": "ca258871bd8ef0ce000e7ebdad364acee507b7359949001ead100ac90c53d854"
+        }
+    ],
+    "evidence_limitations": [
+        "Builds came from earlier lane definitions and are equal by drvPath and outPath at the receipted definitions; definition_commit names the commit whose tree holds those definitions.",
+        "The default-store run is a pre-existing step-1 build in a long-lived store, not a fresh store; the isolated run is the fresh-store control.",
+        "No systemd resource bounds were applied and no realized input was forcibly rebuilt; the isolated store substituted only from cache.nixos.org.",
+        "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images."
+    ]
+}

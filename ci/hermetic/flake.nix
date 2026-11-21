@@ -225,6 +225,15 @@
       ] ++ nativeLibs ++ map (package: pkgs.lib.getOutput "dev" package) nativeLibs;
     in
     {
+      # Composed mini-family images (groups.nix). Kept out of
+      # `packages` and standard outputs so evaluating the monolith
+      # `.#image` never forces groups evaluation (seat abort proof;
+      # flake output checking forces standard outputs, measured).
+      # Build as `.#hermeticImages.x86_64-linux.mini` etc. New
+      # families edit only groups.nix, never this file again.
+      hermeticImages.${system} = import ./groups.nix {
+        inherit pkgs requiredGuestPaths archCoreutils;
+      };
       packages.${system} = {
         image = pkgs.dockerTools.buildLayeredImage {
           name = "hermit-hermetic-validate";

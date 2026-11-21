@@ -1,5 +1,6 @@
 #!/usr/bin/env -S rust-script --force
-//! Check the pinned validation image's tracked dual-build receipt for consistency.
+//! Check the pinned validation image's tracked dual-build receipt and every
+//! composed image receipt under ci/hermetic/images for consistency.
 //!
 //! ```cargo
 //! [dependencies]
@@ -50,13 +51,14 @@ const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/flake.nix",
     "ci/hermetic/guest-paths.txt",
 ];
-const EVIDENCE_LIMITATIONS: [&str; 6] = [
+const EVIDENCE_LIMITATIONS: [&str; 7] = [
     "Each service ran under systemd-run with only PATH and NIX_SSL_CERT_FILE set explicitly; fetches went through the host forward proxy (with-proxy). Only variable names were recorded, not their values.",
     "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
     "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
     "The superseded 4e1605ec archive was not rebuilt for this receipt; its df1f0dd4 SHA-256 is carried from the prior receipt that produced the replaced pin.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
+    "The flake.nix input was re-attested by evaluation, not by rebuild: the builds below used flake.nix 663f05a9; the current file is b0ac537c, accepted only because the pinned derivation re-evaluates identically with groups.nix aborting (flake_reattestation).",
 ];
 
 struct ExpectedRun {
@@ -197,7 +199,8 @@ fn parse_provenance(bytes: &[u8]) -> Result<Value, String> {
 fn usage() {
     println!(
         "usage: check-image-provenance.rs\n\n\
-         Check {PROVENANCE}, the current source inputs, and {PIN} for tracked consistency.\n\
+         Check {PROVENANCE}, the current source inputs, {PIN}, and every receipt\n\
+         under {IMAGES_DIR} for tracked consistency.\n\
          Historical build evidence remains review-bound: this checker does not authenticate it,\n\
          build, load, or inspect an image.\n\n\
          options:\n  -h, --help  Show this help"
@@ -460,23 +463,13 @@ fn validate_artifact(artifact: &Value, context: &str) -> Result<(), String> {
     // are asserted. Length alone once let a wrong 391 stand for the
     // real 598, and the same 598 bytes in (mediaType, digest, size)
     // order hash to a different digest than the pin (dh-bca16a).
-    let mut reconstructed = format!(
-        "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"{}\"}},\"layers\":[",
+    let reconstructed = reconstruct_manifest(
         string(artifact, "manifest_media_type", context)?,
-        unsigned(artifact, "config_size_bytes", context)?,
         string(artifact, "config_digest", context)?,
-    );
-    for (index, layer) in layers.iter().enumerate() {
-        if index > 0 {
-            reconstructed.push(',');
-        }
-        reconstructed.push_str(&format!(
-            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"{}\"}}",
-            unsigned(layer, "size_bytes", &format!("{context}.layers[{index}]"))?,
-            string(layer, "digest", &format!("{context}.layers[{index}]"))?,
-        ));
-    }
-    reconstructed.push_str("]}");
+        unsigned(artifact, "config_size_bytes", context)?,
+        layers,
+        context,
+    )?;
     if reconstructed.len() as u64 != unsigned(artifact, "manifest_size_bytes", context)? {
         return Err(format!(
             "{context}.manifest_size_bytes does not equal the reconstructed manifest length {}",
@@ -498,6 +491,7 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
         &[
             "claim_scope",
             "evidence_limitations",
+            "flake_reattestation",
             "method",
             "nix",
             "repin",
@@ -507,6 +501,37 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
         ],
         "provenance",
     )?;
+    let reatt = field(root, "flake_reattestation", "provenance")?;
+    exact_keys(
+        reatt,
+        &[
+            "built_flake_sha256",
+            "current_flake_sha256",
+            "evaluated_commit",
+            "evaluated_drv_path",
+            "nix_version",
+            "stub_text",
+        ],
+        "flake_reattestation",
+    )?;
+    if string(reatt, "built_flake_sha256", "flake_reattestation")?
+        != "663f05a959d1c741729e0b79a8dc39a7bf55503c98df758a54f3976f99469a53"
+        || string(reatt, "stub_text", "flake_reattestation")?
+            != "throw \"groups.nix evaluated: monolith depends on groups\"\n"
+        || string(reatt, "evaluated_drv_path", "flake_reattestation")?
+            != "/nix/store/0am28327vyciiq0s4ahlz03d2kfc2rbk-hermit-hermetic-validate.tar.gz.drv"
+        || string(reatt, "nix_version", "flake_reattestation")? != "nix (Nix) 2.36.0"
+    {
+        return Err("flake_reattestation must record the abort-stub evaluation exactly".into());
+    }
+    require_flat_sha256(
+        string(reatt, "current_flake_sha256", "flake_reattestation")?,
+        "flake_reattestation.current_flake_sha256",
+    )?;
+    let evaluated_commit = string(reatt, "evaluated_commit", "flake_reattestation")?;
+    if evaluated_commit.len() != 40 || !evaluated_commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("flake_reattestation.evaluated_commit must be a full commit hash".into());
+    }
     if unsigned(root, "schema_version", "provenance")? != 1 {
         return Err("provenance.schema_version must be 1".into());
     }
@@ -606,10 +631,15 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
         ));
     }
     let mut input_paths = BTreeSet::new();
+    let mut flake_input_hash = None;
     for (index, input) in inputs.iter().enumerate() {
         let context = format!("source.inputs[{index}]");
         exact_keys(input, &["path", "sha256", "size_bytes"], &context)?;
-        input_paths.insert(string(input, "path", &context)?);
+        let path = string(input, "path", &context)?;
+        input_paths.insert(path);
+        if path == "ci/hermetic/flake.nix" {
+            flake_input_hash = Some(string(input, "sha256", &context)?.to_string());
+        }
         require_flat_sha256(
             string(input, "sha256", &context)?,
             &format!("{context}.sha256"),
@@ -617,6 +647,17 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     }
     if input_paths != INPUT_PATHS.into_iter().collect() {
         return Err(format!("source.inputs paths differ: {input_paths:?}"));
+    }
+    if flake_input_hash.as_deref()
+        != Some(string(
+            reatt,
+            "current_flake_sha256",
+            "flake_reattestation",
+        )?)
+    {
+        return Err(
+            "flake_reattestation.current_flake_sha256 must equal the flake.nix input hash".into(),
+        );
     }
 
     let nix = field(root, "nix", "provenance")?;
@@ -835,12 +876,505 @@ fn repo_root() -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve repository root: {error}"))
 }
 
+const IMAGES_DIR: &str = "ci/hermetic/images";
+const COMPOSED_METHOD: &str = "two-store-same-host-v1";
+const COMPOSED_INPUT_PATHS: [&str; 4] = [
+    "ci/hermetic/groups.nix",
+    "ci/hermetic/flake.nix",
+    "ci/hermetic/flake.lock",
+    "ci/hermetic/guest-paths.txt",
+];
+const COMPOSED_NAMES: [&str; 5] = [
+    "hermit-hermetic-mini",
+    "hermit-hermetic-mini-crypto",
+    "hermit-hermetic-mini-python",
+    "hermit-hermetic-mini-runner",
+    "hermit-hermetic-mini-suite",
+];
+const COMPOSED_EVIDENCE_LIMITATIONS: [&str; 4] = [
+    "Builds came from earlier lane definitions and are equal by drvPath and outPath at the receipted definitions; definition_commit names the commit whose tree holds those definitions.",
+    "The default-store run is a pre-existing step-1 build in a long-lived store, not a fresh store; the isolated run is the fresh-store control.",
+    "No systemd resource bounds were applied and no realized input was forcibly rebuilt; the isolated store substituted only from cache.nixos.org.",
+    "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images.",
+];
+/// Expected ordered parents per composed image (immediate parent first).
+/// Only the L0 base may have none. This is the completeness source the
+/// prefix check enforces; receipts may not opt out by declaring fewer.
+fn expected_parents(name: &str) -> &'static [&'static str] {
+    match name {
+        "hermit-hermetic-mini" => &[],
+        "hermit-hermetic-mini-crypto" => &["mini"],
+        "hermit-hermetic-mini-python" => &["mini"],
+        "hermit-hermetic-mini-runner" => &["mini"],
+        "hermit-hermetic-mini-suite" => &["mini-runner", "mini"],
+        _ => &[],
+    }
+}
+
+/// The compact Docker-v2 manifest in Podman's stored descriptor key
+/// order (mediaType, size, digest), shared by both validators.
+fn reconstruct_manifest(
+    manifest_media_type: &str,
+    config_digest: &str,
+    config_size: u64,
+    layers: &[Value],
+    context: &str,
+) -> Result<String, String> {
+    let mut s = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"{manifest_media_type}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{config_size},\"digest\":\"{config_digest}\"}},\"layers\":["
+    );
+    for (i, layer) in layers.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"{}\"}}",
+            unsigned(layer, "size_bytes", &format!("{context}.layers[{i}]"))?,
+            string(layer, "digest", &format!("{context}.layers[{i}]"))?
+        ));
+    }
+    s.push_str("]}");
+    Ok(s)
+}
+
+fn layer_digests(image: &Value, context: &str) -> Result<Vec<String>, String> {
+    array(field(image, "layers", context)?, context)?
+        .iter()
+        .map(|layer| Ok(string(layer, "digest", context)?.to_string()))
+        .collect()
+}
+
+fn validate_composed_image(root: &Value, expected_name: &str) -> Result<Value, String> {
+    let ctx = format!("composed {expected_name}");
+    exact_keys(
+        root,
+        &[
+            "artifact",
+            "claim_scope",
+            "evidence_limitations",
+            "image",
+            "method",
+            "nix",
+            "runs",
+            "schema_version",
+            "source",
+        ],
+        &ctx,
+    )?;
+    let limits = array(field(root, "evidence_limitations", &ctx)?, &ctx)?;
+    let actual_limits = limits
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .ok_or("composed evidence limitation must be a string")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual_limits != COMPOSED_EVIDENCE_LIMITATIONS {
+        return Err(format!(
+            "{ctx} evidence_limitations must retain every known evidence gap"
+        ));
+    }
+    if unsigned(root, "schema_version", &ctx)? != 1
+        || string(root, "method", &ctx)? != COMPOSED_METHOD
+    {
+        return Err(format!(
+            "{ctx} must retain schema 1 and method {COMPOSED_METHOD:?}"
+        ));
+    }
+    let claim = field(root, "claim_scope", &ctx)?;
+    exact_keys(
+        claim,
+        &["cross_host_reproducible", "note", "same_host_reproducible"],
+        &ctx,
+    )?;
+    if !boolean(claim, "same_host_reproducible", &ctx)?
+        || boolean(claim, "cross_host_reproducible", &ctx)?
+        || !string(claim, "note", &ctx)?.contains("does not establish cross-host")
+    {
+        return Err(format!(
+            "{ctx} claim_scope must state same-host evidence only"
+        ));
+    }
+    let image = field(root, "image", &ctx)?;
+    exact_keys(
+        image,
+        &[
+            "config_digest",
+            "config_size_bytes",
+            "flake_output",
+            "layers",
+            "manifest_digest",
+            "name",
+            "parents",
+            "reference",
+        ],
+        &ctx,
+    )?;
+    if string(image, "name", &ctx)? != expected_name {
+        return Err(format!("{ctx} image.name does not match its file"));
+    }
+    let manifest = string(image, "manifest_digest", &ctx)?;
+    require_sha256(manifest, &format!("{ctx}.manifest_digest"))?;
+    require_sha256(
+        string(image, "config_digest", &ctx)?,
+        &format!("{ctx}.config_digest"),
+    )?;
+    if string(image, "reference", &ctx)? != format!("localhost/{expected_name}@{manifest}") {
+        return Err(format!("{ctx} reference does not name its manifest digest"));
+    }
+    let layers = array(field(image, "layers", &ctx)?, &ctx)?;
+    if layers.is_empty() || layers.len() % 2 != 0 {
+        return Err(format!("{ctx} must have store+customisation layer pairs"));
+    }
+    for (i, layer) in layers.iter().enumerate() {
+        let lc = format!("{ctx}.layers[{i}]");
+        exact_keys(
+            layer,
+            &["digest", "group", "runner_only", "size_bytes"],
+            &lc,
+        )?;
+        require_sha256(string(layer, "digest", &lc)?, &lc)?;
+        if unsigned(layer, "size_bytes", &lc)? == 0 || string(layer, "group", &lc)?.is_empty() {
+            return Err(format!("{lc} must name a group and a nonzero size"));
+        }
+        let _ = boolean(layer, "runner_only", &lc)?;
+    }
+    let reconstructed = reconstruct_manifest(
+        "application/vnd.docker.distribution.manifest.v2+json",
+        string(image, "config_digest", &ctx)?,
+        unsigned(image, "config_size_bytes", &ctx)?,
+        layers,
+        &ctx,
+    )?;
+    let digest = format!("sha256:{}", sha256(reconstructed.as_bytes()));
+    if digest != manifest {
+        return Err(format!(
+            "{ctx}.manifest_digest does not equal the reconstructed manifest digest {digest}"
+        ));
+    }
+    let artifact = field(root, "artifact", &ctx)?;
+    exact_keys(artifact, &["archive_sha256", "archive_size_bytes"], &ctx)?;
+    let archive_sha = string(artifact, "archive_sha256", &ctx)?;
+    require_flat_sha256(archive_sha, &ctx)?;
+    if unsigned(artifact, "archive_size_bytes", &ctx)? == 0 {
+        return Err(format!("{ctx} archive size must be nonzero"));
+    }
+    let runs = array(field(root, "runs", &ctx)?, &ctx)?;
+    if runs.len() != 2 {
+        return Err(format!("{ctx} runs must contain exactly two builds"));
+    }
+    let mut stores = BTreeSet::new();
+    for run in runs {
+        exact_keys(run, &["archive_sha256", "store"], &ctx)?;
+        if string(run, "archive_sha256", &ctx)? != archive_sha {
+            return Err(format!("{ctx} run archive differs from artifact"));
+        }
+        stores.insert(string(run, "store", &ctx)?);
+    }
+    if stores != ["default", "isolated"].into_iter().collect() {
+        return Err(format!("{ctx} runs must be default plus isolated stores"));
+    }
+    Ok(root.clone())
+}
+
+fn validate_locked_inputs_against_lock(lock: &Value, locked: &Value) -> Result<(), String> {
+    let nodes = field(lock, "nodes", "flake.lock")?;
+    for item in array(locked, "composed.locked_inputs")? {
+        exact_keys(
+            item,
+            &["name", "nar_hash", "revision"],
+            "composed.locked_inputs",
+        )?;
+        let name = string(item, "name", "composed.locked_inputs")?;
+        let node = field(nodes, name, "flake.lock.nodes")?;
+        let locked_node = field(node, "locked", "flake.lock.nodes")?;
+        if string(locked_node, "rev", "flake.lock")? != string(item, "revision", name)?
+            || string(locked_node, "narHash", "flake.lock")? != string(item, "nar_hash", name)?
+        {
+            return Err(format!(
+                "composed locked_input {name} differs from flake.lock"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_composed(repo: &Path) -> Result<(), String> {
+    let dir = repo.join(IMAGES_DIR);
+    if !dir.is_dir() {
+        return Err(format!(
+            "{IMAGES_DIR} is missing; every composed receipt must be present"
+        ));
+    }
+    let mut present = BTreeSet::new();
+    let entries =
+        fs::read_dir(&dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot list {IMAGES_DIR}: {error}"))?;
+        present.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    let expected: BTreeSet<String> = COMPOSED_NAMES
+        .iter()
+        .map(|name| {
+            format!(
+                "{}.json",
+                name.strip_prefix("hermit-hermetic-").unwrap_or(name)
+            )
+        })
+        .collect();
+    if present != expected {
+        return Err(format!(
+            "{IMAGES_DIR} files differ from the expected receipts: {present:?}"
+        ));
+    }
+    let mut images: Vec<(String, Value)> = Vec::new();
+    for name in COMPOSED_NAMES {
+        let file = name.strip_prefix("hermit-hermetic-").unwrap_or(name);
+        let path = dir.join(format!("{file}.json"));
+        let bytes =
+            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let root =
+            parse_provenance(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        images.push((name.to_string(), validate_composed_image(&root, name)?));
+    }
+    // Live inputs: same four files, same hashes in every receipt.
+    let mut expected_inputs: Option<Vec<(String, String, u64)>> = None;
+    let mut expected_locked: Option<Value> = None;
+    let mut expected_commit: Option<String> = None;
+    for (name, root) in &images {
+        let source = field(root, "source", name)?;
+        exact_keys(source, &["definition_commit", "inputs", "repository"], name)?;
+        if string(source, "repository", name)? != "https://github.com/rrnewton/hermit" {
+            return Err(format!("{name} source.repository must stay canonical"));
+        }
+        let commit = string(source, "definition_commit", name)?;
+        if !is_lower_hex(commit, 40) {
+            return Err(format!(
+                "{name} source.definition_commit must be a full lowercase commit hash"
+            ));
+        }
+        match &expected_commit {
+            None => expected_commit = Some(commit.to_string()),
+            Some(prev) if prev != commit => {
+                return Err(format!(
+                    "{name} definition_commit differs across composed receipts"
+                ));
+            }
+            _ => {}
+        }
+        let inputs = array(field(source, "inputs", name)?, name)?;
+        let mut seen = Vec::new();
+        for (i, input) in inputs.iter().enumerate() {
+            let ic = format!("{name}.inputs[{i}]");
+            exact_keys(input, &["path", "sha256", "size_bytes"], &ic)?;
+            let path = string(input, "path", &ic)?;
+            let hash = string(input, "sha256", &ic)?;
+            require_flat_sha256(hash, &ic)?;
+            let size = unsigned(input, "size_bytes", &ic)?;
+            let live = fs::read(repo.join(path))
+                .map_err(|error| format!("cannot read {path}: {error}"))?;
+            if sha256(&live) != hash || live.len() as u64 != size {
+                return Err(format!(
+                    "{path} differs from the proven composed build input in {name}"
+                ));
+            }
+            seen.push((path.to_string(), hash.to_string(), size));
+        }
+        let paths: BTreeSet<&str> = seen.iter().map(|(p, _, _)| p.as_str()).collect();
+        if paths != COMPOSED_INPUT_PATHS.into_iter().collect() {
+            return Err(format!("{name} source.inputs paths differ: {paths:?}"));
+        }
+        match &expected_inputs {
+            None => expected_inputs = Some(seen),
+            Some(prev) if *prev != seen => {
+                return Err(format!(
+                    "{name} source.inputs differ across composed receipts"
+                ));
+            }
+            _ => {}
+        }
+        let nix = field(root, "nix", name)?;
+        exact_keys(
+            nix,
+            &[
+                "derivation_path",
+                "locked_inputs",
+                "output_nar_hash",
+                "output_nar_size_bytes",
+                "output_path",
+                "system",
+                "version",
+            ],
+            name,
+        )?;
+        if string(nix, "system", name)? != "x86_64-linux"
+            || string(nix, "version", name)?.is_empty()
+        {
+            return Err(format!("{name} nix version/system must be explicit"));
+        }
+        require_nix_store_path(string(nix, "derivation_path", name)?, name)?;
+        require_nix_store_path(string(nix, "output_path", name)?, name)?;
+        require_nix_sha256(string(nix, "output_nar_hash", name)?, name)?;
+        validate_locked_inputs(field(nix, "locked_inputs", name)?)?;
+        let locked = field(nix, "locked_inputs", name)?.clone();
+        match &expected_locked {
+            None => expected_locked = Some(locked),
+            Some(prev) if *prev != locked => {
+                return Err(format!(
+                    "{name} locked_inputs differ across composed receipts"
+                ));
+            }
+            _ => {}
+        }
+    }
+    // Locked inputs must also equal the live flake.lock.
+    if let Some(locked) = &expected_locked {
+        let lock_bytes = fs::read(repo.join("ci/hermetic/flake.lock"))
+            .map_err(|error| format!("cannot read ci/hermetic/flake.lock: {error}"))?;
+        let lock_root = parse_provenance(&lock_bytes)?;
+        validate_locked_inputs_against_lock(&lock_root, locked)?;
+    }
+    // Identity binding + distinctness: drv/out/archive/config/manifest
+    // must name their own image and differ across receipts.
+    let mut seen_ids: Vec<(&str, &str, String)> = Vec::new();
+    for (name, root) in &images {
+        let shortn = name.strip_prefix("hermit-hermetic-").unwrap_or(name);
+        let image = field(root, "image", name)?;
+        let nix = field(root, "nix", name)?;
+        let artifact = field(root, "artifact", name)?;
+        let checks = [
+            (
+                "derivation",
+                string(nix, "derivation_path", name)?.to_string(),
+            ),
+            ("output", string(nix, "output_path", name)?.to_string()),
+            (
+                "archive",
+                string(artifact, "archive_sha256", name)?.to_string(),
+            ),
+            ("config", string(image, "config_digest", name)?.to_string()),
+            (
+                "manifest",
+                string(image, "manifest_digest", name)?.to_string(),
+            ),
+        ];
+        if !checks[0]
+            .1
+            .ends_with(&format!("-hermit-hermetic-{shortn}.tar.gz.drv"))
+            || !checks[1]
+                .1
+                .ends_with(&format!("-hermit-hermetic-{shortn}.tar.gz"))
+            || string(image, "flake_output", name)?
+                != format!("hermeticImages.x86_64-linux.{shortn}")
+        {
+            return Err(format!(
+                "{name} derivation, output or flake_output does not name this image"
+            ));
+        }
+        for (kind, value) in checks {
+            if seen_ids.iter().any(|(_, k, v)| *k == kind && *v == value) {
+                return Err(format!("{name} {kind} duplicates another receipt"));
+            }
+            seen_ids.push((name, kind, value));
+        }
+    }
+    // Group/digest bijection and per-group runner_only across receipts.
+    let mut group_digest: std::collections::BTreeMap<String, String> = Default::default();
+    let mut digest_group: std::collections::BTreeMap<String, String> = Default::default();
+    let mut group_runner: std::collections::BTreeMap<String, bool> = Default::default();
+    for (name, root) in &images {
+        let image = field(root, "image", name)?;
+        for layer in array(field(image, "layers", name)?, name)? {
+            let group = string(layer, "group", name)?.to_string();
+            let digest = string(layer, "digest", name)?.to_string();
+            let runner = boolean(layer, "runner_only", name)?;
+            match group_digest.get(&group) {
+                Some(prev) if *prev != digest => {
+                    return Err(format!("group {group} names two digests across receipts"));
+                }
+                _ => {
+                    group_digest.insert(group.clone(), digest.clone());
+                }
+            }
+            match digest_group.get(&digest) {
+                Some(prev) if *prev != group => {
+                    return Err(format!("digest {digest} names two groups across receipts"));
+                }
+                _ => {
+                    digest_group.insert(digest, group.clone());
+                }
+            }
+            match group_runner.get(&group) {
+                Some(prev) if *prev != runner => {
+                    return Err(format!("group {group} runner_only differs across receipts"));
+                }
+                _ => {
+                    group_runner.insert(group, runner);
+                }
+            }
+        }
+    }
+    // Complete parent chain: declared parents must equal expected, each
+    // parent's layers prefix the child's, and each image is its
+    // immediate parent plus exactly one store+customisation pair.
+    let by_name: std::collections::BTreeMap<&str, &Value> = images
+        .iter()
+        .map(|(n, r)| (n.as_str(), field(r, "image", n).unwrap()))
+        .collect();
+    for (name, root) in &images {
+        let image = field(root, "image", name)?;
+        let declared: Vec<&str> = array(field(image, "parents", name)?, name)?
+            .iter()
+            .map(|p| {
+                p.as_str()
+                    .ok_or_else(|| format!("{name} parents must be strings"))
+            })
+            .collect::<Result<_, _>>()?;
+        if declared.as_slice() != expected_parents(name) {
+            return Err(format!(
+                "{name} parents {declared:?} differ from expected {:?}",
+                expected_parents(name)
+            ));
+        }
+        let mine = layer_digests(image, name)?;
+        if declared.is_empty() {
+            if mine.len() != 2 {
+                return Err(format!(
+                    "{name} base image must have exactly one layer pair"
+                ));
+            }
+            continue;
+        }
+        for parent in &declared {
+            let parent_image = by_name
+                .get(format!("hermit-hermetic-{parent}").as_str())
+                .ok_or_else(|| format!("{name} names unknown parent {parent:?}"))?;
+            let theirs = layer_digests(parent_image, name)?;
+            if mine.len() < theirs.len() || mine[..theirs.len()] != theirs[..] {
+                return Err(format!(
+                    "{name} layers do not start with parent {parent} layers"
+                ));
+            }
+        }
+        let immediate = by_name
+            .get(format!("hermit-hermetic-{}", declared[0]).as_str())
+            .unwrap();
+        if mine.len() != layer_digests(immediate, name)?.len() + 2 {
+            return Err(format!(
+                "{name} must be its immediate parent plus one layer pair"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify(repo: &Path) -> Result<(), String> {
     let bytes = fs::read(repo.join(PROVENANCE))
         .map_err(|error| format!("cannot read {PROVENANCE}: {error}"))?;
     let root = parse_provenance(&bytes)?;
     validate_semantics(&root)?;
     verify_files(repo, &root)?;
+    verify_composed(repo)?;
     Ok(())
 }
 
@@ -859,7 +1393,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => {
             println!(
-                "check-image-provenance: PASS -- tracked pin, source inputs, and dual-build receipt are internally consistent; historical evidence remains review-bound"
+                "check-image-provenance: PASS -- tracked pin, source inputs, dual-build receipt, and 5 composed receipts are internally consistent; historical evidence remains review-bound"
             );
             ExitCode::SUCCESS
         }
@@ -888,6 +1422,138 @@ mod tests {
     }
 
     #[test]
+    fn composed_receipt_validates_and_rejects_edited_manifest() {
+        let mini = parse_provenance(include_bytes!("images/mini.json")).unwrap();
+        validate_composed_image(&mini, "hermit-hermetic-mini").unwrap();
+        let mut wrong = mini;
+        *mutate(&mut wrong, "/image/manifest_digest") =
+            Value::String(format!("sha256:{}", "a".repeat(64)));
+        *mutate(&mut wrong, "/image/reference") = Value::String(format!(
+            "localhost/hermit-hermetic-mini@sha256:{}",
+            "a".repeat(64)
+        ));
+        assert!(
+            validate_composed_image(&wrong, "hermit-hermetic-mini")
+                .unwrap_err()
+                .contains("does not equal the reconstructed manifest digest")
+        );
+        let repo = repo_root().unwrap();
+        verify_composed(&repo).unwrap();
+    }
+
+    fn composed_fixture(mutate_file: &str, pointer: &str, value: Value) -> tempfile::TempDir {
+        let root = repo_root().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let mut files: Vec<String> = INPUT_PATHS
+            .into_iter()
+            .chain([PIN, PROVENANCE, "ci/hermetic/groups.nix"])
+            .map(str::to_string)
+            .collect();
+        for name in COMPOSED_NAMES {
+            let short = name.strip_prefix("hermit-hermetic-").unwrap_or(name);
+            files.push(format!("{IMAGES_DIR}/{short}.json"));
+        }
+        for path in files {
+            let destination = fixture.path().join(&path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            if path == mutate_file {
+                let mut value_json =
+                    parse_provenance(&fs::read(root.join(&path)).unwrap()).unwrap();
+                *mutate(&mut value_json, pointer) = value.clone();
+                fs::write(
+                    &destination,
+                    serde_json::to_vec_pretty(&value_json).unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::copy(root.join(&path), destination).unwrap();
+            }
+        }
+        fixture
+    }
+
+    #[test]
+    fn rejects_composed_guard_violations() {
+        // Each case must fail with its guard's own error text; this is
+        // the unit-level mirror of the seat mutation list.
+        let cases: Vec<(&str, &str, Value, &str)> = vec![
+            (
+                "ci/hermetic/images/mini-suite.json",
+                "/image/parents",
+                Value::Array(vec![]),
+                "differ from expected",
+            ),
+            (
+                "ci/hermetic/images/mini-suite.json",
+                "/image/layers/4/group",
+                Value::String("wrong-store".into()),
+                "names two groups",
+            ),
+            (
+                "ci/hermetic/images/mini-crypto.json",
+                "/nix/output_path",
+                Value::String(
+                    "/nix/store/pwgfzq71viss2aj11n6952vb8qxc619q-hermit-hermetic-mini.tar.gz"
+                        .into(),
+                ),
+                "does not name this image",
+            ),
+            (
+                "ci/hermetic/images/mini-crypto.json",
+                "/artifact/archive_sha256",
+                Value::String(
+                    "a04405d8610cabe9667ca05a5f3816bc7db7b818802c7f7d5eb908dd1a6b7810".into(),
+                ),
+                "run archive differs",
+            ),
+            (
+                "ci/hermetic/images/mini.json",
+                "/source/definition_commit",
+                Value::String("garbage".into()),
+                "full lowercase commit hash",
+            ),
+            (
+                "ci/hermetic/images/mini.json",
+                "/evidence_limitations",
+                Value::Array(vec![]),
+                "retain every known evidence gap",
+            ),
+            (
+                "ci/hermetic/images/mini-runner.json",
+                "/image/layers/2/runner_only",
+                Value::Bool(false),
+                "runner_only differs",
+            ),
+        ];
+        for (file, pointer, value, needle) in cases {
+            let fixture = composed_fixture(file, pointer, value);
+            let err = verify_composed(fixture.path()).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "{file} {pointer}: want {needle:?} in {err:#}"
+            );
+        }
+        // Missing directory and unknown extra file fail closed.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            verify_composed(empty.path())
+                .unwrap_err()
+                .contains("is missing")
+        );
+        let fixture = composed_fixture("", "", Value::Null);
+        fs::write(
+            fixture.path().join(IMAGES_DIR).join("mini-cc.json"),
+            b"not json",
+        )
+        .unwrap();
+        assert!(
+            verify_composed(fixture.path())
+                .unwrap_err()
+                .contains("files differ")
+        );
+    }
+
+    #[test]
     fn accepts_rebased_unrelated_head_with_identical_image_inputs() {
         let root = repo_root().unwrap();
         let fixture = tempfile::tempdir().unwrap();
@@ -895,6 +1561,18 @@ mod tests {
             let destination = fixture.path().join(path);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
             fs::copy(root.join(path), destination).unwrap();
+        }
+        // Composed receipts are fail-closed now: the fixture must carry
+        // groups.nix and every composed receipt, not skip that half.
+        let mut composed_files: Vec<String> = vec!["ci/hermetic/groups.nix".to_string()];
+        for name in COMPOSED_NAMES {
+            let short = name.strip_prefix("hermit-hermetic-").unwrap_or(name);
+            composed_files.push(format!("{IMAGES_DIR}/{short}.json"));
+        }
+        for path in composed_files {
+            let destination = fixture.path().join(&path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(root.join(&path), destination).unwrap();
         }
         for args in [
             vec!["init", "-q"],
