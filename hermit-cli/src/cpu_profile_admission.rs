@@ -1629,7 +1629,9 @@ pub fn refuse_unadmitted_launch(
 /// It always measures and never reads or writes the cache [`admit`] uses.
 #[cfg(target_arch = "x86_64")]
 pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
-    qualify_host_with(|_| xstate_probe::qualify(xstate_probe::ProbeOptions::default()))
+    qualify_host_with(&crate::host_qualification::HostKey::current(), |_| {
+        xstate_probe::qualify(xstate_probe::ProbeOptions::default())
+    })
 }
 
 /// [`admit`]'s host half: the same qualification, with the XINUSE probe
@@ -1639,7 +1641,8 @@ pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
 fn qualify_host_cached_announcing(
     announce: &mut dyn FnMut(&str),
 ) -> Result<Qualification, AdmissionRefusal> {
-    qualify_host_with(|xcr0| cached_probe(xcr0, announce))
+    let host = crate::host_qualification::HostKey::current();
+    qualify_host_with(&host, |xcr0| cached_probe(&host, xcr0, announce))
 }
 
 /// [`admit`]'s host half on a non-x86-64 host: the x86-64-v3 profile
@@ -1693,12 +1696,13 @@ fn probe_cache_inputs(xcr0: u64) -> String {
 /// but moves the guest to a host the forced-exit arm never certified.
 #[cfg(target_arch = "x86_64")]
 fn cached_probe(
+    host: &crate::host_qualification::HostKey,
     xcr0: u64,
     announce: &mut dyn FnMut(&str),
 ) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
     cached_probe_at(
         cache_path_for(under_hypervisor()).as_deref(),
-        &crate::host_qualification::HostKey::current(),
+        host,
         xcr0,
         announce,
         || xstate_probe::qualify(xstate_probe::ProbeOptions::default()),
@@ -1748,7 +1752,7 @@ enum CachedProbeVerdict {
 /// arithmetic on the key's own XCR0. The FPU-reload XINUSE instability
 /// (`XINUSE is not stable across a host FPU reload: ...`, the matrix's
 /// reload compare) was measured deterministic — 200 of 200 trials on
-/// both hosts that show it (Skylake-SP and Sapphire Rapids) — so it is a
+/// the two hosts measured (Skylake-SP and Sapphire Rapids) — so it is a
 /// fact of the host in the same sense. The sibling repetitions
 /// instability is deliberately not cached: nothing has measured that
 /// exact class, and caching it waits for a measurement behind it.
@@ -1764,8 +1768,47 @@ fn cacheable_refusal(reason: &str) -> bool {
     if reason.contains("(reused refusal:") {
         return false;
     }
-    reason.starts_with("XCR0 ")
-        || reason.starts_with("XINUSE is not stable across a host FPU reload:")
+    reason.starts_with("XCR0 ") || reason.starts_with(xstate_probe::FPU_RELOAD_INSTABILITY)
+}
+
+/// An FPU-reload instability refusal ([`xstate_probe::FPU_RELOAD_INSTABILITY`],
+/// fresh or reused) with the host's CPU signature and cpu0's microcode
+/// revision named, as `host` read them. Which hosts show this instability is
+/// a per-host fact that the CPU model and the kernel alone do not decide, so
+/// the refusal names what it was measured on. A value the key could not read
+/// is named "unknown". Every other refusal is returned unchanged, and the
+/// probe cache always stores the probe's own text: the host key already binds
+/// both values.
+#[cfg(target_arch = "x86_64")]
+fn name_reload_refusal(
+    reason: AdmissionRefusal,
+    host: &crate::host_qualification::HostKey,
+) -> AdmissionRefusal {
+    if !reason.starts_with(xstate_probe::FPU_RELOAD_INSTABILITY) {
+        return reason;
+    }
+    let known = |value: &str| match value {
+        "" => "unknown".to_owned(),
+        value => value.to_owned(),
+    };
+    format!(
+        "{reason} (host CPU {}, microcode {} on cpu0)",
+        known(&host.cpu),
+        known(&host.microcode)
+    )
+}
+
+/// [`qualify_host_with`]'s probe step: `probe`'s verdict for `xcr0`, its
+/// refusal returned through [`name_reload_refusal`]. This is the one place
+/// a refusal is named, whichever probe ran: [`admit`]'s cached one or the
+/// fresh one of `hermit host-capabilities`.
+#[cfg(target_arch = "x86_64")]
+fn probe_naming_host(
+    host: &crate::host_qualification::HostKey,
+    xcr0: u64,
+    probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
+) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    probe(xcr0).map_err(|reason| name_reload_refusal(reason, host))
 }
 
 /// The name of the KVM fixed-guest qualification's file in the host
@@ -1881,7 +1924,9 @@ fn kvm_fixed_probe_at(
 }
 
 /// [`cached_probe`] with its cache path (`None`: no cache), host key, warning
-/// writer and probe as parameters, for the tests.
+/// writer and probe as parameters, for the tests. A refusal, measured or
+/// cached, is the probe's own text (what the cache stores);
+/// [`probe_naming_host`] names the host on it.
 #[cfg(target_arch = "x86_64")]
 fn cached_probe_at(
     path: Option<&std::path::Path>,
@@ -1961,20 +2006,23 @@ fn cached_probe_at(
     })
 }
 
-/// [`qualify_host`] with the XINUSE probe as a parameter, given XCR0: the
-/// kernel, the every-bit CPUID check and the dynamic-feature refusal run every
-/// time, and the host facts are captured from this host every time.
+/// [`qualify_host`] with this host's key and the XINUSE probe as parameters,
+/// given XCR0: the kernel, the every-bit CPUID check and the dynamic-feature
+/// refusal run every time, the probe's refusal names `host`
+/// ([`probe_naming_host`]), and the host facts are captured from this host
+/// every time.
 #[cfg(target_arch = "x86_64")]
 fn qualify_host_with(
+    host: &crate::host_qualification::HostKey,
     probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
 ) -> Result<Qualification, AdmissionRefusal> {
     let xcr0 = fixed_host_checks()?;
     // The refuse-only XCR0 test seam, before any cached probe report can
     // stand in for measuring (see `xstate_probe::XCR0_EXTRA_TEST_ENV`).
     xstate_probe::check_forced_extra_bits(xcr0)?;
-    let probe = probe(xcr0)?;
-    let host = capture(&probe)?;
-    Ok((probe, host))
+    let probe = probe_naming_host(host, xcr0, probe)?;
+    let facts = capture(&probe)?;
+    Ok((probe, facts))
 }
 
 /// The qualification's checks of fixed host facts, which give the same answer
@@ -2279,6 +2327,117 @@ pub(crate) mod tests {
                 assert_eq!(result, Err(stored.into()), "{stored}");
             }
         }
+    }
+
+    /// An FPU-reload instability refusal, fresh or reused, names the host's
+    /// CPU signature and cpu0's microcode, as literal text; an unread value
+    /// is "unknown"; every other refusal family comes back unchanged.
+    #[test]
+    fn an_fpu_reload_refusal_names_the_host_cpu_and_microcode() {
+        const RELOAD: &str =
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2e5 against 0x2e7";
+        // cache_host(): AuthenticAMD family 0x1a model 0x11 stepping 0x0, microcode 0xb101054.
+        const NAMED: &str = " (host CPU AuthenticAMD family 0x1a model 0x11 stepping 0x0, \
+                             microcode 0xb101054 on cpu0)";
+        let reused = format!(
+            "{RELOAD} (reused refusal: measured by another Hermit process on this host 3s ago)"
+        );
+        for (reason, want) in [
+            (RELOAD.to_owned(), format!("{RELOAD}{NAMED}")),
+            (reused.clone(), format!("{reused}{NAMED}")),
+        ] {
+            assert_eq!(
+                name_reload_refusal(reason.clone(), &cache_host()),
+                want,
+                "{reason}"
+            );
+        }
+
+        let mut unread = cache_host();
+        unread.cpu = String::new();
+        unread.microcode = String::new();
+        assert_eq!(
+            name_reload_refusal(RELOAD.into(), &unread),
+            format!("{RELOAD} (host CPU unknown, microcode unknown on cpu0)"),
+            "an unread value is named unknown, never left out"
+        );
+
+        for other in [
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)",
+            "XINUSE is not stable across repetitions: the reference image changed",
+            "XINUSE is not stable across a hypervisor exit: XSTATE_BV 0x2e5 against 0x2e7",
+            "the interrupt-counter calibration on CPU 3 did not finish",
+            "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7) \
+             (reused refusal: measured by another Hermit process on this host 3s ago)",
+        ] {
+            assert_eq!(
+                name_reload_refusal(other.into(), &cache_host()),
+                other,
+                "{other} is returned unchanged"
+            );
+        }
+    }
+
+    /// Admission names the host on an FPU-reload refusal exactly once,
+    /// whether the cached probe measured it or answered it from the cache, and
+    /// the cache keeps the probe's own text. The probe `hermit
+    /// host-capabilities` runs goes through the same step.
+    #[test]
+    fn the_probe_step_names_the_host_once_measured_or_cached() {
+        const RELOAD: &str =
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2e5 against 0x2e7";
+        // cache_host()'s CPU signature and microcode, as the naming writes them.
+        let named = format!(
+            "{RELOAD} (host CPU AuthenticAMD family 0x1a model 0x11 stepping 0x0, \
+             microcode 0xb101054 on cpu0)"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let through_cache = |answer: Result<xstate_probe::ProbeReport, String>| {
+            let mut ran = false;
+            let result = probe_naming_host(&cache_host(), 0x2e7, |xcr0| {
+                cached_probe_at(Some(&path), &cache_host(), xcr0, &mut |_| {}, || {
+                    ran = true;
+                    answer
+                })
+            });
+            (result, ran)
+        };
+        let (result, ran) = through_cache(Err(RELOAD.into()));
+        assert_eq!(
+            result,
+            Err(named.clone()),
+            "a measured refusal is named once"
+        );
+        assert!(ran, "the first admission measures");
+        assert_eq!(
+            crate::host_qualification::load::<CachedProbeVerdict>(
+                &path,
+                &cache_host(),
+                &probe_cache_inputs(0x2e7)
+            ),
+            Some(CachedProbeVerdict::Refused(RELOAD.into())),
+            "the cache keeps the probe's own text"
+        );
+        let (result, ran) = through_cache(Ok(probe_report(0x2e7)));
+        assert_eq!(
+            result,
+            Err(named.clone()),
+            "a cached refusal is named once too"
+        );
+        assert!(!ran, "the second admission is answered from the cache");
+
+        let fresh = probe_naming_host(&cache_host(), 0x2e7, |_| Err(RELOAD.into()));
+        assert_eq!(
+            fresh,
+            Err(named),
+            "the uncached probe is named the same way"
+        );
+        assert_eq!(
+            probe_naming_host(&cache_host(), 0x2e7, |xcr0| Ok(probe_report(xcr0))),
+            Ok(probe_report(0x2e7)),
+            "a pass is returned as is"
+        );
     }
 
     /// A cached report whose recorded fields this host's probe would not

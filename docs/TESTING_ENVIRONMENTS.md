@@ -432,6 +432,10 @@ What matters in the output:
 serial numbers, microcode revisions, or internal identifiers. Post only the
 CPU model, feature flags, kernel version, and virtualization type relevant to
 the failure; remove hostnames and any internal identifiers before sharing.
+An `x86-64-v3` refusal that says `XINUSE is not stable across a host FPU
+reload` also ends with the host's CPU signature and microcode revision; keep
+the CPU signature and redact the microcode revision there too if you remove
+it elsewhere.
 
 ## Troubleshooting flow
 

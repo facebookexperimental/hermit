@@ -100,6 +100,17 @@ impl Case {
 /// Why the host cannot use the v3 profile, as one sentence for the refusal.
 pub type ProbeRefusal = String;
 
+/// How the FPU-reload instability refusal begins. [`Probe::compare`] writes
+/// this constant verbatim as that refusal's lead, so admission, which
+/// recognizes that deterministic refusal by it (to cache it and to name the
+/// host on it), matches the producer's own bytes by construction.
+pub const FPU_RELOAD_INSTABILITY: &str = "XINUSE is not stable across a host FPU reload:";
+
+/// How the hypervisor-exit instability refusal begins, written verbatim by
+/// [`Probe::compare`] like [`FPU_RELOAD_INSTABILITY`]. Admission neither
+/// caches nor names it.
+const HYPERVISOR_EXIT_INSTABILITY: &str = "XINUSE is not stable across a hypervisor exit:";
+
 /// The admitted component sets: x87, SSE and AVX are required by v3; the two
 /// MPX components and the three AVX-512 components each come together or not
 /// at all; PKRU is optional. Any other bit refuses, over all 64 bits.
@@ -1344,11 +1355,11 @@ impl Probe {
             self.check_reached(case, &where_)?;
             self.trial(case, Mode::Reload, peer, mxcsr, 1)
                 .map_err(|e| format!("{e} ({})", where_()))?;
-            self.compare(0, 1, "a host FPU reload", &where_)?;
+            self.compare(0, 1, FPU_RELOAD_INSTABILITY, &where_)?;
             if self.forced_exit {
                 self.trial(case, Mode::ForcedExit, peer, mxcsr, 2)
                     .map_err(|e| format!("{e} ({})", where_()))?;
-                self.compare(0, 2, "a hypervisor exit", &where_)?;
+                self.compare(0, 2, HYPERVISOR_EXIT_INSTABILITY, &where_)?;
             }
             if repetition == 0 {
                 self.first.0[..size + 4].copy_from_slice(&self.save[0].0[..size + 4]);
@@ -1555,11 +1566,12 @@ impl Probe {
         Ok(())
     }
 
+    /// Refuses, led by `lead` verbatim, when the two save images differ.
     fn compare(
         &self,
         reference: usize,
         other: usize,
-        transition: &str,
+        lead: &str,
         where_: &dyn Fn() -> String,
     ) -> Result<(), ProbeRefusal> {
         let n = self.layout.size + 4;
@@ -1572,8 +1584,7 @@ impl Probe {
             .find(|i| self.save[reference].0[*i] != self.save[other].0[*i])
             .unwrap_or(0);
         Err(format!(
-            "XINUSE is not stable across {transition}: XSTATE_BV {:#x} against {:#x}, \
-             first difference at save-area byte {offset} ({})",
+            "{lead} XSTATE_BV {:#x} against {:#x}, first difference at save-area byte {offset} ({})",
             header(reference),
             header(other),
             where_()
@@ -1828,6 +1839,28 @@ impl Switches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `compare` writes each lead verbatim, so the reload refusal begins with
+    /// [`FPU_RELOAD_INSTABILITY`] by construction. What admission also needs
+    /// is that no other refusal begins with it: a hypervisor-exit refusal must
+    /// be neither cached nor named. The leads are pinned to the bytes the
+    /// probe wrote before they became constants.
+    #[test]
+    fn the_reload_refusal_begins_with_the_lead_admission_matches() {
+        assert_eq!(
+            FPU_RELOAD_INSTABILITY,
+            "XINUSE is not stable across a host FPU reload:"
+        );
+        assert_eq!(
+            HYPERVISOR_EXIT_INSTABILITY,
+            "XINUSE is not stable across a hypervisor exit:"
+        );
+        assert!(
+            !HYPERVISOR_EXIT_INSTABILITY.starts_with(FPU_RELOAD_INSTABILITY)
+                && !FPU_RELOAD_INSTABILITY.starts_with(HYPERVISOR_EXIT_INSTABILITY),
+            "only the reload refusal carries the lead admission matches"
+        );
+    }
 
     fn coordinated_paths(
         name: &str,
