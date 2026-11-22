@@ -8,8 +8,8 @@
   },
   "generated_by": "scripts/syscall-pages.rs aggregate",
   "prose_counts": {
-    "checked": 44,
-    "none": 339
+    "checked": 45,
+    "none": 338
   },
   "schema": "syscalls.json/v3",
   "syscalls": [
