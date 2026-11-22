@@ -47,15 +47,18 @@
 #   - BUCK2_TEST_EXTRA_EXTERNAL_CONFIG adds stock-runner.buckconfig, which no other mode reads.
 # Any other BUCK2_TEST_* variable, or BUCK2_SETTINGS_OVERRIDE, refuses (exit 2).
 # Right after exporting them, in every form, before any buck2 runs, it refuses a buck2
-# settings file in HOME or the checkout, and an untracked or linked .buckconfig.local or
-# .buckconfig.d in the checkout (the shared action cache link of docs/BUCK2_OSS.md is one).
+# settings file in HOME or at the checkout's root, and an untracked or linked
+# .buckconfig.local or .buckconfig.d at the checkout's root (the shared action cache link of
+# docs/BUCK2_OSS.md is one). An untracked config at another cell's root (shim/, say) is
+# caught only by the per-value check below.
 # The forms that run cells (no argument, --cells-only) also:
 #   - write each machine-local file's sha256 to buck-invocations/buckconfig-external.tsv,
 #     before the daemon starts;
 #   - after the bounded daemon starts, write its buckconfig for every cell, with where each
 #     value is defined, to buck-invocations/buckconfig-effective.txt;
-#   - refuse before the stage unless that dump has values, every value comes from a file of
-#     HEAD (a submodule's HEAD inside one) with HEAD's bytes and no symlink on its path, from
+#   - refuse before the stage or the cells unless that dump has values, every value comes
+#     from a file of HEAD (inside a submodule, the submodule's HEAD, which must be the commit
+#     HEAD records for it) with HEAD's bytes and no symlink on its path, from
 #     the bundled prelude, or from stock-runner.buckconfig, and both of that file's keys are
 #     defined there.
 # --stage-only starts no bounded daemon, so its buckconfig gets the knobs and the refusal

@@ -138,6 +138,19 @@ git -C "$co" -c user.name=t -c user.email=t@t commit -q -m submodule
 { clean_dump; printf '[sub]\n    key = 1\n  (defined at sub/.buckconfig:2)\n'; } >"$work/subcell"
 expect 0 "a file of a submodule HEAD records" "$work/subcell" true
 
+# A submodule moved off the commit HEAD records, with its own HEAD holding the edited bytes:
+# that HEAD is not this commit's, so it does not vouch.
+recorded=$(git -C "$co" rev-parse HEAD:sub)
+echo '# edited' >>"$co/sub/.buckconfig"
+git -C "$co/sub" -c user.name=t -c user.email=t@t commit -q -a -m off-gitlink
+[[ $(git -C "$co/sub" ls-tree HEAD -- .buckconfig | awk '{print $3}') == "$(git -C "$co/sub" hash-object -- .buckconfig)" ]] ||
+    fail "the moved submodule's own HEAD does not hold the edited bytes"
+expect 2 "a file of a submodule moved off its gitlink" "$work/subcell" true
+grep -qF "not this commit's ($co/sub/.buckconfig; see" "$work/case.log" ||
+    { cat "$work/case.log" >&2; fail "a file of a submodule moved off its gitlink: the refusal does not name exactly sub/.buckconfig"; }
+git -C "$co/sub" checkout -q "$recorded"
+expect 0 "the submodule back at its gitlink" "$work/subcell" true
+
 # Each case below edits shim/.buckconfig and then makes git vouch for the edited bytes in a
 # way an unguarded check would believe (asserted first, so the case cannot pass vacuously).
 head_blob=$(git -C "$co" rev-parse HEAD:shim/.buckconfig)

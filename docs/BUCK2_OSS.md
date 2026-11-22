@@ -610,23 +610,27 @@ How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
 - **In every form, right after the knobs and before any buck2 runs**, it exits 2
   on:
   - a buck2 settings file (`.bucksettings.toml` or `.bucksettings.local.toml`)
-    in HOME or in the checkout;
-  - an untracked or linked `.buckconfig.local` or `.buckconfig.d` in the
-    checkout. The shared action cache's link below is one: remove it from a
-    checkout used for a Buck-only run.
+    in HOME or at the checkout's root;
+  - an untracked or linked `.buckconfig.local` or `.buckconfig.d` at the
+    checkout's root. The shared action cache's link below is one: remove it
+    from a checkout used for a Buck-only run.
+
+  An untracked config at another cell's root (`shim/.buckconfig.local`, say) is
+  caught only by the per-value check below.
 - **In the forms that run cells** (no argument, `--cells-only`):
   - before the daemon starts, it writes each machine-local file's SHA-256 to
     `buck-invocations/buckconfig-external.tsv`;
   - after the bounded daemon starts, it writes the daemon's buckconfig for
     every cell, with where each value is defined, to
     `buck-invocations/buckconfig-effective.txt`;
-  - it exits 2 before the stage unless that dump has values, every location
-    line in it parses, every value comes from a file of HEAD (a submodule's
-    HEAD inside one) with HEAD's bytes and no symlink on its path, from the
-    bundled prelude, or from `stock-runner.buckconfig`, and both of that
-    file's keys are defined there. HEAD's bytes are compared raw, ignoring any
-    clean filter or `refs/replace` entry, and a file in a nested repository
-    that HEAD does not record as a submodule is not a file of HEAD.
+  - it exits 2 before the stage or the cells unless that dump has values, every
+    location line in it parses, every value comes from a file of HEAD (inside
+    a submodule, the submodule's HEAD) with HEAD's bytes and no symlink on its
+    path, from the bundled prelude, or from `stock-runner.buckconfig`, and both
+    of that file's keys are defined there. HEAD's bytes are compared raw,
+    ignoring any clean filter or `refs/replace` entry. A file in a nested
+    repository is a file of HEAD only when HEAD records that repository as a
+    submodule and the submodule is checked out at exactly the recorded commit.
 
   `--stage-only` starts no bounded daemon, so its buckconfig gets the knobs and
   the refusal above, but no dump and no per-value check.

@@ -57,16 +57,18 @@ record_external_buckconfigs() {
 head_git() { git --no-replace-objects "$@"; }
 
 # head_repo TOP: 0 if the git top level TOP is the checkout itself, or a submodule whose
-# superproject records it as a gitlink at HEAD, up to the checkout. A nested repository that
-# is not such a submodule would judge a file against its own HEAD, so it refuses.
+# superproject records it as a gitlink at HEAD, checked out at exactly that commit, up to the
+# checkout. A nested repository that is not such a submodule, or a submodule moved off its
+# gitlink, would judge a file against a HEAD this commit does not name, so it refuses.
 head_repo() {
-    local top=$1 super entry mode type
+    local top=$1 super entry mode type recorded
     [[ $top == "$(realpath -e -- "$root")" ]] && return 0
     super=$(head_git -C "$top" rev-parse --show-superproject-working-tree 2>/dev/null) || return 1
     [[ -n $super && $top == "$super"/* ]] || return 1
     entry=$(head_git -C "$super" ls-tree HEAD -- "${top#"$super"/}" 2>/dev/null) || return 1
-    read -r mode type _ <<<"$entry"
+    read -r mode type recorded _ <<<"$entry"
     [[ $mode == 160000 && $type == commit ]] || return 1
+    [[ $(head_git -C "$top" rev-parse --verify -q HEAD 2>/dev/null) == "$recorded" ]] || return 1
     head_repo "$super"
 }
 
