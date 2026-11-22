@@ -327,7 +327,12 @@ Commands:
       With --pinned-root, build with the canonical pinned-root producers
       and run every prepare/cell step inside the pinned root (fail-closed;
       --results must be under the checkout); the retained evidence then
-      records environment pinned-root instead of host.
+      records environment pinned-root instead of host. Before any step runs,
+      `run` refuses a plan whose host steps get a fresh tmpfs at a
+      HERMIT_E2E_EMPTY_WORKDIR path that is not a directory on this host,
+      naming the path, the cell runs by backend, and the remedy. A step run
+      through the pinned-root launcher needs no such path: the launcher
+      mounts its own /test.
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -4296,15 +4301,127 @@ fn base_cell_dir_name(name: &str) -> &str {
 /// The `cell.*` tags of every planned cell run: each repetition of the
 /// selected cells and of a sample's parity references.
 fn planned_cell_run_tags(metadata: &RunMetadata) -> BTreeSet<String> {
+    planned_cell_runs(metadata).into_keys().collect()
+}
+
+/// Every planned cell run's `cell.*` tag, with the cell it runs.
+fn planned_cell_runs(metadata: &RunMetadata) -> BTreeMap<String, &CellId> {
     metadata
         .cells
         .iter()
         .chain(&metadata.reference_cells)
         .flat_map(|cell| {
             repetition_numbers(metadata.repetitions)
-                .map(move |repetition| format!("cell.{}", cell_run_slug(cell, repetition)))
+                .map(move |repetition| (format!("cell.{}", cell_run_slug(cell, repetition)), cell))
         })
         .collect()
+}
+
+/// The host preflight `run` performs on its final graph, against this host's
+/// filesystem ([`require_host_workdirs`] with [`Path::is_dir`]): the lines it
+/// prints, one per directory it checked, or one saying no host step needs a
+/// working directory.
+fn host_workdir_preflight(dag: &DagConfig, metadata: &RunMetadata) -> Result<Vec<String>, String> {
+    let checked = require_host_workdirs(dag, metadata, Path::is_dir)?;
+    if checked.is_empty() {
+        return Ok(vec![format!(
+            "Host preflight: no host step needs a host working directory ({} step(s) checked)",
+            dag.steps.len()
+        )]);
+    }
+    Ok(checked
+        .iter()
+        .map(|(workdir, steps)| {
+            format!(
+                "Host preflight: {} is a directory; {steps} host step(s) get a fresh tmpfs there",
+                workdir.display()
+            )
+        })
+        .collect())
+}
+
+/// Refuse a plan whose host steps need a working directory that is not a
+/// directory on this host, before any of its steps runs. On success, each
+/// directory checked, with the number of host steps that need it.
+///
+/// A step whose environment sets [`HERMETIC_TEST_WORKDIR_ENV`] asks its harness
+/// for a fresh tmpfs at that path. Hermit mounts it with
+/// `--mount=type=tmpfs,target=PATH` and refuses a target the host lacks, and
+/// the DBT harness mounts it in a mount namespace of its own, which needs an
+/// existing directory (`common/test-workdir`), so every such step would end
+/// without a result. A step that [`runs_in_pinned_root`] needs nothing from the
+/// host: the launcher mounts a fresh tmpfs at /test inside its container and
+/// forwards the variable by name. The directories are read from the plan's own
+/// steps, and each missing one is named with the cell runs, by backend, and any
+/// other step that needs it.
+fn require_host_workdirs(
+    dag: &DagConfig,
+    metadata: &RunMetadata,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<BTreeMap<PathBuf, usize>, String> {
+    let mut needed = BTreeMap::<PathBuf, Vec<String>>::new();
+    for step in &dag.steps {
+        if runs_in_pinned_root(step) {
+            continue;
+        }
+        if let Some(workdir) = step.env.get(HERMETIC_TEST_WORKDIR_ENV) {
+            needed
+                .entry(PathBuf::from(workdir))
+                .or_default()
+                .push(step.tag());
+        }
+    }
+    let cell_runs = planned_cell_runs(metadata);
+    let refusals: Vec<String> = needed
+        .iter()
+        .filter(|(workdir, _)| !is_dir(workdir))
+        .map(|(workdir, tags)| {
+            let mut by_backend = BTreeMap::<&str, usize>::new();
+            let mut other_steps = Vec::new();
+            for tag in tags {
+                match cell_runs.get(tag) {
+                    Some(cell) => *by_backend.entry(cell.backend.as_str()).or_default() += 1,
+                    None => other_steps.push(tag.as_str()),
+                }
+            }
+            let mut needers = Vec::new();
+            if !by_backend.is_empty() {
+                needers.push(format!(
+                    "{} cell run(s) ({})",
+                    by_backend.values().sum::<usize>(),
+                    by_backend
+                        .iter()
+                        .map(|(backend, runs)| format!("{backend} {runs}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !other_steps.is_empty() {
+                needers.push(format!("step(s) {}", other_steps.join(", ")));
+            }
+            format!(
+                "{workdir} is not a directory on this host, but {count} host step(s) of this plan \
+                 get a fresh tmpfs there through {HERMETIC_TEST_WORKDIR_ENV}: {needers}. Hermit \
+                 refuses a --mount target the host lacks, and the DBT harness needs the directory \
+                 to exist, so each of them would end without a result. Create it as root \
+                 (`install -d -m 0755 {workdir}`), or run a selection --pinned-root accepts in \
+                 the pinned root, whose launcher mounts its own",
+                workdir = workdir.display(),
+                count = tags.len(),
+                needers = needers.join(" and "),
+            )
+        })
+        .collect();
+    if !refusals.is_empty() {
+        return Err(format!(
+            "host preflight refused the plan before any step ran: {}",
+            refusals.join("; ")
+        ));
+    }
+    Ok(needed
+        .into_iter()
+        .map(|(workdir, tags)| (workdir, tags.len()))
+        .collect())
 }
 
 /// The typed scheduler must return exactly one outcome per planned cell run,
@@ -4892,6 +5009,13 @@ fn run() -> Result<(), String> {
                     } else {
                         print_exact_manifest_command(&dag, &metadata)?;
                     }
+                }
+                // The last check before the graph runs: a host step needing a
+                // working directory this host lacks would end without a
+                // result, so the run is refused here, before any step of the
+                // graph runs.
+                for line in host_workdir_preflight(&dag, &metadata)? {
+                    println!("{line}");
                 }
                 // --log-tail-bytes: bound and sample every cell run beside the scheduler.
                 let warden = log_tail_options
@@ -8419,7 +8543,7 @@ fn compat_fixture_step(
                 source.cmd
             ));
         }
-    } else if !source.cmd.ends_with(&expected_tail) || source.cmd.contains(PINNED_ROOT_LAUNCHER) {
+    } else if !source.cmd.ends_with(&expected_tail) || runs_in_pinned_root(source) {
         return Err(format!(
             "{PORTABLE_DAG} {VALIDATE_FIXTURE_STEP} no longer runs on the host into $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}: {}",
             source.cmd
@@ -8489,7 +8613,7 @@ fn host_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
                     "canonical build graph duplicates host variant {tag}"
                 ));
             }
-            if step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+            if runs_in_pinned_root(&step) {
                 return Err(format!(
                     "canonical host variant {tag} runs through {PINNED_ROOT_LAUNCHER}; the host pressure graph cannot run it"
                 ));
@@ -8555,7 +8679,7 @@ fn pinned_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
                     "canonical build graph duplicates pinned variant {tag}"
                 ));
             }
-            if !step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+            if !runs_in_pinned_root(&step) {
                 return Err(format!(
                     "canonical pinned variant {tag} does not run through {PINNED_ROOT_LAUNCHER}; refusing to call it pinned"
                 ));
@@ -8592,6 +8716,26 @@ fn pinned_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
 /// host build and never substitutes in a pinned plan).
 fn pinned_required_build_tags() -> BTreeSet<&'static str> {
     PINNED_REQUIRED_BUILD_TAGS.into_iter().collect()
+}
+
+/// Whether `step` runs in the pinned root: its command invokes
+/// [`PINNED_ROOT_LAUNCHER`], wherever in the command (the planner wraps the
+/// copied pinned producers and the fixture node in a build-marker shell, so
+/// the launcher is not always the first word). This is the one model of the
+/// fact: the canonical variant checks ([`host_build_steps`],
+/// [`pinned_build_steps`], the host source of [`compat_fixture_step`]), the
+/// plan audit and the host preflight ([`require_host_workdirs`]) all decide it
+/// here. The stricter shape checks (the pinned fixture source starts with the
+/// launcher; prepare, cell and manifest-gate steps carry the exact wrapper)
+/// imply it.
+///
+/// It reads the command because the command is the authority: the canonical
+/// graph marks no step as pinned other than by running the launcher, and a
+/// planner-set label would be a second copy of this same fact, read off the
+/// same text, that the audit would have to hold equal to the command, with an
+/// exception for the plans retained before the label existed.
+fn runs_in_pinned_root(step: &Step) -> bool {
+    step.cmd.contains(PINNED_ROOT_LAUNCHER)
 }
 
 /// Wrap one generated prepare/cell command in the pinned root. Every
@@ -9763,7 +9907,7 @@ fn audit_dag_impl(
                     "{tag} is not wrapped in the exact pinned form in a pinned run"
                 ));
             }
-            if step.group == "compatprep" && !step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+            if step.group == "compatprep" && !runs_in_pinned_root(step) {
                 return Err(format!(
                     "{tag} prepares compat fixtures on the host in a pinned run"
                 ));
@@ -27647,6 +27791,318 @@ mod typed_termination_tests {
         let guard = SelfTestDirectory::new(path.clone());
         retained_termination_self_test(&path).unwrap();
         guard.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod host_workdir_preflight_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> (PathBuf, SelfTestDirectory) {
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&path).unwrap();
+        (path.clone(), SelfTestDirectory::new(path))
+    }
+
+    fn cell(test: &str, backend: &str) -> CellId {
+        CellId {
+            lane: "portable".into(),
+            category: "applications".into(),
+            test: test.into(),
+            mode: "verify".into(),
+            backend: backend.into(),
+        }
+    }
+
+    fn metadata(cells: &[CellId]) -> RunMetadata {
+        serde_json::from_value(json!({
+            "schema": RUN_SCHEMA,
+            "hermit_sha": "0".repeat(40),
+            "detcore_tree": "0".repeat(40),
+            "source_tree_dirty": false,
+            "run_timeout_seconds": 600,
+            "repetitions": 2,
+            "cells": cells,
+        }))
+        .unwrap()
+    }
+
+    fn step(tag: &str, cmd: &str, workdir: Option<&Path>) -> JsonValue {
+        let (group, job) = tag.split_once('.').unwrap();
+        let mut step = json!({
+            "group": group,
+            "job": job,
+            "cmd": cmd,
+            "deps": [],
+            "timeout": 5,
+            "cpu_timeout": 5,
+        });
+        if let Some(workdir) = workdir {
+            step["env"] = json!({ HERMETIC_TEST_WORKDIR_ENV: workdir.to_string_lossy() });
+        }
+        step
+    }
+
+    fn dag(steps: Vec<JsonValue>) -> DagConfig {
+        dag_from_json(
+            &json!({"description": "host working-directory preflight", "steps": steps}).to_string(),
+        )
+        .unwrap()
+    }
+
+    /// Host cell runs on ptrace and KVM and a host build step need WORKDIR; a
+    /// pinned-root LiteInst cell names it too, but its image provides it; a
+    /// second host build step needs no working directory.
+    fn plan(workdir: &Path) -> (RunMetadata, DagConfig) {
+        let metadata = metadata(&[
+            cell("applications/a", "ptrace"),
+            cell("applications/b", "kvm"),
+            cell("applications/c", "liteinst"),
+        ]);
+        let pinned = format!("{PINNED_ROOT_LAUNCHER} --src . -- bash -c true");
+        let mut steps = vec![
+            step("build.plain", "true", None),
+            step("build.needs", "true", Some(workdir)),
+        ];
+        for (tag, cell) in planned_cell_runs(&metadata) {
+            let cmd = if cell.backend == "liteinst" {
+                pinned.as_str()
+            } else {
+                "true"
+            };
+            steps.push(step(&tag, cmd, Some(workdir)));
+        }
+        (metadata, dag(steps))
+    }
+
+    #[test]
+    fn a_missing_host_workdir_refuses_the_plan_naming_path_cells_and_remedy() {
+        let (root, guard) = scratch("host-workdir");
+        let workdir = root.join("test");
+        let path = workdir.display().to_string();
+        let (metadata, dag) = plan(&workdir);
+
+        let refusal = require_host_workdirs(&dag, &metadata, Path::is_dir).unwrap_err();
+        assert!(
+            refusal.starts_with("host preflight refused the plan before any step ran: "),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("{path} is not a directory on this host")),
+            "{refusal}"
+        );
+        // Two host cells of two repetitions each, and the host build step.
+        assert!(refusal.contains("5 host step(s)"), "{refusal}");
+        assert!(
+            refusal.contains("4 cell run(s) (kvm 2, ptrace 2) and step(s) build.needs"),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("liteinst") && !refusal.contains("build.plain"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("`install -d -m 0755 {path}`"))
+                && refusal.contains("--pinned-root"),
+            "{refusal}"
+        );
+
+        // A file at the path is no directory either.
+        fs::write(&workdir, b"").unwrap();
+        let refusal = require_host_workdirs(&dag, &metadata, Path::is_dir).unwrap_err();
+        assert!(
+            refusal.contains(&format!("{path} is not a directory on this host")),
+            "{refusal}"
+        );
+        fs::remove_file(&workdir).unwrap();
+
+        fs::create_dir(&workdir).unwrap();
+        assert_eq!(
+            require_host_workdirs(&dag, &metadata, Path::is_dir).unwrap(),
+            BTreeMap::from([(workdir.clone(), 5)])
+        );
+        guard.remove().unwrap();
+    }
+
+    #[test]
+    fn every_missing_host_workdir_is_named_and_a_present_one_is_not() {
+        let (root, guard) = scratch("host-workdirs");
+        let present = root.join("present");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir(&present).unwrap();
+        let metadata = metadata(&[cell("applications/a", "ptrace")]);
+        let dag = dag(vec![
+            step("build.first", "true", Some(&first)),
+            step("build.second", "true", Some(&second)),
+            step("build.present", "true", Some(&present)),
+        ]);
+        let refusal = require_host_workdirs(&dag, &metadata, Path::is_dir).unwrap_err();
+        for (missing, tag) in [(&first, "build.first"), (&second, "build.second")] {
+            assert!(
+                refusal.contains(&format!(
+                    "{} is not a directory on this host, but 1 host step(s) of this plan get a fresh tmpfs there through {HERMETIC_TEST_WORKDIR_ENV}: step(s) {tag}.",
+                    missing.display()
+                )),
+                "{refusal}"
+            );
+        }
+        assert!(
+            !refusal.contains(&present.display().to_string()),
+            "{refusal}"
+        );
+        guard.remove().unwrap();
+    }
+
+    #[test]
+    fn a_plan_whose_steps_need_no_host_workdir_checks_no_host_path() {
+        let workdir = Path::new("/nonexistent-host-workdir");
+        let metadata = metadata(&[cell("applications/a", "ptrace")]);
+        let pinned = format!("{PINNED_ROOT_LAUNCHER} --src . -- bash -c true");
+        // The planner wraps a copied pinned producer in a build-marker shell,
+        // so the launcher is not its first word.
+        let marked = format!(
+            "mkdir -p /results/build; if test -f /results/build/marker; then exit 0; fi; ( {pinned} ) && printf 'ok\\n' > /results/build/marker"
+        );
+        let mut steps = vec![
+            step("build.plain", "true", None),
+            step("build.marked", &marked, Some(workdir)),
+        ];
+        for tag in planned_cell_runs(&metadata).keys() {
+            steps.push(step(tag, &pinned, Some(workdir)));
+        }
+        let dag = dag(steps);
+        let checked = require_host_workdirs(&dag, &metadata, |path: &Path| {
+            panic!("no host path should be checked, got {}", path.display())
+        })
+        .unwrap();
+        assert!(checked.is_empty(), "{checked:?}");
+        assert_eq!(
+            host_workdir_preflight(&dag, &metadata).unwrap(),
+            ["Host preflight: no host step needs a host working directory (4 step(s) checked)"]
+        );
+    }
+
+    /// What `run` calls ([`host_workdir_preflight`]) checks this host's
+    /// filesystem for a directory: a regular file at the path is refused, and
+    /// a directory there is accepted and reported.
+    #[test]
+    fn the_run_preflight_wants_a_directory_on_this_host() {
+        let (root, guard) = scratch("host-workdir-run");
+        let workdir = root.join("test");
+        let path = workdir.display().to_string();
+        let (metadata, dag) = plan(&workdir);
+        fs::write(&workdir, b"").unwrap();
+        let refusal = host_workdir_preflight(&dag, &metadata).unwrap_err();
+        assert!(
+            refusal.contains(&format!("{path} is not a directory on this host")),
+            "{refusal}"
+        );
+        fs::remove_file(&workdir).unwrap();
+        fs::create_dir(&workdir).unwrap();
+        assert_eq!(
+            host_workdir_preflight(&dag, &metadata).unwrap(),
+            [format!(
+                "Host preflight: {path} is a directory; 5 host step(s) get a fresh tmpfs there"
+            )]
+        );
+        guard.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod host_workdir_preflight_real_plan_tests {
+    //! The host preflight over plans from the real planner
+    //! (`write_plan_after_scorecard_check`, as `pinned_plan_self_test_at` calls
+    //! it), with a predicate that reports only `/test` missing, so `/test`
+    //! itself is never read or touched. Adopted from the review of the first
+    //! version, which refused every `--pinned-root` plan on a host without
+    //! `/test`.
+    use super::*;
+
+    fn real_plan(tag: &str, pinned_root: bool) -> (SelfTestDirectory, RunMetadata, DagConfig) {
+        // This checkout, wherever the harness runs from.
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let ignored = root.join("ignored");
+        let prefix = format!("hermit-pressure-self-test-host-workdir-{tag}-");
+        let plan = ignored.join(format!(
+            "{prefix}{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&plan).unwrap();
+        let guard = SelfTestDirectory::at(plan.clone(), ignored, &prefix);
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let selection = CellSelection {
+            test: Some("compat/cat".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            green: true,
+            repetitions: Some(1),
+            run_timeout_seconds: Some(1_000_000_000),
+            pinned_root,
+            ..CellSelection::default()
+        };
+        let (metadata, dag) =
+            write_plan_after_scorecard_check(&checked, &plan, &plan.join("dag.json"), &selection)
+                .unwrap();
+        assert_eq!(metadata.pinned_root, pinned_root);
+        (guard, metadata, dag)
+    }
+
+    fn host_without_test(path: &Path) -> bool {
+        path != Path::new("/test")
+    }
+
+    #[test]
+    fn a_real_host_plan_is_refused_naming_its_cell_run() {
+        let (guard, metadata, dag) = real_plan("host", false);
+        let verdict = require_host_workdirs(&dag, &metadata, host_without_test);
+        let ok = require_host_workdirs(&dag, &metadata, |_: &Path| true);
+        guard.remove().unwrap();
+        let refusal = verdict.unwrap_err();
+        assert!(refusal.contains("1 cell run(s) (ptrace 1)"), "{refusal}");
+        assert_eq!(ok.unwrap(), BTreeMap::from([(PathBuf::from("/test"), 1)]));
+    }
+
+    #[test]
+    fn a_real_pinned_plan_is_not_refused_on_a_host_without_test() {
+        let (guard, metadata, dag) = real_plan("pinned", true);
+        let verdict = require_host_workdirs(&dag, &metadata, host_without_test);
+        // The pinned producers and the fixture node do request /test, inside
+        // the pinned root; none of them is a host step.
+        let requesting = dag
+            .steps
+            .iter()
+            .filter(|step| step.env.contains_key(HERMETIC_TEST_WORKDIR_ENV))
+            .count();
+        guard.remove().unwrap();
+        assert!(
+            verdict.is_ok(),
+            "a --pinned-root plan was refused on a host without /test: {verdict:?}"
+        );
+        assert!(verdict.unwrap().is_empty());
+        assert!(requesting > 1, "{requesting}");
     }
 }
 
