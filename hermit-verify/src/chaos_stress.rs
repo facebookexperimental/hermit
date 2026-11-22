@@ -11,6 +11,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use clap::Parser;
@@ -149,8 +152,9 @@ impl ChaosStressOpts {
     /// passed through as it arrives and kept for [`classify`]. Every line
     /// this run prints is tagged with its iteration and seed, so a
     /// failure under `--jobs` is attributable and its run reproducible.
-    /// With `--jobs` above 1 the guest's stdout is also piped and
-    /// re-emitted tagged; sequentially it is inherited as before.
+    /// The guest's stdout is piped and re-emitted tagged in both modes,
+    /// so a sequential and a parallel search present the same output
+    /// shape (under a test runner that stdout is captured either way).
     fn run_hermit(&self, common_args: &CommonOpts, run: i32) -> anyhow::Result<(RunOutcome, u16)> {
         let mut rng = rand::rng();
         let random_seed: u16 = rng.random();
@@ -163,10 +167,10 @@ impl ChaosStressOpts {
             .into_args();
 
         let mut command = std::process::Command::new(&common_args.hermit_bin);
-        command.args(hermit_cli_args).stderr(Stdio::piped());
-        if self.jobs > 1 {
-            command.stdout(Stdio::piped());
-        }
+        command
+            .args(hermit_cli_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         println!("   {tag} {}", display_cmd(&command).white().bold());
         let started = Instant::now();
         let mut child = command.spawn()?;
@@ -277,10 +281,7 @@ impl ChaosStressOpts {
     /// happened to finish first.
     fn run_parallel(&self, common_args: &CommonOpts) -> anyhow::Result<bool> {
         use std::sync::Mutex;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::AtomicI32;
         use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
 
         let workers = self.jobs.min(self.max_iterations_count as usize);
         let results = Mutex::new(
@@ -288,21 +289,16 @@ impl ChaosStressOpts {
                 .map(|_| None::<anyhow::Result<(RunOutcome, u32)>>)
                 .collect::<Vec<_>>(),
         );
-        let next = AtomicI32::new(1);
+        let handout = Handout::new();
         let success_count = AtomicUsize::new(0);
         let fail_count = AtomicUsize::new(0);
-        let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
                     loop {
-                        if stop.load(Ordering::Relaxed) {
+                        let Some(i) = handout.take(self.max_iterations_count) else {
                             return;
-                        }
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i > self.max_iterations_count {
-                            return;
-                        }
+                        };
                         let result = self.run_iteration(common_args, i);
                         match &result {
                             Ok((outcome, _retries)) => {
@@ -320,14 +316,14 @@ impl ChaosStressOpts {
                                     }
                                 };
                                 if successes > 0 && failures > 0 {
-                                    stop.store(true, Ordering::Relaxed);
+                                    handout.stop();
                                 }
                             }
                             Err(err) => {
                                 // Printed even when an earlier-indexed pair
                                 // will decide the verdict over this error.
                                 eprintln!("[run #{i}] error: {err:#}");
-                                stop.store(true, Ordering::Relaxed);
+                                handout.stop();
                             }
                         }
                         results.lock().unwrap()[(i - 1) as usize] = Some(result);
@@ -345,6 +341,38 @@ impl ChaosStressOpts {
             "{successes} passing and {failures} failing runs; {skid_retries} skid refusals retried"
         );
         Ok(false)
+    }
+}
+
+/// Hands out iteration numbers to the parallel workers in order, and
+/// stops handing them out once [`Handout::stop`] is called. Because a
+/// number is handed out only to a worker about to run it, at most one
+/// iteration per worker can be in flight past the stop: the number of
+/// iterations started beyond any deciding point is bounded by the
+/// worker count.
+struct Handout {
+    next: AtomicI32,
+    stop: AtomicBool,
+}
+
+impl Handout {
+    fn new() -> Self {
+        Self {
+            next: AtomicI32::new(1),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn take(&self, max_iterations_count: i32) -> Option<i32> {
+        if self.stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        (i <= max_iterations_count).then_some(i)
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -389,6 +417,23 @@ mod tests {
 
     fn exited(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn the_handout_stops_handing_out_iterations() {
+        let handout = Handout::new();
+        assert_eq!(handout.take(3), Some(1));
+        assert_eq!(handout.take(3), Some(2));
+        handout.stop();
+        // Nothing further is handed out once stopped, however many
+        // workers ask: at most the already-taken iterations (one per
+        // worker) can still be in flight past the stop.
+        assert_eq!(handout.take(3), None);
+        assert_eq!(handout.take(3), None);
+        let handout = Handout::new();
+        assert_eq!(handout.take(2), Some(1));
+        assert_eq!(handout.take(2), Some(2));
+        assert_eq!(handout.take(2), None);
     }
 
     #[test]
