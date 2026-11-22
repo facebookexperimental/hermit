@@ -2576,8 +2576,8 @@ fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
             hermit_command(&["host-capabilities", "--cpu-profile", profile, "--json"])
                 .stdin(Stdio::null()),
         );
-        let verdict: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .unwrap_or_else(|error| {
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
                     "{profile} JSON verdict is not JSON: {error}: {}",
                     String::from_utf8_lossy(&output.stdout)
@@ -2600,7 +2600,11 @@ fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
         match output.status.code() {
             Some(0) => {
                 assert_eq!(verdict["qualified"], true, "{profile}: {verdict}");
-                assert_eq!(verdict["refusal"], serde_json::Value::Null, "{profile}: {verdict}");
+                assert_eq!(
+                    verdict["refusal"],
+                    serde_json::Value::Null,
+                    "{profile}: {verdict}"
+                );
             }
             Some(code) if code == HERMIT_POLICY_REFUSAL_EXIT => {
                 assert_eq!(verdict["qualified"], false, "{profile}: {verdict}");
@@ -2608,17 +2612,28 @@ fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
                     !verdict["refusal"].as_str().unwrap_or_default().is_empty(),
                     "{profile}: {verdict}"
                 );
-                assert_eq!(verdict["probe"], serde_json::Value::Null, "{profile}: {verdict}");
+                assert_eq!(
+                    verdict["probe"],
+                    serde_json::Value::Null,
+                    "{profile}: {verdict}"
+                );
             }
             other => panic!("{profile} JSON verdict exited {other:?}: {verdict}"),
         }
         if profile == "x86-64-v3" && verdict["qualified"] == true {
             assert!(verdict["probe"].is_object(), "{profile}: {verdict}");
-            assert!(verdict["probe"]["xcr0"].as_u64().unwrap_or(0) > 0, "{profile}: {verdict}");
+            assert!(
+                verdict["probe"]["xcr0"].as_u64().unwrap_or(0) > 0,
+                "{profile}: {verdict}"
+            );
         }
         if profile == "x86-64-v2" {
             assert_eq!(output.status.code(), Some(0), "{profile}: {verdict}");
-            assert_eq!(verdict["probe"], serde_json::Value::Null, "{profile}: {verdict}");
+            assert_eq!(
+                verdict["probe"],
+                serde_json::Value::Null,
+                "{profile}: {verdict}"
+            );
         }
     }
 }
@@ -2631,7 +2646,8 @@ fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
 #[test]
 fn host_capabilities_cpu_profile_json_refusal_exits_122_under_xcr0_seam() {
     let _guard = hermit_run_guard();
-    let mut command = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3", "--json"]);
+    let mut command =
+        hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3", "--json"]);
     command
         .env("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS", "0x80000")
         .stdin(Stdio::null());

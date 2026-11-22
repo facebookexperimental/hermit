@@ -151,11 +151,7 @@ impl ChaosStressOpts {
     /// failure under `--jobs` is attributable and its run reproducible.
     /// With `--jobs` above 1 the guest's stdout is also piped and
     /// re-emitted tagged; sequentially it is inherited as before.
-    fn run_hermit(
-        &self,
-        common_args: &CommonOpts,
-        run: i32,
-    ) -> anyhow::Result<(RunOutcome, u16)> {
+    fn run_hermit(&self, common_args: &CommonOpts, run: i32) -> anyhow::Result<(RunOutcome, u16)> {
         let mut rng = rand::rng();
         let random_seed: u16 = rng.random();
         let tag = format!("[run #{run} seed={random_seed}]");
@@ -212,27 +208,20 @@ impl ChaosStressOpts {
             "{tag} Executed command with status: {status_text} in {:.1?}",
             started.elapsed()
         );
-        let outcome = classify(status, &stderr)
-            .map_err(|err| anyhow::anyhow!("{tag} {err}"))?;
+        let outcome = classify(status, &stderr).map_err(|err| anyhow::anyhow!("{tag} {err}"))?;
         Ok((outcome, random_seed))
     }
 
     /// One search iteration: its guest outcome and how many skid
     /// refusals were retried on the way to it.
-    fn run_iteration(
-        &self,
-        common_args: &CommonOpts,
-        i: i32,
-    ) -> anyhow::Result<(RunOutcome, u32)> {
+    fn run_iteration(&self, common_args: &CommonOpts, i: i32) -> anyhow::Result<(RunOutcome, u32)> {
         println!("{}", format!(":: Run #{}...", i).yellow().bold());
         let mut attempt = 1;
         let mut skid_retries = 0;
         let outcome = loop {
             match self.run_hermit(common_args, i)? {
                 (RunOutcome::SkidRefused(refusal), seed) if attempt < SKID_ATTEMPTS => {
-                    eprintln!(
-                        "[run #{i} seed={seed}] SKID-RETRY attempt {attempt}: {refusal}"
-                    );
+                    eprintln!("[run #{i} seed={seed}] SKID-RETRY attempt {attempt}: {refusal}");
                     skid_retries += 1;
                     attempt += 1;
                 }
@@ -305,42 +294,44 @@ impl ChaosStressOpts {
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i > self.max_iterations_count {
-                        return;
-                    }
-                    let result = self.run_iteration(common_args, i);
-                    match &result {
-                        Ok((outcome, _retries)) => {
-                            let (successes, failures) = match outcome {
-                                RunOutcome::Passed => (
-                                    success_count.fetch_add(1, Ordering::Relaxed) + 1,
-                                    fail_count.load(Ordering::Relaxed),
-                                ),
-                                RunOutcome::Failed => (
-                                    success_count.load(Ordering::Relaxed),
-                                    fail_count.fetch_add(1, Ordering::Relaxed) + 1,
-                                ),
-                                RunOutcome::SkidRefused(_) => {
-                                    unreachable!("retried in run_iteration")
+                scope.spawn(|| {
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i > self.max_iterations_count {
+                            return;
+                        }
+                        let result = self.run_iteration(common_args, i);
+                        match &result {
+                            Ok((outcome, _retries)) => {
+                                let (successes, failures) = match outcome {
+                                    RunOutcome::Passed => (
+                                        success_count.fetch_add(1, Ordering::Relaxed) + 1,
+                                        fail_count.load(Ordering::Relaxed),
+                                    ),
+                                    RunOutcome::Failed => (
+                                        success_count.load(Ordering::Relaxed),
+                                        fail_count.fetch_add(1, Ordering::Relaxed) + 1,
+                                    ),
+                                    RunOutcome::SkidRefused(_) => {
+                                        unreachable!("retried in run_iteration")
+                                    }
+                                };
+                                if successes > 0 && failures > 0 {
+                                    stop.store(true, Ordering::Relaxed);
                                 }
-                            };
-                            if successes > 0 && failures > 0 {
+                            }
+                            Err(err) => {
+                                // Printed even when an earlier-indexed pair
+                                // will decide the verdict over this error.
+                                eprintln!("[run #{i}] error: {err:#}");
                                 stop.store(true, Ordering::Relaxed);
                             }
                         }
-                        Err(err) => {
-                            // Printed even when an earlier-indexed pair
-                            // will decide the verdict over this error.
-                            eprintln!("[run #{i}] error: {err:#}");
-                            stop.store(true, Ordering::Relaxed);
-                        }
+                        results.lock().unwrap()[(i - 1) as usize] = Some(result);
                     }
-                    results.lock().unwrap()[(i - 1) as usize] = Some(result);
                 });
             }
         });

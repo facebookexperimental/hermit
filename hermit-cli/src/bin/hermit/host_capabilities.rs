@@ -382,7 +382,10 @@ mod tests {
             &mut out,
             CpuProfile::X86_64V3,
             false,
-            Some("XCR0 0x802e7 enables components the XINUSE probe does not cover (it covers 0x2ff)".into()),
+            Some(
+                "XCR0 0x802e7 enables components the XINUSE probe does not cover (it covers 0x2ff)"
+                    .into(),
+            ),
             None,
         )
         .unwrap();
@@ -390,7 +393,12 @@ mod tests {
         assert_eq!(value["schema"], 1);
         assert_eq!(value["profile"], "x86-64-v3");
         assert_eq!(value["qualified"], false);
-        assert!(value["refusal"].as_str().unwrap().starts_with("XCR0 0x802e7"));
+        assert!(
+            value["refusal"]
+                .as_str()
+                .unwrap()
+                .starts_with("XCR0 0x802e7")
+        );
         assert_eq!(value["probe"], serde_json::Value::Null);
 
         let mut out = Vec::new();
