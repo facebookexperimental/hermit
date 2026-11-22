@@ -78,7 +78,32 @@ pub(crate) const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
 /// Largest uncompressed (expanded) size of one layer tar. A gzip layer whose
 /// tar expands past this is refused during `diff_id` verification, before
 /// anything is written to the rootfs.
-pub(crate) const MAX_LAYER_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+///
+/// Sized from measurement, not preference: the pinned validate image's
+/// large layer expands to about 5.47e9 tar-stream bytes (197,974 entries
+/// in the overlay diff; total expanded image about 5.49e9, inside
+/// [`MAX_TOTAL_EXPANDED_BYTES`], which does not move). This cap is the
+/// smallest power of two at or above 1.5x that measured layer, per the
+/// raising rule recorded with the measurement. If a future pinned image
+/// outgrows it, re-measure and re-derive by the same rule; do not raise
+/// it by feel, and never remove it: it is the decompression-bomb bound.
+pub(crate) const MAX_LAYER_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The measured expanded size the cap above was derived from, kept so the
+/// derivation is checked by every build instead of only in review text.
+const PINNED_LAYER_MEASURED_EXPANDED_BYTES: u64 = 5_473_997_312;
+
+/// The raising rule, checked at compile time in every build: the cap is a
+/// power of two, at least 1.5x the measured layer, and the smallest such
+/// power.
+const _: () = {
+    let cap = MAX_LAYER_EXPANDED_BYTES as u128;
+    let need = PINNED_LAYER_MEASURED_EXPANDED_BYTES as u128 * 3 / 2;
+    assert!(MAX_LAYER_EXPANDED_BYTES.is_power_of_two());
+    assert!(cap >= need);
+    assert!(cap / 2 < need);
+    assert!(MAX_TOTAL_EXPANDED_BYTES > PINNED_LAYER_MEASURED_EXPANDED_BYTES);
+};
 
 /// Largest total payload bytes written while applying all layers of one
 /// image, and likewise the largest total bytes spooled for one
@@ -2630,6 +2655,44 @@ mod tests {
         assert!(
             format!("{err:#}").contains("quota"),
             "expansion refusal must name the quota: {err:#}"
+        );
+    }
+
+    /// M3: the expansion quota's boundary, on a plain layer. A tar stream of
+    /// exactly the limit verifies (it ends at the limit, so the one-byte
+    /// probe reads nothing); one byte more is refused naming the quota and
+    /// the limit, before the digest is compared. Exercised through the
+    /// bounded helper with a small limit; production uses
+    /// [`MAX_LAYER_EXPANDED_BYTES`].
+    #[test]
+    fn plain_layer_at_quota_verifies_and_one_byte_over_is_refused() {
+        const LIMIT: u64 = 1_048_576;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plain_layer = |name: &str, bytes: &[u8]| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            LayerFile {
+                path,
+                compression: Compression::Plain,
+                origin: "test plain layer".to_string(),
+            }
+        };
+
+        let at_limit = vec![0u8; LIMIT as usize];
+        let layer = plain_layer("at-limit.tar", &at_limit);
+        verify_diff_id_with_limit(&layer, &sha256_hex(&at_limit), "layer 0", LIMIT)
+            .expect("a layer of exactly the quota must verify");
+
+        // The digest is right, so only the quota can refuse this one.
+        let over = vec![0u8; LIMIT as usize + 1];
+        let layer = plain_layer("over-limit.tar", &over);
+        let err =
+            verify_diff_id_with_limit(&layer, &sha256_hex(&over), "layer 0", LIMIT).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("quota"), "refusal must name the quota: {msg}");
+        assert!(
+            msg.contains(&LIMIT.to_string()),
+            "refusal must name the limit: {msg}"
         );
     }
 
