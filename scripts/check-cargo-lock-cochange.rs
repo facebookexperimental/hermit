@@ -45,7 +45,39 @@
 //! nested lock did not, and every later `cargo metadata --locked`
 //! on it exited 101). A `[workspace.dependencies]` edit is judged
 //! the same way, by re-checking every member package in each nested
-//! resolution against its lock. Callers: the Makefile target in
+//! resolution against its lock.
+//!
+//! Which Reverie a nested lock records decides which manifests it is
+//! judged against. Cargo resolves `liteinst-runtime-build/Cargo.lock`
+//! only in a Hermit checkout, where `reverie/` is the submodule at
+//! Hermit's pin; `extract-harness` lives inside Reverie and resolves
+//! the Reverie beside it. In fbsource, `reverie/` is the in-tree
+//! Reverie, which the pin follows only at the next repin, and Buck
+//! never reads Hermit's nested lock. So with `--reverie-in-tree` (the
+//! fbsource contract gate) a Reverie manifest does not oblige
+//! `liteinst-runtime-build/Cargo.lock`, and that lock is judged here
+//! only for the Hermit packages it records. Its other path packages
+//! belong to the pinned Reverie, which this snapshot does not hold:
+//! one with a Reverie manifest, or one no manifest names that a
+//! recorded package depends on (the pin's packages are in the lock
+//! only as dependencies). Every member of a nested workspace must be
+//! recorded under its current name, so a renamed Hermit member still
+//! refuses. Between a Reverie dependency change and the repin, no lock
+//! could match both Reverie trees, so judging it against the in-tree
+//! one refused a change that no regeneration could satisfy. The pinned
+//! Reverie judges it instead: fbsource's Hermit CI job
+//! (`fb-only/ci.sh`) materializes the pinned tree from this repository's
+//! history (`fb-only/check-pinned-reverie-crates.py`, verified against
+//! the pin record's digest) and runs `cargo metadata --locked` on
+//! liteinst-runtime-build against it, so a repin, which rewrites the
+//! pin record, is refused at its own diff if it does not carry the
+//! lock's update. That refusal blocks the repin only when the Hermit CI
+//! job runs on the repin's published version and is land-blocking
+//! there, which fb-only/ci.sh notes is not yet established for that
+//! job. Tier 1's `pre.cargo_lock` probe on the export-shaped
+//! tree judges the same lock with the real submodule. Without the flag
+//! (the export checkout), `reverie/` is the pin and every rule here
+//! applies to it. Callers: the Makefile target in
 //! either tree, changed files fed via `--files-from-stdin` where a
 //! diff system supplies them, and the fbsource contract gate
 //! (`fb-only/contract_checks`, `--check-tree` over a declared
@@ -106,12 +138,41 @@ const EXTRACT_LOCK: &str = "reverie/reverie-liteinst/extract-harness/Cargo.lock"
 /// path, so a manifest edit outside them can stale their lockfiles.
 const NESTED_LOCKS: &[&str] = &[LITEINST_LOCK, EXTRACT_LOCK];
 
+/// What the tree's `reverie/` is, which decides whether Reverie's
+/// manifests are inputs of `liteinst-runtime-build/Cargo.lock`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReverieSource {
+    /// A Hermit checkout: `reverie/` is the submodule at Hermit's pin,
+    /// the Reverie Cargo resolves Hermit's nested lock against.
+    #[default]
+    Pinned,
+    /// fbsource: `reverie/` is the in-tree Reverie, which Hermit's pin
+    /// follows only at the next repin.
+    InTree,
+}
+
+/// Whether the nested lock `lock_path` records a different Reverie
+/// from the tree's `reverie/`: only `liteinst-runtime-build/Cargo.lock`
+/// in fbsource, where it records Hermit's pin (see the module docs).
+fn records_pinned_reverie(reverie: ReverieSource, lock_path: &str) -> bool {
+    reverie == ReverieSource::InTree && lock_path == LITEINST_LOCK
+}
+
+/// Whether the manifest at `normalized` is an input of the nested lock
+/// `lock_path`: every manifest is, except a Reverie manifest for a lock
+/// that records a different Reverie from this tree's.
+fn is_nested_input(reverie: ReverieSource, lock_path: &str, normalized: &str) -> bool {
+    let path = normalized.strip_prefix("hermit/").unwrap_or(normalized);
+    !(records_pinned_reverie(reverie, lock_path) && path.starts_with("reverie/"))
+}
+
 #[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
     base: Option<String>,
     files_from_stdin: bool,
     check_tree: bool,
+    reverie: ReverieSource,
 }
 
 fn usage() -> &'static str {
@@ -128,6 +189,9 @@ fn usage() -> &'static str {
        --changed-from-git BASE   Changed files via `git diff --name-only BASE`\n\
        --files-from-stdin        Read changed paths from stdin, one per line\n\
        --check-tree              Judge the whole tree at --repo instead\n\
+       --reverie-in-tree         reverie/ is fbsource's in-tree Reverie, not\n\
+                                 Hermit's pin: Reverie manifests then do not\n\
+                                 oblige liteinst-runtime-build/Cargo.lock\n\
        --repo PATH               Hermit checkout (default: git root)\n\
        -h, --help                Show this help"
 }
@@ -151,6 +215,7 @@ fn parse_args() -> Result<Config, String> {
             }
             "--files-from-stdin" => config.files_from_stdin = true,
             "--check-tree" => config.check_tree = true,
+            "--reverie-in-tree" => config.reverie = ReverieSource::InTree,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -411,6 +476,13 @@ impl Lockfile {
         self.packages
             .iter()
             .find(|pkg| pkg.is_path() && pkg.name == name)
+    }
+
+    /// Whether a recorded package depends on a package with this name.
+    fn is_depended_on(&self, name: &str) -> bool {
+        self.packages
+            .iter()
+            .any(|pkg| pkg.deps.iter().any(|dep| dep.name == name))
     }
 }
 
@@ -1370,6 +1442,7 @@ fn root_stales_nested(
 /// A manifest missing two required locks appears twice, once per lock,
 /// so the remedy names every lockfile to regenerate.
 fn violations(
+    reverie: ReverieSource,
     changed: &BTreeSet<String>,
     nested: &[(&'static str, &Lockfile)],
     read: &dyn Fn(&str) -> Option<String>,
@@ -1384,7 +1457,10 @@ fn violations(
             found.push((normalized.clone(), owner));
         }
         for (lock_path, lock) in nested {
-            if *lock_path == owner || lock_changed(changed, lock_path) {
+            if *lock_path == owner
+                || lock_changed(changed, lock_path)
+                || !is_nested_input(reverie, lock_path, &normalized)
+            {
                 continue;
             }
             if nested_stale_for_manifest(&normalized, lock_path, lock, read) {
@@ -1398,7 +1474,9 @@ fn violations(
             continue;
         }
         for (lock_path, lock) in nested {
-            if !lock_changed(changed, lock_path) && root_stales_nested(root, lock_path, lock, read)
+            if !lock_changed(changed, lock_path)
+                && is_nested_input(reverie, lock_path, root)
+                && root_stales_nested(root, lock_path, lock, read)
             {
                 found.push((root.to_string(), lock_path));
             }
@@ -1453,8 +1531,13 @@ fn tree_manifests(
 /// `--check-tree`: refuse a tree whose nested lockfiles no longer
 /// match their manifests, with the same fingerprint the co-change
 /// rule uses. This is the fbsource contract gate's mode: Buck
-/// supplies a declared snapshot instead of a changed set.
-fn check_tree(repo: &Path) -> Result<i32, String> {
+/// supplies a declared snapshot instead of a changed set. Every member
+/// of a nested workspace must be recorded in its lock under its current
+/// name. With an in-tree Reverie, `liteinst-runtime-build/Cargo.lock` is
+/// judged only for the Hermit packages it records; a path package with
+/// a Reverie manifest, or with none that a recorded package depends on,
+/// is the pinned Reverie's, which fb-only/ci.sh judges with Cargo.
+fn check_tree(repo: &Path, reverie: ReverieSource) -> Result<i32, String> {
     let read = |path: &str| read_tree_file(repo, path);
     let locks: Vec<(&str, Lockfile)> = NESTED_LOCKS
         .iter()
@@ -1483,9 +1566,32 @@ fn check_tree(repo: &Path) -> Result<i32, String> {
         locks.len()
     );
     let mut stale: Vec<String> = Vec::new();
+    let mut judged = 0;
+    let mut pinned = 0;
     for (lock_path, lock) in &locks {
+        // A fresh lock records every member of its workspace by its
+        // current name; a renamed member is caught only here, since the
+        // loop below walks the lock's names.
+        for (path, manifest, root) in &manifests {
+            let Some(name) = &manifest.name else {
+                continue;
+            };
+            if root.as_str() == nested_root_manifest(lock_path) && lock.path_package(name).is_none()
+            {
+                stale.push(format!(
+                    "  {path}: workspace member {name} is not in {lock_path}"
+                ));
+            }
+        }
         for pkg in lock.packages.iter().filter(|pkg| pkg.is_path()) {
             let Some(idx) = by_package.get(&pkg.name) else {
+                // A package no manifest here names: the pinned Reverie's
+                // (renamed or removed in-tree since the pin) when the lock
+                // records the pin and a recorded package depends on it.
+                if records_pinned_reverie(reverie, lock_path) && lock.is_depended_on(&pkg.name) {
+                    pinned += 1;
+                    continue;
+                }
                 stale.push(format!(
                     "  {} (in {lock_path}) has no manifest in the tree",
                     pkg.name
@@ -1493,6 +1599,11 @@ fn check_tree(repo: &Path) -> Result<i32, String> {
                 continue;
             };
             let (path, manifest, root) = &manifests[*idx];
+            if !is_nested_input(reverie, lock_path, path) {
+                pinned += 1;
+                continue;
+            }
+            judged += 1;
             if let Some(reason) = fingerprint_mismatch(
                 manifest,
                 roots.get(root),
@@ -1509,7 +1620,17 @@ fn check_tree(repo: &Path) -> Result<i32, String> {
         }
     }
     if stale.is_empty() {
-        println!("OK: every nested lockfile matches its manifests.");
+        if pinned == 0 {
+            println!(
+                "OK: every nested lockfile matches its manifests ({judged} path packages judged)."
+            );
+        } else {
+            println!(
+                "OK: every nested lockfile matches its manifests ({judged} path packages judged; \
+                 {pinned} in {LITEINST_LOCK} belong to Hermit's pinned Reverie and are left to \
+                 fb-only/ci.sh, which runs Cargo against the pinned tree)."
+            );
+        }
         return Ok(0);
     }
     loud_header("NESTED LOCKFILE STALE VS MANIFESTS - BLOCKED");
@@ -1591,7 +1712,7 @@ fn loud_header(title: &str) {
 fn run_with_config(config: Config) -> Result<i32, String> {
     let repo = config.repo.clone().map_or_else(git_root, Ok)?;
     if config.check_tree {
-        return check_tree(&repo);
+        return check_tree(&repo, config.reverie);
     }
     let changed = if config.files_from_stdin {
         let mut input = String::new();
@@ -1620,7 +1741,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         nested.len()
     );
 
-    let found = violations(&changed, &nested, &read);
+    let found = violations(config.reverie, &changed, &nested, &read);
     if found.is_empty() {
         println!("OK: every changed Cargo.toml is accompanied by its required Cargo.lock(s).");
         return Ok(0);
@@ -1678,6 +1799,18 @@ mod tests {
             .map(|(path, text)| (path.to_string(), text.to_string()))
             .collect();
         move |path: &str| map.get(path).cloned()
+    }
+
+    /// The co-change rule as a Hermit checkout runs it, where
+    /// `reverie/` is the submodule at Hermit's pin. Tests that judge
+    /// an fbsource tree call `super::violations` with
+    /// `ReverieSource::InTree`.
+    fn violations(
+        changed: &BTreeSet<String>,
+        nested: &[(&'static str, &Lockfile)],
+        read: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<(String, &'static str)> {
+        super::violations(ReverieSource::Pinned, changed, nested, read)
     }
 
     /// A nested resolution containing none of the changed packages,
@@ -1972,6 +2105,95 @@ reverie-syscalls = { path = \"reverie/reverie-syscalls\", version = \"0.5.7\" }\
                 &read
             )
             .is_empty()
+        );
+    }
+
+    /// fbsource's in-tree Reverie is not the Reverie Hermit's nested
+    /// lock resolves (that is Hermit's pin), so a Reverie manifest
+    /// change there must not oblige liteinst-runtime-build/Cargo.lock:
+    /// between the change and the repin no lock satisfies both trees.
+    /// The same sets refuse in a Hermit checkout (the red half), and
+    /// with an in-tree Reverie the rule still holds for Hermit's own
+    /// manifests and for extract-harness, which resolves the Reverie
+    /// beside it.
+    #[test]
+    fn in_tree_reverie_does_not_oblige_hermits_nested_lock() {
+        let lock = parse_lockfile(NESTED_LOCK_TEXT);
+        let liteinst = [(LITEINST_LOCK, &lock)];
+        let staled_procfs = "[package]\nname = \"reverie-procfs\"\nversion = \"0.5.7\"\n\
+             \n[dependencies]\nlibc = \"0.2.186\"\n\
+             reverie-proc-grammar = { version = \"0.5.7\", path = \"../reverie-proc-grammar\" }\n\
+             serde = { version = \"1.0.219\", features = [\"derive\"] }\n";
+        let read = reader(&[
+            ("reverie/reverie-procfs/Cargo.toml", staled_procfs),
+            (
+                "reverie/Cargo.toml",
+                "[workspace]\nmembers = [\"reverie-procfs\"]\n",
+            ),
+            (
+                "detcore-model/Cargo.toml",
+                "[package]\nname = \"detcore-model\"\nversion = \"0.5.7\"\n\
+                 \n[dependencies]\nlibc = \"0.2.186\"\n\
+                 reverie-core = { workspace = true }\n\
+                 reverie-proc-grammar = { workspace = true }\n\
+                 reverie-syscalls = { workspace = true }\n\
+                 serde = { version = \"1.0.219\", features = [\"derive\"] }\n",
+            ),
+            ("Cargo.toml", HERMIT_ROOT_TEXT),
+        ]);
+        let reverie_change = changed(&[
+            "fbcode/hermetic_infra/reverie/Cargo.lock",
+            "fbcode/hermetic_infra/reverie/reverie-procfs/Cargo.toml",
+        ]);
+        let reverie_root_edit = changed(&["reverie/Cargo.toml", "reverie/Cargo.lock"]);
+
+        // Red half: a Hermit checkout, where reverie/ is the pin.
+        assert_eq!(
+            super::violations(ReverieSource::Pinned, &reverie_change, &liteinst, &read),
+            [(
+                "reverie/reverie-procfs/Cargo.toml".to_string(),
+                LITEINST_LOCK
+            )]
+        );
+        assert_eq!(
+            super::violations(ReverieSource::Pinned, &reverie_root_edit, &liteinst, &read),
+            [("reverie/Cargo.toml".to_string(), LITEINST_LOCK)]
+        );
+
+        // Green half: fbsource, where reverie/ is the in-tree Reverie.
+        assert!(
+            super::violations(ReverieSource::InTree, &reverie_change, &liteinst, &read).is_empty(),
+            "an in-tree Reverie manifest must not oblige Hermit's nested lock"
+        );
+        assert!(
+            super::violations(ReverieSource::InTree, &reverie_root_edit, &liteinst, &read)
+                .is_empty(),
+            "an in-tree Reverie root edit must not oblige Hermit's nested lock"
+        );
+
+        // Kept: Hermit's own manifest still obliges its nested lock.
+        assert_eq!(
+            super::violations(
+                ReverieSource::InTree,
+                &changed(&[
+                    "fbcode/hermetic_infra/hermit/detcore-model/Cargo.toml",
+                    "fbcode/hermetic_infra/hermit/Cargo.lock"
+                ]),
+                &liteinst,
+                &read
+            ),
+            [("detcore-model/Cargo.toml".to_string(), LITEINST_LOCK)]
+        );
+
+        // Kept: extract-harness lives inside Reverie, so the in-tree
+        // Reverie is its input (the same resolution stands in for it).
+        let extract = [(EXTRACT_LOCK, &lock)];
+        assert_eq!(
+            super::violations(ReverieSource::InTree, &reverie_change, &extract, &read),
+            [(
+                "reverie/reverie-procfs/Cargo.toml".to_string(),
+                EXTRACT_LOCK
+            )]
         );
     }
 
@@ -2627,6 +2849,14 @@ dependencies = [\n\
 ]\n\
 \n\
 [[package]]\n\
+name = \"hermit-liteinst-runtime-artifact\"\n\
+version = \"0.5.7\"\n\
+\n\
+[[package]]\n\
+name = \"hermit-liteinst-runtime-build\"\n\
+version = \"0.5.7\"\n\
+\n\
+[[package]]\n\
 name = \"libc\"\n\
 version = \"0.2.186\"\n\
 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
@@ -2639,7 +2869,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
              dependencies = [\n \"libc\",\n]\n",
         );
         assert_eq!(
-            check_tree(&repo).expect("tree check runs"),
+            check_tree(&repo, ReverieSource::Pinned).expect("tree check runs"),
             0,
             "matching snapshot must pass"
         );
@@ -2649,9 +2879,220 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
              \n[dependencies]\nlibc = \"0.2.186\"\n",
         );
         assert_eq!(
-            check_tree(&repo).expect("tree check runs"),
+            check_tree(&repo, ReverieSource::Pinned).expect("tree check runs"),
             1,
             "stale snapshot must refuse"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The fbsource gate's shape of the reverie-memory zerocopy
+    /// change: the in-tree Reverie gains a dependency that Hermit's
+    /// pin does not have yet, so Hermit's nested lock (which records
+    /// the pin) lacks it. A Hermit checkout refuses that tree (red);
+    /// fbsource passes it (green), still refuses a stale Hermit
+    /// package, and still judges extract-harness against the in-tree
+    /// Reverie.
+    #[test]
+    fn check_tree_with_in_tree_reverie_judges_only_hermit_packages() {
+        use std::fs;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let repo = env::temp_dir().join(format!(
+            "cargo-lock-cochange-in-tree-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&repo);
+        let write = |rel: &str, text: &str| {
+            let path = repo.join(rel);
+            fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let detcore_model = |version: &str| {
+            format!(
+                "[package]\nname = \"detcore-model\"\nversion = \"{version}\"\n\
+                 \n[dependencies]\nlibc = \"0.2.186\"\n\
+                 reverie-memory = {{ version = \"0.5.7\", path = \"reverie/reverie-memory\" }}\n"
+            )
+        };
+        let reverie_memory = |extra: &str| {
+            format!(
+                "[package]\nname = \"reverie-memory\"\nversion = \"0.5.7\"\n\
+                 \n[dependencies]\nlibc = \"0.2.186\"\n{extra}"
+            )
+        };
+        let pinned_memory_lock = "\
+[[package]]\n\
+name = \"reverie-memory\"\n\
+version = \"0.5.7\"\n\
+dependencies = [\n\
+ \"libc\",\n\
+ \"reverie-renamed-in-tree\",\n\
+]\n";
+        let members_lock = "\
+[[package]]\n\
+name = \"hermit-liteinst-runtime-artifact\"\n\
+version = \"0.5.7\"\n\
+\n\
+[[package]]\n\
+name = \"hermit-liteinst-runtime-build\"\n\
+version = \"0.5.7\"\n\
+\n";
+        let libc_lock = "\
+version = 4\n\
+\n\
+[[package]]\n\
+name = \"libc\"\n\
+version = \"0.2.186\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+\n";
+        write("Cargo.toml", "[workspace]\nmembers = [\"detcore-model\"]\n");
+        write("detcore-model/Cargo.toml", &detcore_model("0.5.7"));
+        write(
+            "reverie/Cargo.toml",
+            "[workspace]\nmembers = [\"reverie-memory\"]\n",
+        );
+        // The in-tree Reverie is past the pin: it gained zerocopy.
+        write(
+            "reverie/reverie-memory/Cargo.toml",
+            &reverie_memory("zerocopy = { version = \"0.8.63\", features = [\"derive\"] }\n"),
+        );
+        write(
+            "liteinst-runtime-build/Cargo.toml",
+            "[workspace]\nmembers = [\"runtime\"]\n\
+             \n[package]\nname = \"hermit-liteinst-runtime-build\"\nversion = \"0.5.7\"\n",
+        );
+        write(
+            "liteinst-runtime-build/runtime/Cargo.toml",
+            "[package]\nname = \"hermit-liteinst-runtime-artifact\"\nversion = \"0.5.7\"\n",
+        );
+        write(
+            "reverie/reverie-liteinst/extract-harness/Cargo.toml",
+            "[package]\nname = \"s5b-extract-harness\"\nversion = \"0.0.0\"\n\
+             \n[workspace]\n\n[dependencies]\nlibc = \"0.2.186\"\n",
+        );
+        // Hermit's nested lock records its two members, the pin's
+        // reverie-memory (no zerocopy) and a package reverie-memory
+        // depends on at the pin that the in-tree Reverie has since
+        // renamed away.
+        let liteinst_lock = format!(
+            "{libc_lock}[[package]]\nname = \"detcore-model\"\nversion = \"0.5.7\"\n\
+             dependencies = [\n \"libc\",\n \"reverie-memory\",\n]\n\
+             \n{members_lock}{pinned_memory_lock}\n\
+             [[package]]\nname = \"reverie-renamed-in-tree\"\nversion = \"0.5.7\"\n"
+        );
+        write("liteinst-runtime-build/Cargo.lock", &liteinst_lock);
+        let extract_lock = format!(
+            "{libc_lock}[[package]]\nname = \"s5b-extract-harness\"\nversion = \"0.0.0\"\n\
+             dependencies = [\n \"libc\",\n]\n"
+        );
+        write(
+            "reverie/reverie-liteinst/extract-harness/Cargo.lock",
+            &extract_lock,
+        );
+
+        // Red half: a Hermit checkout judges the nested lock against
+        // reverie/ and refuses both Reverie packages.
+        assert_eq!(
+            check_tree(&repo, ReverieSource::Pinned).expect("tree check runs"),
+            1,
+            "a Hermit checkout must refuse the nested lock against its reverie/"
+        );
+
+        // Green half: fbsource judges only Hermit's packages there.
+        assert_eq!(
+            check_tree(&repo, ReverieSource::InTree).expect("tree check runs"),
+            0,
+            "the in-tree Reverie must not judge Hermit's nested lock"
+        );
+
+        // Kept: a stale Hermit package still refuses in fbsource.
+        write("detcore-model/Cargo.toml", &detcore_model("0.5.8"));
+        assert_eq!(
+            check_tree(&repo, ReverieSource::InTree).expect("tree check runs"),
+            1,
+            "a stale Hermit package must still refuse"
+        );
+        write("detcore-model/Cargo.toml", &detcore_model("0.5.7"));
+
+        // Kept: a Hermit workspace member renamed without regenerating
+        // the lock refuses in both trees. Its old name is depended on by
+        // nothing, so it is not taken for a pinned Reverie package, and
+        // its new name is not in the lock.
+        let runtime = "liteinst-runtime-build/runtime/Cargo.toml";
+        write(
+            runtime,
+            "[package]\nname = \"hermit-liteinst-runtime-renamed\"\nversion = \"0.5.7\"\n",
+        );
+        for source in [ReverieSource::InTree, ReverieSource::Pinned] {
+            assert_eq!(
+                check_tree(&repo, source).expect("tree check runs"),
+                1,
+                "a renamed workspace member must refuse ({source:?})"
+            );
+        }
+        write(
+            runtime,
+            "[package]\nname = \"hermit-liteinst-runtime-artifact\"\nversion = \"0.5.7\"\n",
+        );
+
+        // Kept: a member added without regenerating the lock refuses in
+        // both trees. Nothing in the lock names it, so only the member
+        // rule sees it.
+        let liteinst_root = "liteinst-runtime-build/Cargo.toml";
+        write(
+            liteinst_root,
+            "[workspace]\nmembers = [\"runtime\", \"runtime2\"]\n\
+             \n[package]\nname = \"hermit-liteinst-runtime-build\"\nversion = \"0.5.7\"\n",
+        );
+        write(
+            "liteinst-runtime-build/runtime2/Cargo.toml",
+            "[package]\nname = \"hermit-liteinst-runtime-added\"\nversion = \"0.5.7\"\n",
+        );
+        for source in [ReverieSource::InTree, ReverieSource::Pinned] {
+            assert_eq!(
+                check_tree(&repo, source).expect("tree check runs"),
+                1,
+                "a member missing from the lock must refuse ({source:?})"
+            );
+        }
+        write(
+            liteinst_root,
+            "[workspace]\nmembers = [\"runtime\"]\n\
+             \n[package]\nname = \"hermit-liteinst-runtime-build\"\nversion = \"0.5.7\"\n",
+        );
+
+        // A recorded path package that no manifest names and nothing
+        // depends on is not the pin's either: it refuses in fbsource.
+        write(
+            "liteinst-runtime-build/Cargo.lock",
+            &format!(
+                "{liteinst_lock}\n[[package]]\nname = \"hermit-removed-crate\"\nversion = \"0.5.7\"\n"
+            ),
+        );
+        assert_eq!(
+            check_tree(&repo, ReverieSource::InTree).expect("tree check runs"),
+            1,
+            "an unreferenced package with no manifest must refuse"
+        );
+        write("liteinst-runtime-build/Cargo.lock", &liteinst_lock);
+        assert_eq!(
+            check_tree(&repo, ReverieSource::InTree).expect("tree check runs"),
+            0,
+            "the restored tree passes again"
+        );
+
+        // Kept: extract-harness is judged against the in-tree Reverie.
+        write(
+            "reverie/reverie-liteinst/extract-harness/Cargo.lock",
+            &format!("{extract_lock}\n{pinned_memory_lock}"),
+        );
+        assert_eq!(
+            check_tree(&repo, ReverieSource::InTree).expect("tree check runs"),
+            1,
+            "extract-harness must still be judged against the in-tree Reverie"
         );
         let _ = fs::remove_dir_all(&repo);
     }
@@ -2743,6 +3184,7 @@ name = \"not-a-package\"\n";
                 base: Some(base.to_string()),
                 files_from_stdin: false,
                 check_tree: false,
+                reverie: ReverieSource::Pinned,
             })
             .expect("lint runs")
         };
