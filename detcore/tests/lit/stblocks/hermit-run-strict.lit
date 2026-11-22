@@ -1,0 +1,7 @@
+RUN: %hermit run --env=TMPDIR=/tmp --epoch=2026-01-01T00:00:00Z -- %me | FileCheck %s
+CHECK: empty: size=0 blocks=0 blksize=4096
+CHECK-NEXT: contiguous: size=91320 blocks=184
+CHECK-NEXT: fragmented: size=91320 blocks=184
+CHECK-NEXT: sparse: size=1048576 blocks=2048
+CHECK-NEXT: keep_size: size=4096 blocks=8
+CHECK-NEXT: symlink: short_blocks=0 long_blocks=8

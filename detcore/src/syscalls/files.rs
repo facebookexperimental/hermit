@@ -13694,6 +13694,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         {
             stat.size = 4096;
+            stat.blksize = 4096;
             if stat.mask.contains(StatxMask::STATX_BLOCKS) {
                 stat.blocks = 8;
             }
@@ -13741,6 +13742,60 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !procfs.is_procfs()
         {
             stat.nlink = 1;
+        }
+
+        // A file's block count is its host allocator's state, not the
+        // guest's: on ext4 a file in more than four extents carries one
+        // extra 4096-byte extent-tree block, and delayed allocation makes
+        // a just-written file's count depend on writeback timing, so the
+        // host's `st_blocks` can differ between the two executions of one
+        // `--verify` run
+        // (https://github.com/facebookexperimental/hermit/issues/462).
+        // Report only what the pinned inputs and the guest's actions
+        // determine -- the size, at a fixed 4096-byte unit, never the
+        // host's `st_blksize`, which varies with the host file system. A
+        // sparse file therefore reports as dense and a fallocate
+        // reservation beyond EOF is invisible in the count; the bytes a
+        // guest reads are unchanged. `st_blksize`, a preferred-I/O hint
+        // in Linux, is pinned to the same unit so the fields agree
+        // (`blocks == ceil(size / blksize) * blksize / 512`). Directories
+        // take both values from the size pin above, which this formula
+        // also gives (4096 bytes, 8 units); a proved procfs entry keeps
+        // the kernel's values, as there. Pseudo-filesystem files that
+        // are not proved procfs (sysfs attributes, whose size Linux
+        // reports as 4096 with 0 blocks) therefore report 8 units here;
+        // on KVM `/proc/self/maps` by path likewise goes from 1 to 8.
+        // Unlike the directory size pin, this block skips the
+        // unprovable-procfs exclusion: it never touches the size, so no
+        // SEEK_END-style consumer can be misled, and a deterministic
+        // count is preferable to a host one even for a file that might
+        // be procfs (on DBT, procfs files report blksize 4096).
+        if !procfs.is_procfs() {
+            let file_type = stat.mode & libc::S_IFMT;
+            if stat.mask.contains(StatxMask::STATX_BLOCKS) {
+                if file_type == libc::S_IFREG {
+                    let size = stat.size.max(0);
+                    stat.blocks = (size / 4096 + i64::from(size % 4096 != 0)) * 8;
+                } else if file_type == libc::S_IFLNK {
+                    // ext4's rule, whatever the host file system: a target
+                    // under 60 bytes lives in the inode itself and takes
+                    // no block; a longer one (at most 4095 bytes) takes
+                    // one 4096-byte block.
+                    stat.blocks = if stat.size < 60 { 0 } else { 8 };
+                } else if matches!(
+                    file_type,
+                    libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK
+                ) {
+                    // Fifos, sockets and devices allocate no file data;
+                    // Linux reports 0. Pin it rather than keep a host
+                    // value (ext4 counts an external xattr block in
+                    // `i_blocks` for every file type).
+                    stat.blocks = 0;
+                }
+            }
+            if matches!(file_type, libc::S_IFREG | libc::S_IFLNK) {
+                stat.blksize = 4096;
+            }
         }
 
         let epoch_tp = Timespec {

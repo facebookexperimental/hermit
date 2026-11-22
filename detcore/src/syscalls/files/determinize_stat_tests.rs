@@ -428,6 +428,7 @@ async fn determinize_stat_nlink_pin_edges() {
         stat.mask = mask;
         stat.nlink = nlink;
         stat.size = size;
+        stat.blksize = 1024;
         stat
     };
 
@@ -451,6 +452,7 @@ async fn determinize_stat_nlink_pin_edges() {
     )
     .await;
     assert_eq!(stat.size, 4096);
+    assert_eq!(stat.blksize, 4096, "the size pin also pins blksize");
     assert_eq!(stat.nlink, 5, "no STATX_NLINK, no nlink pin");
 
     // A deleted directory (mkdir, open(O_DIRECTORY), rmdir, fstat) keeps 0.
@@ -480,6 +482,7 @@ async fn determinize_stat_nlink_pin_edges() {
         "DBT must pin an autofs-like directory's nlink"
     );
     assert_eq!(stat.size, 1234, "the size pin still abstains on this path");
+    assert_eq!(stat.blksize, 1024, "the blksize pin abstains with it");
 
     // A proved procfs directory keeps its host count: `/proc/<pid>/fd`
     // reports nlink 2 and carries its descriptor count in its size.
@@ -492,4 +495,118 @@ async fn determinize_stat_nlink_pin_edges() {
     .await;
     assert_eq!(stat.nlink, 2, "a proved procfs directory keeps its count");
     assert_eq!(stat.size, 7, "a proved procfs directory keeps its size");
+}
+
+/// A regular file's block count is derived from its size at a fixed
+/// 4096-byte unit, never from the host allocator: the same 91,320-byte
+/// file reports 184 whether the host laid it out contiguously (184) or
+/// in more than four extents with an extent-tree block (192), the pair
+/// that diverged under `--verify` in hermit#462. A sparse file and a
+/// fallocate reservation beyond EOF are likewise invisible in the
+/// count, and `st_blksize` is pinned to the same unit.
+#[tokio::test]
+async fn determinize_stat_derives_blocks_from_size() {
+    let epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let cfg = config(false, epoch);
+    let reg_stat = |size: i64, blocks: i64, blksize: i64| {
+        let mut stat = host_uuid_stat();
+        stat.mode = libc::S_IFREG | 0o644;
+        stat.size = size;
+        stat.blocks = blocks;
+        stat.blksize = blksize;
+        stat
+    };
+
+    for host_blocks in [184, 192] {
+        let stat = determinized(
+            &cfg,
+            None,
+            reg_stat(91_320, host_blocks, 1024),
+            ProcfsEntry::NotProcfs,
+        )
+        .await;
+        assert_eq!(stat.blocks, 184, "host blocks {host_blocks} must not leak");
+        assert_eq!(stat.blksize, 4096);
+    }
+
+    // Sparse: 1 MiB with one allocated host block reports dense.
+    let stat = determinized(
+        &cfg,
+        None,
+        reg_stat(1 << 20, 8, 4096),
+        ProcfsEntry::NotProcfs,
+    )
+    .await;
+    assert_eq!(stat.blocks, 2048);
+
+    // fallocate(KEEP_SIZE) reservation: 4 KiB size, 1 MiB reserved.
+    let stat = determinized(
+        &cfg,
+        None,
+        reg_stat(4096, 2048, 4096),
+        ProcfsEntry::NotProcfs,
+    )
+    .await;
+    assert_eq!(stat.blocks, 8);
+
+    // Empty files take no blocks, whatever the host still shows.
+    let stat = determinized(&cfg, None, reg_stat(0, 8, 4096), ProcfsEntry::NotProcfs).await;
+    assert_eq!(stat.blocks, 0);
+
+    // Without STATX_BLOCKS in the mask the field is not reported, so it
+    // is left alone; `st_blksize`, always reported, is still pinned.
+    let mut unmasked = reg_stat(91_320, 192, 1024);
+    unmasked.mask = StatxMask::STATX_SIZE;
+    let stat = determinized(&cfg, None, unmasked, ProcfsEntry::NotProcfs).await;
+    assert_eq!(stat.blocks, 192, "no STATX_BLOCKS, no blocks pin");
+    assert_eq!(stat.blksize, 4096);
+
+    // A proved procfs file keeps the kernel's count and block size.
+    let stat = determinized(
+        &cfg,
+        None,
+        reg_stat(0, 0, 1024),
+        ProcfsEntry::At("/version".into()),
+    )
+    .await;
+    assert_eq!(stat.blksize, 1024, "a proved procfs file keeps its blksize");
+
+    // Fifos, sockets and devices allocate no file data and report 0,
+    // never a host count (ext4 counts an external xattr block in
+    // `i_blocks` for every file type).
+    for mode in [
+        libc::S_IFIFO | 0o644,
+        libc::S_IFSOCK | 0o755,
+        libc::S_IFCHR | 0o666,
+        libc::S_IFBLK | 0o660,
+    ] {
+        let mut host = reg_stat(0, 8, 4096);
+        host.mode = mode;
+        let stat = determinized(&cfg, None, host, ProcfsEntry::NotProcfs).await;
+        assert_eq!(stat.blocks, 0, "mode {mode:#o} must report 0 blocks");
+    }
+}
+
+/// A symlink follows ext4's rule whatever the host file system: a
+/// target under 60 bytes lives in the inode (0 blocks); a longer one
+/// takes one 4096-byte block (8 units).
+#[tokio::test]
+async fn determinize_stat_symlink_blocks_follow_the_ext4_rule() {
+    let epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let cfg = config(false, epoch);
+    let link_stat = |size: i64, blocks: i64| {
+        let mut stat = host_uuid_stat();
+        stat.mode = libc::S_IFLNK | 0o777;
+        stat.size = size;
+        stat.blocks = blocks;
+        stat.blksize = 1024;
+        stat
+    };
+
+    let stat = determinized(&cfg, None, link_stat(10, 8), ProcfsEntry::NotProcfs).await;
+    assert_eq!(stat.blocks, 0, "a fast symlink takes no block");
+    assert_eq!(stat.blksize, 4096);
+
+    let stat = determinized(&cfg, None, link_stat(100, 0), ProcfsEntry::NotProcfs).await;
+    assert_eq!(stat.blocks, 8, "a long symlink takes one block");
 }

@@ -383,7 +383,8 @@ fn every_lit_fixture_is_within_the_supported_subset() {
     // 29 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
     // fifo_jump_replay (main.c + hermit-run.lit) joined with the guest-poll
     // replay work: 82 + 2 = 84. PR 4614's chaos_schedule_replay fixture: 85.
-    assert_eq!(fixtures.len(), 85, "{fixtures:#?}");
+    // stblocks (main.rs + 2 .lit): 88.
+    assert_eq!(fixtures.len(), 88, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -403,8 +404,8 @@ fn every_lit_fixture_is_within_the_supported_subset() {
         }
     }
     // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts
-    // 47 (fifo_jump_replay adds two).
-    assert_eq!(checked, 47);
+    // 47 (fifo_jump_replay adds two); stblocks' strict .lit adds one: 48.
+    assert_eq!(checked, 48);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
@@ -608,6 +609,9 @@ lit_cases! {
     lit_sched_getaffinity_hermit_run_strict_verify => "sched_getaffinity/hermit-run-strict-verify.lit",
     lit_sched_getaffinity_hermit_run_strict => "sched_getaffinity/hermit-run-strict.lit",
     lit_sched_getaffinity_main => "sched_getaffinity/main.rs",
+    lit_stblocks_hermit_run_strict_verify => "stblocks/hermit-run-strict-verify.lit",
+    lit_stblocks_hermit_run_strict => "stblocks/hermit-run-strict.lit",
+    lit_stblocks_main => "stblocks/main.rs",
     lit_utime_hermit_run_strict => "utime/hermit-run-strict.lit",
     lit_utime_hermit_run => "utime/hermit-run.lit",
     lit_utime_main => "utime/main.rs",
