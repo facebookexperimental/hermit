@@ -298,6 +298,20 @@ printf '%s\n' "${TMPDIR:-}" >"$STUB_LOG/tmpdir"
 if [[ -n ${TMPDIR:-} && -d $TMPDIR ]]; then printf 'yes\n' >"$STUB_LOG/tmpdir-existed"; fi
 printf '%s\n' "$$" >"$STUB_LOG/pid"
 if [[ -n ${STUB_PROXY_MARK:-} ]]; then printf '%s\n' "$STUB_PROXY_MARK" >"$STUB_LOG/proxy"; fi
+if [[ -n ${STUB_SPAWN_CHILD:-} ]]; then
+    # Leave a child behind that outlives this driver, holding every fd the
+    # driver inherited (the ownership lock among them), until the test
+    # releases it (bounded: 60 s WALL).
+    (
+        : >"$STUB_LOG/child-ready"
+        for _ in $(seq 1 600); do
+            [[ -e $STUB_LOG/child-release ]] && break
+            sleep 0.1
+        done
+        : >"$STUB_LOG/child-done"
+    ) </dev/null >/dev/null 2>&1 &
+    for _ in $(seq 1 100); do [[ -e $STUB_LOG/child-ready ]] && break; sleep 0.1; done
+fi
 if [[ -n ${STUB_WAIT_FOR_TERM:-} ]]; then
     # Wait, bounded, for the test to send SIGTERM to this process; record
     # whether the private TMPDIR still existed when it arrived.
@@ -559,6 +573,83 @@ route_cases() {
         fail "route: section headers" "$(cat "$header_out")"
     fi
 
+    # R3f: a process the driver started that outlives it keeps the private
+    # TMPDIR: the reaper waits for the last holder of the ownership lock, not
+    # for the driver, and removes the directory only once that child exits.
+    log=$(new_log)
+    out=$log/out
+    rc=0
+    "${clean_env[@]}" STUB_LOG="$log" STUB_SPAWN_CHILD=1 CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        TMPDIR="$hermit/target/tmp" \
+        "$hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+    seen_tmp=$(cat "$log/tmpdir" 2>/dev/null || true)
+    local kept_while_child='no'
+    if [[ -e $log/child-ready && ! -e $log/child-done ]]; then
+        # The driver has exited; give a reaper that wrongly waited only for it
+        # time to act before looking.
+        sleep 1
+        [[ -n $seen_tmp && -d $seen_tmp ]] && kept_while_child='yes'
+    fi
+    : >"$log/child-release"
+    tenth=0
+    while [[ ! -e $log/child-done ]] && ((tenth < REAPER_WALL_BACKSTOP_TENTHS)); do
+        sleep 0.1
+        tenth=$((tenth + 1))
+    done
+    if ((rc == 0)) && [[ $seen_tmp == /tmp/hermit-validate-?????? && $kept_while_child == yes ]] \
+        && [[ -e $log/child-done ]] && wait_gone "$seen_tmp"; then
+        pass "route: a child that outlives the driver keeps the private TMPDIR until it exits; then the reaper removes it"
+    else
+        fail "route: an outliving child keeps the private TMPDIR" "rc=$rc" "TMPDIR $seen_tmp" \
+            "kept while the child lived: $kept_while_child" \
+            "child finished: $([[ -e $log/child-done ]] && echo yes || echo no)" \
+            "still present: $([[ -n $seen_tmp && -e $seen_tmp ]] && echo yes || echo no)" "$(cat "$out")"
+    fi
+
+    # R3g: a candidate parent mounted nosuid or nodev is skipped (Hermit's
+    # container cannot use it), read through findmnt; a fake findmnt on PATH
+    # stands in for such mounts. With every candidate rejected, the run is
+    # refused by name before the driver.
+    local mounts=$TMP/mounts fake_bin=$TMP/fake-findmnt
+    mkdir -p "$mounts/nosuid" "$mounts/nodev" "$mounts/plain" "$fake_bin"
+    cat >"$fake_bin/findmnt" <<'FAKE'
+#!/usr/bin/env bash
+target=
+while (($# > 0)); do
+    case $1 in
+        --target) target=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case $target in
+    */nosuid) echo rw,nosuid,relatime ;;
+    */nodev) echo rw,nodev,relatime ;;
+    *) echo rw,relatime ;;
+esac
+FAKE
+    chmod +x "$fake_bin/findmnt"
+    log=$(new_log)
+    out=$log/out
+    rc=0
+    "${clean_env[@]}" PATH="$fake_bin:$PATH" STUB_LOG="$log" CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        HERMIT_VALIDATE_TMPDIR_PARENTS="$mounts/nosuid $mounts/nodev $mounts/plain" TMPDIR="$hermit/target/tmp" \
+        "$hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+    seen_tmp=$(cat "$log/tmpdir" 2>/dev/null || true)
+    local rejected_log rc_rejected=0
+    rejected_log=$(new_log)
+    "${clean_env[@]}" PATH="$fake_bin:$PATH" STUB_LOG="$rejected_log" CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        HERMIT_VALIDATE_TMPDIR_PARENTS="$mounts/nosuid $mounts/nodev" TMPDIR="$hermit/target/tmp" \
+        "$hermit/scripts/validate-front-door.sh" -- --all >"$rejected_log/out" 2>&1 || rc_rejected=$?
+    if ((rc == 0)) && [[ $seen_tmp == "$(realpath -- "$mounts/plain")"/hermit-validate-?????? ]] \
+        && wait_gone "$seen_tmp" && ((rc_rejected == 1)) && [[ ! -e $rejected_log/driver ]] \
+        && grep -q 'no usable parent for a private TMPDIR' "$rejected_log/out"; then
+        pass "route: nosuid and nodev parents are skipped, and with none left the run is refused before the driver"
+    else
+        fail "route: nosuid/nodev parents are skipped" "rc=$rc TMPDIR=$seen_tmp (want under $mounts/plain)" \
+            "all rejected: rc=$rc_rejected, driver ran: $([[ -e $rejected_log/driver ]] && echo yes || echo no)" \
+            "$(cat "$out")" "$(cat "$rejected_log/out")"
+    fi
+
     # R4: the driver builds against the reverie submodule, so an unpopulated
     # one is refused by name before the driver starts.
     local bare=$TMP/bare
@@ -627,7 +718,7 @@ route_cases() {
         "$solo/hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
     if ((rc == 0)) && [[ $(cat "$log/driver" 2>/dev/null) == "--all" ]] \
         && grep -q 'no dev-hermit parent' "$out"; then
-        pass "route: a standalone checkout runs validate as before"
+        pass "route: a standalone checkout runs validate without classifying the caller"
     else
         fail "route: a standalone checkout passes through" "rc=$rc" "$(cat "$out")"
     fi
@@ -653,6 +744,7 @@ route_cases() {
         && grep -q 'not validation evidence' "$log/out" \
         && ! grep -q 'tree is not clean' "$log/out" && [[ ! -e $log/submodules ]] \
         && [[ $(cat "$log/proxy" 2>/dev/null) == with-proxy ]] \
+        && grep -q '^validate: == with-proxy scripts/validate.rs --human-off-the-record --all with TMPDIR=' "$log/out" \
         && [[ $(cat "$log/tmpdir" 2>/dev/null) == /tmp/hermit-validate-?????? ]] \
         && [[ -e $log/tmpdir-existed ]] && wait_gone "$(cat "$log/tmpdir")"; then
         pass "route: a human on a clean tree is warned off the record and runs the full validate under with-proxy"
@@ -699,7 +791,7 @@ e2e() {
     rc=$(run_detached_unbounded "$log" "$log/out" "$@")
     cat "$log/out"
     if [[ $rc == 0 ]] && grep -q '^validate: OFF THE RECORD: a human run' "$log/out" \
-        && grep -q '^validate: == scripts/validate.rs --human-off-the-record ' "$log/out"; then
+        && grep -Eq '^validate: == (with-proxy )?scripts/validate.rs --human-off-the-record ' "$log/out"; then
         printf 'ok   e2e: the human route ran the real validate off the record\n'
         return 0
     fi

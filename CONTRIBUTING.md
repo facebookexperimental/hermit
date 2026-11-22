@@ -64,8 +64,11 @@ This is routing, not a security boundary. An agent that clears its
 environment and leaves its process tree looks human: through a
 `systemd-run --user` service, over ssh, or in a tmux server started elsewhere.
 That is acceptable because such a run publishes nothing. Outside the harness,
-and inside a ci-hub validate-run unit, `make validate` runs the driver as
-before. See `scripts/validate-front-door.sh --help`.
+and inside a ci-hub validate-run unit, `make validate` runs the driver without
+classifying the caller. Every route outside a ci-hub unit, the human route
+included, starts the driver under `with-proxy` when it exists, as ci-hub's unit
+does, because the fetch node downloads from crates.io and GitHub. See
+`scripts/validate-front-door.sh --help`.
 
 `scripts/validate.rs portable-only` is the local mirror of the manual
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,

@@ -24,11 +24,14 @@
 #           with --human-off-the-record.
 #
 # Two routes skip the classification and run the driver with the caller's
-# arguments, as `make validate` always did: a run inside a ci-hub validate-run
-# unit (CI_HUB_VALIDATE_PRODUCER is set; the driver's own lock admission
-# decides), and any checkout outside a dev-hermit parent (no ci-hub to route
-# to). Every route starts the driver directly: its DAG's first node,
-# pre.submodules, verifies the submodule pins, so no copy runs in front of it.
+# arguments: a run inside a ci-hub validate-run unit (CI_HUB_VALIDATE_PRODUCER
+# is set; the driver's own lock admission decides), and any checkout outside a
+# dev-hermit parent (no ci-hub to route to). Every route starts the driver
+# directly: its DAG's first node, pre.submodules, verifies the submodule pins,
+# so no copy runs in front of it. Every route outside a ci-hub unit, the human
+# route and a checkout outside a dev-hermit parent alike, starts the driver
+# under with-proxy when with-proxy exists, as the unit itself already runs
+# under it (see run_validate); each route's section header shows it.
 #
 # THIS IS ROUTING, NOT A SECURITY BOUNDARY. A caller can clear its environment
 # and detach from its ancestors; nothing here is meant to stop that. An agent
@@ -298,14 +301,16 @@ run_validate() {
         fi
     fi
     local -a launcher=()
+    local shown=''
     if [[ -z ${CI_HUB_VALIDATE_PRODUCER:-} ]] && command -v with-proxy >/dev/null 2>&1; then
         launcher=(with-proxy)
+        shown='with-proxy '
     fi
     local caller_tmp='' real_root
     real_root=$(realpath -- "$root")
     [[ -z ${TMPDIR:-} ]] || caller_tmp=$(realpath -m -- "$TMPDIR")
     if [[ -n $caller_tmp && $caller_tmp != "$real_root" && $caller_tmp != "$real_root"/* ]]; then
-        section "scripts/validate.rs $(shell_quote_args "$@"): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
+        section "${shown}scripts/validate.rs $(shell_quote_args "$@"): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
         exec "${launcher[@]}" ./scripts/validate.rs "$@"
     fi
     local tmp_parent run_tmp
@@ -324,7 +329,7 @@ run_validate() {
     setsid -f bash -c 'flock -x "$1" true; case $2 in */hermit-validate-??????) rm -rf -- "$2" ;; esac' \
         hermit-validate-tmpdir-reaper "$run_tmp/.owner" "$run_tmp" 9>&- </dev/null >/dev/null 2>&1
     export TMPDIR=$run_tmp
-    section "scripts/validate.rs $(shell_quote_args "$@") with TMPDIR=$run_tmp (outside the checkout, removed once the driver and everything it started have exited): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
+    section "${shown}scripts/validate.rs $(shell_quote_args "$@") with TMPDIR=$run_tmp (outside the checkout, removed once the driver and everything it started have exited): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
     exec "${launcher[@]}" ./scripts/validate.rs "$@"
 }
 
@@ -399,7 +404,7 @@ main() {
 
     root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
     if ! parent=$(find_parent "${root%/*}") || [[ ! -d $parent/ci-hub ]]; then
-        section "front door: no dev-hermit parent, so nothing to route; running validate as before"
+        section "front door: no dev-hermit parent, so nothing to route; running validate without classifying the caller"
         run_validate "$root" "$@"
     fi
     if [[ -n ${CI_HUB_VALIDATE_PRODUCER:-} ]]; then
