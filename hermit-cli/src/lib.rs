@@ -2625,6 +2625,48 @@ impl std::fmt::Display for BackendUnavailable {
 
 impl std::error::Error for BackendUnavailable {}
 
+/// A statically selected application backend (an executable-supplied
+/// adapter, named by its `BackendAdapter::NAME`) is unavailable because a
+/// host prerequisite it explicitly requires is absent. Sibling of
+/// [`BackendUnavailable`], whose `backend` field can only name the four
+/// built-in backends. Only absence may use this type: identity or
+/// integrity failures of a present input keep their ordinary class, so
+/// CI never reads a product/artifact regression as a host gap.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterUnavailable {
+    backend: &'static str,
+    reason: String,
+}
+
+impl AdapterUnavailable {
+    pub fn new(backend: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            backend,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for AdapterUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend `{}` is unavailable: {}",
+            self.backend, self.reason
+        )
+    }
+}
+
+impl std::error::Error for AdapterUnavailable {}
+
 impl Backend {
     const ALL: [Self; 4] = [Self::Ptrace, Self::Liteinst, Self::InGuestTrap, Self::Kvm];
 

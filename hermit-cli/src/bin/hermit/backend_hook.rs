@@ -83,6 +83,74 @@ impl VerificationLogTransport {
     }
 }
 
+/// Guest code the adapter's physical runtime lets through untraced, declared
+/// before preparation. Required: no empty/default declaration can silently
+/// omit the guard (compare [`VerificationLogTransport`]). The endpoint bytes
+/// stay core-owned; an adapter names the page, never a range of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UntracedCode {
+    /// The runtime lets no guest code through untraced, or the declaration is
+    /// never consulted (core-selected backends map from `Backend` instead).
+    None,
+    /// Reverie ptrace's private page holds the untraced syscall stub.
+    ReveriePtracePrivatePage,
+}
+
+/// Reverie ptrace's private page, `[start, end)`, mapped in every guest
+/// process (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET/SIZE`, kept private
+/// there). It holds the untraced stub the core guards while recording
+/// host inputs. The single source for [`UntracedCode::range`] and the
+/// core ptrace mapping in `run.rs`; the cli test
+/// `reverie_private_page_is_the_range_hermit_guards` pins it against a
+/// guest's own memory map.
+pub(super) const REVERIE_PTRACE_PRIVATE_PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
+
+impl UntracedCode {
+    /// The half-open guest range core guards for this declaration.
+    pub(super) fn range(self) -> Option<(u64, u64)> {
+        match self {
+            Self::None => None,
+            Self::ReveriePtracePrivatePage => Some(REVERIE_PTRACE_PRIVATE_PAGE),
+        }
+    }
+}
+
+/// Refuse unless the common prepared configuration carries exactly the
+/// range core assigns to `A::UNTRACED_CODE`. Never mutates or repairs the
+/// configuration: a mismatched preparation is a core bug to name, not a
+/// value for the adapter to patch over.
+pub fn require_untraced_code<A: BackendAdapter>(config: &DetConfig) -> Result<(), Error> {
+    if config.untraced_code_range == A::UNTRACED_CODE.range() {
+        Ok(())
+    } else {
+        Err(Error::msg(
+            "prepared configuration differs from the adapter's untraced-code declaration",
+        ))
+    }
+}
+
+/// Parsed flags only, for static admission: no environment, filesystem or
+/// program-resolution access is reachable through this view.
+pub struct StaticOptions<'a> {
+    pub(super) mode: Mode,
+    pub(super) engagement_path: Option<&'a Path>,
+    pub(super) summary_json: Option<&'a Path>,
+}
+
+impl StaticOptions<'_> {
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn engagement_path(&self) -> Option<&Path> {
+        self.engagement_path
+    }
+
+    pub fn summary_json(&self) -> Option<&Path> {
+        self.summary_json
+    }
+}
+
 /// One statically linked physical adapter, never a registry or a verdict owner.
 ///
 /// The selected executable supplies its own concrete options and state. None
@@ -99,6 +167,10 @@ pub trait BackendAdapter {
     const CAPABILITIES: reverie::BackendCapabilities;
     /// Required physical record transport; independent of descriptor sharing.
     const LOG_TRANSPORT: VerificationLogTransport;
+    /// Guest code this adapter's runtime lets through untraced. Required;
+    /// core supplies the declared range through the prepared `DetConfig`
+    /// and the adapter guards it with [`require_untraced_code`].
+    const UNTRACED_CODE: UntracedCode;
     /// An immutable identity diagnostic, emitted only after both native decoders
     /// and their complete pair evidence succeeded. It cannot affect a verdict.
     /// Common comparison publishes JSON and every native comparison message
@@ -109,6 +181,9 @@ pub trait BackendAdapter {
     const NONDEFAULT_CPU_PROFILE_REFUSAL: &'static str = "only the ptrace backend is qualified";
 
     type Options;
+    /// Custody of runtime inputs ensured once by
+    /// [`BackendAdapter::ensure_runtime_inputs`] and moved into `prepare`.
+    type RuntimeInputs;
     type Session;
     type Pending;
     type Facts;
@@ -153,8 +228,25 @@ pub trait BackendAdapter {
         }
     }
 
-    fn prepare(&self, options: Self::Options, request: Prepare<'_>)
-    -> Result<Self::Session, Error>;
+    /// Static admission over parsed flags only, for run/verify admission
+    /// only (record, strace and offline comparison never call it). Called after the stale
+    /// engagement-record clear and before any runtime probe, program
+    /// resolution or stdin reservation. Must be a pure function of the
+    /// view: no runtime probing, no resource creation.
+    fn admit_static_options(&self, options: &StaticOptions<'_>) -> Result<(), Error>;
+
+    /// Run/verify admission only. Consume this adapter's explicit runtime inputs (never produce,
+    /// infer or substitute them) and return their custody for `prepare`.
+    /// Called once, after static admission and core's static refusals,
+    /// before stdin reservation and program resolution.
+    fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error>;
+
+    fn prepare(
+        &self,
+        options: Self::Options,
+        runtime_inputs: Self::RuntimeInputs,
+        request: Prepare<'_>,
+    ) -> Result<Self::Session, Error>;
 
     fn execute(
         &self,
@@ -1293,9 +1385,12 @@ mod tests {
 
     /// Synthetic physical captures exercise the real application boundary;
     /// they are not guest execution or a backend qualification.
+    type RecordedRange = (&'static str, Option<(u64, u64)>);
+
     #[derive(Default)]
     struct StaticAdapter {
         events: RefCell<Vec<String>>,
+        config_ranges: RefCell<Vec<RecordedRange>>,
         first_loss: bool,
         first_exit: i32,
         fail_finish: Option<VerificationRun>,
@@ -1313,8 +1408,10 @@ mod tests {
         const EVIDENCE: EvidenceRequirement = EvidenceRequirement::NativeCounters;
         const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::DBT;
         const LOG_TRANSPORT: VerificationLogTransport = VerificationLogTransport::NativeEvidence;
+        const UNTRACED_CODE: UntracedCode = UntracedCode::None;
 
         type Options = u64;
+        type RuntimeInputs = ();
         type Session = Session;
         type Pending = (VerificationRun, u64);
         type Facts = NativeFacts;
@@ -1338,9 +1435,30 @@ mod tests {
                 .unwrap_or(7))
         }
 
-        fn prepare(&self, count: u64, mut request: Prepare<'_>) -> Result<Session, Error> {
+        fn admit_static_options(&self, _: &StaticOptions<'_>) -> Result<(), Error> {
+            self.events.borrow_mut().push("admit".to_owned());
+            Ok(())
+        }
+
+        fn ensure_runtime_inputs(&self) -> Result<(), Error> {
+            self.events.borrow_mut().push("ensure".to_owned());
+            Ok(())
+        }
+
+        fn prepare(&self, count: u64, (): (), mut request: Prepare<'_>) -> Result<Session, Error> {
             assert_eq!(request.backend_name(), Self::NAME);
             assert!(request.take_stdin().is_none());
+            self.config_ranges
+                .borrow_mut()
+                .push(("prepare", request.config().untraced_code_range));
+            self.config_ranges.borrow_mut().push((
+                "container",
+                request
+                    .container()
+                    .physical
+                    .as_ref()
+                    .and_then(|physical| physical.config().untraced_code_range),
+            ));
             self.events
                 .borrow_mut()
                 .push(format!("prepare:{:?}", request.mode()));
@@ -1360,6 +1478,9 @@ mod tests {
                 "synthetic adapter mode changed"
             );
             let mut capture = request.into_verification()?;
+            self.config_ranges
+                .borrow_mut()
+                .push(("capture", capture.config().untraced_code_range));
             self.events
                 .borrow_mut()
                 .push(format!("execute:{:?}", capture.run));
@@ -1462,6 +1583,7 @@ mod tests {
             None,
             adapter,
             7,
+            Some(()),
         )
     }
 
@@ -1476,8 +1598,10 @@ mod tests {
         const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
         const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
         const LOG_TRANSPORT: VerificationLogTransport = VerificationLogTransport::InGuestSocket;
+        const UNTRACED_CODE: UntracedCode = StaticAdapter::UNTRACED_CODE;
 
         type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = <StaticAdapter as BackendAdapter>::RuntimeInputs;
         type Session = <StaticAdapter as BackendAdapter>::Session;
         type Pending = <StaticAdapter as BackendAdapter>::Pending;
         type Facts = <StaticAdapter as BackendAdapter>::Facts;
@@ -1486,12 +1610,93 @@ mod tests {
             self.0.parse(matches)
         }
 
+        fn admit_static_options(&self, options: &StaticOptions<'_>) -> Result<(), Error> {
+            self.0.admit_static_options(options)
+        }
+
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.0.ensure_runtime_inputs()
+        }
+
         fn prepare(
             &self,
             options: Self::Options,
+            runtime_inputs: Self::RuntimeInputs,
             request: Prepare<'_>,
         ) -> Result<Self::Session, Error> {
-            self.0.prepare(options, request)
+            self.0.prepare(options, runtime_inputs, request)
+        }
+
+        fn execute(
+            &self,
+            session: &mut Self::Session,
+            request: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.0.execute(session, request)
+        }
+
+        fn finish(
+            &self,
+            pending: Self::Pending,
+            observation: Observation<'_>,
+        ) -> Result<Self::Facts, Error> {
+            self.0.finish(pending, observation)
+        }
+
+        fn pair_evidence(
+            &self,
+            first: &Self::Facts,
+            second: &Self::Facts,
+        ) -> Result<PairEvidence, Error> {
+            self.0.pair_evidence(first, second)
+        }
+    }
+
+    /// Synthetic driver fixtures pin the baseline CPU profile explicitly:
+    /// `--cpu-profile auto` resolves from the host executable/libc ISA
+    /// level, which on v3 hosts refuses these application adapters before
+    /// the hook sites under test are reached. The profile is incidental
+    /// host state, never what these tests prove.
+    const BASELINE_CPU: &str = "--cpu-profile=x86-64-v2";
+
+    struct PrivatePageAdapter(StaticAdapter);
+
+    impl BackendAdapter for PrivatePageAdapter {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = StaticAdapter::LOG_TRANSPORT;
+        const UNTRACED_CODE: UntracedCode = UntracedCode::ReveriePtracePrivatePage;
+
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = <StaticAdapter as BackendAdapter>::RuntimeInputs;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+
+        fn validate_mode(&self, _mode: Mode) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn parse(&self, matches: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.0.parse(matches)
+        }
+
+        fn admit_static_options(&self, options: &StaticOptions<'_>) -> Result<(), Error> {
+            self.0.admit_static_options(options)
+        }
+
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.0.ensure_runtime_inputs()
+        }
+
+        fn prepare(
+            &self,
+            options: Self::Options,
+            runtime_inputs: Self::RuntimeInputs,
+            request: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.0.prepare(options, runtime_inputs, request)
         }
 
         fn execute(
@@ -1520,6 +1725,680 @@ mod tests {
     }
 
     #[test]
+    fn require_untraced_code_accepts_only_the_exact_declared_range() {
+        // Literal endpoints on purpose: this test must fail if the core
+        // private-page constant ever moves, not track it silently.
+        let config = DetConfig {
+            untraced_code_range: Some((0x7100_0000, 0x7100_1000)),
+            record_host_inputs: true,
+            ..Default::default()
+        };
+        assert!(require_untraced_code::<PrivatePageAdapter>(&config).is_ok());
+        for wrong in [
+            None,
+            Some((0x7100_0001, 0x7100_1000)),
+            Some((0x7100_0000, 0x7100_0fff)),
+            Some((0x7100_0000, 0x7100_1001)),
+            Some((0x7100_0000, 0x7100_0000)),
+        ] {
+            let mut refused = config.clone();
+            refused.untraced_code_range = wrong;
+            let before = refused.clone();
+            let error = require_untraced_code::<PrivatePageAdapter>(&refused).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "prepared configuration differs from the adapter's untraced-code declaration"
+            );
+            assert_eq!(refused.untraced_code_range, before.untraced_code_range);
+            assert_eq!(refused.record_host_inputs, before.record_host_inputs);
+        }
+        // The None declaration accepts only no range.
+        let mut none_config = DetConfig {
+            untraced_code_range: None,
+            ..Default::default()
+        };
+        assert!(require_untraced_code::<StaticAdapter>(&none_config).is_ok());
+        none_config.untraced_code_range = Some((0x7100_0000, 0x7100_1000));
+        assert!(require_untraced_code::<StaticAdapter>(&none_config).is_err());
+    }
+
+    struct RefuseAdmit(StaticAdapter);
+
+    impl BackendAdapter for RefuseAdmit {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = StaticAdapter::LOG_TRANSPORT;
+        const UNTRACED_CODE: UntracedCode = StaticAdapter::UNTRACED_CODE;
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = <StaticAdapter as BackendAdapter>::RuntimeInputs;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+        fn parse(&self, m: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.0.parse(m)
+        }
+        fn admit_static_options(&self, o: &StaticOptions<'_>) -> Result<(), Error> {
+            self.0.admit_static_options(o)?;
+            Err(Error::msg("synthetic static refusal"))
+        }
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.0.ensure_runtime_inputs()
+        }
+        fn prepare(
+            &self,
+            o: Self::Options,
+            r: Self::RuntimeInputs,
+            q: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.0.prepare(o, r, q)
+        }
+        fn execute(
+            &self,
+            s: &mut Self::Session,
+            q: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.0.execute(s, q)
+        }
+        fn finish(&self, p: Self::Pending, o: Observation<'_>) -> Result<Self::Facts, Error> {
+            self.0.finish(p, o)
+        }
+        fn pair_evidence(&self, f: &Self::Facts, s: &Self::Facts) -> Result<PairEvidence, Error> {
+            self.0.pair_evidence(f, s)
+        }
+    }
+
+    struct RefuseEnsure(StaticAdapter);
+
+    impl BackendAdapter for RefuseEnsure {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = StaticAdapter::LOG_TRANSPORT;
+        const UNTRACED_CODE: UntracedCode = StaticAdapter::UNTRACED_CODE;
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = <StaticAdapter as BackendAdapter>::RuntimeInputs;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+        fn parse(&self, m: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.0.parse(m)
+        }
+        fn admit_static_options(&self, o: &StaticOptions<'_>) -> Result<(), Error> {
+            self.0.admit_static_options(o)
+        }
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.0.ensure_runtime_inputs()?;
+            Err(Error::new(hermit::AdapterUnavailable::new(
+                Self::NAME,
+                "synthetic absent runtime input",
+            )))
+        }
+        fn prepare(
+            &self,
+            o: Self::Options,
+            r: Self::RuntimeInputs,
+            q: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.0.prepare(o, r, q)
+        }
+        fn execute(
+            &self,
+            s: &mut Self::Session,
+            q: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.0.execute(s, q)
+        }
+        fn finish(&self, p: Self::Pending, o: Observation<'_>) -> Result<Self::Facts, Error> {
+            self.0.finish(p, o)
+        }
+        fn pair_evidence(&self, f: &Self::Facts, s: &Self::Facts) -> Result<PairEvidence, Error> {
+            self.0.pair_evidence(f, s)
+        }
+    }
+
+    struct CountingInputs {
+        inner: StaticAdapter,
+        ensures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BackendAdapter for CountingInputs {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = StaticAdapter::LOG_TRANSPORT;
+        const UNTRACED_CODE: UntracedCode = StaticAdapter::UNTRACED_CODE;
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = u64;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+        fn parse(&self, m: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.inner.parse(m)
+        }
+        fn admit_static_options(&self, o: &StaticOptions<'_>) -> Result<(), Error> {
+            self.inner.admit_static_options(o)
+        }
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.ensures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.ensure_runtime_inputs()?;
+            Ok(0xC0FFEE)
+        }
+        fn prepare(
+            &self,
+            o: Self::Options,
+            token: Self::RuntimeInputs,
+            q: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.inner
+                .events
+                .borrow_mut()
+                .push(format!("inputs:{token:#x}"));
+            self.inner.prepare(o, (), q)
+        }
+        fn execute(
+            &self,
+            s: &mut Self::Session,
+            q: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.inner.execute(s, q)
+        }
+        fn finish(&self, p: Self::Pending, o: Observation<'_>) -> Result<Self::Facts, Error> {
+            self.inner.finish(p, o)
+        }
+        fn pair_evidence(&self, f: &Self::Facts, s: &Self::Facts) -> Result<PairEvidence, Error> {
+            self.inner.pair_evidence(f, s)
+        }
+    }
+
+    #[test]
+    fn runtime_inputs_are_ensured_once_and_delivered_to_prepare() {
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = CountingInputs {
+            inner: StaticAdapter::default(),
+            ensures: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+            directory.path().join("logs").to_str().unwrap(),
+            "--verify-json",
+            directory.path().join("report.json").to_str().unwrap(),
+            "--",
+            "/bin/true",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let mut stdin = super::super::OwnedStdin::new(|| Ok(None));
+        options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+                &mut stdin,
+            )
+            .unwrap();
+        assert_eq!(adapter.ensures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events = adapter.inner.events.borrow();
+        let order: Vec<usize> = [
+            "admit",
+            "ensure",
+            "inputs:0xc0ffee",
+            "prepare:VerificationPair",
+        ]
+        .iter()
+        .map(|want| {
+            events
+                .iter()
+                .position(|event| event == want)
+                .unwrap_or_else(|| panic!("missing {want} in {events:?}"))
+        })
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "admission order: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("inputs:")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_static_refusal_wins_over_runtime_ensure() {
+        // --max-log-bytes refusal sits after admit (stale-record clear) and
+        // before ensure: it must win, the engagement record must already be
+        // cleared, and ensure must never run.
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("engagement.json");
+        std::fs::write(&record, b"stale").unwrap();
+        let adapter = RefuseEnsure(StaticAdapter::default());
+        let engagement_arg = format!("--backend-engagement-json={}", record.display());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run".to_owned(),
+            "--max-timeslice=disabled".to_owned(),
+            BASELINE_CPU.to_owned(),
+            engagement_arg,
+            "--".to_owned(),
+            "/bin/true".to_owned(),
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let error = options
+            .main_with_backend(
+                &super::super::global_opts::GlobalOpts::parse_from([
+                    "hermit-dynamorio",
+                    "--max-log-bytes=1024",
+                ]),
+                &adapter,
+                7,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--max-log-bytes is not qualified"),
+            "{error:#}"
+        );
+        assert!(!record.exists(), "stale engagement record must be cleared");
+        assert_eq!(*adapter.0.events.borrow(), ["admit"]);
+    }
+
+    #[test]
+    fn core_selected_run_reaches_resolution_without_adapter_hooks() {
+        // Structurally: the core path has no adapter, so no hook can be
+        // called. Behaviorally it must reach program resolution (the
+        // nonexistent program), proving no admission hook intercepted it.
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/nonexistent-core-selected-program",
+        ]);
+        let error = options
+            .main(&super::super::global_opts::GlobalOpts::parse_from([
+                "hermit",
+            ]))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nonexistent-core-selected-program"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn preparation_supplies_declared_range_at_all_three_points() {
+        // Through the real driver (main_with_backend binds the declaration;
+        // this fixture never binds by hand), in all three modes. Removing
+        // the driver's binding call turns every range below to None (the
+        // executed RED run in the twin evidence).
+        const LITERAL: Option<(u64, u64)> = Some((0x7100_0000, 0x7100_1000));
+        let global = super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]);
+        for mode in ["ordinary", "pair", "saved"] {
+            let directory = tempfile::tempdir().unwrap();
+            let adapter = PrivatePageAdapter(StaticAdapter::default());
+            let mut options = match mode {
+                "ordinary" => super::super::run::RunOpts::parse_from([
+                    "run",
+                    "--max-timeslice=disabled",
+                    BASELINE_CPU,
+                    "--",
+                    "/bin/true",
+                ]),
+                "pair" => super::super::run::RunOpts::parse_from([
+                    "run",
+                    "--max-timeslice=disabled",
+                    BASELINE_CPU,
+                    "--verify",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    directory.path().join("logs").to_str().unwrap(),
+                    "--verify-json",
+                    directory.path().join("report.json").to_str().unwrap(),
+                    "--",
+                    "/bin/true",
+                ]),
+                _ => super::super::run::RunOpts::parse_from([
+                    "run",
+                    "--max-timeslice=disabled",
+                    BASELINE_CPU,
+                    "--verify-run",
+                    directory.path().join("saved").to_str().unwrap(),
+                    "--",
+                    "/bin/true",
+                ]),
+            };
+            options
+                .select_application_backend(StaticAdapter::NAME)
+                .unwrap();
+            // Ordinary/saved synthetic execution may fail past prepare;
+            // the preparation observations are what this proof checks.
+            let mut stdin = super::super::OwnedStdin::new(|| Ok(None));
+            let _ = options.main_with_backend_and_stdin(&global, &adapter, 7, &mut stdin);
+            let ranges = adapter.0.config_ranges.borrow();
+            // Exact labeled sequence per mode: prepare + container, plus
+            // one capture per physical verification run.
+            let expected: Vec<(&str, Option<(u64, u64)>)> = match mode {
+                "ordinary" => vec![("prepare", LITERAL), ("container", LITERAL)],
+                "saved" => vec![
+                    ("prepare", LITERAL),
+                    ("container", LITERAL),
+                    ("capture", LITERAL),
+                ],
+                _ => vec![
+                    ("prepare", LITERAL),
+                    ("container", LITERAL),
+                    ("capture", LITERAL),
+                    ("capture", LITERAL),
+                ],
+            };
+            assert_eq!(*ranges, expected, "{mode} prepared ranges");
+        }
+    }
+
+    #[test]
+    fn static_refusal_prevents_runtime_ensure_and_prepare() {
+        let adapter = RefuseAdmit(StaticAdapter::default());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/bin/true",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let error = options
+            .main_with_backend(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("synthetic static refusal"));
+        assert_eq!(*adapter.0.events.borrow(), ["admit"]);
+    }
+
+    #[test]
+    fn runtime_unavailable_precedes_program_resolution() {
+        let adapter = RefuseEnsure(StaticAdapter::default());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/nonexistent-adapter-ensure-program",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let error = options
+            .main_with_backend(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+            )
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<hermit::AdapterUnavailable>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            super::super::classify_failure(&error),
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dynamorio"
+        );
+        assert_eq!(super::super::failure_exit_code(&error), 125);
+        assert_eq!(*adapter.0.events.borrow(), ["admit", "ensure"]);
+    }
+
+    #[test]
+    fn core_validate_refusal_wins_over_runtime_ensure() {
+        // validate_args (strict + host time) sits after admit and before
+        // ensure: the core refusal must win and ensure must never run.
+        let adapter = RefuseEnsure(StaticAdapter::default());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--strict",
+            "--no-virtualize-time",
+            "--",
+            "/bin/true",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let mut stdin = super::super::OwnedStdin::new(|| Ok(None));
+        let error = options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+                &mut stdin,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--strict refuses --no-virtualize-time"),
+            "{error:#}"
+        );
+        assert_eq!(*adapter.0.events.borrow(), ["admit"]);
+    }
+
+    #[test]
+    fn ensure_precedes_stdin_reservation() {
+        // The stdin producer must not run when ensure refuses: reservation
+        // is after ensure in the driver.
+        let adapter = RefuseEnsure(StaticAdapter::default());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/bin/true",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let produced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let produced_in = produced.clone();
+        let mut stdin = super::super::OwnedStdin::new(move || {
+            produced_in.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        });
+        let error = options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+                &mut stdin,
+            )
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<hermit::AdapterUnavailable>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(*adapter.0.events.borrow(), ["admit", "ensure"]);
+        assert!(
+            !produced.load(std::sync::atomic::Ordering::SeqCst),
+            "stdin producer ran before ensure refused"
+        );
+    }
+
+    struct WrongNameEnsure(StaticAdapter);
+
+    impl BackendAdapter for WrongNameEnsure {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = StaticAdapter::LOG_TRANSPORT;
+        const UNTRACED_CODE: UntracedCode = StaticAdapter::UNTRACED_CODE;
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type RuntimeInputs = <StaticAdapter as BackendAdapter>::RuntimeInputs;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+        fn parse(&self, m: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.0.parse(m)
+        }
+        fn admit_static_options(&self, o: &StaticOptions<'_>) -> Result<(), Error> {
+            self.0.admit_static_options(o)
+        }
+        fn ensure_runtime_inputs(&self) -> Result<Self::RuntimeInputs, Error> {
+            self.0.ensure_runtime_inputs()?;
+            Err(Error::new(hermit::AdapterUnavailable::new(
+                "other-backend",
+                "synthetic absent input kept verbatim",
+            )))
+        }
+        fn prepare(
+            &self,
+            o: Self::Options,
+            r: Self::RuntimeInputs,
+            q: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.0.prepare(o, r, q)
+        }
+        fn execute(
+            &self,
+            s: &mut Self::Session,
+            q: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.0.execute(s, q)
+        }
+        fn finish(&self, p: Self::Pending, o: Observation<'_>) -> Result<Self::Facts, Error> {
+            self.0.finish(p, o)
+        }
+        fn pair_evidence(&self, f: &Self::Facts, s: &Self::Facts) -> Result<PairEvidence, Error> {
+            self.0.pair_evidence(f, s)
+        }
+    }
+
+    #[test]
+    fn mismatched_unavailable_name_is_refused_with_its_reason() {
+        let adapter = WrongNameEnsure(StaticAdapter::default());
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/bin/true",
+        ]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let mut stdin = super::super::OwnedStdin::new(|| Ok(None));
+        let error = options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+                &mut stdin,
+            )
+            .unwrap_err();
+        // The driver must not classify another backend's absence under
+        // this adapter, and must keep the adapter's exact reason.
+        assert!(
+            error.downcast_ref::<hermit::AdapterUnavailable>().is_none(),
+            "{error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("reported backend `other-backend`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("synthetic absent input kept verbatim"),
+            "{message}"
+        );
+        assert_eq!(*adapter.0.events.borrow(), ["admit", "ensure"]);
+    }
+
+    #[test]
+    fn core_selected_admission_never_calls_adapter_hooks() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        // Through the real driver hook sites with a recording adapter and
+        // no selected backend: execution_backend_name stays core, every
+        // hook call site is guarded by the selection, and the drive stops
+        // at program resolution. Removing any guard records an event or an
+        // ensure here. Ranges are asserted field-explicitly on the same
+        // options the driver consumed.
+        let adapter = CountingInputs {
+            inner: StaticAdapter::default(),
+            ensures: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/nonexistent-core-selected-program",
+        ]);
+        // No select_application_backend call: core-selected by construction.
+        let mut stdin = super::super::OwnedStdin::new(|| Ok(None));
+        let error = options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]),
+                &adapter,
+                7,
+                &mut stdin,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nonexistent-core-selected-program"),
+            "{error:#}"
+        );
+        assert_eq!(adapter.ensures.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(adapter.inner.events.borrow().is_empty());
+        assert!(adapter.inner.config_ranges.borrow().is_empty());
+        assert_eq!(
+            options.effective_det_config().untraced_code_range,
+            Some((0x7100_0000, 0x7100_1000))
+        );
+        // Repeat through the driver with KVM selected BEFORE entry (not
+        // reset afterward): hooks still never fire, and the resulting
+        // field through that drive is None.
+        let adapter = CountingInputs {
+            inner: StaticAdapter::default(),
+            ensures: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut kvm_options = super::super::run::RunOpts::parse_from([
+            "run",
+            "--max-timeslice=disabled",
+            BASELINE_CPU,
+            "--",
+            "/nonexistent-core-selected-program",
+        ]);
+        let mut kvm_stdin = super::super::OwnedStdin::new(|| Ok(None));
+        let kvm_error = kvm_options
+            .main_with_backend_and_stdin(
+                &super::super::global_opts::GlobalOpts::parse_from([
+                    "hermit-dynamorio",
+                    "--backend=kvm",
+                ]),
+                &adapter,
+                7,
+                &mut kvm_stdin,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{kvm_error:#}").contains("nonexistent-core-selected-program"),
+            "{kvm_error:#}"
+        );
+        assert_eq!(adapter.ensures.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(adapter.inner.events.borrow().is_empty());
+        assert_eq!(kvm_options.effective_det_config().untraced_code_range, None);
+    }
+
+    #[test]
     fn verification_transport_mismatch_refuses_before_prepare_or_capture() {
         let directory = tempfile::tempdir().unwrap();
         let adapter = WrongTransport(StaticAdapter::default());
@@ -1534,6 +2413,7 @@ mod tests {
                 None,
                 &adapter,
                 7,
+                Some(()),
             )
             .unwrap_err();
         assert!(error.to_string().contains("log transport does not match"));

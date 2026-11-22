@@ -1773,6 +1773,18 @@ mod tests {
     }
 
     #[test]
+    fn record_or_replay_never_records_host_inputs() {
+        // Pins the record-path argument for the untraced-code binding:
+        // Detcore reads untraced_code_range only while recording host
+        // inputs, so record/replay needs no adapter declaration guard.
+        // If record mode ever starts recording host inputs, this fails
+        // and that argument must be revisited.
+        let config = record_or_replay_config(Path::new("replay-data"));
+        assert!(!config.record_host_inputs);
+        assert_eq!(config.untraced_code_range, None);
+    }
+
+    #[test]
     fn pre_yield_readmission_recordings_are_refused_by_the_version_gate() {
         // A 0x132 recording never readmitted a background call while a
         // yielder was queued, and its replayer cannot follow one that did.

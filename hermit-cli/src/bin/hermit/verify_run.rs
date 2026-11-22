@@ -853,7 +853,10 @@ mod tests {
         const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::PTRACE;
         const LOG_TRANSPORT: super::super::backend_hook::VerificationLogTransport =
             super::super::backend_hook::VerificationLogTransport::NativeEvidence;
+        const UNTRACED_CODE: super::super::backend_hook::UntracedCode =
+            super::super::backend_hook::UntracedCode::None;
         type Options = ();
+        type RuntimeInputs = ();
         type Session = ();
         type Pending = ();
         type Facts = super::super::backend_hook::NativeFacts;
@@ -868,7 +871,21 @@ mod tests {
                 | super::super::backend_hook::Mode::SavedVerification => Ok(()),
             }
         }
-        fn prepare(&self, _: (), _: super::super::backend_hook::Prepare<'_>) -> Result<(), Error> {
+        fn admit_static_options(
+            &self,
+            _: &super::super::backend_hook::StaticOptions<'_>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn ensure_runtime_inputs(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        fn prepare(
+            &self,
+            _: (),
+            _: Self::RuntimeInputs,
+            _: super::super::backend_hook::Prepare<'_>,
+        ) -> Result<(), Error> {
             panic!("offline comparison must not prepare a physical run")
         }
         fn execute(

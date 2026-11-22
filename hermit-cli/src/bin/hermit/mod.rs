@@ -254,6 +254,7 @@ use clap::FromArgMatches;
 use clap::Parser;
 use clap::parser::ValueSource;
 use colored::*;
+use hermit::AdapterUnavailable;
 use hermit::BackendUnavailable;
 use hermit::Error;
 use hermit::ExitStatus;
@@ -1441,6 +1442,12 @@ fn classify_failure(error: &Error) -> String {
             unavailable.backend().as_str()
         );
     }
+    if let Some(unavailable) = error.downcast_ref::<AdapterUnavailable>() {
+        return format!(
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={}",
+            unavailable.backend()
+        );
+    }
     if error.downcast_ref::<ContainerChildPanic>().is_some() {
         // The child PANICKED and the panic was caught and reported. Still the
         // tracer breaking, not the CLI refusing -- which is the distinction the
@@ -1536,6 +1543,7 @@ mod tests {
     use clap::CommandFactory;
     use clap::FromArgMatches;
     use clap::Parser;
+    use hermit::AdapterUnavailable;
     use hermit::Backend;
     use hermit::BackendUnavailable;
     use hermit::Error;
@@ -2863,6 +2871,15 @@ mod tests {
             "HERMIT_INTERNAL_FAILURE class=cli-error",
             "changing only prose must not manufacture the typed class"
         );
+
+        let adapter_typed = Error::new(AdapterUnavailable::new(
+            "sabre",
+            "HERMIT_SABRE_COHORT must name the exact core-engine/shim/loader producer cohort; no current producer is inferred",
+        ));
+        assert_eq!(
+            classify_failure(&adapter_typed),
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre"
+        );
     }
 
     /// Each scheduler terminal outcome has its own exit status and class line,
@@ -3426,8 +3443,9 @@ mod tests {
         let saved_call = sole_offset("return self.verify_run_with_adapter(");
         let ordinary = sole_offset("if self.application_backend.is_some() && !self.verify {");
         let physical = sole_offset("return adapter.execute(");
-        let verify =
-            sole_offset("self.verify(global, application_stdin, adapter, adapter_options)");
+        let verify = sole_offset(
+            "self.verify(global, application_stdin, adapter, adapter_options, adapter_runtime_inputs",
+        );
         // Exactly two adapter preparations: the ordinary single run's, between
         // its branch and its physical execution, and the saved run's, inside
         // `verify_run_with_adapter`.

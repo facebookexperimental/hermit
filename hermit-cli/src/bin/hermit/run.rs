@@ -1022,14 +1022,6 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
     }
 }
 
-/// Reverie ptrace's private page, `[start, end)`, which Reverie maps in every
-/// guest process (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET` and
-/// `cp::PRIVATE_PAGE_SIZE`, which that crate keeps private). It holds the
-/// untraced stub described in [`unobserved_guest_execution`]. The cli test
-/// `reverie_private_page_is_the_range_hermit_guards` pins it against a
-/// guest's own memory map.
-const REVERIE_PTRACE_PRIVATE_PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
-
 /// The guest code that makes syscalls `backend` lets through untraced
 /// (`DetConfig::untraced_code_range`), which Detcore guards in a run that
 /// records host inputs: Reverie's private page on the ptrace runtime, and
@@ -1037,7 +1029,7 @@ const REVERIE_PTRACE_PRIVATE_PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
 /// name a host input change ([`unobserved_guest_execution`]).
 fn untraced_code_range(backend: Backend) -> Option<(u64, u64)> {
     match backend {
-        Backend::Ptrace => Some(REVERIE_PTRACE_PRIVATE_PAGE),
+        Backend::Ptrace => super::backend_hook::UntracedCode::ReveriePtracePrivatePage.range(),
         Backend::Kvm | Backend::Liteinst | Backend::InGuestTrap => None,
     }
 }
@@ -1852,6 +1844,11 @@ pub struct RunOpts {
     /// the selected adapter type before common launch admission.
     #[clap(skip)]
     adapter_capabilities: Option<reverie::BackendCapabilities>,
+
+    /// The selected adapter's untraced-code declaration, bound with its
+    /// capabilities before common launch admission.
+    #[clap(skip)]
+    adapter_untraced_code: Option<super::backend_hook::UntracedCode>,
 
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
@@ -6345,7 +6342,7 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
 fn the_ptrace_runtime_guards_reverie_private_page() {
     assert_eq!(
         untraced_code_range(Backend::Ptrace),
-        Some(REVERIE_PTRACE_PRIVATE_PAGE)
+        Some(super::backend_hook::REVERIE_PTRACE_PRIVATE_PAGE)
     );
     for backend in [Backend::Kvm, Backend::Liteinst, Backend::InGuestTrap] {
         assert_eq!(untraced_code_range(backend), None, "{backend:?}");
@@ -6357,6 +6354,21 @@ fn the_ptrace_runtime_guards_reverie_private_page() {
     );
     ro.set_backend(Some(Backend::Kvm));
     assert_eq!(ro.effective_det_config().untraced_code_range, None);
+}
+
+/// Bridge for the adapter preparation proof: the pre-launch derivations
+/// (Prepare/container/capture) only cover what the runtime receives if
+/// container completion preserves the untraced-code range unchanged.
+#[test]
+fn complete_container_config_preserves_the_untraced_range() {
+    for range in [None, Some((0x7100_0000, 0x7100_1000))] {
+        let config = detcore::Config {
+            untraced_code_range: range,
+            ..Default::default()
+        };
+        let completed = complete_container_config(config, None, None).unwrap();
+        assert_eq!(completed.untraced_code_range, range);
+    }
 }
 
 #[test]
@@ -13508,6 +13520,26 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Bind the selected adapter's immutable declarations before common
+    /// launch admission. The driver calls this exactly once, in
+    /// `main_with_backend_and_stdin`; no test binds by hand any more.
+    pub(super) fn bind_application_adapter<A: super::backend_hook::BackendAdapter>(&mut self) {
+        self.adapter_capabilities = Some(A::CAPABILITIES);
+        self.adapter_untraced_code = Some(A::UNTRACED_CODE);
+    }
+
+    /// The adapter operation mode for this run, derived once here so
+    /// validate/admit/prepare can never disagree about it.
+    pub(super) fn adapter_mode(&self) -> super::backend_hook::Mode {
+        if self.verify_run.is_some() {
+            super::backend_hook::Mode::SavedVerification
+        } else if self.verify {
+            super::backend_hook::Mode::VerificationPair
+        } else {
+            super::backend_hook::Mode::Ordinary
+        }
+    }
+
     /// How this run's pinned CPU is placed: `--pinned-cpu`,
     /// `--pinned-cpu-dir` and `--pinned-cpu-notice`, with the environment's
     /// fallbacks, and `--timeout` as the bound of a `wait`.
@@ -14743,15 +14775,10 @@ impl RunOpts {
         adapter_options: A::Options,
         stdin: &mut super::OwnedStdin<impl FnOnce() -> std::io::Result<Option<File>>>,
     ) -> Result<ExitStatus, Error> {
+        let adapter_mode = self.adapter_mode();
         if self.application_backend.is_some() {
-            self.adapter_capabilities = Some(A::CAPABILITIES);
-            adapter.validate_mode(if self.verify_run.is_some() {
-                super::backend_hook::Mode::SavedVerification
-            } else if self.verify {
-                super::backend_hook::Mode::VerificationPair
-            } else {
-                super::backend_hook::Mode::Ordinary
-            })?;
+            self.bind_application_adapter::<A>();
+            adapter.validate_mode(adapter_mode)?;
         }
         // An executable-selected adapter has no DAP/namespace-only dispatch.
         // Refuse those switches before the built-in dispatcher can launch a
@@ -14932,6 +14959,17 @@ impl RunOpts {
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
+        // Static adapter admission: immediately after the stale-record
+        // clear above (clear-then-refuse, as prepare does today), before
+        // any runtime probe, stdin reservation or program resolution.
+        if self.application_backend.is_some() {
+            let static_mode = self.adapter_mode();
+            adapter.admit_static_options(&super::backend_hook::StaticOptions {
+                mode: static_mode,
+                engagement_path: self.backend_engagement_json.as_deref(),
+                summary_json: self.summary_json.as_deref(),
+            })?;
+        }
         // Before `--verify` reads stdin to its end below: a run that in-guest
         // LiteInst refuses must not wait for its input. `validate_args` repeats
         // the check for its other callers.
@@ -15040,6 +15078,24 @@ impl RunOpts {
         // without the feature refuses those runs the way a feature build does;
         // and before stdin is read.
         self.refuse_liteinst_without_the_feature()?;
+        // Runtime-input custody, ensured once after every static refusal
+        // above and immediately before stdin reservation / program
+        // resolution: availability never preempts a static verdict.
+        let mut adapter_runtime_inputs = if self.application_backend.is_some() {
+            Some(adapter.ensure_runtime_inputs().map_err(|error| {
+                match error.downcast_ref::<hermit::AdapterUnavailable>() {
+                    Some(unavailable) if unavailable.backend() != A::NAME => Error::msg(format!(
+                        "adapter `{}` reported backend `{}` unavailable: {}",
+                        A::NAME,
+                        unavailable.backend(),
+                        unavailable.reason()
+                    )),
+                    _ => error,
+                }
+            })?)
+        } else {
+            None
+        };
         let verification = self.verify || self.verify_run.is_some();
         let application_stdin = if self.application_backend.is_some() {
             // DBT streams this reservation during live or saved-run execution.
@@ -15215,21 +15271,23 @@ impl RunOpts {
                 application_stdin,
                 adapter,
                 adapter_options,
+                adapter_runtime_inputs
+                    .take()
+                    .expect("application runtime inputs ensured before saved execution"),
             );
         }
         if self.application_backend.is_some() && !self.verify {
             self.warn_no_namespace();
             self.log_auto_resolution();
-            let mode = if self.verify_run.is_some() {
-                super::backend_hook::Mode::SavedVerification
-            } else {
-                super::backend_hook::Mode::Ordinary
-            };
+            let mode = self.adapter_mode();
             let physical = self
                 .application_backend
                 .map(|_| super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES));
             let mut session = adapter.prepare(
                 adapter_options,
+                adapter_runtime_inputs
+                    .take()
+                    .expect("application runtime inputs ensured before ordinary execution"),
                 super::backend_hook::Prepare {
                     options: self,
                     global,
@@ -15304,7 +15362,13 @@ impl RunOpts {
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
-            self.verify(global, application_stdin, adapter, adapter_options)
+            self.verify(
+                global,
+                application_stdin,
+                adapter,
+                adapter_options,
+                adapter_runtime_inputs,
+            )
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
@@ -18698,6 +18762,7 @@ impl RunOpts {
         stdin: Option<fs::File>,
         adapter: &A,
         adapter_options: A::Options,
+        adapter_runtime_inputs: A::RuntimeInputs,
     ) -> Result<ExitStatus, Error> {
         use super::backend_hook::EvidenceRequirement;
         use super::backend_hook::Mode;
@@ -18709,6 +18774,7 @@ impl RunOpts {
         let physical = super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES);
         let mut session = adapter.prepare(
             adapter_options,
+            adapter_runtime_inputs,
             super::backend_hook::Prepare {
                 options: self,
                 global,
@@ -18789,6 +18855,7 @@ impl RunOpts {
         stdin: Option<fs::File>,
         adapter: &A,
         adapter_options: A::Options,
+        adapter_runtime_inputs: Option<A::RuntimeInputs>,
     ) -> Result<ExitStatus, Error> {
         // Stamp before fallible snapshot/preparation work, as in the original
         // physical path. Both runs retain this one ld.so.cache snapshot.
@@ -18796,7 +18863,13 @@ impl RunOpts {
             write_pending_verification_json(path)?;
         }
         self.with_verification_ld_so_cache()?
-            .verify_sharing_ld_so_cache(global, stdin, adapter, adapter_options)
+            .verify_sharing_ld_so_cache(
+                global,
+                stdin,
+                adapter,
+                adapter_options,
+                adapter_runtime_inputs,
+            )
     }
 
     pub(super) fn verify_sharing_ld_so_cache<A: super::backend_hook::BackendAdapter>(
@@ -18805,6 +18878,7 @@ impl RunOpts {
         stdin: Option<fs::File>,
         adapter: &A,
         adapter_options: A::Options,
+        adapter_runtime_inputs: Option<A::RuntimeInputs>,
     ) -> Result<ExitStatus, Error> {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
         let mapped_image = if self.in_guest_exec_stop {
@@ -18820,6 +18894,7 @@ impl RunOpts {
             stdin,
             adapter,
             adapter_options,
+            adapter_runtime_inputs,
             #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
             mapped_image,
         )
@@ -18832,6 +18907,7 @@ impl RunOpts {
         stdin: Option<fs::File>,
         adapter: &A,
         adapter_options: A::Options,
+        adapter_runtime_inputs: Option<A::RuntimeInputs>,
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped_image: Option<
             std::sync::Arc<super::mapped_first_admission::RetainedImage>,
         >,
@@ -18868,16 +18944,20 @@ impl RunOpts {
             .application_backend
             .map(|_| super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES));
         let mut session = if selected {
-            Some(adapter.prepare(
-                adapter_options,
-                super::backend_hook::Prepare {
-                    options: self,
-                    global,
-                    mode: Mode::VerificationPair,
-                    stdin,
-                    physical: physical.as_ref(),
-                },
-            )?)
+            Some(
+                adapter.prepare(
+                    adapter_options,
+                    adapter_runtime_inputs
+                        .expect("selected adapter runtime inputs ensured before pair execution"),
+                    super::backend_hook::Prepare {
+                        options: self,
+                        global,
+                        mode: Mode::VerificationPair,
+                        stdin,
+                        physical: physical.as_ref(),
+                    },
+                )?,
+            )
         } else {
             None
         };
@@ -21302,11 +21382,12 @@ impl RunOpts {
         // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
         self.apply_run_metadata(&mut config);
-        config.untraced_code_range = self
-            .application_backend
-            .is_none()
-            .then(|| untraced_code_range(self.selected_backend()))
-            .flatten();
+        config.untraced_code_range = match self.application_backend {
+            // Application backends get exactly the range core assigns to
+            // their declaration; core-selected backends map from `Backend`.
+            Some(_) => self.adapter_untraced_code.and_then(|code| code.range()),
+            None => untraced_code_range(self.selected_backend()),
+        };
         config.fatal_core_capture = self.fatal_core_capture();
         // The files `--rewrite-exclusives` left unchanged for want of
         // mapping symbols, for the run's summary.
@@ -23280,6 +23361,7 @@ mod tests {
                 None,
                 &super::super::core_adapter::CoreApplicationAdapter,
                 (),
+                None,
                 Some(image.clone()),
             )
             .unwrap();

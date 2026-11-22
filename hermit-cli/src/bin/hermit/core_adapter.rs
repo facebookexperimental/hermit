@@ -39,7 +39,12 @@ impl BackendAdapter for CoreApplicationAdapter {
     const EVIDENCE: EvidenceRequirement = EvidenceRequirement::Common;
     const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::PTRACE;
     const LOG_TRANSPORT: VerificationLogTransport = VerificationLogTransport::CoordinatorTracing;
+    // Not consulted: core-selected backends map their untraced range from
+    // `Backend` (core ptrace keeps the private-page range that way).
+    const UNTRACED_CODE: super::backend_hook::UntracedCode =
+        super::backend_hook::UntracedCode::None;
     type Options = ();
+    type RuntimeInputs = ();
     type Session = CoreSession;
     type Pending = CorePending;
     type Facts = CoreFacts;
@@ -47,7 +52,16 @@ impl BackendAdapter for CoreApplicationAdapter {
     fn parse(&self, _: &clap::ArgMatches) -> Result<(), clap::Error> {
         Ok(())
     }
-    fn prepare(&self, (): (), _request: Prepare<'_>) -> Result<CoreSession, Error> {
+    fn admit_static_options(
+        &self,
+        _: &super::backend_hook::StaticOptions<'_>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    fn ensure_runtime_inputs(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn prepare(&self, (): (), (): (), _request: Prepare<'_>) -> Result<CoreSession, Error> {
         Err(Error::msg(
             "built-in physical execution is owned by the core driver",
         ))

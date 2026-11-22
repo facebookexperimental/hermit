@@ -540,7 +540,8 @@ fn a_private_page_written_through_proc_self_mem_names_no_host_input_change() {
 }
 
 /// hermit-cli hard-codes Reverie's private page as the range Detcore guards
-/// (`REVERIE_PTRACE_PRIVATE_PAGE` in run.rs), because reverie-ptrace keeps
+/// (`REVERIE_PTRACE_PRIVATE_PAGE` in backend_hook.rs), because
+/// reverie-ptrace keeps
 /// its constants private. A guest's own memory map under the ptrace backend
 /// shows it there, one executable page, so a move in Reverie fails here.
 #[test]
