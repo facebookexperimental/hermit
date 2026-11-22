@@ -21796,6 +21796,13 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             // Selects the schema-4 result report; the cells and their retries
             // are unchanged.
             "--diagnostic-results" => {}
+            // Every flag the generator emits into a committed harness command
+            // is modelled here, or this policy refuses that node's command.
+            // This one plans each selected test's parity golden CPU profile as
+            // an unfiltered run of it would; the cells and their retries are
+            // unchanged, and test-harness refuses it without --backend ptrace
+            // or with an exact --test.
+            "--parity-plan-of-selected-tests" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
             | "--exclude-category" | "--label" | "--results" | "--junit" | "--jobs" => {
                 index += 1;
