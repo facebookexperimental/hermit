@@ -244,6 +244,7 @@ LINT_CHECK_TARGETS := \
     lint-check-private-static-pipeline \
     lint-check-musl-detcore \
     lint-check-nested-lockfiles \
+    lint-check-cargo-proxy \
     lint-check-cargo-lock-freshness \
     lint-check-cargo-lock-cochange \
     lint-check-record-version-floor \
@@ -411,6 +412,9 @@ lint-check-musl-detcore:
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+lint-check-cargo-proxy:
+	./ci/hermetic/tests/test-cargo-proxy.sh
 
 # Tier 1 of the two-tier Cargo.lock gate: full `cargo metadata --locked`
 # (never --no-deps) on every OSS Cargo root. Also runs fail-fast as the

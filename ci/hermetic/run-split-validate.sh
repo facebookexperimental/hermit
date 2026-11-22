@@ -95,6 +95,9 @@ ROOT=$(cd -- "$HERE/../.." && pwd)
 # full validate run -- the test sources THIS file, not a copy of it.
 # shellcheck source=ci/hermetic/retry-fetch.sh
 source "$HERE/retry-fetch.sh"
+# The fetch phase's Cargo proxy default, in its own file for the same reason.
+# shellcheck source=ci/hermetic/cargo-proxy.sh
+source "$HERE/cargo-proxy.sh"
 
 lane=portable
 out="$ROOT/ignored/hermetic/split"
@@ -333,49 +336,13 @@ if [[ $do_fetch -eq 1 ]]; then
         # a relative PATH entry independent of the neutral Agent Utils cwd.
         cargo_bin=$(command -v cargo)
         [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
-        # Config inspection needs the project's nightly Cargo. A rustup shim
-        # may select a different default at /; preserve that choice for the
-        # actual Agent Utils fetch, but resolve the inspection tool here.
-        cargo_config_bin=""
-        proxy=${https_proxy:-${HTTPS_PROXY:-}}
-        if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
-            cargo_config_bin=$cargo_bin
-            if rustup_bin=$(command -v rustup) &&
-                [[ "$cargo_bin" -ef "$rustup_bin" ]]; then
-                cargo_config_bin=$("$rustup_bin" which cargo 2>/dev/null) || cargo_config_bin=""
-            fi
-        fi
-        # Cargo falls back to Git's proxy before consulting the operational
-        # environment. A private Cargo home can expose a different Git route.
-        # Preserve explicit Cargo settings (including empty values), then use
-        # libcurl's HTTPS environment order. HTTP-only settings stay HTTP-only.
-        # Query in each child's actual cwd: Agent Utils intentionally uses /.
+        # Cargo falls back to Git's http.proxy before the environment's, so
+        # cargo_proxy_default (ci/hermetic/cargo-proxy.sh) hands Cargo the
+        # environment's https proxy unless Cargo itself already names one.
+        # Decide in each child's actual cwd: Agent Utils intentionally uses /,
+        # and its CARGO_HOME is the one the fetch uses.
         host_fetch() (
-            proxy=${https_proxy:-${HTTPS_PROXY:-}}
-            if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
-                # An unresolved proxy can select a different toolchain here.
-                # Establish capability at the query cwd, before inspecting
-                # config; unsupported inspection keeps the original fetch.
-                if [[ -z $cargo_config_bin ]] ||
-                    ! cargo_version=$("$cargo_config_bin" --version 2>/dev/null) ||
-                    [[ $cargo_version != "cargo "*"-nightly "* && $cargo_version != "cargo "*"-dev "* ]]; then
-                    echo 'run-split-validate: nightly Cargo configuration inspection unavailable; applying no proxy default, using the original fetch configuration.' >&2
-                    "$@"
-                    exit $?
-                fi
-                if ! configured=$("$cargo_config_bin" -Zunstable-options config get --format json 2>/dev/null |
-                    jq -r 'if type != "object" then error("invalid Cargo config")
-                           else (.http // {}) | if type != "object" then error("invalid http config")
-                           else has("proxy") end end'); then
-                    echo 'run-split-validate: cannot inspect Cargo proxy configuration; refusing host fetch.' >&2
-                    exit 2
-                fi
-                case $configured in
-                    true) ;; # Cargo's own setting takes precedence, even "".
-                    false) export CARGO_HTTP_PROXY="$proxy" ;;
-                    *) echo 'run-split-validate: invalid Cargo proxy configuration query result.' >&2; exit 2 ;;
-                esac
-            fi
+            cargo_proxy_default . || exit $?
             "$@"
         )
         for manifest in "${FETCH_MANIFESTS[@]}"; do
