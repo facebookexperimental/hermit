@@ -1366,12 +1366,21 @@ fn malformed_local_images_are_refused_by_name() {
         format!("oci-dir:{}", device_dir.display()),
         &["device entry", "outside /dev"],
     );
-    // ../ traversal and absolute path (patched into a valid tar).
+    // ../ traversal (patched into a valid tar) is refused. An
+    // absolute entry is NOT: since the loader maps absolute layer
+    // entries under the image root, it is staged confined there and
+    // the guest runs. That case is asserted separately below.
     const TRAVERSAL_NEEDLES: &[&str] = &["path traversal"];
-    const ABSOLUTE_NEEDLES: &[&str] = &["absolute path"];
     for (name, placeholder, target, needles) in [
         ("traversal", "zz/evil", "../evil", TRAVERSAL_NEEDLES),
-        ("absolute", "zabs/evil", "/abs/evil", ABSOLUTE_NEEDLES),
+        // An absolute name carrying ".." stays refused end to end:
+        // only a leading RootDir is mapped, never a parent component.
+        (
+            "abs-traversal",
+            "za/zz/zz/evil",
+            "/a/../../evil",
+            TRAVERSAL_NEEDLES,
+        ),
     ] {
         let (pl1, pl2) = fixture_layers(
             &[entry(placeholder, tar::EntryType::Regular, 0o644, b"x")],
@@ -1393,14 +1402,101 @@ fn malformed_local_images_are_refused_by_name() {
                 },
             ],
         );
-        // Leak the needles slice of string literals is fine: they are 'static.
         add(
             match name {
                 "traversal" => "path traversal",
-                _ => "absolute path",
+                _ => "absolute path traversal",
             },
             format!("oci-dir:{}", dir.display()),
             needles,
+        );
+    }
+    // Absolute entry "/abs/evil": staged CONFINED at rootfs/abs/evil
+    // and the guest runs. Host confinement is proven falsifiably by
+    // the writable-canary case right after: /abs is not writable on a
+    // normal host, so it cannot serve as the canary itself.
+    {
+        let (pl1, pl2) = fixture_layers(
+            &[entry("zabs/evil", tar::EntryType::Regular, 0o644, b"x")],
+            Some(("zabs/evil", "/abs/evil")),
+        );
+        let dir = tmp.path().join("absolute");
+        let config = config_bytes(&[sha256_hex(&pl1), sha256_hex(&pl2)]);
+        write_oci_dir(
+            &dir,
+            &config,
+            &[
+                StoredLayer {
+                    blob: pl1,
+                    media_type: MT_TAR,
+                },
+                StoredLayer {
+                    blob: pl2,
+                    media_type: MT_TAR,
+                },
+            ],
+        );
+        let cache = tmp.path().join("cache-absolute");
+        let output = run_image(&cache, &format!("oci-dir:{}", dir.display()));
+        assert_guest_ran(&output);
+        let rootfs = find_rootfs(&cache);
+        assert_eq!(
+            std::fs::read(rootfs.join("abs/evil")).unwrap(),
+            b"x",
+            "absolute entry must be staged confined under the rootfs"
+        );
+    }
+    // Writable host canary, mirroring the loader unit test
+    // applier_absolute_host_path_lands_under_rootfs_not_on_host: the
+    // absolute name is a host path this test owns, so a loader that
+    // accepts absolute names without confining them would succeed on
+    // the host and only these checks catch it. The canary directory
+    // is rooted directly under /tmp so the raw name always fits the
+    // 100-byte tar name field patch_entry_name requires.
+    {
+        let canary_tmp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let outside = canary_tmp.path().join("abs-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"host-secret").unwrap();
+        let host_target = outside.join("evil");
+        let name = host_target.to_str().unwrap().to_string();
+        assert!(name.len() <= 100, "raw name must fit the tar name field");
+        let placeholder = format!("z{}", &name[1..]);
+        let (pl1, pl2) = fixture_layers(
+            &[entry(&placeholder, tar::EntryType::Regular, 0o644, b"x")],
+            Some((&placeholder, &name)),
+        );
+        let dir = tmp.path().join("absolute-canary");
+        let config = config_bytes(&[sha256_hex(&pl1), sha256_hex(&pl2)]);
+        write_oci_dir(
+            &dir,
+            &config,
+            &[
+                StoredLayer {
+                    blob: pl1,
+                    media_type: MT_TAR,
+                },
+                StoredLayer {
+                    blob: pl2,
+                    media_type: MT_TAR,
+                },
+            ],
+        );
+        let cache = tmp.path().join("cache-absolute-canary");
+        let output = run_image(&cache, &format!("oci-dir:{}", dir.display()));
+        assert_guest_ran(&output);
+        assert!(!host_target.exists(), "host path written: {name}");
+        let rootfs = find_rootfs(&cache);
+        let mapped = rootfs.join(host_target.strip_prefix("/").unwrap());
+        assert_eq!(
+            std::fs::read(&mapped).unwrap(),
+            b"x",
+            "absolute host path must land confined under the rootfs"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("secret")).unwrap(),
+            b"host-secret",
+            "canary neighbor must be untouched"
         );
     }
     // Escaping hardlink.
