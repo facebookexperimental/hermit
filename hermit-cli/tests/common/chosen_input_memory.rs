@@ -20,6 +20,7 @@ use super::HERMIT_POLICY_REFUSAL_EXIT;
 use super::assert_success;
 use super::hermit_test;
 use super::own_pid_namespace;
+use super::own_pid_namespace_unavailable;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -83,6 +84,10 @@ fn expected(mode: &str) -> String {
 /// fails this same guest oracle.
 #[test]
 fn chosen_clone_preserves_old_stack_inputs_and_native_output_aliases() {
+    if own_pid_namespace_unavailable("chosen_clone_preserves_old_stack_inputs_and_native_output_aliases")
+    {
+        return;
+    }
     for mode in ["input", "outputs"] {
         let native = run(mode, None);
         assert_success(&native, &["native", mode]);
@@ -109,6 +114,11 @@ fn chosen_clone_preserves_old_stack_inputs_and_native_output_aliases() {
 /// failure/fallback path this test exercises.
 #[test]
 fn chosen_clone_eperm_fallback_preserves_original_input_and_output_aliases() {
+    if own_pid_namespace_unavailable(
+        "chosen_clone_eperm_fallback_preserves_original_input_and_output_aliases",
+    ) {
+        return;
+    }
     for mode in ["fallback-input", "fallback-outputs"] {
         let native = run(mode, None);
         assert_success(&native, &["native", mode]);
@@ -137,6 +147,10 @@ fn chosen_clone_eperm_fallback_preserves_original_input_and_output_aliases() {
 /// child, not a successful memory-preservation run or a native errno result.
 #[test]
 fn strict_chosen_clone_eperm_refuses_before_original_stack_alias_call() {
+    if own_pid_namespace_unavailable("strict_chosen_clone_eperm_refuses_before_original_stack_alias_call")
+    {
+        return;
+    }
     for mode in ["fallback-input", "fallback-outputs"] {
         let refused = run(mode, Some(&["--pid-base=5000", "--summary"]));
         assert_eq!(

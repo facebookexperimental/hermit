@@ -15626,6 +15626,11 @@ fn native_chosen_ids_fixture(namespace: &[&str], guest_args: &[&str]) -> Output 
 /// not a claimed public eligible-background-W reproducer.
 #[test]
 fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() {
+    if own_pid_namespace_unavailable(
+        "no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids",
+    ) {
+        return;
+    }
     fn expected(base: i64, capability: &str, table: &str, first: i64, later: i64) -> String {
         format!(
             "first process {base}\ncw capability {capability}\ncw table {table}\n\
@@ -15787,27 +15792,207 @@ const OWN_PID_NAMESPACE: [&str; 7] = [
 const OWN_PID_NAMESPACE_PRIVILEGED: [&str; 5] =
     ["--pid", "--fork", "--mount", "--mount-proc", "--net"];
 
-/// The [`OWN_PID_NAMESPACE`] form this host admits with a fresh /proc of the
-/// test's own PID namespace: the privileged form where this process may
-/// make the namespaces directly, else a user namespace of its own. Probed
-/// once with the privileged form itself.
-fn own_pid_namespace() -> &'static [&'static str] {
-    static ADMITTED: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
-    ADMITTED.get_or_init(|| {
-        let privileged = Command::new("unshare")
-            .args(OWN_PID_NAMESPACE_PRIVILEGED)
-            .arg("true")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if privileged {
-            &OWN_PID_NAMESPACE_PRIVILEGED
-        } else {
-            &OWN_PID_NAMESPACE
+/// How one `unshare <form> true` probe ended. `Denied` is exactly a
+/// kernel-denial errno (EPERM, EACCES, EINVAL, ENOSPC, EUSERS), as
+/// strerror names it under `LC_ALL=C`; anything else — a spawn failure, an
+/// unrecognized refusal — is `Other` and never reads as a denial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnshareProbe {
+    Admitted,
+    Denied,
+    Other,
+}
+
+/// Which [`OWN_PID_NAMESPACE`] form this host admits, or that it admits
+/// neither, with what each refused form printed.
+#[derive(Debug)]
+enum OwnPidNamespaceAdmission {
+    Privileged,
+    UserNamespace,
+    Denied(String),
+}
+
+/// `true` where a whole line of util-linux `unshare`'s stderr is exactly
+/// one of the two stage refusals the gate measures — its `unshare` call or
+/// its `/proc` mount — with a kernel-denial errno as strerror names it.
+/// Any other line is not a denial, including one that merely embeds the
+/// errno text: an exec failure (`failed to execute true: Permission
+/// denied`) happens after the namespaces and the mount succeeded.
+fn unshare_denied(stderr_line: &str) -> bool {
+    let Some(denial) = ["unshare: unshare failed: ", "unshare: mount /proc failed: "]
+        .iter()
+        .find_map(|stage| stderr_line.strip_prefix(stage))
+    else {
+        return false;
+    };
+    matches!(
+        denial,
+        "Operation not permitted"
+            | "Permission denied"
+            | "Invalid argument"
+            | "No space left on device"
+            | "Too many users"
+    )
+}
+
+/// The choice two probe outcomes give, before any refusal is worded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnPidNamespaceChoice {
+    Privileged,
+    UserNamespace,
+    Denied,
+}
+
+/// Either admitted form, a denial only where both forms were
+/// kernel-denied, else the user-namespace form, whose run then fails as
+/// loudly as it did before this probe existed.
+fn own_pid_namespace_choice(
+    privileged: UnshareProbe,
+    user_namespace: UnshareProbe,
+) -> OwnPidNamespaceChoice {
+    match (privileged, user_namespace) {
+        (UnshareProbe::Admitted, _) => OwnPidNamespaceChoice::Privileged,
+        (UnshareProbe::Denied, UnshareProbe::Denied) => OwnPidNamespaceChoice::Denied,
+        _ => OwnPidNamespaceChoice::UserNamespace,
+    }
+}
+
+fn unshare_probe(form: &[&str]) -> (UnshareProbe, String) {
+    let output = Command::new("unshare")
+        .args(form)
+        .arg("true")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return (UnshareProbe::Other, String::new());
+    };
+    if output.status.success() {
+        return (UnshareProbe::Admitted, String::new());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr.lines().next().unwrap_or_default().trim().to_owned();
+    let probe = if unshare_denied(&line) {
+        UnshareProbe::Denied
+    } else {
+        UnshareProbe::Other
+    };
+    (probe, line)
+}
+
+/// This host's admission, probed once with the forms themselves: the
+/// privileged form first (the only form a host masking /proc entries
+/// admits), then the user-namespace form. A host with neither — unprivileged
+/// in its container's user namespace, under a masked /proc — denies both.
+fn own_pid_namespace_admission() -> &'static OwnPidNamespaceAdmission {
+    static ADMISSION: std::sync::OnceLock<OwnPidNamespaceAdmission> =
+        std::sync::OnceLock::new();
+    ADMISSION.get_or_init(|| {
+        let (privileged, privileged_line) = unshare_probe(&OWN_PID_NAMESPACE_PRIVILEGED);
+        if privileged == UnshareProbe::Admitted {
+            return OwnPidNamespaceAdmission::Privileged;
+        }
+        let (user_namespace, user_namespace_line) = unshare_probe(&OWN_PID_NAMESPACE);
+        match own_pid_namespace_choice(privileged, user_namespace) {
+            OwnPidNamespaceChoice::Privileged => OwnPidNamespaceAdmission::Privileged,
+            OwnPidNamespaceChoice::UserNamespace => OwnPidNamespaceAdmission::UserNamespace,
+            OwnPidNamespaceChoice::Denied => OwnPidNamespaceAdmission::Denied(format!(
+                "this host denies a fresh /proc in a new PID namespace for both \
+                 unshare forms (direct: {privileged_line}; user namespace: \
+                 {user_namespace_line}) (minibeads dh-jd7o1p)"
+            )),
         }
     })
+}
+
+/// Whether `test` cannot start on this host because neither unshare form
+/// mounts a fresh /proc in a new PID namespace (see
+/// [`own_pid_namespace_admission`]): records the measured refusal as a
+/// runtime skip and returns `true`, so the caller returns at once. A probe
+/// outcome that is not a kernel denial of both forms is never a skip.
+fn own_pid_namespace_unavailable(test: &str) -> bool {
+    let OwnPidNamespaceAdmission::Denied(reason) = own_pid_namespace_admission() else {
+        return false;
+    };
+    record_test_skip(test, reason);
+    true
+}
+
+/// The [`OWN_PID_NAMESPACE`] form this host admits with a fresh /proc of the
+/// test's own PID namespace. Callers guard with
+/// [`own_pid_namespace_unavailable`] first; on a host that admits neither
+/// form an unguarded call panics rather than run under a form that cannot
+/// start.
+fn own_pid_namespace() -> &'static [&'static str] {
+    match own_pid_namespace_admission() {
+        OwnPidNamespaceAdmission::Privileged => &OWN_PID_NAMESPACE_PRIVILEGED,
+        OwnPidNamespaceAdmission::UserNamespace => &OWN_PID_NAMESPACE,
+        OwnPidNamespaceAdmission::Denied(reason) => panic!(
+            "own_pid_namespace called where no form is admitted; guard the test \
+             with own_pid_namespace_unavailable: {reason}"
+        ),
+    }
+}
+
+#[test]
+fn own_pid_namespace_choice_admits_either_form_and_denies_only_both_denied() {
+    use OwnPidNamespaceChoice::{Denied, Privileged, UserNamespace};
+    use UnshareProbe::{Admitted, Denied as KernelDenied, Other};
+    let choice = |privileged, user_namespace| {
+        match own_pid_namespace_choice(privileged, user_namespace) {
+            Privileged => "privileged",
+            UserNamespace => "user namespace",
+            Denied => "denied",
+        }
+    };
+    for (privileged, user_namespace, expected) in [
+        (Admitted, Admitted, "privileged"),
+        (Admitted, KernelDenied, "privileged"),
+        (Admitted, Other, "privileged"),
+        (KernelDenied, Admitted, "user namespace"),
+        (KernelDenied, KernelDenied, "denied"),
+        // An outcome the probes could not classify is never a denial: the
+        // run proceeds in the historic form and fails there, by name.
+        (KernelDenied, Other, "user namespace"),
+        (Other, KernelDenied, "user namespace"),
+        (Other, Other, "user namespace"),
+        (Other, Admitted, "user namespace"),
+    ] {
+        assert_eq!(
+            choice(privileged, user_namespace),
+            expected,
+            "privileged probe {privileged:?}, user-namespace probe {user_namespace:?}"
+        );
+    }
+}
+
+#[test]
+fn unshare_denied_recognizes_only_kernel_denial_errnos() {
+    for line in [
+        // The refusals as util-linux prints them under LC_ALL=C: the direct
+        // form unprivileged, and the masked /proc mount.
+        "unshare: unshare failed: Operation not permitted",
+        "unshare: mount /proc failed: Operation not permitted",
+        "unshare: unshare failed: Permission denied",
+        "unshare: unshare failed: Invalid argument",
+        "unshare: unshare failed: No space left on device",
+        "unshare: unshare failed: Too many users",
+    ] {
+        assert!(unshare_denied(line), "denial not recognized: {line}");
+    }
+    for line in [
+        "",
+        // A missing operand or binary is a host fault, not a kernel denial:
+        // the wrapped run must fail with it, never skip. So is an exec
+        // refusal, which embeds a denial errno's text but happens after
+        // the namespaces and the mount succeeded.
+        "unshare: failed to execute true: No such file or directory",
+        "unshare: failed to execute true: Permission denied",
+        "unshare: unexpected token",
+    ] {
+        assert!(!unshare_denied(line), "non-denial misread as denial: {line}");
+    }
 }
 
 /// C4 deliberately narrows the former continuing-Chosen collision promise:
@@ -15816,6 +16001,11 @@ fn own_pid_namespace() -> &'static [&'static str] {
 /// restore staging. Strict runs name the cost; tolerant records must say Host.
 #[test]
 fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging() {
+    if own_pid_namespace_unavailable(
+        "no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging",
+    ) {
+        return;
+    }
     for (lifetime, offset) in [("reaped", "1"), ("reaped", "100"), ("live", "3")] {
         let guest_args = ["guest-chosen-lifecycle", lifetime, offset];
         let accepted = format!("explicit accepted +{offset}\n");
@@ -15889,6 +16079,10 @@ fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging(
 /// original clone3 EINVAL must survive and the next fork must still stage.
 #[test]
 fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
+    if own_pid_namespace_unavailable("no_namespace_original_clone3_no_child_keeps_later_chosen_ids")
+    {
+        return;
+    }
     let guest_args = ["guest-chosen-lifecycle", "no-child", "100"];
     let native = native_chosen_ids_fixture(own_pid_namespace(), &guest_args);
     assert_success(&native, &guest_args);
@@ -15934,6 +16128,9 @@ fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
 
 #[test]
 fn no_namespace_validates_parent_signal_before_choosing_an_id() {
+    if own_pid_namespace_unavailable("no_namespace_validates_parent_signal_before_choosing_an_id") {
+        return;
+    }
     for (signal, created, error) in [("65", 0, libc::EINVAL), ("17", 1, 0)] {
         let output = no_namespace_in_own_pid_namespace(
             own_pid_namespace(),
@@ -15975,6 +16172,11 @@ fn no_namespace_validates_parent_signal_before_choosing_an_id() {
 /// thread.
 #[test]
 fn a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_did() {
+    if own_pid_namespace_unavailable(
+        "a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_did",
+    ) {
+        return;
+    }
     let guest = hb_two_threads_guest();
     let run = |args: &[String]| {
         let mut command = Command::new("unshare");
@@ -16035,6 +16237,9 @@ fn a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_d
 /// succeed, each with its own base and its guest's IDs following it.
 #[test]
 fn no_namespace_concurrent_runs_take_different_windows() {
+    if own_pid_namespace_unavailable("no_namespace_concurrent_runs_take_different_windows") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let hermit = env!("CARGO_BIN_EXE_hermit");
     let guest = chosen_guest_ids_guest().to_str().unwrap().to_owned();
@@ -16095,6 +16300,9 @@ fn no_namespace_concurrent_runs_take_different_windows() {
 /// `--no-namespace` cannot take yet.
 #[test]
 fn no_namespace_guest_ids_follow_the_base_and_creation_order() {
+    if own_pid_namespace_unavailable("no_namespace_guest_ids_follow_the_base_and_creation_order") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join("verify.json");
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -16140,6 +16348,9 @@ fn no_namespace_guest_ids_follow_the_base_and_creation_order() {
 /// The summary and the INFO log say how the guest was numbered.
 #[test]
 fn no_namespace_reports_its_guest_numbering() {
+    if own_pid_namespace_unavailable("no_namespace_reports_its_guest_numbering") {
+        return;
+    }
     let output = no_namespace_in_own_pid_namespace(
         own_pid_namespace(),
         &["--pid-base=5000", "--summary"],
@@ -16164,6 +16375,9 @@ fn no_namespace_reports_its_guest_numbering() {
 /// its IDs came from the host, so a replay refuses it.
 #[test]
 fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
+    if own_pid_namespace_unavailable("no_namespace_refuses_a_taken_chosen_id_only_when_asked") {
+        return;
+    }
     let refused = no_namespace_with_external_id_holder(&["--pid-base=5000"]);
     assert_eq!(
         refused.status.code(),
@@ -16265,6 +16479,10 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// ones).
 #[test]
 fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
+    if own_pid_namespace_unavailable("no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base")
+    {
+        return;
+    }
     for (base, call, expected) in [
         (
             "--pid-base=5000",
@@ -16371,6 +16589,9 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
 /// summary's count.
 #[test]
 fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
+    if own_pid_namespace_unavailable("no_namespace_completes_a_guest_set_tid_with_the_chosen_id") {
+        return;
+    }
     for (base, call, expected) in [
         (
             "--pid-base=5000",
@@ -16445,6 +16666,9 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
 /// the missing `--strict`, which `--no-namespace` cannot take yet.
 #[test]
 fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
+    if own_pid_namespace_unavailable("no_namespace_gives_a_new_pid_namespace_child_its_chosen_id") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join("verify.json");
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -16494,6 +16718,11 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 /// run, since it could carry a `set_tid` Detcore cannot check (#4370).
 #[test]
 fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
+    if own_pid_namespace_unavailable(
+        "no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id",
+    ) {
+        return;
+    }
     let newpid_child = "newpid child: own ID 1\n";
     for (call, reason, before) in [
         ("signal65", "its exit signal 65 is not a signal number", ""),
@@ -16669,6 +16898,9 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
 /// namespace's init) is refused before the guest starts, naming the holder.
 #[test]
 fn no_namespace_refuses_a_held_pid_base() {
+    if own_pid_namespace_unavailable("no_namespace_refuses_a_held_pid_base") {
+        return;
+    }
     let output = no_namespace_in_own_pid_namespace(own_pid_namespace(), &["--pid-base=1"], &[]);
     assert_eq!(
         output.status.code(),
@@ -16751,6 +16983,9 @@ fn chosen_window_admission_reads_hermits_own_namespace_under_a_misaligned_proc()
 /// fork is the first call past it.
 #[test]
 fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
+    if own_pid_namespace_unavailable("no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task") {
+        return;
+    }
     let pid_max: i32 = fs::read_to_string("/proc/sys/kernel/pid_max")
         .unwrap()
         .trim()
@@ -16783,6 +17018,9 @@ fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
 /// own, with or without preemption points.
 #[test]
 fn no_namespace_preemption_records_replay_under_their_base() {
+    if own_pid_namespace_unavailable("no_namespace_preemption_records_replay_under_their_base") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let path = |name: &str| directory.path().join(name).display().to_string();
     let record_arg = format!("--record-preemptions-to={}", path("recorded.json"));
@@ -16926,6 +17164,9 @@ fn no_namespace_preemption_records_replay_under_their_base() {
 /// schedules switch threads only at syscalls (`--max-timeslice=disabled`).
 #[test]
 fn no_namespace_bisect_replays_the_schedules_it_writes() {
+    if own_pid_namespace_unavailable("no_namespace_bisect_replays_the_schedules_it_writes") {
+        return;
+    }
     const RACE: &str = "echo a & echo b; wait";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let path = |name: &str| directory.path().join(name).display().to_string();
@@ -17014,6 +17255,9 @@ fn no_namespace_bisect_replays_the_schedules_it_writes() {
 /// the init of a user and PID namespace, with the base Hermit chooses there.
 #[test]
 fn no_namespace_minimize_replays_its_candidate_records() {
+    if own_pid_namespace_unavailable("no_namespace_minimize_replays_its_candidate_records") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join("report.json").display().to_string();
     let mut command = Command::new("unshare");
@@ -77885,6 +78129,11 @@ fn namespace_only_keeps_ignoring_schedule_inputs() {
 /// Synthetic JSON is not the producer.
 #[test]
 fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
+    if own_pid_namespace_unavailable(
+        "chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders",
+    ) {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let recording = directory.path().join("qualified.json");
     let record_flag = format!("--record-preemptions-to={}", recording.display());

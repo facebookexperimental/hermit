@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use super::assert_success;
 use super::hermit_test;
 use super::own_pid_namespace;
+use super::own_pid_namespace_unavailable;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -156,16 +157,25 @@ fn check(mode: &str, pending: u8, take_back: usize) {
 
 #[test]
 fn nonleader_exec_takes_back_a_timer_proxy() {
+    if own_pid_namespace_unavailable("nonleader_exec_takes_back_a_timer_proxy") {
+        return;
+    }
     check("proxy-nonleader", 0, 1);
 }
 
 #[test]
 fn same_leader_exec_takes_back_a_timer_proxy() {
+    if own_pid_namespace_unavailable("same_leader_exec_takes_back_a_timer_proxy") {
+        return;
+    }
     check("proxy-leader", 0, 1);
 }
 
 #[test]
 fn exec_keeps_a_plain_signal_beside_the_timer() {
+    if own_pid_namespace_unavailable("exec_keeps_a_plain_signal_beside_the_timer") {
+        return;
+    }
     for mode in ["plain-nonleader", "plain-leader"] {
         check(mode, 1, 0);
     }
@@ -173,6 +183,9 @@ fn exec_keeps_a_plain_signal_beside_the_timer() {
 
 #[test]
 fn exec_lets_linux_flush_an_own_si_timer_record() {
+    if own_pid_namespace_unavailable("exec_lets_linux_flush_an_own_si_timer_record") {
+        return;
+    }
     for mode in ["own-timer-nonleader", "own-timer-leader"] {
         check(mode, 0, 0);
     }

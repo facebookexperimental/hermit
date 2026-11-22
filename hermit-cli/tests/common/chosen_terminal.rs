@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use super::assert_success;
 use super::hermit_test;
 use super::own_pid_namespace;
+use super::own_pid_namespace_unavailable;
 use super::process_build_root;
 use super::stderr;
 use super::stdout;
@@ -89,6 +90,9 @@ fn run_control(mode: &str, expected: &str) {
 
 #[test]
 fn ordinary_thread_exit_preserves_later_chosen_clone() {
+    if own_pid_namespace_unavailable("ordinary_thread_exit_preserves_later_chosen_clone") {
+        return;
+    }
     run_control(
         "ordinary-thread-exit",
         "ordinary exit: later clone completed\n",
@@ -97,5 +101,8 @@ fn ordinary_thread_exit_preserves_later_chosen_clone() {
 
 #[test]
 fn zombie_leader_exit_preserves_later_chosen_clone() {
+    if own_pid_namespace_unavailable("zombie_leader_exit_preserves_later_chosen_clone") {
+        return;
+    }
     run_control("zombie-leader", "zombie leader: later clone completed\n");
 }
