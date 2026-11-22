@@ -23,10 +23,12 @@
 #           dirty, by how many paths; then the FULL validate runs in place
 #           with --human-off-the-record.
 #
-# Two routes skip the classification and run exactly what `make validate` ran
-# before: a run inside a ci-hub validate-run unit (CI_HUB_VALIDATE_PRODUCER is
-# set; the driver's own lock admission decides), and any checkout outside a
-# dev-hermit parent (no ci-hub to route to).
+# Two routes skip the classification and run the driver with the caller's
+# arguments, as `make validate` always did: a run inside a ci-hub validate-run
+# unit (CI_HUB_VALIDATE_PRODUCER is set; the driver's own lock admission
+# decides), and any checkout outside a dev-hermit parent (no ci-hub to route
+# to). Every route starts the driver directly: its DAG's first node,
+# pre.submodules, verifies the submodule pins, so no copy runs in front of it.
 #
 # THIS IS ROUTING, NOT A SECURITY BOUNDARY. A caller can clear its environment
 # and detach from its ancestors; nothing here is meant to stop that. An agent
@@ -240,8 +242,19 @@ section() {
     printf 'validate: == %s\n' "$1" >&2
 }
 
-# What `make validate` ran before this front door existed, behind section
-# headers: the submodule pin check, then the driver with DRIVER_ARGS.
+# The driver with DRIVER_ARGS, behind its section header.
+#
+# No pre-gate runs in sequence here. verify-submodules is the DAG's first node,
+# pre.submodules, which every node that reads a submodule depends on; running
+# it again in front of the driver only added its time to every run. What the
+# driver BUILD itself needs is narrower: its path dependencies reach the Reverie
+# crates in the reverie submodule. So two cases are refused here by name,
+# instead of surfacing as a Cargo error or as a driver built against the wrong
+# Reverie: an unpopulated reverie (an uninitialized submodule is an empty
+# directory), and a populated one checked out at a commit other than the
+# gitlink HEAD records (two git calls). A dirty reverie and every other
+# submodule stay pre.submodules' job; nothing before that node tests or
+# publishes anything.
 #
 # TMPDIR: the driver points an unset TMPDIR at target/validation/run-*/tmp,
 # inside this Cargo workspace, and then its own self-test node refuses ("run the
@@ -268,8 +281,22 @@ run_validate() {
     local root=$1
     shift
     cd "$root"
-    section "verify-submodules: checks every submodule pin against HEAD without repairing it; gates the driver build and every validation node"
-    SUBMODULE_GIT=${SUBMODULE_GIT:-git} ./ci/verify-submodules.sh
+    if [[ ! -f reverie/reverie/Cargo.toml ]]; then
+        printf 'validate: the reverie submodule is not populated (no reverie/reverie/Cargo.toml), and the driver builds against it; run `make check-submodules`, then retry\n' >&2
+        exit 1
+    fi
+    local recorded checked_out
+    recorded=$(GIT_OPTIONAL_LOCKS=0 git ls-tree HEAD reverie 2>/dev/null || true)
+    if [[ $recorded == "160000 commit "* && -e reverie/.git ]]; then
+        recorded=${recorded#160000 commit }
+        recorded=${recorded%%$'\t'*}
+        checked_out=$(GIT_OPTIONAL_LOCKS=0 git -C reverie rev-parse HEAD 2>/dev/null || true)
+        if [[ $checked_out != "$recorded" ]]; then
+            printf 'validate: the reverie submodule is at %s but HEAD records %s, and the driver builds against it; run `make check-submodules`, then retry\n' \
+                "${checked_out:-an unreadable commit}" "$recorded" >&2
+            exit 1
+        fi
+    fi
     local -a launcher=()
     if [[ -z ${CI_HUB_VALIDATE_PRODUCER:-} ]] && command -v with-proxy >/dev/null 2>&1; then
         launcher=(with-proxy)
@@ -278,7 +305,7 @@ run_validate() {
     real_root=$(realpath -- "$root")
     [[ -z ${TMPDIR:-} ]] || caller_tmp=$(realpath -m -- "$TMPDIR")
     if [[ -n $caller_tmp && $caller_tmp != "$real_root" && $caller_tmp != "$real_root"/* ]]; then
-        section "scripts/validate.rs $(shell_quote_args "$@"): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile; gates the verdict"
+        section "scripts/validate.rs $(shell_quote_args "$@"): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
         exec "${launcher[@]}" ./scripts/validate.rs "$@"
     fi
     local tmp_parent run_tmp
@@ -297,7 +324,7 @@ run_validate() {
     setsid -f bash -c 'flock -x "$1" true; case $2 in */hermit-validate-??????) rm -rf -- "$2" ;; esac' \
         hermit-validate-tmpdir-reaper "$run_tmp/.owner" "$run_tmp" 9>&- </dev/null >/dev/null 2>&1
     export TMPDIR=$run_tmp
-    section "scripts/validate.rs $(shell_quote_args "$@") with TMPDIR=$run_tmp (outside the checkout, removed once the driver and everything it started have exited): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile; gates the verdict"
+    section "scripts/validate.rs $(shell_quote_args "$@") with TMPDIR=$run_tmp (outside the checkout, removed once the driver and everything it started have exited): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
     exec "${launcher[@]}" ./scripts/validate.rs "$@"
 }
 

@@ -21,8 +21,10 @@
 #               verify-submodules and driver are recording stubs: the agent
 #               refusal (at most three lines, exact ci-hub command, nothing
 #               run), the human route on a clean and a dirty tree, the ci-hub
-#               unit and standalone pass-throughs, section headers, and exit
-#               status propagation.
+#               unit and standalone pass-throughs, section headers, exit
+#               status propagation, the unpopulated-reverie refusal, and that
+#               no route runs verify-submodules in front of the driver (the
+#               DAG's pre.submodules node owns that check).
 #   cost        the decision is measured in CPU seconds (load-invariant, so it
 #               holds on a loaded host), never in wall time.
 #
@@ -278,10 +280,11 @@ cost_cases() {
 
 # A planted dev-hermit parent: ci-hub/, a .gitmodules naming the hermit
 # submodule, and a git checkout at hermit/ whose verify-submodules and driver
-# record what they were given.
+# record what they were given, with a populated-looking reverie.
 plant_checkout() {
     local parent=$1 with_boundary=$2 hermit=$1/hermit
-    mkdir -p "$hermit/scripts" "$hermit/ci"
+    mkdir -p "$hermit/scripts" "$hermit/ci" "$hermit/reverie/reverie"
+    printf '[package]\nname = "reverie-core"\n' >"$hermit/reverie/reverie/Cargo.toml"
     if [[ $with_boundary == yes ]]; then
         mkdir -p "$parent/ci-hub"
         printf '[submodule "hermit"]\n\tpath = hermit\n\turl = https://example.invalid/hermit\n' \
@@ -441,18 +444,19 @@ route_cases() {
     out=$log/out
     rc=0
     "${clean_env[@]}" PATH="$proxybin:$PATH" STUB_LOG="$log" CLAUDECODE=1 \
-        CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 TMPDIR="$unit_tmp" SUBMODULE_GIT="with-proxy git" \
+        CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 TMPDIR="$unit_tmp" \
         "$hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
     if ((rc == 0)) && [[ $(cat "$log/driver" 2>/dev/null) == "--all" ]] \
-        && [[ $(cat "$log/submodules" 2>/dev/null) == "SUBMODULE_GIT=with-proxy git" ]] \
+        && [[ ! -e $log/submodules ]] \
         && [[ $(cat "$log/tmpdir" 2>/dev/null) == "$unit_tmp" ]] \
         && [[ ! -e $log/proxy ]] \
         && grep -q 'inside a ci-hub validate-run unit' "$out"; then
-        pass "route: a ci-hub unit runs verify-submodules and the driver unchanged"
+        pass "route: a ci-hub unit starts the driver unchanged, with no pre-gate in front"
     else
         fail "route: a ci-hub unit passes through" "rc=$rc" \
             "driver argv: $(tr '\n' ' ' <"$log/driver" 2>/dev/null)" \
             "driver TMPDIR: $(cat "$log/tmpdir" 2>/dev/null) (want $unit_tmp)" \
+            "verify-submodules ran in front: $([[ -e $log/submodules ]] && echo yes || echo no)" \
             "$(cat "$out")"
     fi
 
@@ -548,25 +552,69 @@ route_cases() {
 
     # Section headers: one per section, each saying what runs and what it gates
     # (R3b's run, with the substituted TMPDIR named in it).
-    if grep -Eq '^validate: == verify-submodules: .*; gates ' "$header_out" \
-        && grep -Eq '^validate: == scripts/validate.rs --all with TMPDIR=/tmp/hermit-validate-[^ ]+ \(outside the checkout, removed once the driver and everything it started have exited\): .*; gates ' "$header_out" \
+    if grep -Eq '^validate: == scripts/validate.rs --all with TMPDIR=/tmp/hermit-validate-[^ ]+ \(outside the checkout, removed once the driver and everything it started have exited\): .*pre\.submodules.*; gates ' "$header_out" \
         && grep -q '^validate: == front door: inside a ci-hub validate-run unit' "$header_out"; then
         pass "route: each section opens with a header naming what runs and what it gates"
     else
         fail "route: section headers" "$(cat "$header_out")"
     fi
 
-    # R4: a failing verify-submodules stops the route before the driver.
+    # R4: the driver builds against the reverie submodule, so an unpopulated
+    # one is refused by name before the driver starts.
+    local bare=$TMP/bare
+    plant_checkout "$bare" yes
+    # An uninitialized submodule leaves an EMPTY directory, not none.
+    rm -r "$bare/hermit/reverie"
+    mkdir "$bare/hermit/reverie"
     log=$(new_log)
     out=$log/out
     rc=0
-    "${clean_env[@]}" STUB_LOG="$log" STUB_SUBMODULES_EXIT=1 \
-        CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
-        "$hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
-    if ((rc == 1)) && [[ ! -e $log/driver ]]; then
-        pass "route: a failed verify-submodules stops before the driver"
+    "${clean_env[@]}" STUB_LOG="$log" CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        "$bare/hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+    if ((rc == 1)) && [[ ! -e $log/driver ]] && grep -q 'make check-submodules' "$out"; then
+        pass "route: an unpopulated reverie is refused by name before the driver"
     else
-        fail "route: a failed verify-submodules stops before the driver" "rc=$rc" "$(cat "$out")"
+        fail "route: an unpopulated reverie is refused before the driver" "rc=$rc" "$(cat "$out")"
+    fi
+
+    # R4b: a populated reverie checked out at a commit other than the gitlink
+    # HEAD records is refused before the driver builds against it; at the
+    # recorded commit the driver starts.
+    local linked=$TMP/linked rv recorded_rev stale_rev
+    plant_checkout "$linked" yes
+    rv=$linked/hermit/reverie
+    git -C "$linked/hermit" rm -r -q --cached reverie
+    git -C "$rv" init -q
+    git -C "$rv" add -A
+    git -C "$rv" -c user.name=front-door-test -c user.email=test@example.invalid commit -q -m recorded
+    recorded_rev=$(git -C "$rv" rev-parse HEAD)
+    printf '# moved on\n' >>"$rv/reverie/Cargo.toml"
+    git -C "$rv" -c user.name=front-door-test -c user.email=test@example.invalid commit -q -am stale
+    stale_rev=$(git -C "$rv" rev-parse HEAD)
+    git -C "$linked/hermit" update-index --add --cacheinfo "160000,$recorded_rev,reverie"
+    git -C "$linked/hermit" -c user.name=front-door-test -c user.email=test@example.invalid \
+        commit -q -m 'record the reverie gitlink'
+    log=$(new_log)
+    out=$log/out
+    rc=0
+    "${clean_env[@]}" STUB_LOG="$log" CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        "$linked/hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+    if ((rc == 1)) && [[ ! -e $log/driver ]] \
+        && grep -Fq "is at $stale_rev but HEAD records $recorded_rev" "$out"; then
+        pass "route: a reverie at a commit other than its gitlink is refused by name before the driver"
+    else
+        fail "route: a stale reverie is refused before the driver" "rc=$rc" "$(cat "$out")"
+    fi
+    git -C "$rv" checkout -q "$recorded_rev"
+    log=$(new_log)
+    out=$log/out
+    rc=0
+    "${clean_env[@]}" STUB_LOG="$log" CI_HUB_VALIDATE_PRODUCER=systemd-user-v1 \
+        "$linked/hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+    if ((rc == 0)) && [[ -e $log/driver ]]; then
+        pass "route: a reverie at its recorded gitlink starts the driver"
+    else
+        fail "route: a reverie at its recorded gitlink starts the driver" "rc=$rc" "$(cat "$out")"
     fi
 
     # R5: outside a dev-hermit parent there is no ci-hub to route to.
@@ -603,7 +651,7 @@ route_cases() {
     if [[ $rc == 0 ]] && [[ $(tr '\n' ' ' <"$log/driver" 2>/dev/null) == "--human-off-the-record --all " ]] \
         && grep -q '^validate: OFF THE RECORD: a human run' "$log/out" \
         && grep -q 'not validation evidence' "$log/out" \
-        && ! grep -q 'tree is not clean' "$log/out" && [[ -e $log/submodules ]] \
+        && ! grep -q 'tree is not clean' "$log/out" && [[ ! -e $log/submodules ]] \
         && [[ $(cat "$log/proxy" 2>/dev/null) == with-proxy ]] \
         && [[ $(cat "$log/tmpdir" 2>/dev/null) == /tmp/hermit-validate-?????? ]] \
         && [[ -e $log/tmpdir-existed ]] && wait_gone "$(cat "$log/tmpdir")"; then

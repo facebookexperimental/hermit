@@ -123,10 +123,10 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
 # validation entrypoint. The front door routes before anything compiles: inside
 # a dev-hermit parent it refuses an agent toward `ci-hub validate-run` and runs
-# a human's validate in place, off the record; it then runs verify-submodules
-# and scripts/validate.rs exactly as this target did (see its --help).
+# a human's validate in place, off the record; it then starts scripts/validate.rs,
+# whose first DAG node (pre.submodules) verifies the submodule pins (see --help).
 validate: ## Run the full validation suite (agents are routed to ci-hub; pass flags via ARGS)
-	@SUBMODULE_GIT='$(SUBMODULE_GIT)' ./scripts/validate-front-door.sh -- --all $(ARGS)
+	@./scripts/validate-front-door.sh -- --all $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
