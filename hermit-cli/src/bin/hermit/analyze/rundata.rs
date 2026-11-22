@@ -1707,6 +1707,17 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).small_trial_max_timeslice_notice(skid_margin)
     }
 
+    /// The notice `hermit run` writes when a trial's backend starts the
+    /// guest through the `LD_PRELOAD` route
+    /// (`RunOpts::unmonitored_startup_notice`), for the run arguments every
+    /// trial shares. As with the small-timeslice notice, `analyze` and
+    /// `bisect` write it once here rather than once per trial; the strict
+    /// `--require-first-instruction` refusal already reaches trials through
+    /// `validate_args`.
+    pub fn trial_unmonitored_startup_notice(&self) -> Option<String> {
+        RunData::get_raw_runopts(self).unmonitored_startup_notice()
+    }
+
     /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
     /// run: Reverie's PMU configuration is per process, and every trial of
     /// one `analyze` or `bisect` runs in this process with the same run

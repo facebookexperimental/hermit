@@ -1379,6 +1379,10 @@ mod tests {
     /// The `run` rows of the sample table; see [`GLOBAL_SAMPLES`].
     const RUN_SAMPLES: &[(&str, &[&str])] = &[
         ("in-guest-exec-stop", &["--in-guest-exec-stop"]),
+        (
+            "require-first-instruction",
+            &["--require-first-instruction"],
+        ),
         #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
         (
             "native-exec-inputs",

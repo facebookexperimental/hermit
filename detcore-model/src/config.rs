@@ -560,6 +560,23 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_refuses_host_timed_producers: bool,
 
+    /// Whether this run's guest startup was unmonitored: `Some(true)` when
+    /// it starts through the in-guest `LD_PRELOAD` route, so the guest's
+    /// dynamic loader and constructors run before Detcore is armed;
+    /// `Some(false)` only on a route known to intercept from the first
+    /// instruction (ptrace, KVM, the exec-stop loader route); `None`, the
+    /// default, makes no claim (any other route, or a producer that did
+    /// not record it). Recorded in the run summary
+    /// (`RunSummary::startup_unmonitored`) so every run report states it
+    /// plainly; Detcore itself makes no policy decision from it.
+    ///
+    /// The host sets it, not a flag, when it prepares a run whose startup
+    /// route it knows. Like `in_guest_site_patching_off`, it has no legacy
+    /// key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub startup_unmonitored: Option<bool>,
+
     /// The guest's first image, as its `/proc/self/exe` link names it, and
     /// the image the kernel exec'd in its place where a launcher loads the
     /// guest ([`LaunchImage`]). Detcore answers that link from it until the
@@ -4453,7 +4470,7 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 67] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 68] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4462,6 +4479,7 @@ mod legacy_backend_json {
         "in_guest_site_patching_off",
         "in_guest_reserved_signals",
         "in_guest_refuses_host_timed_producers",
+        "startup_unmonitored",
         "launch_image",
         "ephemeral_port_range_override",
         "target_timeslice_syscalls_only",
@@ -4705,7 +4723,8 @@ mod legacy_backend_json {
                 }
                 // Unset, as its serde default is.
                 Some(
-                    "in_guest_detlog_forward_policy"
+                    "startup_unmonitored"
+                    | "in_guest_detlog_forward_policy"
                     | "launch_image"
                     | "ephemeral_port_range_override"
                     | "detlog_anon"
@@ -5015,6 +5034,7 @@ mod legacy_backend_json {
                 | "in_guest_site_patching_off"
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
+                | "startup_unmonitored"
                 | "launch_image"
                 | "ephemeral_port_range_override"
                 | "target_timeslice_syscalls_only"
@@ -6099,6 +6119,7 @@ mod tests {
                 | "in_guest_site_patching_off"
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
+                | "startup_unmonitored"
                 | "launch_image"
                 | "ephemeral_port_range_override"
                 | "target_timeslice_syscalls_only"
@@ -6200,13 +6221,13 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`,
         // `allow_unresolved_restart_codes` and `strict_schedule_boundaries`
-        // none: fourteen more keys and sixty-six fewer (lenient_replay joined
+        // none: fourteen more keys and sixty-seven fewer (lenient_replay joined
         // them in dh-mvz7y, chaos_timed_wait_spread later, `autofs_roots` and
         // `notice_autofs_eloop` later still, then
-        // `ephemeral_port_range_override`), so fifty-two keys fewer
-        // than fields.
+        // `ephemeral_port_range_override`, then `startup_unmonitored`), so
+        // fifty-three keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 52);
+        assert_eq!(fields.len(), keys.len() + 53);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6232,6 +6253,61 @@ mod tests {
             .collect();
         let array = serde_json::to_string(&values).unwrap();
         assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
+    }
+
+    /// `startup_unmonitored` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as
+    /// `None` (no claim) from both the object and the array form - never
+    /// as `Some(false)`, which would invent a monitored-startup claim
+    /// for a record whose producer made none.
+    #[test]
+    fn startup_unmonitored_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        assert_eq!(off.startup_unmonitored, None);
+        for claim in [Some(true), Some(false)] {
+            let on = Config {
+                startup_unmonitored: claim,
+                ..off.clone()
+            };
+            let json = to_legacy_backend_json(&on).unwrap();
+            assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+            assert!(!json.contains("startup_unmonitored"), "{json}");
+            assert_eq!(
+                from_legacy_backend_json(&json).unwrap().startup_unmonitored,
+                None
+            );
+            let values: Vec<serde_json::Value> = ordered_entries(&json)
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            let array = serde_json::to_string(&values).unwrap();
+            assert_eq!(
+                from_legacy_backend_json(&array)
+                    .unwrap()
+                    .startup_unmonitored,
+                None
+            );
+        }
+    }
+
+    /// A normal (non-legacy) Config JSON in the base shape - serialized
+    /// before `startup_unmonitored` existed, so the key is absent -
+    /// decodes with no startup claim.
+    #[test]
+    fn startup_unmonitored_absent_in_base_shaped_json_decodes_to_none() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("startup_unmonitored")
+                .is_some()
+        );
+        let decoded: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.startup_unmonitored, None);
     }
 
     /// The files the exclusive rewrite left unchanged never enter the legacy

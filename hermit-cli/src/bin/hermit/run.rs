@@ -1797,6 +1797,21 @@ pub struct RunOpts {
     #[clap(long)]
     in_guest_exec_stop: bool,
 
+    /// Refuse to run unless the guest is intercepted from its first
+    /// instruction. Without the exec-stop loader route, the in-guest
+    /// backends (`liteinst`, `in-guest-trap`) start the guest through
+    /// `LD_PRELOAD`, so the guest's dynamic loader and constructors run
+    /// unmonitored before Detcore is armed; with this flag such a run
+    /// refuses before launch instead of starting unmonitored. Only routes
+    /// known to intercept from the first instruction are admitted:
+    /// `ptrace`, `kvm`, and `--backend=in-guest-trap --in-guest-exec-stop`
+    /// with the packaged private runtime. Everything else refuses by
+    /// name, including `--namespace-only` (no instrumentation backend) and
+    /// application backends. Without this flag a preload-route run still
+    /// prints that its startup is unmonitored.
+    #[clap(long)]
+    require_first_instruction: bool,
+
     #[cfg_attr(
         feature = "native-exec",
         doc = "Freeze explicitly declared dynamic files for the native trap exec domain."
@@ -3173,6 +3188,9 @@ impl fmt::Display for RunOpts {
         if self.in_guest_exec_stop {
             write!(f, " --in-guest-exec-stop")?;
         }
+        if self.require_first_instruction {
+            write!(f, " --require-first-instruction")?;
+        }
         // The rewrite changes which instructions the guest executes, so a
         // reproducer without it reproduces a different program.
         if self.rewrite_exclusives {
@@ -3863,6 +3881,17 @@ fn assert_exec_stop_not_ready(error: &Error) {
     );
 }
 
+/// A `--require-first-instruction` refusal is a `PolicyRefusal` (the CLI's
+/// exit-122 class) naming the unmonitored startup and its remedies.
+#[cfg(test)]
+fn assert_startup_unmonitored_refusal(error: &Error) {
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("startup-unmonitored"),
+        "{error:#}"
+    );
+}
+
 #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
 #[test]
 fn exec_stop_admission_reads_the_global_backend_before_launch() {
@@ -4464,6 +4493,78 @@ fn exec_stop_opt_in_is_uniform_and_retained_in_reproducers() {
 }
 
 #[test]
+fn preload_route_startup_is_named_unmonitored_and_strict_mode_refuses_it() {
+    // Both in-guest backends start through LD_PRELOAD without the exec-stop
+    // loader route: the notice names the unmonitored startup and its remedy,
+    // and --require-first-instruction refuses instead of launching.
+    for backend in ["liteinst", "in-guest-trap"] {
+        let backend_arg = format!("--backend={backend}");
+        let ordinary = run_opts_for(&["hermit", &backend_arg, "run", "--", "/nonexistent/guest"]);
+        assert!(!ordinary.require_first_instruction);
+        ordinary.refuse_unmonitored_startup_if_required().unwrap();
+        let notice = ordinary
+            .unmonitored_startup_notice()
+            .expect("a preload-route run states its unmonitored startup");
+        assert!(notice.contains("unmonitored"), "{notice}");
+        assert!(notice.contains("--in-guest-exec-stop"), "{notice}");
+        assert!(
+            notice.ends_with('\n'),
+            "the notice must not run into the next stderr line: {notice:?}"
+        );
+        // No Display assertion here: Display consumes a normalized
+        // configuration (see exec_stop_opt_in_is_uniform_and_retained_in_reproducers),
+        // and this loop's options are deliberately unvalidated.
+
+        let strict = run_opts_for(&[
+            "hermit",
+            &backend_arg,
+            "run",
+            "--require-first-instruction",
+            "--",
+            "/nonexistent/guest",
+        ]);
+        assert!(strict.require_first_instruction);
+        let refusal = strict.refuse_unmonitored_startup_if_required().unwrap_err();
+        let refusal = format!("{refusal:#}");
+        assert!(refusal.contains("startup-unmonitored"), "{refusal}");
+        assert!(refusal.contains("--in-guest-exec-stop"), "{refusal}");
+        assert!(refusal.contains("--backend=ptrace"), "{refusal}");
+    }
+
+    // A backend that intercepts from the first instruction needs neither the
+    // notice nor the refusal, and a rendered reproducer keeps the flag.
+    let mut ptrace = run_opts_for(&[
+        "hermit",
+        "--backend=ptrace",
+        "run",
+        "--require-first-instruction",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    ptrace.refuse_unmonitored_startup_if_required().unwrap();
+    assert!(ptrace.unmonitored_startup_notice().is_none());
+    ptrace.validate_args_with_perf_support(true).unwrap();
+    assert!(
+        ptrace.to_string().contains("--require-first-instruction"),
+        "a strict reproducer keeps its flag: {ptrace}"
+    );
+
+    // The exec-stop loader route is not the preload route: strict mode does
+    // not refuse it here (its own admission is refuse_unready_exec_stop).
+    let loader = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--in-guest-exec-stop",
+        "--require-first-instruction",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    loader.refuse_unmonitored_startup_if_required().unwrap();
+    assert!(loader.unmonitored_startup_notice().is_none());
+}
+
+#[test]
 fn exec_stop_direct_entries_refuse_before_launch_work() {
     let args = crate::app::Args::try_parse_from([
         "hermit",
@@ -4500,6 +4601,129 @@ fn exec_stop_direct_entries_refuse_before_launch_work() {
         panic!("flagged request reached verification execution")
     });
     assert_exec_stop_not_ready(&verification_result.unwrap_err());
+}
+
+#[test]
+fn require_first_instruction_refuses_before_launch_work() {
+    // Through the real argv and entry points, as
+    // exec_stop_direct_entries_refuse_before_launch_work does for its flag.
+    // The refusal has three call sites (dispatch_before_validation,
+    // validate_args, and RunOpts::run for in-process callers); this test
+    // exercises the first two entry points with independently parsed
+    // options. No mutant run is shown for any single site: main() reaches
+    // validate_args too, so deleting one site may still refuse through
+    // another.
+    for backend in ["liteinst", "in-guest-trap"] {
+        let backend_arg = format!("--backend={backend}");
+        let args = crate::app::Args::try_parse_from([
+            "hermit",
+            &backend_arg,
+            "run",
+            "--require-first-instruction",
+            "--",
+            "/nonexistent/guest",
+        ])
+        .unwrap();
+        let crate::app::Subcommand::Run(mut options) = args.command else {
+            unreachable!()
+        };
+        assert_startup_unmonitored_refusal(&options.main(&args.global).unwrap_err());
+        // Fresh options: main() above already mutated its own copy.
+        let mut options = run_opts_for(&[
+            "hermit",
+            &backend_arg,
+            "run",
+            "--require-first-instruction",
+            "--",
+            "/nonexistent/guest",
+        ]);
+        assert_startup_unmonitored_refusal(&options.validate_args().unwrap_err());
+    }
+
+    // --namespace-only runs no instrumentation backend at all, so the
+    // allowlist refuses it by name instead of admitting it through the
+    // ptrace default.
+    let args = crate::app::Args::try_parse_from([
+        "hermit",
+        "run",
+        "--namespace-only",
+        "--require-first-instruction",
+        "--",
+        "/nonexistent/guest",
+    ])
+    .unwrap();
+    let crate::app::Subcommand::Run(mut options) = args.command else {
+        unreachable!()
+    };
+    let error = options.main(&args.global).unwrap_err();
+    assert_startup_unmonitored_refusal(&error);
+    assert!(error.to_string().contains("--namespace-only"), "{error:#}");
+    assert_startup_unmonitored_refusal(&options.validate_args().unwrap_err());
+}
+
+#[test]
+fn native_exec_with_exec_stop_is_still_not_a_first_instruction_route() {
+    // The native-exec inputs beside the admitted exec-stop route: not
+    // allowlisted, and the startup claim built on it is no claim - never
+    // Some(false) (monitored) for a route the strict gate refuses.
+    let intercepts =
+        intercepts_from_first_instruction_for(Backend::InGuestTrap, false, false, true, true);
+    assert!(!intercepts);
+    assert_eq!(startup_unmonitored_claim_for(false, intercepts), None);
+}
+
+/// The claim mapping itself, in every build: preload is the only
+/// unmonitored claim, an allowlisted route the only monitored one, and
+/// every other route - native-exec's (`false`, `false`) included - makes
+/// no claim, never a monitored one (N-1).
+#[test]
+fn startup_claim_for_an_unproven_route_is_none_not_monitored() {
+    assert_eq!(startup_unmonitored_claim_for(true, true), Some(true));
+    assert_eq!(startup_unmonitored_claim_for(true, false), Some(true));
+    assert_eq!(startup_unmonitored_claim_for(false, true), Some(false));
+    assert_eq!(startup_unmonitored_claim_for(false, false), None);
+}
+
+/// The native-exec domain makes no startup claim (N-1): its summary must
+/// never say "monitored" for a route the strict gate refuses by name.
+/// Helper-level only: the fbsource Buck build does not enable
+/// `native-exec`, so this compiles (and runs) only in native-exec builds;
+/// the config the native branch builds takes this same claim
+/// (`startup_unmonitored_claim`) over the loader route's `Some(false)`.
+#[cfg(feature = "native-exec")]
+#[test]
+fn native_exec_startup_claim_is_none_not_monitored() {
+    // Both native-exec argvs, with the same three asserts on each: without
+    // --in-guest-exec-stop is the only coverage of the
+    // `&& !self.uses_native_exec()` term in starts_via_preload_route (a
+    // mutant deleting it makes that case claim the preload route instead
+    // of no claim); with it is the Vladimir case.
+    for argv in [
+        vec![
+            "hermit",
+            "--backend=in-guest-trap",
+            "run",
+            "--verify",
+            "--native-exec-inputs=/nonexistent/native-exec-inputs.json",
+            "--",
+            "/nonexistent/guest",
+        ],
+        vec![
+            "hermit",
+            "--backend=in-guest-trap",
+            "run",
+            "--verify",
+            "--in-guest-exec-stop",
+            "--native-exec-inputs=/nonexistent/native-exec-inputs.json",
+            "--",
+            "/nonexistent/guest",
+        ],
+    ] {
+        let options = run_opts_for(&argv);
+        assert!(options.uses_native_exec());
+        assert_eq!(options.startup_unmonitored_claim(), None);
+        assert!(!options.intercepts_from_first_instruction());
+    }
 }
 
 /// A version-2 happens-before spec needs an effective preemption timer.
@@ -13437,7 +13661,19 @@ impl RunOpts {
         self.lower_strace_only();
         self.refuse_virtual_timeout_with_debugger()?;
         self.prepare_mapped_verification_inputs()?;
+        // Record the startup claim early, before the refusals below: the
+        // claim value is the single source every consumer reads (the
+        // dispatch and validation records here, the verify-run record in
+        // verify_run_record, and Config on the native-exec path), so it
+        // must be right at record time, whatever refuses later.
+        // Validation records it again (a disagreeing second record fails
+        // loudly in debug builds rather than silently keeping a stale
+        // value). An entry pending stamp from a dispatch wrapper may
+        // still predate this record; it then carries no claim until
+        // restamped.
+        self.record_startup_claim();
         self.refuse_unready_exec_stop()?;
+        self.refuse_unmonitored_startup_if_required()?;
         // Before stdin is read or any backend is probed, so a backend that
         // cannot even start here gets the same verdict, and before
         // `--dap-listen` binds its port and starts the run it supervises.
@@ -14313,6 +14549,175 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Whether this run starts the guest through the in-guest `LD_PRELOAD`
+    /// route, where the guest's dynamic loader and constructors run before
+    /// Detcore is armed, so guest startup is unmonitored rather than
+    /// intercepted from the first instruction (likewise for each program
+    /// the guest later execs, which starts the same way). The exec-stop
+    /// loader route (`in_guest_exec_stop`; its own admission is
+    /// [`Self::refuse_unready_exec_stop`]) and the native-exec domain (which
+    /// uses its embedded catalog, not the ordinary preload) are not this
+    /// route, and neither is any backend outside the in-guest LiteInst pair.
+    /// `--namespace-only` runs no backend at all, so it is not this route
+    /// either ([`Self::uses_in_guest_liteinst`] already excludes it); strict
+    /// mode still refuses it, through the allowlist below.
+    fn starts_via_preload_route(&self) -> bool {
+        self.uses_in_guest_liteinst() && !self.in_guest_exec_stop && !self.uses_native_exec()
+    }
+}
+
+/// The first-instruction allowlist over one route's facts, separated
+/// from `RunOpts` so the native-exec case is testable in builds without
+/// the `native-exec` feature (no `RunOpts` there can carry
+/// `uses_native_exec == true`). The native-exec domain is never an
+/// allowlisted route, whatever else is set: it is not known to intercept
+/// from the first instruction, so even `--in-guest-exec-stop` beside it
+/// must not produce a monitored claim.
+fn intercepts_from_first_instruction_for(
+    backend: Backend,
+    namespace_only: bool,
+    has_application_backend: bool,
+    uses_native_exec: bool,
+    in_guest_exec_stop: bool,
+) -> bool {
+    if namespace_only || has_application_backend || uses_native_exec {
+        return false;
+    }
+    match backend {
+        Backend::Ptrace | Backend::Kvm => true,
+        Backend::InGuestTrap => in_guest_exec_stop,
+        Backend::Liteinst => false,
+    }
+}
+
+/// The startup claim for one route, from its two route facts: the single
+/// mapping `RunOpts::startup_unmonitored_claim` (and so every report)
+/// uses. Separated so the native-exec case (`false`, `false` -> `None`,
+/// never a monitored claim) is testable in builds without the
+/// `native-exec` feature, where no `RunOpts` can carry those inputs.
+fn startup_unmonitored_claim_for(
+    starts_via_preload_route: bool,
+    intercepts_from_first_instruction: bool,
+) -> Option<bool> {
+    if starts_via_preload_route {
+        Some(true)
+    } else if intercepts_from_first_instruction {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+impl RunOpts {
+    /// The three-way startup claim every report of this run carries: the
+    /// single source the verify JSON stamp, the `--verify-run` record and
+    /// (through `Config::startup_unmonitored`, set on the matching dispatch
+    /// paths in `lib.rs`) the run summary all state. `Some(true)` on the
+    /// preload route, `Some(false)` only on an allowlisted
+    /// first-instruction route, `None` (no claim) on any other route, so
+    /// an unproven route is never reported as monitored.
+    pub(crate) fn startup_unmonitored_claim(&self) -> Option<bool> {
+        startup_unmonitored_claim_for(
+            self.starts_via_preload_route(),
+            self.intercepts_from_first_instruction(),
+        )
+    }
+
+    /// Record this run's startup claim for the reports this process writes,
+    /// when it makes one. An unproven route records nothing, so its
+    /// reports carry no claim rather than a monitored one.
+    fn record_startup_claim(&self) {
+        if let Some(unmonitored) = self.startup_unmonitored_claim() {
+            crate::app::verify::record_startup_unmonitored(unmonitored);
+        }
+    }
+
+    /// The allowlist for `--require-first-instruction`: whether this run's
+    /// route is positively known to intercept the guest from its first
+    /// instruction. Only these routes carry that evidence today: `ptrace`
+    /// (the tracer stops the guest at exec), `kvm` (the hypervisor starts
+    /// the guest), and the admitted exec-stop loader route on
+    /// `in-guest-trap`. Everything else is refused by name under strict
+    /// mode rather than admitted on no evidence: the `LD_PRELOAD` route,
+    /// `--namespace-only` (no instrumentation backend at all), application
+    /// (adapter) backends, and the native-exec domain, whose initial-image
+    /// interception is not established here.
+    fn intercepts_from_first_instruction(&self) -> bool {
+        intercepts_from_first_instruction_for(
+            self.selected_backend(),
+            self.namespace_only,
+            self.application_backend.is_some(),
+            self.uses_native_exec(),
+            self.in_guest_exec_stop,
+        )
+    }
+
+    /// The notice a preload-route run prints so that its unmonitored startup
+    /// is stated plainly, with the first-instruction remedy. `None` on every
+    /// other route, whose startup claim needs no such qualification, and
+    /// for `--hb-list-events`, which starts no guest (as the sibling
+    /// `small_max_timeslice_notice` excludes it).
+    pub(crate) fn unmonitored_startup_notice(&self) -> Option<String> {
+        if self.hb_list_events {
+            return None;
+        }
+        self.starts_via_preload_route().then(|| {
+            format!(
+                "WARNING: --backend={} starts the guest through LD_PRELOAD: the guest's \
+                 dynamic loader and constructors run before Detcore is armed, so guest \
+                 startup is unmonitored (not intercepted from the first instruction), \
+                 and likewise for each program the guest later execs. \
+                 For first-instruction interception use --backend=in-guest-trap \
+                 --in-guest-exec-stop with the packaged private runtime, or pass \
+                 --require-first-instruction to refuse unmonitored startup.\n",
+                self.selected_backend().as_str()
+            )
+        })
+    }
+
+    /// `--require-first-instruction`: refuse, before launch, any run whose
+    /// route is not on the first-instruction allowlist
+    /// ([`Self::intercepts_from_first_instruction`]), naming the route and
+    /// the remedies. An unadmitted `--in-guest-exec-stop` request is
+    /// refused earlier by [`Self::refuse_unready_exec_stop`] with its own
+    /// remedy.
+    pub(crate) fn refuse_unmonitored_startup_if_required(&self) -> Result<(), Error> {
+        if !self.require_first_instruction || self.intercepts_from_first_instruction() {
+            return Ok(());
+        }
+        let route = if self.namespace_only {
+            "--namespace-only runs the guest with no instrumentation backend".to_string()
+        } else if let Some(application) = self.application_backend {
+            format!(
+                "the {application} application backend is not known to intercept \
+                 the guest from its first instruction"
+            )
+        } else if self.uses_native_exec() {
+            "the native-exec domain is not known to intercept the guest \
+             from its first instruction"
+                .to_string()
+        } else if self.starts_via_preload_route() {
+            format!(
+                "--backend={} would start the guest through LD_PRELOAD, so its \
+                 dynamic loader and constructors would run before Detcore is armed",
+                self.selected_backend().as_str()
+            )
+        } else {
+            format!(
+                "--backend={} is not known to intercept the guest from its \
+                 first instruction",
+                self.selected_backend().as_str()
+            )
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "--require-first-instruction: startup-unmonitored: {route}; use \
+             --backend=in-guest-trap --in-guest-exec-stop with the packaged \
+             private runtime, use a backend that intercepts from the first \
+             instruction (such as --backend=ptrace), or drop \
+             --require-first-instruction"
+        )))
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter, ())
     }
@@ -14722,6 +15127,11 @@ impl RunOpts {
         // remains mandatory after program/config validation and before either
         // physical run; an adjacent preload cannot establish its availability.
         self.install_pmu_config()?;
+        // Before the pending-report rewrite below, so even a run the strict
+        // counter check refuses leaves a pending report that states its
+        // startup route (`startup_unmonitored` on every report this process
+        // writes from here on).
+        self.record_startup_claim();
         // After the PMU configuration, which Reverie's validation reads, and
         // before every check below that can still refuse the run: the pending
         // report is rewritten with the verdict, so that a run refused here,
@@ -14738,6 +15148,13 @@ impl RunOpts {
         // every check below that can still refuse the run, like the warning
         // above, so the cost is stated once whatever happens next.
         if let Some(notice) = self.small_max_timeslice_notice(installed_skid_margin) {
+            crate::app::tracing::write_stderr_diagnostic(&notice);
+        }
+        // With the notices above, before every check below that can still
+        // refuse the run, so an unmonitored startup is stated once whatever
+        // happens next (the verdict itself was recorded above, before the
+        // pending-report rewrite).
+        if let Some(notice) = self.unmonitored_startup_notice() {
             crate::app::tracing::write_stderr_diagnostic(&notice);
         }
         // The KVM backend reaches real reverie-kvm code from its dispatch path
@@ -14905,6 +15322,7 @@ impl RunOpts {
         self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
+        self.refuse_unmonitored_startup_if_required()?;
         self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
@@ -17360,6 +17778,10 @@ impl RunOpts {
         #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
         self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_unready_exec_stop()?;
+        // Beside it, so the strict first-instruction refusal holds for
+        // in-process callers (analyze/bisect trials) too, not only through
+        // the CLI entry's validation.
+        self.refuse_unmonitored_startup_if_required()?;
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_exclusive_rewrite_in_an_image()?;
         self.refuse_an_invalid_replayed_record()?;
@@ -18353,6 +18775,7 @@ impl RunOpts {
             passthru_opt: self.det_opts.det_config.passthru_opt,
             epoch: self.epoch_rfc3339(),
             exact_branch_counter,
+            startup_unmonitored: self.startup_unmonitored_claim(),
             dbt,
             role: verify_run::RunRole::Run,
             outcome,
@@ -21617,6 +22040,11 @@ impl RunOpts {
             detcore::detlog::set_forwarded_source(receiver, log.record_sink());
             let policy = hermit::in_guest_detlog_forward_policy_for_native();
             let mut config = hermit::prepare_in_guest_loader_route_config(config)?;
+            // The loader-route preparation records a monitored startup,
+            // but the native-exec domain is not known to intercept from
+            // the first instruction: take the CLI claim as the single
+            // source (None here), so no report calls this startup monitored.
+            config.startup_unmonitored = self.startup_unmonitored_claim();
             config.in_guest_detlog_forward_policy = Some(policy.encode());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

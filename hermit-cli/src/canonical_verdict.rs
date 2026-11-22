@@ -464,6 +464,15 @@ pub struct VerificationReport {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_branch_counter: Option<BranchCounterVerdict>,
+    /// Whether the compared runs started through the in-guest `LD_PRELOAD`
+    /// route, where the guest's dynamic loader and constructors run before
+    /// Detcore is armed, so guest startup was unmonitored rather than
+    /// intercepted from the first instruction. `Some(true)` states that
+    /// plainly; `Some(false)` states the runs did not take that route.
+    /// Absent when the producer recorded no startup-route verdict, and in a
+    /// report written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_unmonitored: Option<bool>,
     /// aarch64: the store-exclusives that failed in a diverged comparison,
     /// with the load/store-exclusive loops either run could still retry. A
     /// failed store-exclusive runs its loop again, or sends a weak
@@ -577,6 +586,7 @@ impl VerificationReport {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            startup_unmonitored: None,
             store_exclusive_retries: None,
         }
     }
@@ -1391,6 +1401,7 @@ mod tests {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            startup_unmonitored: None,
             store_exclusive_retries: None,
         }
     }

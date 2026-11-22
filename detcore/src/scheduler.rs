@@ -24597,6 +24597,8 @@ impl Scheduler {
                 replay_departure: self.replay_departure.clone(),
                 // GlobalState records the effective run configuration.
                 preemption: None,
+                // GlobalState records the startup route from the config.
+                startup_unmonitored: None,
                 post_crash: None,
                 property_snapshot: None,
                 // GlobalState knows what the accounting point could not see

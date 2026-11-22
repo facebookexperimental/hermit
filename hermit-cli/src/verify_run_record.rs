@@ -69,6 +69,15 @@ pub struct VerifyRunRecord {
     /// on a backend that reads that counter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_branch_counter: Option<BranchCounterVerdict>,
+    /// Whether this run's guest startup was unmonitored
+    /// (`VerificationReport::startup_unmonitored`): `Some(true)` for the
+    /// in-guest `LD_PRELOAD` route, `Some(false)` only for a route known
+    /// to intercept from the first instruction, `None` for no claim.
+    /// Carried per run so a split comparison (`hermit log-diff`) can state
+    /// the pair's startup route without re-deriving it. Absent in records
+    /// written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_unmonitored: Option<bool>,
     /// What the DBT backend's comparison reads besides the log, for a DBT run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dbt: Option<DbtRunRecord>,

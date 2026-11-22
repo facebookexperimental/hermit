@@ -3514,6 +3514,9 @@ impl AnalyzeOpts {
         {
             crate::app::tracing::write_stderr_diagnostic(&notice);
         }
+        if let Some(notice) = self.trial_unmonitored_startup_notice() {
+            crate::app::tracing::write_stderr_diagnostic(&notice);
+        }
         // `--run1-schedule` and `--run2-schedule` parse but have no
         // implementation. Refuse them before any workspace or trial, rather
         // than panicking here.

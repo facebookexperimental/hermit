@@ -1040,6 +1040,9 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
         exact_branch_counter: None,
+        // Stamped from the recorded startup route at write time
+        // (`with_startup_unmonitored`), like `exact_branch_counter` above.
+        startup_unmonitored: None,
         // Only a divergence names a cause (`store_exclusive_retries`).
         store_exclusive_retries: outcome
             .store_exclusive_retries
@@ -1071,6 +1074,45 @@ fn with_exact_branch_counter(
     let mut report = report.clone();
     if report.exact_branch_counter.is_none() {
         report.exact_branch_counter = recorded.cloned();
+    }
+    report
+}
+
+/// The `startup_unmonitored` verdict every verification report this process
+/// writes carries, once [`record_startup_unmonitored`] has run.
+static STARTUP_UNMONITORED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record, once per process, whether this process's runs start through the
+/// in-guest `LD_PRELOAD` route (guest startup unmonitored), so that every
+/// verification report this process writes from then on carries it
+/// ([`write_report_json`]). Called by `hermit run` at dispatch, before its
+/// launch refusals, and again in validation; a report written before the
+/// first record (an entry pending stamp) carries no claim (`None`), never
+/// a false one, until a later write restamps it.
+pub(crate) fn record_startup_unmonitored(unmonitored: bool) {
+    // First set wins for the process (every run of one process shares the
+    // route). A later record that DISAGREES means an input was still
+    // unresolved at the first record - fail loudly in debug builds rather
+    // than silently keeping the stale value.
+    if let Some(recorded) = STARTUP_UNMONITORED.get() {
+        debug_assert_eq!(
+            *recorded, unmonitored,
+            "startup route changed after first record"
+        );
+        return;
+    }
+    let _ = STARTUP_UNMONITORED.set(unmonitored);
+}
+
+/// `report` with the recorded `startup_unmonitored` verdict (`recorded`),
+/// unless it already carries one.
+fn with_startup_unmonitored(
+    report: &VerificationReport,
+    recorded: Option<bool>,
+) -> VerificationReport {
+    let mut report = report.clone();
+    if report.startup_unmonitored.is_none() {
+        report.startup_unmonitored = recorded;
     }
     report
 }
@@ -1525,9 +1567,26 @@ fn staging_directory(path: &Path) -> &Path {
 }
 
 pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
+    write_report_json_recorded(
+        path,
+        report,
+        EXACT_BRANCH_COUNTER.get(),
+        STARTUP_UNMONITORED.get().copied(),
+    )
+}
+
+/// [`write_report_json`] with the recorded verdicts supplied, so tests can
+/// exercise the stamping write path without the process-wide records.
+fn write_report_json_recorded(
+    path: &Path,
+    report: &VerificationReport,
+    recorded_branch_counter: Option<&BranchCounterVerdict>,
+    recorded_startup_unmonitored: Option<bool>,
+) -> Result<(), Error> {
     use std::io::Write as _;
 
-    let report = with_exact_branch_counter(report, EXACT_BRANCH_COUNTER.get());
+    let report = with_exact_branch_counter(report, recorded_branch_counter);
+    let report = with_startup_unmonitored(&report, recorded_startup_unmonitored);
     let json = serde_json::to_string(&report)?;
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.
@@ -3114,6 +3173,44 @@ mod tests {
             with_exact_branch_counter(&carrying, Some(&recorded)).exact_branch_counter,
             Some(own)
         );
+    }
+
+    #[test]
+    fn a_recorded_startup_route_is_stamped_on_every_report_once() {
+        // Nothing recorded: the report is written as built (no claim).
+        let report = VerificationReport::no_result();
+        assert_eq!(with_startup_unmonitored(&report, None), report);
+        // Recorded: every report states the startup route plainly, the
+        // pending no-result stamp included.
+        let stamped = with_startup_unmonitored(&report, Some(true));
+        assert_eq!(stamped.startup_unmonitored, Some(true));
+        let stamped = with_startup_unmonitored(&report, Some(false));
+        assert_eq!(stamped.startup_unmonitored, Some(false));
+        // A report that already carries a verdict keeps its own.
+        let mut carrying = VerificationReport::no_result();
+        carrying.startup_unmonitored = Some(true);
+        assert_eq!(
+            with_startup_unmonitored(&carrying, Some(false)).startup_unmonitored,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_written_report_carries_the_recorded_startup_route_in_its_json() {
+        // Through the real write path: the recorded verdict lands in the
+        // file's JSON and reads back. Removing the stamping call from
+        // write_report_json_recorded fails this test.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verdict.json");
+        write_report_json_recorded(&path, &VerificationReport::no_result(), None, Some(true))
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("\"startup_unmonitored\":true"),
+            "the written report states its startup route: {written}"
+        );
+        let parsed: VerificationReport = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(parsed.startup_unmonitored, Some(true));
     }
 
     fn classified_container<T: serde::Serialize + serde::de::DeserializeOwned>(

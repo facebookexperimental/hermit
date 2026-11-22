@@ -4042,6 +4042,9 @@ pub fn prepare_in_guest_loader_route_config(
 ) -> Result<DetConfig, sleep_registration_admission::UnreadableSleeperSignalState> {
     let mut config = prepare_backend_config(config, Backend::InGuestTrap);
     config.in_guest_site_patching_off = true;
+    // The loader route starts Detcore before the guest's first
+    // instruction: startup is monitored, and reports say so.
+    config.startup_unmonitored = Some(false);
     sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     Ok(config)
 }
@@ -4487,6 +4490,11 @@ async fn dispatch_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
+    // Ptrace and KVM intercept from the first instruction; the in-guest
+    // branch below records its own (unmonitored) claim.
+    if matches!(backend, Backend::Ptrace | Backend::Kvm) {
+        config.startup_unmonitored = Some(false);
+    }
     if backend == Backend::Kvm {
         return Ok(run_kvm(
             &command,
@@ -4504,6 +4512,11 @@ async fn dispatch_backend(
         {
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
+            // This dispatch is the LD_PRELOAD route (the loader route
+            // launches without reaching here): guest startup is unmonitored
+            // until the in-guest runtime arms Detcore, and every run report
+            // must say so. Set on the config every Tool image receives,
+            // below with its sibling in-guest fields.
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
@@ -4517,6 +4530,7 @@ async fn dispatch_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.startup_unmonitored = Some(true);
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
@@ -4885,6 +4899,9 @@ async fn dispatch_output_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
+    if matches!(backend, Backend::Ptrace | Backend::Kvm) {
+        config.startup_unmonitored = Some(false);
+    }
     if backend == Backend::Kvm {
         return run_kvm(
             &command,
@@ -4901,6 +4918,9 @@ async fn dispatch_output_backend(
         {
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
+            // As in dispatch_backend: this is the LD_PRELOAD route, so the
+            // config every Tool image receives records the unmonitored
+            // startup for every run report.
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
@@ -4914,6 +4934,7 @@ async fn dispatch_output_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.startup_unmonitored = Some(true);
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);

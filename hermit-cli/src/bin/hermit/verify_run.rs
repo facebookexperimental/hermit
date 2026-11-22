@@ -66,6 +66,7 @@ use super::verify::SignalTerminationReports;
 use super::verify::container_failed_report;
 use super::verify::emit_compared_guest_output;
 use super::verify::record_exact_branch_counter;
+use super::verify::record_startup_unmonitored;
 use super::verify::run_failed_report;
 use super::verify::verification_runtime_from_summaries;
 use super::verify::write_pending_verification_json;
@@ -380,6 +381,27 @@ pub(super) fn compare_for_adapter<A: super::backend_hook::BackendAdapter>(
     )
 }
 
+/// The pair's startup claim from its two records: `Some(true)` when at
+/// least one record states an unmonitored startup and neither states a
+/// monitored one; `Some(false)` only when BOTH state monitored, so a
+/// record with no claim (`None`, an older producer) can never turn into
+/// a false monitored claim for the pair; `None` when neither record
+/// claims unmonitored and at least one makes no claim. Two records that
+/// positively disagree are refused (`Err` carries both values).
+fn pair_startup_unmonitored(
+    first: Option<bool>,
+    second: Option<bool>,
+) -> Result<Option<bool>, (bool, bool)> {
+    match (first, second) {
+        (Some(true), Some(false)) | (Some(false), Some(true)) => {
+            Err((first.unwrap(), second.unwrap()))
+        }
+        (Some(true), _) | (_, Some(true)) => Ok(Some(true)),
+        (Some(false), Some(false)) => Ok(Some(false)),
+        _ => Ok(None),
+    }
+}
+
 fn compare_with_application(
     directories: [&Path; 2],
     verify_json: Option<&Path>,
@@ -517,6 +539,27 @@ fn compare_with_application(
             record2.comparison,
             record2.passthru_opt,
         );
+    }
+    // The pair's startup route, restamped like `exact_branch_counter`
+    // above: the comparing process ran neither guest, so the records are
+    // its only evidence. Two records that disagree were not run alike in
+    // the way the report states, so they are not compared.
+    let startup_unmonitored =
+        pair_startup_unmonitored(record1.startup_unmonitored, record2.startup_unmonitored)
+            .map_err(|(first, second)| {
+                anyhow::anyhow!(
+                    "the two --verify-run directories disagree on whether guest startup was \
+             unmonitored ({} records startup_unmonitored={first}, {} records \
+             startup_unmonitored={second}), so they are not compared",
+                    directories[0].display(),
+                    directories[1].display()
+                )
+            })?;
+    if let Some(unmonitored) = startup_unmonitored {
+        record_startup_unmonitored(unmonitored);
+        if let Some(path) = verify_json {
+            write_pending_verification_json(path)?;
+        }
     }
     let summary2 = run2.summary();
 
@@ -907,6 +950,7 @@ mod tests {
             passthru_opt: false,
             epoch: "2026-01-01T00:00:00Z".to_owned(),
             exact_branch_counter: None,
+            startup_unmonitored: None,
             dbt: native.then_some(DbtRunRecord {
                 initialization_records: 1,
             }),
@@ -1160,6 +1204,7 @@ mod tests {
             passthru_opt: false,
             epoch: "2026-01-01T00:00:00Z".into(),
             exact_branch_counter: None,
+            startup_unmonitored: None,
             dbt: None,
             role: RunRole::Run,
             outcome: VerifyRunOutcome::Completed {
@@ -1202,6 +1247,7 @@ mod tests {
                 passthru_opt: false,
                 epoch: "2026-01-01T00:00:00Z".into(),
                 exact_branch_counter: None,
+                startup_unmonitored: None,
                 dbt: None,
                 role: RunRole::Run,
                 outcome: VerifyRunOutcome::Error {
@@ -1210,5 +1256,34 @@ mod tests {
             })
             .unwrap();
         assert!(VerifyRunDirectory::read(&directory).is_ok());
+    }
+
+    #[test]
+    fn pair_startup_claim_never_invents_a_monitored_startup() {
+        // Both monitored: the only way the pair claims monitored.
+        assert_eq!(
+            pair_startup_unmonitored(Some(false), Some(false)),
+            Ok(Some(false))
+        );
+        // A no-claim record beside a monitored one stays no claim - the
+        // pair must not stamp the silent run as monitored.
+        assert_eq!(pair_startup_unmonitored(Some(false), None), Ok(None));
+        assert_eq!(pair_startup_unmonitored(None, Some(false)), Ok(None));
+        assert_eq!(pair_startup_unmonitored(None, None), Ok(None));
+        // An unmonitored claim survives a silent partner.
+        assert_eq!(pair_startup_unmonitored(Some(true), None), Ok(Some(true)));
+        assert_eq!(
+            pair_startup_unmonitored(Some(true), Some(true)),
+            Ok(Some(true))
+        );
+        // A positive disagreement is refused, carrying both values.
+        assert_eq!(
+            pair_startup_unmonitored(Some(true), Some(false)),
+            Err((true, false))
+        );
+        assert_eq!(
+            pair_startup_unmonitored(Some(false), Some(true)),
+            Err((false, true))
+        );
     }
 }

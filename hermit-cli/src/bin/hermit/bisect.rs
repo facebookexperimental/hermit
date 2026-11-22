@@ -191,6 +191,9 @@ impl BisectOpts {
         {
             crate::app::tracing::write_stderr_diagnostic(&notice);
         }
+        if let Some(notice) = analyzer.trial_unmonitored_startup_notice() {
+            crate::app::tracing::write_stderr_diagnostic(&notice);
+        }
 
         // A schedule of a format this Hermit does not read is refused before
         // anything else is read from either, as a policy refusal: main's

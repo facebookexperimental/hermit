@@ -310,6 +310,17 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preemption: Option<PreemptionSummary>,
 
+    /// Whether the run's guest startup was unmonitored
+    /// (`Config::startup_unmonitored`): `Some(true)` for the in-guest
+    /// `LD_PRELOAD` route, whose dynamic loader and constructors ran
+    /// before Detcore was armed; `Some(false)` only for a route known to
+    /// intercept from the first instruction; absent (`None`, no claim)
+    /// for any other route, older summaries, or producers that did not
+    /// record it. Like `preemption`, shown in the full report but not the
+    /// INFO guest-behavior view used by `--verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_unmonitored: Option<bool>,
+
     /// The post-crash timeslice switch, when the run had it on
     /// (`Config::post_crash_timeslice`). Shown in the full report, but not
     /// the INFO guest-behavior view used by `--verify`.
@@ -911,6 +922,7 @@ impl RunSummary {
             timeslice_stats,
             per_thread_timeslice,
             preemption,
+            startup_unmonitored,
             post_crash,
             property_snapshot,
             dispatch_stats: _,
@@ -986,6 +998,14 @@ impl RunSummary {
 
         if include_report_metadata && let Some(preemption) = preemption {
             writeln!(f, "{preemption}")?;
+        }
+        if include_report_metadata && *startup_unmonitored == Some(true) {
+            writeln!(
+                f,
+                "Guest startup was unmonitored: the run started through LD_PRELOAD, \
+                 so the guest's dynamic loader and constructors ran before Detcore \
+                 was armed (not intercepted from the first instruction)."
+            )?;
         }
         if include_report_metadata && let Some(guest_ids) = guest_ids {
             writeln!(f, "Guest process IDs: {guest_ids}")?;
