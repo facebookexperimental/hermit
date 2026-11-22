@@ -41,6 +41,7 @@
     "selftest.validate_rs",
     "selftest.manifest_cli",
     "selftest.core_build",
+    "selftest.verify_submodules",
     "check.gvisor_vendoring",
     "check.linuxemu_graph",
     "check.linuxemu_unsafe"

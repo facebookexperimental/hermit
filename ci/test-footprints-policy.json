@@ -407,6 +407,11 @@
       "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
       "paths": ["ci/run-with-core-build-test.sh", "ci/run-with-core-build.sh"],
       "nodes": ["quick-super-selftest.core_build"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["ci/verify-submodules.sh"],
+      "nodes": ["quick-super-selftest.verify_submodules"]
     }
   ],
   "backend_rules": [

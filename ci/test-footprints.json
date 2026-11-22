@@ -1017,6 +1017,15 @@
         "ci/run-with-core-build-test.sh",
         "ci/run-with-core-build.sh"
       ]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "nodes": [
+        "quick-super-selftest.verify_submodules"
+      ],
+      "paths": [
+        "ci/verify-submodules.sh"
+      ]
     }
   ],
   "force_full": [
@@ -1045,6 +1054,7 @@
       "quick-super-selftest.scorecard",
       "quick-super-selftest.scorecard_commands",
       "quick-super-selftest.validate_rs",
+      "quick-super-selftest.verify_submodules",
       "quick-super-setup.manifest_plan",
       "quick-super-setup.manifest_plan_in_pinned_root",
       "quick-super-setup.nextest",
@@ -1092,6 +1102,7 @@
       "quick-super-selftest.scorecard",
       "quick-super-selftest.scorecard_commands",
       "quick-super-selftest.validate_rs",
+      "quick-super-selftest.verify_submodules",
       "quick-super-setup.manifest_plan",
       "quick-super-setup.manifest_plan_in_pinned_root",
       "quick-super-setup.nextest",

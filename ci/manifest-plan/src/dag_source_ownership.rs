@@ -204,6 +204,21 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         ],
         populations: &[],
     },
+    // ci/verify-submodules.sh's self-test, moved out of pre.submodules (the
+    // root of every lane's critical path) into its own tool self-test leaf,
+    // with its generated quick/super twin.
+    ExtensionNode {
+        tag: "selftest.verify_submodules",
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &["gate.manifest", "pre.reverie_pin"],
+        populations: &[],
+    },
+    ExtensionNode {
+        tag: "quick-super-selftest.verify_submodules",
+        labels: &["quick", "super"],
+        deps: &["pre.reverie_pin", "quick-super-gate.manifest"],
+        populations: &[],
+    },
 ];
 
 /// Tags admitted by `extension`, after validating it against `source`.

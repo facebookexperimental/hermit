@@ -796,6 +796,17 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         rss_baseline_bytes: 2147483648,
         inner_jobs: 2,
     },
+    ToolSelfTestNode {
+        name: "verify_submodules",
+        desc: "Submodule verifier self-test",
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest verify_submodules"########,
+        description: r########"TOOL SELF-TEST NODE 2026-11-21: runs `ci/verify-submodules.sh --self-test` through `test-harness selftest verify_submodules`. On scratch repositories it proves the checker accepts ordinary populated repositories and empty nested update=none directories, and refuses missing, foreign, wrong-HEAD, dirty, conflicted, symlinked, undeclared, malformed, unreadable, ambiguous-policy and nonempty update=none states without repairing them. It tests the checker, not this tree, so it is a leaf after gate.manifest and no node depends on it; a failure still turns the validation red. It used to run in front of the check inside pre.submodules, the root of every lane's critical path. MEASURED 2026-11-21 on the host recorded in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), Hermit e5732acc483d, load average 185-250 on 316 CPUs, with the telemetry git wrapper first on PATH: 86.34 s wall and 71.99 CPU seconds (10.77 user, 61.22 system) in the slowest of three runs, 38.58 s wall and 36.63 CPU seconds in the fastest; 35.00 s wall and 31.43 CPU seconds with stock git first on PATH; largest process RSS 10228 KiB. Inside the DAG the whole former pre.submodules node took 86.58 s, of which the check itself is 2.7 s. Bounds: 300 s wall (the next 300-second bucket above 1.5 times 86.34 s), 180 CPU seconds (2.5 times 71.99, because the wrapper's system time grows with host load), and the 2-GiB memory pre.submodules had."########,
+        timeout: 300,
+        cpu_timeout: 180,
+        memory_bytes: 2147483648,
+        rss_baseline_bytes: 2147483648,
+        inner_jobs: 1,
+    },
 ];
 
 const STATIC_STEPS: &[StaticStepSpec] = &[
@@ -803,7 +814,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"pre"########,
         job: r########"submodules"########,
         desc: r########"Verify repository submodules without initializing or repairing them"########,
-        description: r########"Checks that every gitlink HEAD records (third-party/rr, agent-utils and reverie, recursively) is declared in .gitmodules and agrees with its index entry. Ordinary entries must be their own populated repositories at exactly the recorded commit with clean worktrees. A nested entry with exactly one update=none declaration in .gitmodules instead requires an existing, completely empty directory, including no hidden files or .git. Missing directories, any content under nested update=none, ambiguous policies, failed policy or directory reads, and top-level or mutable local-config exemptions are refused. ci/verify-submodules.sh first self-tests these cases and its existing refusals (non-repository, wrong HEAD, dirty, conflicted, symlinked, undeclared, unsafe path) on scratch repositories, and never initializes, updates or registers a submodule. Every build and test reads these checkouts, so this keeps the validation on the sources the commit records. A reverie checkout left at an older commit is refused with "submodule HEAD differs from recorded gitlink"; a stray untracked file inside agent-utils is refused as a dirty worktree."########,
+        description: r########"Checks that every gitlink HEAD records (third-party/rr, agent-utils and reverie, recursively) is declared in .gitmodules and agrees with its index entry. Ordinary entries must be their own populated repositories at exactly the recorded commit with clean worktrees. A nested entry with exactly one update=none declaration in .gitmodules instead requires an existing, completely empty directory, including no hidden files or .git. Missing directories, any content under nested update=none, ambiguous policies, failed policy or directory reads, and top-level or mutable local-config exemptions are refused. ci/verify-submodules.sh never initializes, updates or registers a submodule. Every build and test reads these checkouts, so this keeps the validation on the sources the commit records. A reverie checkout left at an older commit is refused with "submodule HEAD differs from recorded gitlink"; a stray untracked file inside agent-utils is refused as a dirty worktree. The checker's own self-test (these cases and its refusals of a non-repository, wrong HEAD, dirty, conflicted, symlinked, undeclared and unsafe path, on scratch repositories) runs in the leaf node selftest.verify_submodules, not here: this node is the root of every lane's critical path, and on 2026-11-21 the self-test took 86.3 s wall (72 CPU s) of it against 2.7 s for the check itself."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -811,7 +822,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"quick"########,
             r########"super"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-submodules.sh"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

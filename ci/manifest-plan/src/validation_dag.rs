@@ -252,6 +252,18 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         run_when_changed: None,
         manifest_plan_helper: false,
     },
+    // ci/verify-submodules.sh's refusal cases on scratch repositories. It
+    // tests the checker, not the tree, so it gates nothing; it used to run in
+    // front of the check inside pre.submodules, the root of every lane's
+    // critical path, where it took 86.3 s wall of that node's ~89 s
+    // (2026-11-21). pre.submodules now runs only the check.
+    ToolSelfTest {
+        name: "verify_submodules",
+        program: "ci/verify-submodules.sh",
+        args: &["--self-test"],
+        run_when_changed: None,
+        manifest_plan_helper: false,
+    },
 ];
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
