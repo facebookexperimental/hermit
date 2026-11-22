@@ -468,7 +468,7 @@ buck_genrule(
     + " && cp $(location :hermit) $OUT/hermit"
     + " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.so $OUT/rsrcs/libdetcore_liteinst.so"
     + " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.package.json $OUT/rsrcs/libdetcore_liteinst.package.json"
-    + " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload[cdylib]) $OUT/rsrcs/libreverie_liteinst.so"
+    + " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload-stripped) $OUT/rsrcs/libreverie_liteinst.so"
     + " && cp $(location //hermetic_infra/hermit:reverie-liteinst-revision) $OUT/rsrcs/libreverie_liteinst.so.revision",
     # GATED OFF until D1c qualifies the Buck-built runtime bytes against
     # the fixed liteinst-runtime build: ci.skip_target() excludes this
