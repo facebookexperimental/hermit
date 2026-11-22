@@ -1118,6 +1118,11 @@ struct Args {
     force_full: bool,
     baseline: Option<String>,
     allow_local_off_the_record_run: bool,
+    /// `--human-off-the-record`: the front door's human route. Implies
+    /// `allow_local_off_the_record_run` and lifts its narrowing rule, for a
+    /// caller the front door classifies as a human. See
+    /// [`local_off_the_record_refusal_with`].
+    human_off_the_record: bool,
     skip_inner_dirty_working_tree_and_rebase_freshness_checks: bool,
     ignore_cache: bool,
     label_pr: bool,
@@ -1164,6 +1169,10 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
+const HUMAN_OFF_THE_RECORD_OPTION: &str = "--human-off-the-record";
+/// The `make validate` front door, whose `--classify` mode is the one
+/// implementation of the agent-or-human routing decision.
+const FRONT_DOOR_SCRIPT: &str = "scripts/validate-front-door.sh";
 const FROZEN_RUN_OPTION: &str = "--frozen-run";
 const FAIL_FAST_OPTION: &str = "--fail-fast";
 /// The one node `--frozen-run` withholds, matched by exact tag. A frozen
@@ -1896,6 +1905,11 @@ fn usage() -> &'static str {
      \x20                  Permit a clean, commit-anchored quick or focused local run for\n\
      \x20                  iterative testing. It writes no ledger row, publishes no receipt,\n\
      \x20                  and cannot be cited as validation evidence.\n\
+     \x20 --human-off-the-record\n\
+     \x20                  The human route of `make validate` (scripts/validate-front-door.sh):\n\
+     \x20                  --allow-local-off-the-record-run at ANY level, the full profile\n\
+     \x20                  included, for a caller that front door classifies as a human.\n\
+     \x20                  Refused for an agent caller. Routing, not a security boundary.\n\
      \x20 --frozen-run     Set by `ci-hub validate-run --frozen-validate` only. Withholds\n\
      \x20                  check.canonical_adapter_accept, which needs the dev-hermit\n\
      \x20                  parent, as an intentional skip (never a pass). Refused without\n\
@@ -2078,6 +2092,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
         baseline: None,
         allow_local_off_the_record_run: false,
+        human_off_the_record: false,
         skip_inner_dirty_working_tree_and_rebase_freshness_checks: env_flag(
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV,
             "1",
@@ -2240,6 +2255,11 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--all" | "--full-run" => args.force_full = true,
             ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION => {
                 args.allow_local_off_the_record_run = true;
+                args.label_pr = false;
+            }
+            HUMAN_OFF_THE_RECORD_OPTION => {
+                args.allow_local_off_the_record_run = true;
+                args.human_off_the_record = true;
                 args.label_pr = false;
             }
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION => {
@@ -12908,17 +12928,83 @@ fn frozen_run_admission_refusal(
     }
 }
 
+/// The front door's routing decision about who is calling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerClass {
+    Agent(String),
+    Human(String),
+}
+
+/// Ask the front door (`scripts/validate-front-door.sh --classify`) to classify
+/// this process's caller. The script is the single implementation of the
+/// decision; the driver re-asks rather than trusting its flag.
+fn front_door_classify() -> Result<CallerClass, String> {
+    let script = repo_root().join(FRONT_DOOR_SCRIPT);
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg("--classify")
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --classify exited {}",
+            script.display(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".into(), |code| code.to_string())
+        ));
+    }
+    parse_caller_class(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_caller_class(stdout: &str) -> Result<CallerClass, String> {
+    let line = stdout.lines().next().unwrap_or_default().trim();
+    match line.split_once(' ') {
+        Some(("agent", reason)) => Ok(CallerClass::Agent(reason.to_string())),
+        Some(("human", reason)) => Ok(CallerClass::Human(reason.to_string())),
+        _ => Err(format!("unrecognized classification {line:?}")),
+    }
+}
+
 /// A local off-the-record run is an iteration tool, not a cheaper publication
 /// path. It therefore requires an explicitly narrowed profile; full-cost
 /// validation and every publishable result stay in ci-hub. It may run on a
 /// dirty tree: it publishes nothing, and reproducing a fix before committing it
 /// is what it is for.
+///
+/// The one exception is the front door's human route (owner, Slack 7286-7287,
+/// 2026-11-21): a human at a terminal gets the FULL validate in place, still
+/// off the record. `--human-off-the-record` asks for it, and the front door's
+/// classifier must agree that the caller is not an agent.
 fn local_off_the_record_refusal(args: &Args) -> Option<String> {
+    local_off_the_record_refusal_with(args, &mut front_door_classify)
+}
+
+fn local_off_the_record_refusal_with(
+    args: &Args,
+    classify: &mut dyn FnMut() -> Result<CallerClass, String>,
+) -> Option<String> {
     if !args.allow_local_off_the_record_run {
         return None;
     }
     if args.show_plan {
         return None;
+    }
+    if args.human_off_the_record {
+        return match classify() {
+            Ok(CallerClass::Human(_)) => None,
+            Ok(CallerClass::Agent(reason)) => Some(format!(
+                "validate: REFUSED — {HUMAN_OFF_THE_RECORD_OPTION} is the human route of \
+                 `make validate`, and this caller is an agent ({reason}).\n\
+                 Agents validate through `ci-hub validate-run`; quick or focused iteration \
+                 stays available with {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION}."
+            )),
+            Err(error) => Some(format!(
+                "validate: REFUSED — {HUMAN_OFF_THE_RECORD_OPTION} needs the front door's \
+                 caller classification, which failed: {error}"
+            )),
+        };
     }
     if args.focused.is_none() && args.level != Level::Quick && args.selected.is_none() {
         return Some(format!(
@@ -26218,10 +26304,120 @@ fn product_front_door_bracket() -> Result<(), String> {
         return Err("off-the-record quick run was incorrectly refused".into());
     }
 
+    human_off_the_record_bracket(&full)?;
+
     println!(
         "  product front door: publishing requires authority; quick/focused local iteration \
-         is off the record; full local forms and diagnostics bracketed"
+         is off the record; a front-door human may run full off the record, an agent may not; \
+         full local forms and diagnostics bracketed"
     );
+    Ok(())
+}
+
+/// The front door's human route: `--human-off-the-record` lifts the narrowing
+/// rule only when the classifier says human, refuses an agent and a failed
+/// classification, and is the only form that ever consults the classifier.
+fn human_off_the_record_bracket(plain_full: &Args) -> Result<(), String> {
+    let human_full = parse_argv(&[HUMAN_OFF_THE_RECORD_OPTION.into(), "full".into()])
+        .map_err(|code| format!("human off-the-record full form did not parse: exit {code}"))?;
+    if !human_full.allow_local_off_the_record_run
+        || !human_full.human_off_the_record
+        || human_full.label_pr
+    {
+        return Err(
+            "--human-off-the-record must imply the off-the-record run and disable labels".into(),
+        );
+    }
+    let mut asked = 0;
+    let mut human = || -> Result<CallerClass, String> {
+        asked += 1;
+        Ok(CallerClass::Human("no agent ancestor".into()))
+    };
+    if let Some(refusal) = local_off_the_record_refusal_with(&human_full, &mut human) {
+        return Err(format!(
+            "a front-door human's full run was refused: {refusal}"
+        ));
+    }
+    if asked != 1 {
+        return Err(format!(
+            "the human route consulted the classifier {asked} times, not once"
+        ));
+    }
+
+    let mut agent = || -> Result<CallerClass, String> {
+        Ok(CallerClass::Agent(
+            "agent ancestor process 7 is claude".into(),
+        ))
+    };
+    let refusal = local_off_the_record_refusal_with(&human_full, &mut agent)
+        .ok_or("an agent's --human-off-the-record full run was not refused")?;
+    if !refusal.contains("agent ancestor process 7 is claude")
+        || !refusal.contains("ci-hub validate-run")
+    {
+        return Err(format!(
+            "the agent refusal lost its reason or route: {refusal}"
+        ));
+    }
+
+    let mut broken =
+        || -> Result<CallerClass, String> { Err("planted classifier failure".to_string()) };
+    let refusal = local_off_the_record_refusal_with(&human_full, &mut broken)
+        .ok_or("a failed classification did not refuse the human route")?;
+    if !refusal.contains("planted classifier failure") {
+        return Err(format!(
+            "the failed-classification refusal lost its cause: {refusal}"
+        ));
+    }
+
+    // Every other form decides without the classifier: the narrowing rule
+    // still refuses a plain full run, and a plan display stays inert.
+    let mut never = || -> Result<CallerClass, String> {
+        Err("the classifier must not be consulted here".into())
+    };
+    let plain = local_off_the_record_refusal_with(plain_full, &mut never)
+        .ok_or("a plain off-the-record full run was not refused")?;
+    if !plain.contains("full-cost validate belongs in ci-hub") {
+        return Err(format!("the plain full refusal changed: {plain}"));
+    }
+    let human_plan = parse_argv(&[
+        HUMAN_OFF_THE_RECORD_OPTION.into(),
+        "full".into(),
+        "--show-plan".into(),
+    ])
+    .map_err(|code| format!("human off-the-record plan form did not parse: exit {code}"))?;
+    if let Some(refusal) = local_off_the_record_refusal_with(&human_plan, &mut never) {
+        return Err(format!(
+            "a human off-the-record plan display was refused: {refusal}"
+        ));
+    }
+
+    for (stdout, expected) in [
+        (
+            "agent environment marker CLAUDECODE is set\n",
+            Ok(CallerClass::Agent(
+                "environment marker CLAUDECODE is set".into(),
+            )),
+        ),
+        (
+            "human no agent ancestor, agent environment marker or herdr agent pane\n",
+            Ok(CallerClass::Human(
+                "no agent ancestor, agent environment marker or herdr agent pane".into(),
+            )),
+        ),
+        ("robot beep\n", Err(())),
+        ("", Err(())),
+    ] {
+        let parsed = parse_caller_class(stdout);
+        match (&parsed, &expected) {
+            (Ok(got), Ok(want)) if got == want => {}
+            (Err(_), Err(())) => {}
+            _ => return Err(format!("classification {stdout:?} parsed as {parsed:?}")),
+        }
+    }
+
+    // The real script answers through the real wiring. Which class it reports
+    // depends on who runs the self-test, so only the shape is pinned.
+    front_door_classify().map_err(|error| format!("the real front door: {error}"))?;
     Ok(())
 }
 
@@ -26419,7 +26615,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 }
             }
         }
-        Ok(())
+        human_flag_from_an_agent_process_case(&executable, &git_dir, &tmp)
     })();
 
     let cleanup = std::fs::remove_dir_all(&tmp).map_err(|error| {
@@ -26431,8 +26627,8 @@ fn product_front_door_process_bracket() -> Result<(), String> {
     match (result, cleanup) {
         (Ok(()), Ok(())) => {
             println!(
-                "  product front door process: full/focused/nested missing-authority runs refused \
-                 before validation state"
+                "  product front door process: full/focused/nested missing-authority runs, and an \
+                 agent's --human-off-the-record full run, refused before validation state"
             );
             Ok(())
         }
@@ -26442,6 +26638,86 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             Err(format!("{problem}; cleanup also failed: {cleanup_problem}"))
         }
     }
+}
+
+/// The human route through the real entry path: an agent that hands
+/// `--human-off-the-record` straight to the driver is refused by the front
+/// door's own classifier, here reached through an agent environment marker, so
+/// the outcome does not depend on who runs the self-test. The planted checkout
+/// carries the real `scripts/validate-front-door.sh`, which the driver runs as
+/// `--classify`, and the refusal must come before any validation state exists.
+fn human_flag_from_an_agent_process_case(
+    executable: &Path,
+    git_dir: &str,
+    tmp: &Path,
+) -> Result<(), String> {
+    let label = "human-flag-from-an-agent";
+    let parent = tmp.join(label);
+    let checkout = parent.join("hermit");
+    let script = checkout.join(FRONT_DOOR_SCRIPT);
+    let fail = |what: &str, error: std::io::Error| {
+        format!("front-door process bracket: {label}: {what}: {error}")
+    };
+    std::fs::create_dir_all(script.parent().expect("the front door lives in scripts/"))
+        .map_err(|error| fail("cannot create the planted checkout", error))?;
+    std::fs::create_dir_all(parent.join("ci-hub"))
+        .map_err(|error| fail("cannot create ci-hub/", error))?;
+    std::fs::write(
+        parent.join(".gitmodules"),
+        "[submodule \"hermit\"]\n\tpath = hermit\n\turl = self-test://unused\n",
+    )
+    .map_err(|error| fail("cannot write .gitmodules", error))?;
+    std::fs::copy(repo_root().join(FRONT_DOOR_SCRIPT), &script)
+        .map_err(|error| fail("cannot copy the front door", error))?;
+
+    let output = Command::new(executable)
+        .args([
+            HUMAN_OFF_THE_RECORD_OPTION,
+            "full",
+            SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
+        ])
+        .current_dir(&checkout)
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", &checkout)
+        .env("CLAUDECODE", "1")
+        .env_remove("HERMIT_VALIDATE_STOP_TEST_MODE")
+        .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
+        .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
+        .env_remove(PARENT_ENV)
+        .env_remove(TOOL_ROOT_ENV)
+        .env_remove(validate_runtime::ACTIVE_ENV)
+        .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
+        .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
+        .output()
+        .map_err(|error| fail("cannot launch the driver", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rendered = format!("{}{}", stdout, String::from_utf8_lossy(&output.stderr));
+    if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
+        || !rendered.contains(
+            "is the human route of `make validate`, and this caller is an agent \
+             (environment marker CLAUDECODE is set)",
+        )
+        || stdout.lines().last() != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+    {
+        return Err(format!(
+            "front-door process bracket: {label} escaped/refused incorrectly: status={:?} \
+             output={rendered}",
+            output.status.code()
+        ));
+    }
+    for unexpected in [
+        checkout.join("target/validation"),
+        checkout.join("ignored/validate"),
+        parent.join("ledger"),
+    ] {
+        if unexpected.exists() {
+            return Err(format!(
+                "front-door process bracket: {label} created side effect before refusal: {}",
+                unexpected.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.

@@ -121,9 +121,12 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
-# validation entrypoint.
-validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
-	./scripts/validate.rs --all $(ARGS)
+# validation entrypoint. The front door routes before anything compiles: inside
+# a dev-hermit parent it refuses an agent toward `ci-hub validate-run` and runs
+# a human's validate in place, off the record; it then runs verify-submodules
+# and scripts/validate.rs exactly as this target did (see its --help).
+validate: ## Run the full validation suite (agents are routed to ci-hub; pass flags via ARGS)
+	@SUBMODULE_GIT='$(SUBMODULE_GIT)' ./scripts/validate-front-door.sh -- --all $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -231,6 +234,7 @@ LINT_CHECK_TARGETS := \
     lint-check-checker-scheduling \
     lint-check-early-artifact-gate \
     lint-check-validate-refusal-predicate \
+    lint-check-validate-front-door \
     lint-check-audit-test-binary-registration \
     lint-check-shellcheck \
     lint-check-whitespace \
@@ -365,6 +369,9 @@ lint-check-early-artifact-gate:
 lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
 	python3 ./scripts/check-validate-refusal-predicate.py
+
+lint-check-validate-front-door:
+	./scripts/test-validate-front-door.sh
 
 lint-check-audit-test-binary-registration:
 	python3 ./ci/audit-test-binary-registration.py

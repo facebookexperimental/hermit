@@ -50,6 +50,23 @@ exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
 future work, not v1 routes. Run `./scripts/validate.rs --all` for the
 complete suite.
 
+`make validate` goes through `scripts/validate-front-door.sh` first. Inside
+the maintainers' `dev-hermit` harness it decides in milliseconds, before
+anything compiles, whether an agent or a human is calling:
+- An agent (an agent harness among the caller's ancestors, an agent
+  environment marker, or a herdr agent pane) is refused in three lines that
+  name the exact `ci-hub validate-run` command.
+- A human is warned that the run is off the record and is not validation
+  evidence, and how many paths are dirty if any. Then the full validate runs in
+  place (`--human-off-the-record`).
+
+This is routing, not a security boundary. An agent that clears its
+environment and leaves its process tree looks human: through a
+`systemd-run --user` service, over ssh, or in a tmux server started elsewhere.
+That is acceptable because such a run publishes nothing. Outside the harness,
+and inside a ci-hub validate-run unit, `make validate` runs the driver as
+before. See `scripts/validate-front-door.sh --help`.
+
 `scripts/validate.rs portable-only` is the local mirror of the manual
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
 format, documentation, and test matrix. The focused privileged capability
