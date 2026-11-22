@@ -4571,8 +4571,16 @@ pub const QUICK_EXCLUDED_CATEGORIES: &[&str] = &["compat"];
 /// requires the committed node to end with it and validate.rs requires it of
 /// the raw publisher, so the omitted cells and the omitted results agree.
 pub fn quick_verify_command() -> String {
+    // --parity-plan-of-selected-tests: this ptrace-only run's own plan
+    // holds no candidate backend for any test, so without it every cell
+    // would keep auto (x86-64-v3 on a qualifying host) where a full run
+    // names the parity golden's x86-64-v2 — which is how
+    // c-programs/arch-prctl-determinism, a guest asserting v2's
+    // normalized arch_prctl answers, drew v3 here and failed while the
+    // full profile passed it explicit. With it each selected test's
+    // golden is planned as a full run of that test plans it.
     let mut command =
-        "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only"
+        "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --parity-plan-of-selected-tests"
             .to_string();
     for category in QUICK_EXCLUDED_CATEGORIES {
         command.push_str(" --exclude-category ");

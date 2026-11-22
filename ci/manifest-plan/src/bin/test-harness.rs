@@ -465,6 +465,9 @@ fn print_command_help(command: &str) -> bool {
              --prebuilt                       Reuse prepared test programs\n  \
              --parity-plan-of-test            With an exact --test: plan the parity golden's CPU profile\n  \
                                               from every cell of the test, as a run of it would\n  \
+             --parity-plan-of-selected-tests  With --backend ptrace and no exact --test: plan the\n  \
+                                              parity golden's CPU profile from every cell of each\n  \
+                                              selected test, as an unfiltered run of it would\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
              --junit <PATH>                   Write JUnit output to PATH\n  \
@@ -560,6 +563,10 @@ struct Args {
     /// `--parity-plan-of-test`: plan the parity golden's CPU profile from
     /// every cell of the selected test ([`parity_plan`]).
     parity_plan_of_test: bool,
+    /// `--parity-plan-of-selected-tests`: plan the parity golden's CPU
+    /// profile from every cell of each selected test, for a
+    /// backend-filtered run of many tests ([`parity_plan`]).
+    parity_plan_of_selected_tests: bool,
     /// `validate --without-footprint-check` ([`FootprintCheck::NotRun`]).
     without_footprint_check: bool,
     results: Option<PathBuf>,
@@ -660,6 +667,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             }
             "--parity-inputs" => args.selection.parity_inputs = true,
             PARITY_PLAN_OF_TEST_ARG => args.parity_plan_of_test = true,
+            PARITY_PLAN_OF_SELECTED_TESTS_ARG => args.parity_plan_of_selected_tests = true,
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
@@ -1188,6 +1196,25 @@ fn validate_args(command: &str, args: &Args) {
         if args.selection.test.is_none() || args.probe_disabled {
             fail(format!(
                 "{PARITY_PLAN_OF_TEST_ARG} requires an exact --test and no --probe-disabled"
+            ));
+        }
+    }
+    if args.parity_plan_of_selected_tests {
+        if command != "run" {
+            fail(format!(
+                "{PARITY_PLAN_OF_SELECTED_TESTS_ARG} is accepted by run only"
+            ));
+        }
+        if args.parity_plan_of_test
+            || args.selection.test.is_some()
+            || args.selection.backend.as_deref()
+                != Some(hermit_manifest_plan::parity::PARITY_REFERENCE_BACKEND)
+            || args.probe_disabled
+        {
+            fail(format!(
+                "{PARITY_PLAN_OF_SELECTED_TESTS_ARG} requires --backend {} with no exact --test, \
+                 no {PARITY_PLAN_OF_TEST_ARG} and no --probe-disabled",
+                hermit_manifest_plan::parity::PARITY_REFERENCE_BACKEND
             ));
         }
     }
@@ -5240,23 +5267,48 @@ fn planned_verify(cells: &[SelectedCell]) -> BTreeSet<(String, String)> {
 /// the selected test.
 const PARITY_PLAN_OF_TEST_ARG: &str = "--parity-plan-of-test";
 
+/// `run`'s flag that plans the parity golden's CPU profile from every cell
+/// of each selected test, for a backend-filtered run of many tests.
+const PARITY_PLAN_OF_SELECTED_TESTS_ARG: &str = "--parity-plan-of-selected-tests";
+
 /// The verify cells whose comparisons decide which ptrace verify runs name the
 /// parity golden's CPU profile (`runner::PARITY_GOLDEN_PROFILE_ARG`):
 /// `planned_verify`, this run's own verify cells, or with
 /// `--parity-plan-of-test` the verify cells of a run of the same filters
 /// without `--mode` and `--backend`, which is the plan of the whole test.
+/// With `--parity-plan-of-selected-tests` it is that whole-test plan for
+/// each test this run selected, for a backend-filtered run of many tests.
 ///
 /// A category run plans a test's ptrace verify cell beside its candidates, so
 /// that cell names x86-64-v2. ci/buck-e2e/cell.sh runs every Buck cell alone
 /// (`--test --mode --backend`), so its own plan holds one cell, no comparison,
 /// and the same cell ran auto (x86-64-v3 on a qualifying host), another CPU
 /// than Cargo validation presents. With the flag a cell run alone names the
-/// profile a run of its test names.
+/// profile a run of its test names. The quick profile's ptrace-only verify
+/// run is the same shape at category scale — its own plan holds no candidate
+/// for any test — so its command carries the selected-tests flag and each
+/// of its cells names the profile a full run of its test names.
 fn parity_plan(
     manifests: &ManifestSet,
     args: &Args,
     own_plan: &BTreeSet<(String, String)>,
 ) -> BTreeSet<(String, String)> {
+    if args.parity_plan_of_selected_tests {
+        let mut plan = own_plan.clone();
+        let tests: BTreeSet<&str> = own_plan.iter().map(|(test, _)| test.as_str()).collect();
+        for test in tests {
+            let whole_test = Selection {
+                test: Some(test.to_string()),
+                mode: None,
+                backend: None,
+                ..run_selection(args)
+            };
+            plan.extend(planned_verify(
+                &manifests.select(&whole_test).unwrap_or_else(|e| fail(e)),
+            ));
+        }
+        return plan;
+    }
     if !args.parity_plan_of_test {
         return own_plan.clone();
     }
@@ -10144,6 +10196,72 @@ sys.exit(1 if failed else 0)
         assert!(
             cells_checked > 0 && golden > 0 && golden < cells_checked,
             "{golden} of {cells_checked}"
+        );
+    }
+
+    /// The quick profile's ptrace-only verify run
+    /// (`--parity-plan-of-selected-tests`, as `quick_verify_command`
+    /// carries it) names the parity golden's profile for a
+    /// parity-compared test exactly as an unfiltered run of that test
+    /// does, where the same selection without the flag names none:
+    /// its own plan holds no candidate backend. Pinned on
+    /// c-programs/arch-prctl-determinism, whose guest asserts
+    /// x86-64-v2's normalized arch_prctl answers and so failed the
+    /// quick route when it drew auto's x86-64-v3.
+    #[test]
+    fn a_ptrace_only_run_with_the_selected_tests_plan_names_the_parity_profile() {
+        use hermit_manifest_plan::parity;
+        let root = super::root(None);
+        let manifests = ManifestSet::load(&root).unwrap();
+        let test = "c-programs/arch-prctl-determinism";
+        let argv = |extra: &[&str]| {
+            let mut argv = vec![
+                "--lane".to_string(),
+                "portable".into(),
+                "--mode".into(),
+                "verify".into(),
+                "--backend".into(),
+                "ptrace".into(),
+                "--ci-only".into(),
+                "--test".into(),
+                test.to_string(),
+            ];
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            parse(argv.into_iter())
+        };
+        let alone = argv(&[]);
+        validate_args("run", &alone);
+        let alone_planned = planned_verify(&run_cells(&manifests, &alone).unwrap());
+        assert!(
+            !parity::planned_comparisons(&parity_plan(&manifests, &alone, &alone_planned))
+                .contains(test),
+            "without the flag the ptrace-only run plans no comparison for {test}"
+        );
+        // The selected-tests flag takes no exact --test: the same
+        // backend-filtered selection by category, as the quick command
+        // runs it, which the flag's own validation requires.
+        let selected = parse(
+            [
+                "--lane",
+                "portable",
+                "--mode",
+                "verify",
+                "--backend",
+                "ptrace",
+                "--ci-only",
+                "--category",
+                "c-programs",
+                super::PARITY_PLAN_OF_SELECTED_TESTS_ARG,
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        validate_args("run", &selected);
+        let planned = planned_verify(&run_cells(&manifests, &selected).unwrap());
+        assert!(
+            parity::planned_comparisons(&parity_plan(&manifests, &selected, &planned))
+                .contains(test),
+            "with the flag the ptrace-only run plans {test}'s comparison, so its golden names x86-64-v2"
         );
     }
 
