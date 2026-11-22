@@ -112,6 +112,17 @@ fn reverie_workspace_package_names(root: &Path) -> Result<BTreeSet<String>, Stri
     Ok(names)
 }
 
+/// The route-invariant Reverie content digest recorded in the stamp:
+/// the content hash every measurement route computes over the same
+/// bytes, never a route's materialization hash.
+fn reverie_content_digest(measured: &serde_json::Value) -> Result<&str, String> {
+    measured
+        .get("source_sha256")
+        .or_else(|| measured.get("sha256"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Reverie source measurement has no content digest".to_owned())
+}
+
 fn env_text(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|error| format!("missing or non-UTF8 build input {key}: {error}"))
 }
@@ -234,35 +245,60 @@ fn resolved_build(
         return Err("actual core Cargo features differ from the producer's built unit".to_owned());
     }
     let core_closure = graph.closure(&core.id)?;
-    let mut roots = BTreeMap::new();
+    let submodule = super::compatibility_source::submodule_reverie_root(core)?;
+    let mut roots: BTreeMap<
+        std::path::PathBuf,
+        (String, super::compatibility_source::ReverieRoute),
+    > = BTreeMap::new();
     let mut commits = BTreeSet::new();
     let mut common_units = BTreeMap::new();
     let mut noncanonical = Vec::new();
     for (id, units) in &graph.units {
         let package = &graph.packages[id];
-        let rest = match canonical_reverie_rest(package) {
-            Some(rest) => rest,
-            None => {
-                noncanonical.push(package);
-                continue;
+        // Cohort membership by route: the canonical git source, or the
+        // core checkout's Reverie submodule (identity from its gitlink).
+        let cohort = match canonical_reverie_rest(package) {
+            Some(rest) => {
+                let (declared, resolved) = rest
+                    .split_once('#')
+                    .ok_or_else(|| "built Reverie source has no resolved commit".to_owned())?;
+                if !full_oid(declared) || declared != resolved {
+                    return Err(
+                        "built Reverie source must declare and resolve the same full commit"
+                            .to_owned(),
+                    );
+                }
+                let directory = package
+                    .manifest_path
+                    .parent()
+                    .ok_or_else(|| "Reverie package has no directory".to_owned())?;
+                let repo =
+                    std::fs::canonicalize(git(directory, &["rev-parse", "--show-toplevel"])?)
+                        .map_err(|error| error.to_string())?;
+                Some((
+                    repo,
+                    resolved.to_owned(),
+                    super::compatibility_source::ReverieRoute::CargoGit,
+                ))
             }
+            None => submodule.as_ref().and_then(|submodule_ref| {
+                super::compatibility_source::package_in_submodule(package, submodule_ref).then(
+                    || {
+                        (
+                            submodule_ref.1.clone(),
+                            submodule_ref.2.clone(),
+                            super::compatibility_source::submodule_route(core),
+                        )
+                    },
+                )
+            }),
         };
-        let (declared, resolved) = rest
-            .split_once('#')
-            .ok_or_else(|| "built Reverie source has no resolved commit".to_owned())?;
-        if !full_oid(declared) || declared != resolved {
-            return Err(
-                "built Reverie source must declare and resolve the same full commit".to_owned(),
-            );
-        }
-        commits.insert(resolved.to_owned());
-        let directory = package
-            .manifest_path
-            .parent()
-            .ok_or_else(|| "Reverie package has no directory".to_owned())?;
-        let repo = std::fs::canonicalize(git(directory, &["rev-parse", "--show-toplevel"])?)
-            .map_err(|error| error.to_string())?;
-        roots.entry(repo).or_insert_with(|| resolved.to_owned());
+        let Some((repo, resolved, cargo_cache)) = cohort else {
+            noncanonical.push(package);
+            continue;
+        };
+        commits.insert(resolved.clone());
+        roots.entry(repo).or_insert((resolved, cargo_cache));
         if core_closure.contains(id) {
             for unit in units {
                 common_units.insert(unit.key()?, unit.clone());
@@ -289,20 +325,15 @@ fn resolved_build(
         admit_noncanonical(package, &graph.workspace_members, &reverie_names)?;
     }
     let mut source_hashes = BTreeSet::new();
-    for (root, expected) in roots {
-        let measured = super::compatibility_source::cargo_git_source(&root, &expected, true)?;
+    for (root, (expected, route)) in roots {
+        let measured =
+            super::compatibility_source::measure_reverie_root(&root, &expected, route, true)?;
         if measured.get("commit").and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
             return Err(
                 "built Reverie package directory is not its resolved source commit".to_owned(),
             );
         }
-        source_hashes.insert(
-            measured
-                .get("sha256")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Reverie source measurement has no content digest".to_owned())?
-                .to_owned(),
-        );
+        source_hashes.insert(reverie_content_digest(&measured)?.to_owned());
     }
     if source_hashes.len() != 1 {
         return Err("actual Reverie source copies have different complete content".to_owned());
@@ -610,6 +641,18 @@ mod tests {
         if !manifest.is_empty() {
             std::fs::write(root.join(dir).join("Cargo.toml"), manifest).unwrap();
         }
+    }
+
+    #[test]
+    fn stamp_digest_is_the_content_digest_on_every_route() {
+        // Reverting the stamp to the Cargo route's materialization
+        // hash (`sha256`) fails here: the content digest wins even
+        // when both fields are present and differ.
+        let cargo = serde_json::json!({"sha256": "materialization", "source_sha256": "content"});
+        assert_eq!(reverie_content_digest(&cargo), Ok("content"));
+        let strict = serde_json::json!({"sha256": "content"});
+        assert_eq!(reverie_content_digest(&strict), Ok("content"));
+        assert!(reverie_content_digest(&serde_json::json!({})).is_err());
     }
 
     #[test]

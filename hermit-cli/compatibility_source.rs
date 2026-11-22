@@ -10,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use sha2::Digest;
@@ -285,6 +286,130 @@ pub fn cargo_git_source(
     cargo_git_source_in(root, expected, &cache, track, unsafe { libc::geteuid() })
 }
 
+/// The Reverie submodule route: a core checkout whose `reverie/`
+/// directory is its pinned submodule. Returns the canonical submodule
+/// directory, its repository root, and the gitlink commit recorded in
+/// the core commit — the one source of truth for that checkout's
+/// Reverie identity. `None` when the core has no `reverie/` directory;
+/// an unreadable gitlink for a present directory refuses.
+pub fn submodule_reverie_root(
+    core: &Package,
+) -> Result<Option<(PathBuf, PathBuf, String)>, String> {
+    let manifest = core
+        .manifest_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve actual core manifest: {error}"))?;
+    let core_root = manifest
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "metadata core has no repository parent".to_owned())?;
+    let directory = core_root.join("reverie");
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let listing = git(core_root, &["ls-tree", "HEAD", "reverie"])?;
+    let mut parts = listing.split([' ', '\t']);
+    let gitlink = match (parts.next(), parts.next(), parts.next()) {
+        (Some("160000"), Some("commit"), Some(oid)) if full_oid(oid) => oid.to_owned(),
+        _ => {
+            return Err("core checkout has no Reverie submodule gitlink".to_owned());
+        }
+    };
+    let root = std::fs::canonicalize(git(&directory, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| error.to_string())?;
+    let directory = std::fs::canonicalize(&directory).map_err(|error| error.to_string())?;
+    Ok(Some((directory, root, gitlink)))
+}
+
+/// Whether one package belongs to the core checkout's Reverie
+/// submodule cohort: its manifest directory, canonicalized, lies under
+/// the submodule directory and its manifest is tracked in the
+/// submodule's tree. The one classification used by both the snapshot
+/// and the measured stamp, so the two cannot disagree.
+pub fn package_in_submodule(package: &Package, submodule: &(PathBuf, PathBuf, String)) -> bool {
+    let (directory, root, _) = submodule;
+    let Some(parent) = package
+        .manifest_path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+    else {
+        return false;
+    };
+    if !parent.starts_with(directory) {
+        return false;
+    }
+    let Ok(relative) = parent.strip_prefix(root) else {
+        return false;
+    };
+    git(
+        root,
+        &[
+            "--literal-pathspecs",
+            "ls-tree",
+            &submodule.2,
+            "--",
+            &relative.join("Cargo.toml").to_string_lossy(),
+        ],
+    )
+    .is_ok_and(|listing| !listing.is_empty())
+}
+
+/// How a Reverie root was reached, decided by the core's own
+/// provenance — never by files inside the Reverie checkout, which an
+/// attacker or accident could plant. The route selects the
+/// measurement policy in `measure_reverie_root`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverieRoute {
+    /// The canonical Cargo git source.
+    CargoGit,
+    /// The `reverie/` submodule of a core Cargo git checkout: Cargo
+    /// materialized it and wrote its `.cargo-ok` marker, and the core
+    /// measurement's own gitlink recursion already uses this policy.
+    SubmoduleOfGitCore,
+    /// The `reverie/` submodule of a path core: strict ordinary Git
+    /// policy; any marker present is stray and refuses as dirt.
+    SubmoduleOfPathCore,
+}
+
+/// The measurement route for a core checkout's submodule, from the
+/// core package's own declared source.
+pub fn submodule_route(core: &Package) -> ReverieRoute {
+    if core.source.is_some() {
+        ReverieRoute::SubmoduleOfGitCore
+    } else {
+        ReverieRoute::SubmoduleOfPathCore
+    }
+}
+
+/// Measure one Reverie root by its route. Either way the returned
+/// identity's content digest (`source_sha256`, or `sha256` on the
+/// strict route) is the same function of the same bytes, so stamps
+/// compare equal across routes for identical content.
+pub fn measure_reverie_root(
+    root: &Path,
+    expected: &str,
+    route: ReverieRoute,
+    track: bool,
+) -> Result<serde_json::Value, String> {
+    match route {
+        ReverieRoute::CargoGit => cargo_git_source(root, expected, track),
+        ReverieRoute::SubmoduleOfGitCore => cargo_repository(
+            root,
+            expected,
+            track,
+            unsafe { libc::geteuid() },
+            &mut BTreeSet::new(),
+        ),
+        ReverieRoute::SubmoduleOfPathCore => {
+            let identity = source(root, track)?;
+            if identity["commit"].as_str() != Some(expected) {
+                return Err("Reverie submodule checkout differs from the core gitlink".to_owned());
+            }
+            Ok(identity)
+        }
+    }
+}
+
 fn cargo_git_source_in(
     root: &Path,
     expected: &str,
@@ -498,10 +623,18 @@ fn metadata_core_in(
     let Some(source_id) = package.source.as_deref() else {
         return Ok(serde_json::json!({"path":root,"identity":source(root, track)?}));
     };
-    let source_id = source_id
-        .strip_prefix("git+https://github.com/rrnewton/hermit?rev=")
-        .or_else(|| source_id.strip_prefix("git+https://github.com/rrnewton/hermit.git?rev="))
-        .ok_or_else(|| "metadata core has a noncanonical or patched source".to_owned())?;
+    // The canonical Hermit repository is facebookexperimental/hermit;
+    // rrnewton/hermit is its mirror with identical commits, so both
+    // spellings name the same canonical source.
+    let source_id = [
+        "git+https://github.com/facebookexperimental/hermit?rev=",
+        "git+https://github.com/facebookexperimental/hermit.git?rev=",
+        "git+https://github.com/rrnewton/hermit?rev=",
+        "git+https://github.com/rrnewton/hermit.git?rev=",
+    ]
+    .iter()
+    .find_map(|prefix| source_id.strip_prefix(prefix))
+    .ok_or_else(|| "metadata core has a noncanonical or patched source".to_owned())?;
     let (declared, resolved) = source_id
         .split_once('#')
         .ok_or_else(|| "metadata core Git source has no resolved commit".to_owned())?;
@@ -529,6 +662,14 @@ fn metadata_core_in(
 /// the final build script independently checks the same pre-build snapshot.
 /// Paths are evidence locators, not cross-executable compatibility dimensions.
 pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, String> {
+    snapshot_in(metadata, track, None)
+}
+
+fn snapshot_in(
+    metadata: &InputFile,
+    track: bool,
+    cache: Option<&Path>,
+) -> Result<serde_json::Value, String> {
     #[derive(serde::Deserialize)]
     struct Metadata {
         version: u64,
@@ -547,9 +688,27 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
     if cores.len() != 1 {
         return Err("source snapshot requires exactly one actual core package".to_owned());
     }
-    let core = metadata_core(cores[0], track)?;
-    let mut roots = BTreeMap::new();
+    let core = match cache {
+        Some(cache) if cores[0].source.is_some() => metadata_core_in(cores[0], Some(cache), track)?,
+        _ => metadata_core(cores[0], track)?,
+    };
+    let submodule = submodule_reverie_root(cores[0])?;
+    let mut roots: BTreeMap<PathBuf, (String, ReverieRoute)> = BTreeMap::new();
     for package in &metadata.packages {
+        // No let-chain here: ci/build-compatible-cli.rs compiles this
+        // file at edition 2021, where let-chains are rejected.
+        #[allow(clippy::collapsible_if)]
+        if let Some(submodule_ref @ (_, root, gitlink)) = &submodule {
+            if package_in_submodule(package, submodule_ref) {
+                if roots
+                    .insert(root.clone(), (gitlink.clone(), submodule_route(cores[0])))
+                    .is_some_and(|old| old.0 != *gitlink)
+                {
+                    return Err("source snapshot root claims different Reverie commits".to_owned());
+                }
+                continue;
+            }
+        }
         let Some(value) = package.source.as_deref() else {
             continue;
         };
@@ -576,8 +735,8 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
         let root = std::fs::canonicalize(git(directory, &["rev-parse", "--show-toplevel"])?)
             .map_err(|error| error.to_string())?;
         if roots
-            .insert(root, resolved.to_owned())
-            .is_some_and(|old| old != resolved)
+            .insert(root, (resolved.to_owned(), ReverieRoute::CargoGit))
+            .is_some_and(|old| old.0 != resolved)
         {
             return Err("source snapshot root claims different Reverie commits".to_owned());
         }
@@ -586,8 +745,8 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
         return Err("source snapshot has no actual Reverie source".to_owned());
     }
     let mut reverie = Vec::new();
-    for (root, expected) in roots {
-        let identity = cargo_git_source(&root, &expected, track)?;
+    for (root, (expected, route)) in roots {
+        let identity = measure_reverie_root(&root, &expected, route, track)?;
         if identity["commit"].as_str() != Some(expected.as_str()) {
             return Err(
                 "source snapshot actual Reverie checkout differs from its metadata source"
@@ -909,6 +1068,16 @@ mod tests {
             "cache markers must not change the canonical core digest"
         );
         assert!(measured["cargo_materialization"]["cargo_marker_before"].is_object());
+        // The canonical facebookexperimental spelling of the same
+        // repository measures identically to its rrnewton mirror.
+        package.source = Some(format!(
+            "git+https://github.com/facebookexperimental/hermit?rev={0}#{0}",
+            fixture.oid
+        ));
+        assert_eq!(
+            metadata_core_in(&package, Some(&fixture.cache), false).unwrap()["identity"],
+            measured["identity"]
+        );
         package.source = None;
         assert!(
             metadata_core_in(&package, Some(&fixture.cache), false).is_err(),
@@ -935,5 +1104,303 @@ mod tests {
         )
         .unwrap();
         assert!(metadata_core_in(&package, Some(&fixture.cache), false).is_err());
+    }
+
+    #[test]
+    fn submodule_inside_a_cargo_checkout_measures_through_its_marker() {
+        // The git-core route: Cargo writes an untracked `.cargo-ok`
+        // into the submodule checkout, which the strict ordinary
+        // policy refuses. The marker route must measure it at the
+        // gitlink instead, like every other gitlink child of a Cargo
+        // core. The fixture's child submodule carries that marker.
+        let fixture = Fixture::new();
+        let child = fixture.root.join("child");
+        let child_oid = command(&child, &["rev-parse", "HEAD"]);
+        assert!(
+            source(&child, false).is_err(),
+            "strict policy must refuse the Cargo marker"
+        );
+        let measured =
+            measure_reverie_root(&child, &child_oid, ReverieRoute::SubmoduleOfGitCore, false)
+                .expect("marked submodule measures through the Cargo policy");
+        assert_eq!(measured["commit"].as_str(), Some(child_oid.as_str()));
+        // Route invariance: the strict route on a clean clone of the
+        // same bytes records the same content digest the stamp keeps.
+        let clean = fixture.directory.join("child-clean");
+        command(
+            &fixture.directory,
+            &[
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                child.to_str().unwrap(),
+                clean.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            measured["source_sha256"],
+            source(&clean, false).unwrap()["sha256"]
+        );
+        assert!(
+            measured["source_sha256"].as_str().is_some_and(
+                |value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_measures_reverie_through_the_core_submodule_gitlink() {
+        // A path core's Reverie comes from its `reverie/` submodule,
+        // not a Cargo git source. The snapshot must measure it at
+        // the core commit's gitlink under the strict policy.
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-submodule-snapshot-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let owned = Owned(directory.clone());
+        let reverie = directory.join("reverie-source");
+        initialize(&reverie);
+        std::fs::create_dir_all(reverie.join("reverie-ptrace")).unwrap();
+        std::fs::write(
+            reverie.join("reverie-ptrace/Cargo.toml"),
+            b"[package]\nname = \"reverie-ptrace\"\n",
+        )
+        .unwrap();
+        command(&reverie, &["add", "--", "reverie-ptrace/Cargo.toml"]);
+        command(&reverie, &["commit", "--quiet", "-m", "reverie fixture"]);
+        let reverie_oid = command(&reverie, &["rev-parse", "HEAD"]);
+
+        let core = directory.join("core");
+        initialize(&core);
+        std::fs::create_dir_all(core.join("hermit-cli")).unwrap();
+        std::fs::write(
+            core.join("hermit-cli/Cargo.toml"),
+            b"[package]\nname = \"hermit-run\"\n",
+        )
+        .unwrap();
+        command(&core, &["add", "--", "hermit-cli/Cargo.toml"]);
+        command(&core, &["commit", "--quiet", "-m", "core fixture"]);
+        command(
+            &core,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                reverie.to_str().unwrap(),
+                "reverie",
+            ],
+        );
+        command(&core, &["commit", "--quiet", "-m", "pin reverie"]);
+
+        let package = |name: &str, manifest: PathBuf| {
+            serde_json::json!({"id": name, "name": name, "version": "0.0.0",
+                "source": null, "manifest_path": manifest, "targets": []})
+        };
+        let metadata = serde_json::json!({"version": 1, "packages": [
+            package("hermit-run", core.join("hermit-cli/Cargo.toml")),
+            package(
+                "reverie-ptrace",
+                core.join("reverie/reverie-ptrace/Cargo.toml")
+            ),
+        ]});
+        let metadata_path = directory.join("metadata.json");
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        std::fs::write(&metadata_path, &bytes).unwrap();
+        let input = InputFile {
+            path: metadata_path,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let measured = snapshot(&input, false).expect("submodule snapshot");
+        assert_eq!(measured["reverie"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            measured["reverie"][0]["identity"]["commit"].as_str(),
+            Some(reverie_oid.as_str())
+        );
+
+        // Planted: an untracked crate under reverie/ is not in the
+        // pinned tree, so it never joins the cohort.
+        let core_package = Package {
+            id: "hermit-run".to_owned(),
+            name: "hermit-run".to_owned(),
+            version: "0.0.0".to_owned(),
+            source: None,
+            manifest_path: core.join("hermit-cli/Cargo.toml"),
+            targets: vec![],
+        };
+        let submodule = submodule_reverie_root(&core_package)
+            .unwrap()
+            .expect("submodule present");
+        std::fs::create_dir_all(core.join("reverie/target/package/stray")).unwrap();
+        std::fs::write(
+            core.join("reverie/target/package/stray/Cargo.toml"),
+            b"[package]\nname = \"stray\"\n",
+        )
+        .unwrap();
+        let stray = Package {
+            id: "stray".to_owned(),
+            name: "stray".to_owned(),
+            version: "0.0.0".to_owned(),
+            source: None,
+            manifest_path: core.join("reverie/target/package/stray/Cargo.toml"),
+            targets: vec![],
+        };
+        assert!(!package_in_submodule(&stray, &submodule));
+        std::fs::remove_dir_all(core.join("reverie/target")).unwrap();
+
+        // Planted: a stray Cargo marker on a path core's submodule is
+        // dirt under the strict policy, never a route switch.
+        marker(&core.join("reverie"));
+        assert!(snapshot(&input, false).is_err());
+        // The route itself, not only the snapshot around it: a stray
+        // marker on a path core's submodule is dirt under the strict
+        // policy, never a switch to the Cargo policy.
+        assert!(
+            measure_reverie_root(
+                &core.join("reverie"),
+                &reverie_oid,
+                ReverieRoute::SubmoduleOfPathCore,
+                false
+            )
+            .unwrap_err()
+            .contains("clean tracked source")
+        );
+        drop(owned);
+    }
+
+    #[test]
+    fn submodule_reverie_root_refuses_a_plain_reverie_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-non-gitlink-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let owned = Owned(directory.clone());
+        let core = directory.join("core");
+        initialize(&core);
+        std::fs::create_dir_all(core.join("hermit-cli")).unwrap();
+        std::fs::write(
+            core.join("hermit-cli/Cargo.toml"),
+            b"[package]\nname = \"hermit-run\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(core.join("reverie")).unwrap();
+        std::fs::write(core.join("reverie/plain.txt"), b"not a submodule\n").unwrap();
+        command(&core, &["add", "--", "reverie/plain.txt"]);
+        command(
+            &core,
+            &["commit", "--quiet", "-m", "plain reverie directory"],
+        );
+        let package = Package {
+            id: "hermit-run".to_owned(),
+            name: "hermit-run".to_owned(),
+            version: "0.0.0".to_owned(),
+            source: None,
+            manifest_path: core.join("hermit-cli/Cargo.toml"),
+            targets: vec![],
+        };
+        assert!(
+            submodule_reverie_root(&package)
+                .unwrap_err()
+                .contains("no Reverie submodule gitlink")
+        );
+        drop(owned);
+    }
+
+    #[test]
+    fn snapshot_measures_git_core_reverie_through_the_marked_submodule() {
+        // The git-core route: the core itself is a Cargo git
+        // checkout, and its Reverie packages arrive under its marked
+        // submodule. The snapshot must measure them at the gitlink
+        // through the Cargo policy, not refuse the marker.
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-gitcore-snapshot-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let owned = Owned(directory.clone());
+        let reverie = directory.join("reverie-source");
+        initialize(&reverie);
+        std::fs::create_dir_all(reverie.join("reverie-ptrace")).unwrap();
+        std::fs::write(
+            reverie.join("reverie-ptrace/Cargo.toml"),
+            b"[package]\nname = \"reverie-ptrace\"\n",
+        )
+        .unwrap();
+        command(&reverie, &["add", "--", "reverie-ptrace/Cargo.toml"]);
+        command(&reverie, &["commit", "--quiet", "-m", "reverie fixture"]);
+        let reverie_oid = command(&reverie, &["rev-parse", "HEAD"]);
+
+        let cache = directory.join("git/checkouts");
+        let core = cache.join("hermit-fixture/revision");
+        initialize(&core);
+        std::fs::create_dir_all(core.join("hermit-cli")).unwrap();
+        std::fs::write(
+            core.join("hermit-cli/Cargo.toml"),
+            b"[package]\nname = \"hermit-run\"\n",
+        )
+        .unwrap();
+        command(&core, &["add", "--", "hermit-cli/Cargo.toml"]);
+        command(&core, &["commit", "--quiet", "-m", "core fixture"]);
+        command(
+            &core,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                reverie.to_str().unwrap(),
+                "reverie",
+            ],
+        );
+        command(&core, &["commit", "--quiet", "-m", "pin reverie"]);
+        let core_oid = command(&core, &["rev-parse", "HEAD"]);
+        marker(&core);
+        marker(&core.join("reverie"));
+
+        let source = format!("git+https://github.com/rrnewton/hermit?rev={core_oid}#{core_oid}");
+        let package = |name: &str, manifest: PathBuf| {
+            serde_json::json!({"id": name, "name": name, "version": "0.0.0",
+                "source": source, "manifest_path": manifest, "targets": []})
+        };
+        let metadata = serde_json::json!({"version": 1, "packages": [
+            package("hermit-run", core.join("hermit-cli/Cargo.toml")),
+            package(
+                "reverie-ptrace",
+                core.join("reverie/reverie-ptrace/Cargo.toml")
+            ),
+        ]});
+        let metadata_path = directory.join("metadata.json");
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        std::fs::write(&metadata_path, &bytes).unwrap();
+        let input = InputFile {
+            path: metadata_path,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let measured = snapshot_in(&input, false, Some(&cache));
+        let measured = measured.expect("git-core submodule snapshot");
+        assert_eq!(measured["reverie"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            measured["reverie"][0]["identity"]["commit"].as_str(),
+            Some(reverie_oid.as_str())
+        );
+        drop(owned);
     }
 }
