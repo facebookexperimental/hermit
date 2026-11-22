@@ -103,8 +103,15 @@ function configured_cpu_report_path {
     fi
 }
 
-# The path a caller asked to keep the typed event stream at
-# (HERMIT_NEXTEST_EVENTS_PATH), or `-` when it asked for none.
+# Where to keep the typed event stream:
+# - the path a caller asked for (HERMIT_NEXTEST_EVENTS_PATH);
+# - else, for a counted DAG step of a validation with a durable result root,
+#   $E2E_RESULT_ROOT/nextest-events/<step>.<attempt>.jsonl, so that two runs can be compared
+#   test by test (each test's typed outcome, in both directions) and a lost test is named.
+#   <step> is the census's name for the step (DAGRUN_TEST_COUNTS_PATH's basename, as in
+#   run_census_check); <attempt> is DAGRUN_STEP_STARTED_MONOTONIC_NS, so a retried step keeps
+#   each attempt's stream instead of being refused for an existing file;
+# - else `-`, none.
 function configured_events_path {
     if [[ ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
         if [[ -z $HERMIT_NEXTEST_EVENTS_PATH ]]; then
@@ -112,6 +119,17 @@ function configured_events_path {
             return 2
         fi
         printf '%s\n' "$HERMIT_NEXTEST_EVENTS_PATH"
+    elif [[ -n ${E2E_RESULT_ROOT:-} && -n ${DAGRUN_TEST_COUNTS_PATH:-} ]]; then
+        local step=${DAGRUN_TEST_COUNTS_PATH##*/} attempt=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
+        step=${step##*:}
+        step=${step%.json}
+        [[ -n $step ]] || step=nextest
+        [[ $attempt =~ ^[0-9]+$ ]] || attempt=$(date +%s%N)-$$
+        if ! mkdir -p -- "$E2E_RESULT_ROOT/nextest-events"; then
+            printf 'run-nextest-counted: cannot create %s to keep the typed event stream\n' "$E2E_RESULT_ROOT/nextest-events" >&2
+            return 2
+        fi
+        printf '%s\n' "$E2E_RESULT_ROOT/nextest-events/$step.$attempt.jsonl"
     else
         printf '%s\n' -
     fi
@@ -1021,10 +1039,38 @@ PYEOF
     grep -q 'cannot keep the typed event stream' "$scratch/retain-refusal" || return 1
     cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
     [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_events_path) == "$scratch/asked" ]] || return 1
-    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_events_path) == - ]] || return 1
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH E2E_RESULT_ROOT; configured_events_path) == - ]] || return 1
     status=0
     HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
     [[ $status == 2 ]] || return 1
+    # A counted step of a validation keeps its stream under the durable result root, named as
+    # the census names the step, one file per attempt; an explicit path still wins, and
+    # without a result root or a counted step nothing is kept.
+    local kept_root=$scratch/result-root counts=$scratch/counts/run-1:test.detcore_unit.json
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
+        DAGRUN_STEP_STARTED_MONOTONIC_NS=41 configured_events_path) == "$kept_root/nextest-events/test.detcore_unit.41.jsonl" ]] || return 1
+    [[ -d $kept_root/nextest-events ]] || return 1
+    [[ $(E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" \
+        configured_events_path) == "$scratch/asked" ]] || return 1
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH E2E_RESULT_ROOT; DAGRUN_TEST_COUNTS_PATH=$counts configured_events_path) == - ]] || return 1
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH DAGRUN_TEST_COUNTS_PATH; E2E_RESULT_ROOT=$kept_root configured_events_path) == - ]] || return 1
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
+        DAGRUN_STEP_STARTED_MONOTONIC_NS=not-a-number configured_events_path) =~ ^$kept_root/nextest-events/test\.detcore_unit\.[0-9]+-[0-9]+\.jsonl$ ]] || return 1
+    # Two attempts of one step keep two streams; neither is refused as an existing file.
+    local attempt
+    for attempt in 41 42; do
+        retain_events "$scratch/events.jsonl" "$(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root \
+            DAGRUN_TEST_COUNTS_PATH=$counts DAGRUN_STEP_STARTED_MONOTONIC_NS=$attempt configured_events_path)" || return 1
+    done
+    cmp -s "$scratch/events.jsonl" "$kept_root/nextest-events/test.detcore_unit.41.jsonl" || return 1
+    cmp -s "$scratch/events.jsonl" "$kept_root/nextest-events/test.detcore_unit.42.jsonl" || return 1
+    # A result root where the directory cannot be made refuses (exit 2), never keeps nothing.
+    : >"$scratch/not-a-directory"
+    status=0
+    (unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$scratch/not-a-directory DAGRUN_TEST_COUNTS_PATH=$counts \
+        configured_events_path) >/dev/null 2>"$scratch/events-dir-refusal" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'cannot create .* to keep the typed event stream' "$scratch/events-dir-refusal" || return 1
 
     printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention, skip classification, skid-infra classification)\n'
 }
