@@ -3,6 +3,28 @@
 
 use reverie::syscalls::Sysno;
 
+/// One declarative list for every copied-syscall action. This macro
+/// declares the Rust constants and, in tests, the complete inventory
+/// used for the C/Rust comparison. Reserved actions may be unused by
+/// the gate until a paired client handles them.
+macro_rules! declare_copied_actions {
+    ($(($name:ident, $value:literal)),* $(,)?) => {
+        $(
+            #[allow(dead_code)]
+            pub(super) const $name: i32 = $value;
+        )*
+        #[cfg(test)]
+        const ALL_COPIED_ACTIONS: &[(&str, i32)] = &[$((stringify!($name), $name)),*];
+    };
+}
+
+declare_copied_actions!(
+    (COPIED_ACTION_EXECUTE_NATIVELY, 0),
+    (COPIED_ACTION_FAIL_CLOSED, 1),
+    (COPIED_ACTION_REPORT_AND_EXECUTE, 2),
+    (COPIED_ACTION_POLICY_REFUSAL, 3),
+);
+
 fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     let Some(operation) = operation else {
         return -libc::ENOLCK;
@@ -12,7 +34,7 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     let valid = operation & !known_flags == 0
         && matches!(base, libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN);
     if !valid || base == libc::LOCK_UN || operation & libc::LOCK_NB != 0 {
-        0
+        COPIED_ACTION_EXECUTE_NATIVELY
     } else {
         -libc::ENOLCK
     }
@@ -90,7 +112,7 @@ pub(super) unsafe fn copied_action(
         if request == Some(libc::TIOCGPGRP) {
             return -libc::ENOTTY;
         }
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // TODO-HUMAN-REVIEW(PR-981): Copied DYNAMORIO children cannot enter the Rust
     // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
@@ -134,7 +156,11 @@ pub(super) unsafe fn copied_action(
     };
     if let Some(refusal) = open_family_refusal {
         emit(refusal);
-        return if strict { 1 } else { -libc::EPERM };
+        return if strict {
+            COPIED_ACTION_FAIL_CLOSED
+        } else {
+            -libc::EPERM
+        };
     }
     // pidfd_getfd NEVER RUNS NATIVELY IN A COPIED CHILD because it is the one native
     // route by which a copied child can reach an open file description that
@@ -162,7 +188,11 @@ pub(super) unsafe fn copied_action(
     // other import route, is refused by the recvmsg arm below the same way.
     if sysno == Sysno::pidfd_getfd {
         emit(b"detcore-dynamorio: refusing pidfd_getfd in copied child: a native duplicate of another process's open file description could change a lock that process's Detcore state holds a claim about\n");
-        return if strict { 1 } else { -libc::EPERM };
+        return if strict {
+            COPIED_ACTION_FAIL_CLOSED
+        } else {
+            -libc::EPERM
+        };
     }
     // An OFD lock change NEVER RUNS NATIVELY IN A COPIED CHILD because the
     // `/proc/locks` ledger in Detcore's global state records which OFD locks
@@ -186,7 +216,11 @@ pub(super) unsafe fn copied_action(
     // ledger's record stay in agreement.
     if sysno == Sysno::fcntl && copied_child_fcntl_changes_ofd_lock(args) {
         emit(b"detcore-dynamorio: refusing fcntl F_OFD_SETLK/F_OFD_SETLKW in copied child: a native OFD lock change would leave the /proc/locks ledger's record of that description stale\n");
-        return if strict { 1 } else { -libc::ENOLCK };
+        return if strict {
+            COPIED_ACTION_FAIL_CLOSED
+        } else {
+            -libc::ENOLCK
+        };
     }
     // recvmsg and recvmmsg NEVER RUN NATIVELY IN A COPIED CHILD, under any
     // policy, because an SCM_RIGHTS message is the other native route by
@@ -206,10 +240,14 @@ pub(super) unsafe fn copied_action(
     // reason the pidfd_getfd arm gives.
     if matches!(sysno, Sysno::recvmsg | Sysno::recvmmsg) {
         emit(b"detcore-dynamorio: refusing recvmsg/recvmmsg in copied child: an SCM_RIGHTS message could import an open file description another process's Detcore state holds a claim about\n");
-        return if strict { 1 } else { -libc::EPERM };
+        return if strict {
+            COPIED_ACTION_FAIL_CLOSED
+        } else {
+            -libc::EPERM
+        };
     }
     if matches!(sysno, Sysno::readlink | Sysno::readlinkat) && strict {
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // setpgid FAILS CLOSED IN STRICT MODE BECAUSE THE COPIED CHILD CAN PERFORM
     // IT BUT CANNOT RECORD IT.
@@ -237,7 +275,7 @@ pub(super) unsafe fn copied_action(
     // copied children keep native behaviour, and only strict execution -- which
     // is where determinism is actually claimed -- refuses.
     if sysno == Sysno::setpgid && strict {
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // getpgrp, getpgid and getsid FAIL CLOSED IN STRICT MODE BECAUSE THE
     // KERNEL'S ANSWER IS NOT DETCORE'S.
@@ -252,7 +290,7 @@ pub(super) unsafe fn copied_action(
     // calls succeed), and a wrong answer about process-group identity is
     // worse than no answer.
     if matches!(sysno, Sysno::getpgrp | Sysno::getpgid | Sysno::getsid) && strict {
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // Detcore answers ordinary scheduling-policy queries with SCHED_OTHER.
     // A copied child cannot enter the Tool and may inherit a different native
@@ -262,28 +300,28 @@ pub(super) unsafe fn copied_action(
         // children. Use its raw write path, without an allocating/locking
         // stderr fallback on the copied runtime stack.
         emit(b"detcore-dynamorio: unsupported syscall sched_getscheduler (145) in copied child\n");
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // Ordinary scheduler parameters are written by Detcore's shared Tool.
     // A copied child cannot enter that Tool or write its modeled output through
     // this ABI. Refuse the strict escape without a second parameter policy.
     if sysno == Sysno::sched_getparam && strict {
         emit(b"detcore-dynamorio: unsupported syscall sched_getparam (143) in copied child\n");
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // Detcore's shared Tool owns affinity masks. A copied child cannot
     // enter that Tool to write its modeled CPU set; refuse the strict native
     // escape without installing another affinity policy here.
     if sysno == Sysno::sched_getaffinity && strict {
         emit(b"detcore-dynamorio: unsupported syscall sched_getaffinity (204) in copied child\n");
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // Ordinary priority queries belong to Detcore's shared policy. A copied
     // child cannot enter that Tool, so strict execution must refuse the native
     // answer rather than install a second priority model here.
     if sysno == Sysno::getpriority && strict {
         emit(b"detcore-dynamorio: unsupported syscall getpriority (140) in copied child\n");
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     // A copied child's clock and resource-limit reads have no deterministic
     // answer here: the DYNAMORIO client keeps no table of its own any more, and
@@ -292,21 +330,21 @@ pub(super) unsafe fn copied_action(
     // than let a vfork child read host time or host limits; non-strict keeps
     // native behaviour, as the arms above do.
     if strict && copied_child_reads_clock_or_limit(sysno, args) {
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
-        return 1;
+        return COPIED_ACTION_FAIL_CLOSED;
     }
     if !detcore::is_unsupported_syscall(sysno) {
-        return 0;
+        return COPIED_ACTION_EXECUTE_NATIVELY;
     }
     if strict {
-        1
+        COPIED_ACTION_FAIL_CLOSED
     } else {
         append_copied_syscall_record(sysnum, report_fd);
-        0
+        COPIED_ACTION_EXECUTE_NATIVELY
     }
 }
 
@@ -358,6 +396,469 @@ mod tests {
     fn take_diagnostics() -> String {
         let bytes = std::mem::take(&mut *DIAGNOSTICS.lock().unwrap());
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn run_c_compiler(header: &str, args: &[&str]) -> Result<std::process::Output, String> {
+        use std::io::Write;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        let mut child = Command::new(&compiler)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("launch C compiler {:?}: {error}", compiler))?;
+        child
+            .stdin
+            .take()
+            .expect("piped C compiler stdin")
+            .write_all(header.as_bytes())
+            .map_err(|error| format!("write header to C compiler: {error}"))?;
+        child
+            .wait_with_output()
+            .map_err(|error| format!("wait for C compiler: {error}"))
+    }
+
+    fn c_copied_actions_result(header: &str) -> Result<Vec<(String, String)>, String> {
+        // First let the C compiler type-check the header so its
+        // _Static_assert X-list/define ties are actually evaluated.
+        // Preprocessing alone would not evaluate them. Then let the
+        // preprocessor decide the effective macro set; this handles
+        // conditionals, #undef, spaced directives and line splices
+        // exactly as a C client sees them.
+        let syntax = run_c_compiler(header, &["-std=c11", "-fsyntax-only", "-x", "c", "-"])?;
+        if !syntax.status.success() {
+            return Err(format!(
+                "C compiler rejected header syntax with {}:\n{}",
+                syntax.status,
+                String::from_utf8_lossy(&syntax.stderr)
+            ));
+        }
+        let output = run_c_compiler(header, &["-E", "-dM", "-x", "c", "-"])?;
+        if !output.status.success() {
+            return Err(format!(
+                "C compiler rejected header with {}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let dump = String::from_utf8(output.stdout)
+            .map_err(|error| format!("C macro dump was not UTF-8: {error}"))?;
+        let mut actions: Vec<(String, String)> = dump
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("#define ")?;
+                let (name_token, value) = rest.split_once(char::is_whitespace)?;
+                let name = name_token.split('(').next()?.to_owned();
+                if !name.starts_with("HERMIT_COPIED_ACTION_") {
+                    return None;
+                }
+                let value = if name_token.contains('(') {
+                    "<function-like macro>".to_owned()
+                } else {
+                    value.trim().to_owned()
+                };
+                Some((name, value))
+            })
+            .collect();
+        actions.sort();
+        Ok(actions)
+    }
+
+    fn c_copied_actions(header: &str) -> Vec<(String, String)> {
+        c_copied_actions_result(header).expect("C compiler must accept the native header")
+    }
+
+    fn strip_rust_comments_and_literals(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut stripped = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        let mut block_depth = 0usize;
+        let mut in_line_comment = false;
+        let mut in_string = false;
+        let mut in_character = false;
+        let mut raw_string_hashes: Option<usize> = None;
+        let mut escaped = false;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_line_comment {
+                stripped.push(if byte == b'\n' { b'\n' } else { b' ' });
+                if byte == b'\n' {
+                    in_line_comment = false;
+                }
+                index += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    stripped.extend_from_slice(b"  ");
+                    index += 2;
+                    block_depth += 1;
+                } else if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    stripped.extend_from_slice(b"  ");
+                    index += 2;
+                    block_depth -= 1;
+                } else {
+                    stripped.push(if byte == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                continue;
+            }
+            if let Some(hashes) = raw_string_hashes {
+                if byte == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|tail| tail.iter().all(|&b| b == b'#'))
+                {
+                    stripped.push(b'"');
+                    stripped.extend(std::iter::repeat_n(b'#', hashes));
+                    index += 1 + hashes;
+                    raw_string_hashes = None;
+                } else {
+                    stripped.push(if byte == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                continue;
+            }
+            if in_string || in_character {
+                let terminator = if in_string { b'"' } else { b'\'' };
+                if escaped {
+                    stripped.push(b' ');
+                    escaped = false;
+                } else if byte == b'\\' {
+                    stripped.push(b' ');
+                    escaped = true;
+                } else if byte == terminator {
+                    stripped.push(byte);
+                    in_string = false;
+                    in_character = false;
+                } else {
+                    stripped.push(if byte == b'\n' { b'\n' } else { b' ' });
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                stripped.extend_from_slice(b"  ");
+                index += 2;
+                in_line_comment = true;
+            } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                stripped.extend_from_slice(b"  ");
+                index += 2;
+                block_depth = 1;
+            } else if byte == b'r'
+                && (index == 0
+                    || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_'))
+                && {
+                    let mut end = index + 1;
+                    while bytes.get(end) == Some(&b'#') {
+                        end += 1;
+                    }
+                    bytes.get(end) == Some(&b'"')
+                }
+            {
+                let hashes = bytes[index + 1..]
+                    .iter()
+                    .take_while(|&&b| b == b'#')
+                    .count();
+                stripped.push(b'r');
+                stripped.extend(std::iter::repeat_n(b'#', hashes));
+                stripped.push(b'"');
+                index += 1 + hashes + 1;
+                raw_string_hashes = Some(hashes);
+            } else if byte == b'"' {
+                stripped.push(byte);
+                index += 1;
+                in_string = true;
+            } else if byte == b'\''
+                && (bytes.get(index + 1) == Some(&b'\\')
+                    || (bytes.get(index + 1).is_some_and(|&next| next != b'\'')
+                        && bytes.get(index + 2) == Some(&b'\'')))
+            {
+                stripped.push(byte);
+                index += 1;
+                in_character = true;
+            } else {
+                stripped.push(byte);
+                index += 1;
+            }
+        }
+
+        String::from_utf8(stripped).unwrap()
+    }
+
+    fn find_rust_word(source: &str, word: &str) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let needle = word.as_bytes();
+        let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut start = 0;
+        while let Some(offset) = source[start..].find(word) {
+            let index = start + offset;
+            let before_ok = index == 0 || !is_ident(bytes[index - 1]);
+            let after = index + needle.len();
+            let after_ok = bytes
+                .get(after)
+                .is_some_and(|&byte| byte.is_ascii_whitespace());
+            if before_ok && after_ok {
+                return Some(index);
+            }
+            start = index + needle.len();
+        }
+        None
+    }
+
+    fn rust_copied_actions() -> Vec<(String, String)> {
+        // The inventory is generated by declare_copied_actions! from
+        // the same list that declares the constants; it is not parsed
+        // from source text or hand-maintained here.
+        let mut actions: Vec<(String, String)> = ALL_COPIED_ACTIONS
+            .iter()
+            .map(|(name, value)| (format!("HERMIT_{name}"), value.to_string()))
+            .collect();
+        actions.sort();
+        actions
+    }
+
+    fn forbidden_copied_action_declarations(source: &str) -> Vec<String> {
+        // Narrow guard only: copied actions may be declared solely by
+        // declare_copied_actions!. Reject any const/static copied-action
+        // declaration elsewhere, including after the test module. This
+        // does not derive the inventory or values.
+        let stripped = strip_rust_comments_and_literals(source);
+        let mut forbidden = Vec::new();
+        let mut rest = stripped.as_str();
+        while let Some((keyword, start)) = ["const", "static"]
+            .into_iter()
+            .filter_map(|keyword| find_rust_word(rest, keyword).map(|start| (keyword, start)))
+            .min_by_key(|(_, start)| *start)
+        {
+            let after_keyword = &rest[start + keyword.len()..];
+            let mut declaration = after_keyword.trim_start();
+            let after_mut = (keyword == "static")
+                .then_some(declaration)
+                .and_then(|text| text.strip_prefix("mut"))
+                .filter(|text| text.chars().next().is_some_and(char::is_whitespace));
+            if let Some(after_mut) = after_mut {
+                declaration = after_mut.trim_start();
+            }
+            if let Some(raw_declaration) = declaration.strip_prefix("r#") {
+                declaration = raw_declaration;
+            }
+            if let Some(name) = declaration.strip_prefix("COPIED_ACTION_") {
+                let ident_end = name
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(name.len());
+                forbidden.push(format!("COPIED_ACTION_{}", &name[..ident_end]));
+            }
+            rest = after_keyword;
+        }
+        forbidden.sort();
+        forbidden
+    }
+
+    fn unknown_copied_action_identifiers(source: &str) -> Vec<String> {
+        // Identifier inventory guard: after stripping comments and
+        // literal contents, every COPIED_ACTION_* identifier in the
+        // file must be one of the macro-generated actions. This also
+        // catches actions introduced through another macro, whose
+        // invocation names the identifier without a const/static
+        // declaration in the source.
+        let stripped = strip_rust_comments_and_literals(source);
+        let known: Vec<String> = ALL_COPIED_ACTIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let mut unknown = Vec::new();
+        let bytes = stripped.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            let mut ident = &stripped[start..index];
+            if ident == "r" && bytes.get(index) == Some(&b'#') {
+                // Raw identifier: evaluate the following identifier.
+                index += 1;
+                let raw_start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                ident = &stripped[raw_start..index];
+            }
+            if ident.starts_with("COPIED_ACTION_") && !known.iter().any(|known| known == ident) {
+                unknown.push(ident.to_owned());
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        unknown
+    }
+
+    #[test]
+    fn copied_action_constants_match_native_header() {
+        const HEADER: &str = include_str!("../../include/hermit-engine-native-v1.h");
+        const RUST_SOURCE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/native/copied_action.rs"
+        ));
+
+        assert_eq!(COPIED_ACTION_EXECUTE_NATIVELY, 0);
+        assert_eq!(COPIED_ACTION_FAIL_CLOSED, 1);
+        assert_eq!(COPIED_ACTION_REPORT_AND_EXECUTE, 2);
+        assert_eq!(COPIED_ACTION_POLICY_REFUSAL, 3);
+        assert_ne!(COPIED_ACTION_POLICY_REFUSAL, COPIED_ACTION_FAIL_CLOSED);
+        assert_ne!(COPIED_ACTION_POLICY_REFUSAL, COPIED_ACTION_EXECUTE_NATIVELY);
+        assert_ne!(
+            COPIED_ACTION_POLICY_REFUSAL,
+            COPIED_ACTION_REPORT_AND_EXECUTE
+        );
+
+        // The cross-check is bidirectional: the complete effective
+        // HERMIT_COPIED_ACTION_* set from the C preprocessor must
+        // equal the macro-generated Rust set, with no extras in
+        // either direction.
+        let expected_actions: Vec<(String, String)> = [
+            ("HERMIT_COPIED_ACTION_EXECUTE_NATIVELY", "0"),
+            ("HERMIT_COPIED_ACTION_FAIL_CLOSED", "1"),
+            ("HERMIT_COPIED_ACTION_POLICY_REFUSAL", "3"),
+            ("HERMIT_COPIED_ACTION_REPORT_AND_EXECUTE", "2"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        assert_eq!(rust_copied_actions(), expected_actions);
+        assert_eq!(c_copied_actions(HEADER), rust_copied_actions());
+        let extra_action = format!("{HEADER}\n#define HERMIT_COPIED_ACTION_FUTURE 4\n");
+        assert_ne!(
+            c_copied_actions_result(&extra_action),
+            Ok(expected_actions.clone())
+        );
+        let commented_extra = format!("/* #define HERMIT_COPIED_ACTION_FUTURE 4 */\n{HEADER}");
+        assert_eq!(c_copied_actions(&commented_extra), expected_actions);
+
+        // Negative controls: the C preprocessor decides effective
+        // values, so complete-token changes, conflicts and inactive
+        // commented text follow C semantics rather than this test's
+        // textual expectations.
+        let policy_name = "HERMIT_COPIED_ACTION_POLICY_REFUSAL";
+        let exact = format!("#define {policy_name} 3");
+        for mutant_value in ["30", "31", "4"] {
+            let mutant =
+                HEADER.replacen(&exact, &format!("#define {policy_name} {mutant_value}"), 1);
+            assert_ne!(
+                c_copied_actions_result(&mutant),
+                Ok(expected_actions.clone()),
+                "C mutant {mutant_value} must not equal the Rust copied-action set"
+            );
+        }
+        let x_list_only_mutant = HEADER.replacen(
+            "X(HERMIT_COPIED_ACTION_POLICY_REFUSAL, 3)",
+            "X(HERMIT_COPIED_ACTION_POLICY_REFUSAL, 30)",
+            1,
+        );
+        assert_ne!(
+            c_copied_actions_result(&x_list_only_mutant),
+            Ok(expected_actions.clone()),
+            "C syntax check must evaluate the X-list static assertions"
+        );
+        let fail_closed_mutant = HEADER.replacen(
+            "#define HERMIT_COPIED_ACTION_FAIL_CLOSED 1",
+            "#define HERMIT_COPIED_ACTION_FAIL_CLOSED 10",
+            1,
+        );
+        assert_ne!(
+            c_copied_actions_result(&fail_closed_mutant),
+            Ok(expected_actions.clone())
+        );
+        let decoys =
+            format!("/* #define {policy_name} 30 */\n{HEADER}\n// #define {policy_name} 4\n");
+        assert_eq!(c_copied_actions(&decoys), expected_actions);
+        let conflict = format!("{HEADER}\n#define {policy_name} 4\n");
+        assert_ne!(
+            c_copied_actions_result(&conflict),
+            Ok(expected_actions.clone())
+        );
+
+        // The preprocessor likewise decides spaced directives,
+        // #undef/redefine, conditionals and line splices.
+        let spaced_extra = format!("{HEADER}\n# define HERMIT_COPIED_ACTION_FUTURE 4\n");
+        assert_ne!(
+            c_copied_actions_result(&spaced_extra),
+            Ok(expected_actions.clone())
+        );
+        let undef_redefine = format!("{HEADER}\n#undef {policy_name}\n# define {policy_name} 30\n");
+        assert_ne!(
+            c_copied_actions_result(&undef_redefine),
+            Ok(expected_actions.clone())
+        );
+        let conditional_define = HEADER.replacen(&exact, &format!("#if 0\n{exact}\n#endif"), 1);
+        assert_ne!(
+            c_copied_actions_result(&conditional_define),
+            Ok(expected_actions.clone())
+        );
+        let spliced_extra = format!("{HEADER}\n#define HERMIT_COPIED_\\\nACTION_FUTURE 4\n");
+        assert_ne!(
+            c_copied_actions_result(&spliced_extra),
+            Ok(expected_actions.clone())
+        );
+
+        // Copied actions may be declared only by the declarative
+        // macro. This guard rejects out-of-macro const/static
+        // declarations anywhere in the file, including after the
+        // test module; it does not derive the inventory.
+        assert!(forbidden_copied_action_declarations(RUST_SOURCE).is_empty());
+        assert!(unknown_copied_action_identifiers(RUST_SOURCE).is_empty());
+        let other_macro_extra = format!(
+            "macro_rules! declare_other_action {{ ($name:ident) => {{ pub(super) const $name: i32 = 4; }}; }}\ndeclare_other_action!(COPIED_ACTION_FUTURE);\n{RUST_SOURCE}"
+        );
+        assert_eq!(
+            unknown_copied_action_identifiers(&other_macro_extra),
+            vec!["COPIED_ACTION_FUTURE".to_owned()]
+        );
+        for rust_extra in [
+            format!("pub(super) const COPIED_ACTION_FUTURE: i32 = 4;\n{RUST_SOURCE}"),
+            format!("pub(super) static\tCOPIED_ACTION_FUTURE: i32 = 4;\n{RUST_SOURCE}"),
+            format!("pub(super) static mut COPIED_ACTION_FUTURE: i32 = 4;\n{RUST_SOURCE}"),
+            format!("pub(super) const r#COPIED_ACTION_FUTURE: i32 = 4;\n{RUST_SOURCE}"),
+            format!(
+                "/*\n#[cfg(test)]\n*/\npub(super) const COPIED_ACTION_FUTURE: i32 = 4;\n{RUST_SOURCE}"
+            ),
+            format!("{RUST_SOURCE}\npub(super) const COPIED_ACTION_FUTURE: i32 = 4;\n"),
+        ] {
+            assert_eq!(
+                forbidden_copied_action_declarations(&rust_extra),
+                vec!["COPIED_ACTION_FUTURE".to_owned()]
+            );
+        }
+        let normalized_header = HEADER
+            .replace('*', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for contract in [
+            "must handle it exactly as HERMIT_COPIED_ACTION_FAIL_CLOSED",
+            "must neither execute the guest syscall nor answer it with an errno",
+            "these values are not hermit_native_answer_v1.action",
+        ] {
+            assert!(
+                normalized_header.contains(contract),
+                "header must state copied-action contract: {contract}"
+            );
+        }
     }
 
     unsafe fn copied_gate_for_test(sysnum: i64, args: *const u64) -> i32 {

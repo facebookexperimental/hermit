@@ -10,6 +10,30 @@
  * No old client is implicitly compatible with this additional engine ABI.
  * This header declares no initial/successor/private-image entry authority. */
 #define HERMIT_ENGINE_NATIVE_ABI_V1 1u
+/* Guest actions for hermit_engine_native_copied_syscall_v1's
+ * int32_t * action only; these values are not
+ * hermit_native_answer_v1.action. A negative action is a guest errno.
+ * FAIL_CLOSED is the generic fail-closed action; POLICY_REFUSAL is
+ * reserved for named policy refusals and is distinct from it. A client
+ * that does not recognize a positive action must handle it exactly as
+ * HERMIT_COPIED_ACTION_FAIL_CLOSED (end the isolated run as a
+ * backend/pairing failure); it must neither execute the guest syscall
+ * nor answer it with an errno, and must never fall through to native
+ * execution. Defining POLICY_REFUSAL here does not by itself claim
+ * that an older client implements it. */
+#define HERMIT_COPIED_ACTIONS(X) \
+  X(HERMIT_COPIED_ACTION_EXECUTE_NATIVELY, 0) \
+  X(HERMIT_COPIED_ACTION_FAIL_CLOSED, 1) \
+  X(HERMIT_COPIED_ACTION_REPORT_AND_EXECUTE, 2) \
+  X(HERMIT_COPIED_ACTION_POLICY_REFUSAL, 3)
+#define HERMIT_COPIED_ACTION_EXECUTE_NATIVELY 0
+#define HERMIT_COPIED_ACTION_FAIL_CLOSED 1
+#define HERMIT_COPIED_ACTION_REPORT_AND_EXECUTE 2
+#define HERMIT_COPIED_ACTION_POLICY_REFUSAL 3
+#define HERMIT_COPIED_ACTION_ASSERT_(name, value) \
+  _Static_assert(name == value, "copied action value mismatch");
+HERMIT_COPIED_ACTIONS(HERMIT_COPIED_ACTION_ASSERT_)
+#undef HERMIT_COPIED_ACTION_ASSERT_
 typedef void (*hermit_native_emit_fn)(const uint8_t *, size_t);
 typedef void (*hermit_native_idle_fn)(void);
 /* Explicit launch facts, separate from the sealed ABI16 callback table.
@@ -192,7 +216,11 @@ int32_t hermit_engine_native_totals_v1(uint64_t *, uint64_t *, uint64_t *, uint6
 int32_t hermit_engine_native_copied_post_v1(void *, const hermit_native_callback_v1 *, const hermit_native_copy_post_v1 *, void **);
 int32_t hermit_engine_native_initialize_copied_thread_v1(void *, const hermit_native_callback_v1 *);
 /* Separate status and copied-policy guest action. No inherited Tool/RPC
- * state is entered; status failure must not be treated as a guest errno. */
+ * state is entered; status failure must not be treated as a guest errno.
+ * The action uses the HERMIT_COPIED_ACTION_* values above (or a negative
+ * guest errno). Unknown positive actions are pairing failures and must
+ * be handled exactly as HERMIT_COPIED_ACTION_FAIL_CLOSED in the client,
+ * never execute natively or be answered with an errno. */
 int32_t hermit_engine_native_copied_syscall_v1(const hermit_native_copied_callback_v1 *, int64_t, const uint64_t *, int32_t *);
 
 /* Thread locators are created, retained and retired inside the engine. The
