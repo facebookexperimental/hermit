@@ -22895,6 +22895,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
         for name in [
             "run-split-validate.sh",
             "retry-fetch.sh",
+            "cargo-proxy.sh",
             "run-in-pinned-root.sh",
             "image.digest",
         ] {
@@ -35825,6 +35826,7 @@ mod committed_selection_preservation_tests {
         for path in [
             "ci/hermetic/run-split-validate.sh",
             "ci/hermetic/retry-fetch.sh",
+            "ci/hermetic/cargo-proxy.sh",
             "ci/check-shard-coverage.sh",
             "ci/debug-shard-success.sh",
             "ci/dag/validate.json",
