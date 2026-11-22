@@ -127,6 +127,7 @@ struct Metadata {
     version: u64,
     packages: Vec<Package>,
     resolve: Option<Resolve>,
+    workspace_members: Vec<String>,
     workspace_root: PathBuf,
 }
 
@@ -215,6 +216,10 @@ struct Artifact {
 #[derive(Debug)]
 pub struct Graph {
     pub packages: BTreeMap<String, Package>,
+    // Read by the build-script consumer (compatibility_build); the
+    // producer only validates and carries it in the measured graph.
+    #[allow(dead_code)]
+    pub workspace_members: BTreeSet<String>,
     edges: BTreeMap<String, BTreeSet<String>>,
     pub units: BTreeMap<String, Vec<Unit>>,
     pub executables: BTreeMap<(String, String), PathBuf>,
@@ -234,6 +239,7 @@ impl Graph {
     ) -> Self {
         Self {
             packages,
+            workspace_members: BTreeSet::new(),
             edges: BTreeMap::new(),
             units,
             executables: BTreeMap::new(),
@@ -263,7 +269,19 @@ impl Graph {
                     .to_owned(),
             );
         }
+        let workspace_members: BTreeSet<String> =
+            metadata.workspace_members.iter().cloned().collect();
+        if workspace_members.is_empty()
+            || workspace_members.len() != metadata.workspace_members.len()
+        {
+            return Err("actual metadata has no unique workspace members".to_owned());
+        }
         let packages = metadata_packages(metadata.packages)?;
+        for member in &workspace_members {
+            if !packages.contains_key(member) {
+                return Err("actual metadata workspace member has no package".to_owned());
+            }
+        }
         let mut edges = BTreeMap::new();
         for node in metadata
             .resolve
@@ -286,6 +304,7 @@ impl Graph {
         }
         let mut graph = Self {
             packages,
+            workspace_members,
             edges,
             units: BTreeMap::new(),
             executables: BTreeMap::new(),
@@ -601,6 +620,7 @@ mod tests {
         };
         let mut graph = Graph {
             packages: metadata_packages(vec![core]).unwrap(),
+            workspace_members: BTreeSet::new(),
             edges: BTreeMap::new(),
             units: BTreeMap::new(),
             executables: BTreeMap::new(),

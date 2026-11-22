@@ -21,6 +21,97 @@ pub const STAMP_ENV: &str = "HERMIT_STAMP_COMPATIBILITY";
 const SCHEMA: &str = "hermit-core-compatibility/v1";
 const API: &str = "hermit-cli-static-backend/v1";
 
+const REVERIE_GIT_PREFIX: &str = "git+https://github.com/facebookexperimental/reverie.git?rev=";
+
+/// The `rev` rest of a package declared from the canonical Reverie git
+/// source, which joins the measured cohort; `None` for every other
+/// package, whose admission is decided by `admit_noncanonical` once the
+/// cohort's checkout is known.
+fn canonical_reverie_rest(package: &super::compatibility_graph::Package) -> Option<&str> {
+    package
+        .source
+        .as_deref()
+        .and_then(|source| source.strip_prefix(REVERIE_GIT_PREFIX))
+}
+
+/// Admission of one built package that is not from the canonical
+/// Reverie git source. The one rule is provenance: a package whose
+/// name the pinned Reverie workspace defines must come from that
+/// canonical commit, whatever its declared source; a member of the
+/// building workspace is itself; any other declared source (registry
+/// or another git repository) stands as declared. A path package
+/// outside the building workspace has no declared canonical source
+/// and is refused.
+fn admit_noncanonical(
+    package: &super::compatibility_graph::Package,
+    workspace_members: &BTreeSet<String>,
+    reverie_package_names: &BTreeSet<String>,
+) -> Result<(), String> {
+    if reverie_package_names.contains(&package.name) {
+        return Err(format!(
+            "built Reverie package {} has a noncanonical or patched source",
+            package.name
+        ));
+    }
+    if package.source.is_none() && !workspace_members.contains(&package.id) {
+        return Err(format!(
+            "built path package {} is not a member of the building workspace",
+            package.name
+        ));
+    }
+    Ok(())
+}
+
+/// Package names defined by one measured Reverie checkout's workspace:
+/// the `[package]` name of every explicit `[workspace]` member, read
+/// with a TOML parser. Anything this cannot enumerate exactly (a glob
+/// member, a missing or duplicate name) refuses, so the set is never
+/// silently partial.
+fn reverie_workspace_package_names(root: &Path) -> Result<BTreeSet<String>, String> {
+    fn read_bounded(path: &Path) -> Result<toml::Value, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(format!("{} exceeds its bound", path.display()));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
+        toml::from_str(&text).map_err(|error| format!("cannot parse {}: {error}", path.display()))
+    }
+    let workspace = read_bounded(&root.join("Cargo.toml"))?;
+    let members = workspace
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "Reverie workspace members are not an array".to_owned())?;
+    if members.is_empty() {
+        return Err("Reverie workspace defines no members".to_owned());
+    }
+    let mut names = BTreeSet::new();
+    for (index, member) in members.iter().enumerate() {
+        let member = member.as_str().ok_or_else(|| {
+            format!("Reverie workspace member #{index} is not a string: {member}")
+        })?;
+        if member.is_empty() || member.contains(['*', '?', '[']) {
+            return Err(format!(
+                "Reverie workspace member {member} is not an explicit path"
+            ));
+        }
+        let manifest = read_bounded(&root.join(member).join("Cargo.toml"))?;
+        let name = manifest
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("Reverie workspace member {member} has no package name"))?;
+        if name.is_empty() || !names.insert(name.to_owned()) {
+            return Err(format!(
+                "Reverie workspace member {member} has no unique package name"
+            ));
+        }
+    }
+    Ok(names)
+}
+
 fn env_text(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|error| format!("missing or non-UTF8 build input {key}: {error}"))
 }
@@ -146,22 +237,15 @@ fn resolved_build(
     let mut roots = BTreeMap::new();
     let mut commits = BTreeSet::new();
     let mut common_units = BTreeMap::new();
+    let mut noncanonical = Vec::new();
     for (id, units) in &graph.units {
         let package = &graph.packages[id];
-        let source = package.source.as_deref().unwrap_or("");
-        let Some(rest) =
-            source.strip_prefix("git+https://github.com/facebookexperimental/reverie.git?rev=")
-        else {
-            if source.contains("github.com/facebookexperimental/reverie")
-                || package.name.starts_with("reverie-")
-                || package.name == "safeptrace"
-            {
-                return Err(format!(
-                    "built Reverie package {} has a noncanonical or patched source",
-                    package.name
-                ));
+        let rest = match canonical_reverie_rest(package) {
+            Some(rest) => rest,
+            None => {
+                noncanonical.push(package);
+                continue;
             }
-            continue;
         };
         let (declared, resolved) = rest
             .split_once('#')
@@ -196,6 +280,13 @@ fn resolved_build(
         .expect("checked one actual cohort");
     if super::build_support::reverie_pin_in(crate_dir) != commit {
         return Err("declared core pin differs from the actual built Reverie cohort".to_owned());
+    }
+    let mut reverie_names = BTreeSet::new();
+    for root in roots.keys() {
+        reverie_names.extend(reverie_workspace_package_names(root)?);
+    }
+    for package in noncanonical {
+        admit_noncanonical(package, &graph.workspace_members, &reverie_names)?;
     }
     let mut source_hashes = BTreeSet::new();
     for (root, expected) in roots {
@@ -381,4 +472,286 @@ pub fn emit(crate_dir: &Path, registry: bool) {
         "compatibility record exceeds its protocol bound"
     );
     println!("cargo:rustc-env=HERMIT_CORE_COMPATIBILITY={text}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::compatibility_graph::Package;
+    use super::*;
+
+    fn package(id: &str, name: &str, source: Option<&str>) -> Package {
+        Package {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            version: "0.0.0".to_owned(),
+            source: source.map(str::to_owned),
+            manifest_path: std::path::PathBuf::from("/ws/Cargo.toml"),
+            targets: Vec::new(),
+        }
+    }
+
+    fn members(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn reverie_names() -> BTreeSet<String> {
+        members(&["reverie", "reverie-ptrace", "safeptrace"])
+    }
+
+    #[test]
+    fn workspace_member_path_packages_are_admitted_as_themselves() {
+        // The companion graph: its own reverie-* path package is a
+        // workspace member and not a name the Reverie workspace
+        // defines, so provenance admits it without a cohort.
+        let pkg = package(
+            "path+file:///ws/reverie-dynamorio",
+            "reverie-dynamorio",
+            None,
+        );
+        assert_eq!(
+            admit_noncanonical(&pkg, &members(&[pkg.id.as_str()]), &reverie_names()),
+            Ok(())
+        );
+        let core = package("path+file:///ws/hermit-cli", "hermit-cli", None);
+        assert_eq!(
+            admit_noncanonical(&core, &members(&[core.id.as_str()]), &reverie_names()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reverie_git_packages_join_the_cohort() {
+        let pkg = package(
+            "reverie 0.0.0",
+            "reverie",
+            Some("git+https://github.com/facebookexperimental/reverie.git?rev=abc#abc"),
+        );
+        assert_eq!(canonical_reverie_rest(&pkg), Some("abc#abc"));
+    }
+
+    #[test]
+    fn patched_reverie_package_is_refused() {
+        // Negative control, every source class: a package whose name
+        // the pinned Reverie workspace defines, from a vendored
+        // registry copy, another git host, or a workspace-member path.
+        let vendored = package(
+            "reverie 0.0.0",
+            "reverie-ptrace",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+        );
+        assert!(
+            admit_noncanonical(&vendored, &members(&[]), &reverie_names())
+                .unwrap_err()
+                .contains("noncanonical or patched")
+        );
+        let fork = package(
+            "reverie 0.0.0",
+            "safeptrace",
+            Some("git+https://example.com/reverie-fork?rev=abc#abc"),
+        );
+        assert!(admit_noncanonical(&fork, &members(&[]), &reverie_names()).is_err());
+        let member_copy = package("path+file:///ws/reverie-ptrace", "reverie-ptrace", None);
+        assert!(
+            admit_noncanonical(
+                &member_copy,
+                &members(&[member_copy.id.as_str()]),
+                &reverie_names()
+            )
+            .unwrap_err()
+            .contains("noncanonical or patched")
+        );
+    }
+
+    #[test]
+    fn path_package_outside_the_workspace_is_refused() {
+        let pkg = package("path+file:///elsewhere/serde", "serde", None);
+        assert!(
+            admit_noncanonical(&pkg, &members(&["path+file:///ws/core"]), &reverie_names())
+                .unwrap_err()
+                .contains("not a member of the building workspace")
+        );
+    }
+
+    #[test]
+    fn other_declared_sources_stand_as_declared() {
+        let pkg = package(
+            "serde 1.0.0",
+            "serde",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+        );
+        assert_eq!(
+            admit_noncanonical(&pkg, &members(&[]), &reverie_names()),
+            Ok(())
+        );
+    }
+
+    struct OwnedRoot(std::path::PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn fixture_root(tag: &str) -> (OwnedRoot, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-reverie-names-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        (OwnedRoot(root.clone()), root)
+    }
+
+    fn write_member(root: &std::path::Path, dir: &str, manifest: &str) {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        if !manifest.is_empty() {
+            std::fs::write(root.join(dir).join("Cargo.toml"), manifest).unwrap();
+        }
+    }
+
+    #[test]
+    fn reverie_workspace_names_come_from_the_checkout() {
+        let (owned, root) = fixture_root("ok");
+        // Planted spellings a line scanner drops: a `]` inside a
+        // comment within the array, and single-quoted members. The
+        // TOML parser keeps every member.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [ # not the end: ]\n    \"reverie-ptrace\", 'safeptrace',\n]\n",
+        )
+        .unwrap();
+        for name in ["reverie-ptrace", "safeptrace"] {
+            write_member(
+                &root,
+                name,
+                &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n"),
+            );
+        }
+        assert_eq!(
+            reverie_workspace_package_names(&root).unwrap(),
+            members(&["reverie-ptrace", "safeptrace"])
+        );
+        drop(owned);
+    }
+
+    #[test]
+    fn reverie_workspace_names_cover_every_core_reverie_dependency() {
+        // The real checkout a stamped build reads: the Reverie
+        // submodule at its pin, beside this crate. Every Reverie
+        // package the core workspace depends on by path must be in
+        // the reader's set, or a patched copy of it would be admitted.
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let reverie_root = crate_dir.join("../reverie");
+        let names = reverie_workspace_package_names(&reverie_root)
+            .expect("the pinned Reverie submodule must enumerate exactly");
+        assert!(!names.is_empty(), "Reverie name set must be nonempty");
+        let root_manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(crate_dir.join("../Cargo.toml")).unwrap())
+                .unwrap();
+        let dependencies = root_manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies"))
+            .and_then(toml::Value::as_table)
+            .expect("core workspace dependencies table");
+        let mut depended = 0usize;
+        for dependency in dependencies.values() {
+            let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            if !path.starts_with("reverie/") {
+                continue;
+            }
+            let manifest: toml::Value = toml::from_str(
+                &std::fs::read_to_string(crate_dir.join("..").join(path).join("Cargo.toml"))
+                    .unwrap(),
+            )
+            .unwrap();
+            let name = manifest
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+                .expect("Reverie dependency manifest name");
+            assert!(
+                names.contains(name),
+                "core depends on Reverie package {name} at {path}, missing from {names:?}"
+            );
+            depended += 1;
+        }
+        assert!(depended > 0, "core must depend on Reverie packages");
+    }
+
+    #[test]
+    fn reverie_workspace_name_reader_refuses_each_partial_input() {
+        // An empty members array must refuse: an empty name set would
+        // admit every non-canonical Reverie package in silence.
+        let (owned, root) = fixture_root("empty");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        assert!(
+            reverie_workspace_package_names(&root)
+                .unwrap_err()
+                .contains("defines no members")
+        );
+        drop(owned);
+
+        let (owned, root) = fixture_root("glob");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        assert!(
+            reverie_workspace_package_names(&root)
+                .unwrap_err()
+                .contains("crates/* is not an explicit path")
+        );
+        drop(owned);
+
+        let (owned, root) = fixture_root("missing");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"gone\"]\n",
+        )
+        .unwrap();
+        write_member(&root, "gone", "");
+        let error = reverie_workspace_package_names(&root).unwrap_err();
+        assert!(error.contains("gone/Cargo.toml"), "{error}");
+        drop(owned);
+
+        let (owned, root) = fixture_root("noname");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"noname\"]\n",
+        )
+        .unwrap();
+        write_member(&root, "noname", "[package]\nversion = \"0.0.0\"\n");
+        assert!(
+            reverie_workspace_package_names(&root)
+                .unwrap_err()
+                .contains("noname has no package name")
+        );
+        drop(owned);
+
+        let (owned, root) = fixture_root("dup");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        for dir in ["a", "b"] {
+            write_member(
+                &root,
+                dir,
+                "[package]\nname = \"same\"\nversion = \"0.0.0\"\n",
+            );
+        }
+        assert!(
+            reverie_workspace_package_names(&root)
+                .unwrap_err()
+                .contains("b has no unique package name")
+        );
+        drop(owned);
+    }
 }

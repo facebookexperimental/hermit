@@ -1717,6 +1717,7 @@ mod tests {
         std::fs::write(&manifest, b"[workspace]\n").unwrap();
         std::fs::write(&lock, b"version = 4\n").unwrap();
         let metadata = serde_json::json!({"version":1,"workspace_root":root,
+            "workspace_members":definitions.iter().map(|(id,_,_,_,_)| id).collect::<Vec<_>>(),
             "packages":definitions.iter().map(|(id,name,crate_name,kind,directory)| serde_json::json!({
                 "id":id,"name":name,"version":"0.5.4","source":null,
                 "manifest_path":root.join(directory).join("Cargo.toml"),
@@ -2076,6 +2077,7 @@ mod tests {
         let metadata = serde_json::json!({
             "version": 1,
             "workspace_root": root,
+            "workspace_members": packages.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
             "packages": packages.iter().map(|(id, name, directory)| {
                 serde_json::json!({
                     "id": id, "name": name, "version": "0.5.4", "source": null,
