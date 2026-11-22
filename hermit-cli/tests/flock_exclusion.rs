@@ -26,6 +26,7 @@
 //! | [`a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace`] | a description a private-table thread had referenced kept its lock in the model after every descriptor closed |
 //! | [`a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace`] | a stopped waiter stayed queued, and was granted while Linux kept it stopped |
 //! | [`an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace`] | a waiter an exec killed stayed queued, took the lock, and kept it for the rest of the run, or left a request blocked under its own forever |
+//! | [`the_native_flock_model_finds_its_rows_behind_more_than_4096_other_flock_rows`] | the native reference's `/proc/locks` snapshot kept the first 4,096 FLOCK rows and dropped the rest, its own among them, wherever a loaded host listed other processes' rows first (shown with synthetic rows; [`the_native_flock_model_finds_its_rows_behind_more_than_4096_real_flock_locks`] shows it with real locks, by hand) |
 //! | [`a_waiter_kept_by_a_mapping_alone_is_refused_by_name_on_ptrace`] | a waiting call whose descriptor a sibling closed while a mapping kept its description returned 0 with no lock on the host, where the kernel then granted a conflicting lock |
 //! | [`dbt_copied_vfork_child_refuses_every_flock_by_name`] | a copied DBT vfork child ran `LOCK_NB` and `LOCK_UN` natively, changing locks behind the flock model |
 //! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations; a DBT fork child's calls now reach the flock model |
@@ -58,13 +59,20 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/test_skip.rs"]
+mod test_skip;
 
 use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -264,14 +272,96 @@ fn hermit_run_model(backend: &str, log: &str, extra: &[&str], scenario: &str) ->
 /// backend must print, from a lock file on a filesystem with Linux's
 /// file-description semantics ([`flock_scratch_root`]).
 fn native_model_run(scenario: &str) -> Run {
+    native_model_run_args(&[scenario], None)
+}
+
+/// This thread's allowed CPUs, as a bit mask in 64-bit words, sized for the
+/// kernel's CPU count however large: the kernel refuses (`EINVAL`) a mask
+/// smaller than its possible CPUs, so the mask doubles until it fits, as
+/// `proc_locks_determinism.rs` reads it.
+fn allowed_cpu_mask() -> Vec<u64> {
+    let mut words = 16;
+    loop {
+        let mut mask = vec![0_u64; words];
+        // SAFETY: the kernel writes at most `words * 8` bytes into `mask`,
+        // which owns them; glibc passes a mask of any size through.
+        let result = unsafe {
+            libc::sched_getaffinity(
+                0,
+                words * std::mem::size_of::<u64>(),
+                mask.as_mut_ptr().cast::<libc::cpu_set_t>(),
+            )
+        };
+        if result == 0 {
+            return mask;
+        }
+        let error = std::io::Error::last_os_error();
+        assert!(
+            error.raw_os_error() == Some(libc::EINVAL) && words < 1 << 16,
+            "sched_getaffinity with {words} words: {error}"
+        );
+        words *= 2;
+    }
+}
+
+/// The CPUs `mask` names, in ascending order.
+fn cpus_in(mask: &[u64]) -> Vec<usize> {
+    let word_bits = u64::BITS as usize;
+    (0..mask.len() * word_bits)
+        .filter(|cpu| mask[cpu / word_bits] & (1 << (cpu % word_bits)) != 0)
+        .collect()
+}
+
+/// A mask of `words` 64-bit words that names `cpu` alone.
+fn only_cpu(cpu: usize, words: usize) -> Vec<u64> {
+    let word_bits = u64::BITS as usize;
+    let mut mask = vec![0_u64; words];
+    mask[cpu / word_bits] = 1 << (cpu % word_bits);
+    mask
+}
+
+/// Let the calling thread run only on the CPUs `mask` names.
+fn set_affinity(mask: &[u64]) -> std::io::Result<()> {
+    // SAFETY: the kernel reads `mask.len() * 8` bytes from `mask`, which owns
+    // them; glibc passes a mask of any size through.
+    let result = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of_val(mask),
+            mask.as_ptr().cast::<libc::cpu_set_t>(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Run `command`, and every process and thread it starts, on the CPUs `mask`
+/// names.
+fn pin_command(command: &mut Command, mask: Vec<u64>) {
+    // SAFETY: the callback makes one async-signal-safe syscall before exec,
+    // on a mask allocated before the fork.
+    unsafe {
+        command.pre_exec(move || set_affinity(&mask));
+    }
+}
+
+/// [`native_model_run`] with the guest's arguments `args`, on the CPUs `pin`
+/// names when it is given, with every process and thread the guest starts.
+fn native_model_run_args(args: &[&str], pin: Option<&[u64]>) -> Run {
     let scratch = tempfile::tempdir_in(flock_scratch_root())
         .expect("failed to create the native flock scratch directory");
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "120s"])
         .arg(model_guest())
-        .arg(scenario)
+        .args(args)
         .env("TMPDIR", scratch.path());
+    if let Some(mask) = pin {
+        pin_command(&mut command, mask.to_vec());
+    }
     let run = finish(
         command
             .output()
@@ -1546,6 +1636,206 @@ fn an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace() {
         native.stdout,
         "ptrace printed other answers than native Linux\n{}",
         run.combined()
+    );
+}
+
+/// The FLOCK rows the flock model's guest once had room for: its
+/// `/proc/locks` snapshot kept the first 4,096 in a fixed table and skipped
+/// the rest without a word, its own rows among them when a loaded host
+/// listed more.
+const OLD_SNAPSHOT_ROWS: usize = 4096;
+
+/// The synthetic FLOCK rows of another process the guest's `crowded` parses
+/// ahead of its own in every read: more than [`OLD_SNAPSHOT_ROWS`].
+const SYNTHETIC_FLOCK_ROWS: usize = 4500;
+const _: () = assert!(SYNTHETIC_FLOCK_ROWS > OLD_SNAPSHOT_ROWS);
+
+/// The native reference finds the flock model guest's own `/proc/locks` rows
+/// behind more FLOCK rows than its snapshot once had room for. The guest's
+/// internal `crowded` runs a scenario with 4,500 synthetic FLOCK rows of
+/// another process parsed ahead of the rows `/proc/locks` shows, in every
+/// read and through the same row parser: the place a loaded host's other
+/// rows take ahead of a guest that runs on a CPU the kernel lists late
+/// (`locks_start` walks one CPU's list after another, fs/locks.c). The
+/// synthetic rows hold no kernel lock, so no other reader of `/proc/locks`
+/// sees them, and need no second CPU and no descriptor limit; the scenarios
+/// still take their own few locks. Before the snapshot's table grew, a guest
+/// with these rows ahead printed `none` for each of its own rows (`rows with
+/// two shared holders = none, expected READ READ`), as the native controls
+/// of four tests did on a loaded development host (4,554 FLOCK rows,
+/// 2026-11-21). Every read requires all 4,500 synthetic rows in
+/// the table, so a table that keeps fewer, or synthetic rows the parser
+/// rejects, end the first scenario at its first read as a named harness
+/// failure (`the snapshot kept 4096 of the 4500 synthetic FLOCK rows`), in
+/// about 0.01 CPU second, instead of a run that tests nothing. `proc-locks`
+/// runs first and reads its rows once two reads agree, so a regression in
+/// how the guest finds its own rows fails it at the `none` assertion in
+/// about 0.1 CPU second. `exec-waiter` (only its descendants' rows) and
+/// `stopped-waiter` (its own lock with its children's waiter rows) wait up
+/// to 5 seconds a check for theirs; such a regression that only they saw
+/// would take them about 4 and 11 CPU seconds where `/proc/locks` shows no
+/// other rows, and about 14 and 29 where it shows 4,600 of a loaded host's,
+/// the last above the per-test CPU cap.
+#[test]
+fn the_native_flock_model_finds_its_rows_behind_more_than_4096_other_flock_rows() {
+    let rows = SYNTHETIC_FLOCK_ROWS.to_string();
+    for scenario in ["proc-locks", "exec-waiter", "stopped-waiter"] {
+        let run = native_model_run_args(&["crowded", &rows, scenario], None);
+        assert!(
+            run.stdout
+                .ends_with(&format!("flock-shared-exclusive {scenario}: ok\n")),
+            "the guest's crowded did not run {scenario}\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// The shared flock locks the opt-in test's crowd holds: more than
+/// [`OLD_SNAPSHOT_ROWS`], with room for the rows a torn read of `/proc/locks`
+/// can skip.
+const CROWD_LOCKS: usize = 4500;
+
+/// How many FLOCK rows `/proc/locks` lists ahead of a shared flock lock taken
+/// on `cpu`, in a file in `dir`, with masks of `words` 64-bit words: where the
+/// rows of a guest running on `cpu` are listed. A torn read (the guest's
+/// `proc_locks_rows` says how) can skip the probe's row, so `/proc/locks` is
+/// read again until it shows, at most 20 times.
+fn flock_rows_ahead_of_a_lock_on(cpu: usize, words: usize, dir: &Path) -> usize {
+    let path = dir.join("probe");
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // This thread ends with the scope, and its affinity with it.
+                if let Err(error) = set_affinity(&only_cpu(cpu, words)) {
+                    panic!("pin the probe thread to CPU {cpu}: {error}");
+                }
+                let file = fs::File::create(&path).expect("failed to create the probe's file");
+                // SAFETY: the descriptor is open for the call.
+                let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+                assert_eq!(
+                    status,
+                    0,
+                    "the probe's LOCK_SH: {}",
+                    std::io::Error::last_os_error()
+                );
+                let inode = file
+                    .metadata()
+                    .expect("failed to stat the probe's file")
+                    .ino()
+                    .to_string();
+                let pid = std::process::id().to_string();
+                for _ in 0..20 {
+                    let table =
+                        fs::read_to_string("/proc/locks").expect("failed to read /proc/locks");
+                    let mut ahead = 0;
+                    for row in table.lines() {
+                        // N: [->] FLOCK ADVISORY ACCESS PID MAJ:MIN:INO START END
+                        let fields: Vec<&str> = row
+                            .split_whitespace()
+                            .skip(1)
+                            .skip_while(|field| *field == "->")
+                            .collect();
+                        if fields.first() != Some(&"FLOCK") {
+                            continue;
+                        }
+                        let row_inode = fields.get(4).and_then(|object| object.rsplit(':').next());
+                        if fields.get(3) == Some(&pid.as_str()) && row_inode == Some(inode.as_str())
+                        {
+                            return ahead;
+                        }
+                        ahead += 1;
+                    }
+                }
+                panic!("20 reads of /proc/locks never listed the probe's own flock row");
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// [`the_native_flock_model_finds_its_rows_behind_more_than_4096_other_flock_rows`]
+/// with real kernel locks, by hand only. The guest's internal `crowd` holds
+/// 4,500 shared flock locks on the first CPU this test may use while the
+/// guest runs on the last. The kernel lists locks CPU by CPU, each CPU's
+/// newest first (`locks_insert_global_locks` puts a lock on the list of the
+/// CPU that takes it, and `locks_start` walks those lists in CPU order with
+/// `seq_hlist_start_percpu`, fs/locks.c), so every crowd row is listed ahead
+/// of every row of the guest's. A lock this test takes on the guest's CPU
+/// shows the crowd ahead before the guest runs, so the test cannot pass for
+/// want of a crowd. Before the snapshot's table grew, the guest printed
+/// `none` for each of its own rows here (`rows while the child's thread waits
+/// = none, expected WRITE ->WRITE`). The crowd's rows reach every reader of
+/// `/proc/locks` whose PID namespace is the test's or an ancestor of it, the
+/// host's included (`locks_translate_pid` hides a row only from a namespace
+/// that cannot see its process), for about a second when the test passes and
+/// about a minute when the guest regresses; another flock model guest
+/// without the fix, run on the same host meanwhile, then loses its rows.
+/// `exec-waiter` has only its descendants' rows, `stopped-waiter` its own
+/// lock with its children's waiter rows under it. Run it with `--ignored`.
+#[test]
+#[ignore = "holds 4,500 real flock locks that every reader of the host's /proc/locks sees, \
+            whatever its PID namespace, for about a second (a minute if the guest regresses), \
+            so an unfixed flock model guest elsewhere on the host fails meanwhile; run it by \
+            hand with --ignored"]
+fn the_native_flock_model_finds_its_rows_behind_more_than_4096_real_flock_locks() {
+    let allowed = allowed_cpu_mask();
+    let cpus = cpus_in(&allowed);
+    let (first, last) = (cpus[0], cpus[cpus.len() - 1]);
+    if first == last {
+        test_skip::record_test_skip(
+            "the_native_flock_model_finds_its_rows_behind_more_than_4096_real_flock_locks",
+            "this test may run on one CPU only, so no crowd of real locks can be listed ahead \
+             of the guest's rows",
+        );
+        return;
+    }
+    let scratch = tempfile::tempdir_in(flock_scratch_root())
+        .expect("failed to create the crowd's scratch directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "300s"])
+        .arg(model_guest())
+        .args(["crowd", &CROWD_LOCKS.to_string()])
+        .env("TMPDIR", scratch.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pin_command(&mut command, only_cpu(first, allowed.len()));
+    // Dropping the crowd, on a panic too, closes its standard input, which
+    // ends it and its locks.
+    let mut crowd = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {command:?}: {error}"));
+    let mut ready = String::new();
+    BufReader::new(crowd.stdout.as_mut().expect("the crowd's stdout is piped"))
+        .read_line(&mut ready)
+        .expect("failed to read the crowd's first line");
+    assert_eq!(
+        ready,
+        format!("crowd: holding {CROWD_LOCKS} shared flock locks\n"),
+        "the crowd did not take its locks"
+    );
+    let ahead = flock_rows_ahead_of_a_lock_on(last, allowed.len(), scratch.path());
+    assert!(
+        ahead > OLD_SNAPSHOT_ROWS,
+        "/proc/locks listed {ahead} FLOCK rows ahead of a lock taken on CPU {last} with the \
+         crowd of {CROWD_LOCKS} held on CPU {first}, not more than {OLD_SNAPSHOT_ROWS}: the \
+         guest's rows would not be behind the crowd, and this test would prove nothing"
+    );
+    let on_last = only_cpu(last, allowed.len());
+    for scenario in ["exec-waiter", "stopped-waiter"] {
+        native_model_run_args(&[scenario], Some(&on_last));
+    }
+    drop(crowd.stdin.take());
+    let crowd = finish(
+        crowd
+            .wait_with_output()
+            .expect("failed to wait for the crowd"),
+    );
+    assert!(
+        crowd.status.success() && crowd.stdout.ends_with("flock-shared-exclusive crowd: ok\n"),
+        "the crowd failed\n{}",
+        crowd.combined()
     );
 }
 

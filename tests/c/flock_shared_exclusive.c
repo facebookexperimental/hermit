@@ -65,6 +65,17 @@
  *                refuses the stop by name.
  *   probe PATH   (internal) a LOCK_EX|LOCK_NB probe of PATH by an exec'd
  *                child.
+ *   crowded COUNT SCENARIO  (internal) SCENARIO, with COUNT synthetic
+ *                FLOCK rows of another process parsed ahead of the rows
+ *                /proc/locks shows, in every read of it: a loaded host's
+ *                other rows, without a kernel lock. It prints what SCENARIO
+ *                prints, and is a harness failure when a read keeps fewer
+ *                than COUNT of them.
+ *   crowd COUNT  (internal) hold COUNT shared flock locks, each through an
+ *                open file description of its own, until standard input
+ *                closes: real FLOCK rows of another process, which an
+ *                opt-in test in hermit-cli/tests/flock_exclusion.rs has
+ *                /proc/locks list ahead of a native run's own rows.
  *
  * Exit status: 0 when every check printed the expected answer, 1 when one
  * did not (a line beginning FAIL), 2 for a harness failure.
@@ -84,6 +95,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -551,6 +563,67 @@ static int pid_is_ours(long pid) {
   return pid == own;
 }
 
+/* The FLOCK rows of one read of /proc/locks, in row order. Rows are
+   collected first: this process's own row, which teaches lock_object, need
+   not come before the rows it must distinguish. Every FLOCK row is kept.
+   Natively /proc/locks lists the flock rows of every process the reading
+   procfs's PID namespace can see, which on a host is every process; a
+   loaded development host has listed more than 4,096 (4,554, 2026-11-21),
+   and the kernel lists locks CPU by CPU (`locks_start`, fs/locks.c), so
+   this program's rows can come after all the others. A fixed table of
+   4,096 rows dropped the rest, this program's own among them, so the native
+   run printed `none`. The table grows instead, so this program never drops
+   its own rows however many a loaded host lists, and is kept for the next
+   read; a failed allocation or read ends the run as a harness failure,
+   never a short table. */
+struct parsed_row {
+  char access[16];
+  char object[64];
+  long pid;
+  int waits;
+};
+static struct parsed_row* parsed;
+static size_t capacity;
+
+/* Add `row`, a line of /proc/locks, to `parsed` as its `*count`th row if it
+   is a FLOCK row. */
+static void parse_proc_locks_row(const char* row, size_t* count) {
+  if (*count == capacity) {
+    size_t grown = capacity == 0 ? 1024 : 2 * capacity;
+    struct parsed_row* larger = realloc(parsed, grown * sizeof(*parsed));
+    if (larger == NULL) {
+      harness("grow the /proc/locks row table");
+    }
+    parsed = larger;
+    capacity = grown;
+  }
+  struct parsed_row* next = &parsed[*count];
+  char kind[16];
+  char waiter[4];
+  char mode[16];
+  char pid[16];
+  /* N: [->] FLOCK ADVISORY ACCESS PID MAJ:MIN:INO START END */
+  int waits = sscanf(row, "%*s %3s", waiter) == 1 && strcmp(waiter, "->") == 0;
+  const char* format =
+      waits ? "%*s %*s %15s %15s %15s %15s %63s" : "%*s %15s %15s %15s %15s %63s";
+  if (sscanf(row, format, kind, mode, next->access, pid, next->object) != 5 ||
+      strcmp(kind, "FLOCK") != 0) {
+    return;
+  }
+  next->waits = waits;
+  next->pid = strtol(pid, NULL, 10);
+  (*count)++;
+}
+
+/* The synthetic rows of `crowded`, which every read parses ahead of the
+   rows /proc/locks shows, as the kernel lists a loaded host's other rows
+   ahead of this program's: 0 outside `crowded`. Each is a shared flock of
+   pid 4194304, PID_MAX_LIMIT, which no process has (pids stay below
+   pid_max), on device 00:00 inode 0, which no file has (anonymous devices
+   start at minor 1, and no file is inode 0), so no row is this program's
+   and none shares the lock file's inode. */
+static long synthetic_flock_rows;
+
 /* The access of each /proc/locks row on the lock file, in row order, a
    waiter's (`->`) after `->`: one read of /proc/locks. */
 static void proc_locks_snapshot(char* out, size_t size) {
@@ -562,34 +635,27 @@ static void proc_locks_snapshot(char* out, size_t size) {
   if (locks == NULL) {
     harness("open /proc/locks");
   }
-  /* Rows are collected first: this process's own row, which teaches
-     lock_object, need not come before the rows it must distinguish. */
-  struct parsed_row {
-    char access[16];
-    char object[64];
-    long pid;
-    int waits;
-  };
-  static struct parsed_row parsed[4096];
-  int count = 0;
+  size_t count = 0;
   char row[256];
+  for (long index = 0; index < synthetic_flock_rows; index++) {
+    snprintf(row, sizeof(row), "%ld: FLOCK  ADVISORY  READ 4194304 00:00:0 0 EOF\n", index + 1);
+    parse_proc_locks_row(row, &count);
+  }
+  /* Every synthetic row must be in the table, or `crowded` tests nothing:
+     rows the parser rejected, or a table that stopped short, would leave
+     this program's rows where a short table still keeps them. */
+  if (count != (size_t)synthetic_flock_rows) {
+    char shortfall[128];
+    snprintf(shortfall, sizeof(shortfall), "the snapshot kept %zu of the %ld synthetic FLOCK rows",
+             count, synthetic_flock_rows);
+    errno = 0;
+    harness(shortfall);
+  }
   while (fgets(row, sizeof(row), locks) != NULL) {
-    char kind[16];
-    char waiter[4];
-    char mode[16];
-    char pid[16];
-    /* N: [->] FLOCK ADVISORY ACCESS PID MAJ:MIN:INO START END */
-    int waits = sscanf(row, "%*s %3s", waiter) == 1 && strcmp(waiter, "->") == 0;
-    const char* format =
-        waits ? "%*s %*s %15s %15s %15s %15s %63s" : "%*s %15s %15s %15s %15s %63s";
-    if (count >= (int)(sizeof(parsed) / sizeof(parsed[0])) ||
-        sscanf(row, format, kind, mode, parsed[count].access, pid, parsed[count].object) != 5 ||
-        strcmp(kind, "FLOCK") != 0) {
-      continue;
-    }
-    parsed[count].waits = waits;
-    parsed[count].pid = strtol(pid, NULL, 10);
-    count++;
+    parse_proc_locks_row(row, &count);
+  }
+  if (ferror(locks)) {
+    harness("read /proc/locks");
   }
   fclose(locks);
   if (lock_object[0] == '\0') {
@@ -599,7 +665,7 @@ static void proc_locks_snapshot(char* out, size_t size) {
     const char* unique = NULL;
     int ambiguous = 0;
     for (int pass = 0; pass < 3 && lock_object[0] == '\0'; pass++) {
-      for (int index = 0; index < count; index++) {
+      for (size_t index = 0; index < count; index++) {
         const char* colon = strrchr(parsed[index].object, ':');
         if (colon == NULL ||
             strtoull(colon + 1, NULL, 10) != (unsigned long long)file.st_ino) {
@@ -625,7 +691,7 @@ static void proc_locks_snapshot(char* out, size_t size) {
     }
   }
   out[0] = '\0';
-  for (int index = 0; index < count; index++) {
+  for (size_t index = 0; index < count; index++) {
     if (!all_flock_rows_are_ours &&
         (lock_object[0] == '\0' || strcmp(parsed[index].object, lock_object) != 0)) {
       continue;
@@ -1063,8 +1129,8 @@ static int take_unrelated_ofd_lock(char* path, size_t size) {
   return unrelated;
 }
 
-/* The /proc/locks rows of that lock, as a word. */
-static void unrelated_ofd_rows(char* out, size_t size) {
+/* The number of /proc/locks rows of that lock: one read. */
+static int unrelated_ofd_count(void) {
   char range[48];
   snprintf(range, sizeof(range), " %ld %ld\n", unrelated_start(), unrelated_start() + 22);
   FILE* locks = fopen("/proc/locks", "re");
@@ -1078,7 +1144,36 @@ static void unrelated_ofd_rows(char* out, size_t size) {
       count++;
     }
   }
+  if (ferror(locks)) {
+    harness("read /proc/locks");
+  }
   fclose(locks);
+  return count;
+}
+
+/* The /proc/locks rows of that lock, as a word, once two consecutive reads
+   agree, as proc_locks_rows settles its rows: a one-shot read of a long
+   /proc/locks tears. The kernel's seq_file hands the file out a buffer per
+   read and finds its place again by row number (`seq_read_iter`,
+   fs/seq_file.c; `locks_start`, fs/locks.c), so a lock taken or dropped
+   between two reads earlier in the list repeats or skips the row at the
+   boundary. On a loaded host (about 5,000 rows, 2026-11-21), 31 to 105 of
+   2,000 one-shot reads counted one held OFD row twice or not at all, which
+   failed the native run with `= 2, expected 1`; 3 to 9 of 2,000 reads
+   settled this way did, as the row sits at the same place in every read,
+   so this makes a torn count rare, not impossible. Bounded; on exhaustion
+   the last read stands. TODO: count the OFD rows in a way a torn
+   /proc/locks read cannot change; tracked as a follow-up. */
+static void unrelated_ofd_rows(char* out, size_t size) {
+  int count = unrelated_ofd_count();
+  for (int attempts = 1; attempts < 250; attempts++) {
+    int again = unrelated_ofd_count();
+    if (again == count) {
+      break;
+    }
+    count = again;
+    sleep_ms(10);
+  }
   snprintf(out, size, "%d", count);
 }
 
@@ -1819,6 +1914,45 @@ static int scenario_exec_report(const char* fd_text) {
   return 0;
 }
 
+/* (internal) The crowd: COUNT shared flock locks on this run's lock file,
+   each through an open file description of its own, so /proc/locks lists
+   COUNT FLOCK rows of this process, held until standard input closes. The
+   soft descriptor limit is raised to fit them, never past the hard one. */
+static void scenario_crowd(const char* count_text) {
+  char* end = NULL;
+  long count = strtol(count_text, &end, 10);
+  if (count <= 0 || *end != '\0') {
+    harness("crowd COUNT must be a positive number");
+  }
+  struct rlimit descriptors;
+  if (getrlimit(RLIMIT_NOFILE, &descriptors) != 0) {
+    harness("getrlimit RLIMIT_NOFILE");
+  }
+  rlim_t needed = (rlim_t)count + 64;
+  if (descriptors.rlim_cur != RLIM_INFINITY && descriptors.rlim_cur < needed) {
+    if (descriptors.rlim_max != RLIM_INFINITY && descriptors.rlim_max < needed) {
+      harness("the hard RLIMIT_NOFILE is below the crowd's descriptors");
+    }
+    descriptors.rlim_cur = needed;
+    if (setrlimit(RLIMIT_NOFILE, &descriptors) != 0) {
+      harness("raise RLIMIT_NOFILE for the crowd");
+    }
+  }
+  for (long index = 0; index < count; index++) {
+    if (flock(open_lock(), LOCK_SH) != 0) {
+      harness("take a crowd lock");
+    }
+  }
+  printf("crowd: holding %ld shared flock locks\n", count);
+  char byte;
+  ssize_t got;
+  while ((got = read(STDIN_FILENO, &byte, 1)) > 0 || (got < 0 && errno == EINTR)) {
+  }
+  if (got < 0) {
+    harness("read the crowd's standard input");
+  }
+}
+
 /* The scenarios `all` runs, in order; each also runs alone by its name. */
 static const struct {
   const char* name;
@@ -1857,6 +1991,14 @@ int main(int argc, char** argv) {
   if (strcmp(scenario, "exec-report") == 0) {
     return argc > 2 ? scenario_exec_report(argv[2]) : HARNESS_FAILURE;
   }
+  if (strcmp(scenario, "crowded") == 0) {
+    char* end = NULL;
+    synthetic_flock_rows = argc > 3 ? strtol(argv[2], &end, 10) : 0;
+    if (synthetic_flock_rows <= 0 || *end != '\0') {
+      harness("crowded needs a positive COUNT and a SCENARIO");
+    }
+    scenario = argv[3];
+  }
   const char* tmp = getenv("TMPDIR");
   snprintf(lock_dir, sizeof(lock_dir), "%s/flock-se-XXXXXX", tmp != NULL && tmp[0] != '\0' ? tmp : "/tmp");
   if (mkdtemp(lock_dir) == NULL) {
@@ -1889,6 +2031,8 @@ int main(int argc, char** argv) {
     scenario_waiter_mapped();
   } else if (!ran && strcmp(scenario, "ebadf") == 0) {
     scenario_ebadf();
+  } else if (!ran && strcmp(scenario, "crowd") == 0) {
+    scenario_crowd(argc > 2 ? argv[2] : "");
   } else if (!ran) {
     printf("HARNESS: unknown scenario %s\n", scenario);
     failures = -1;
