@@ -53,26 +53,46 @@ record_external_buckconfigs() {
     done
 }
 
+# Every read of HEAD here ignores refs/replace, which could make HEAD name other objects.
+head_git() { git --no-replace-objects "$@"; }
+
+# head_repo TOP: 0 if the git top level TOP is the checkout itself, or a submodule whose
+# superproject records it as a gitlink at HEAD, up to the checkout. A nested repository that
+# is not such a submodule would judge a file against its own HEAD, so it refuses.
+head_repo() {
+    local top=$1 super entry mode type
+    [[ $top == "$(realpath -e -- "$root")" ]] && return 0
+    super=$(head_git -C "$top" rev-parse --show-superproject-working-tree 2>/dev/null) || return 1
+    [[ -n $super && $top == "$super"/* ]] || return 1
+    entry=$(head_git -C "$super" ls-tree HEAD -- "${top#"$super"/}" 2>/dev/null) || return 1
+    read -r mode type _ <<<"$entry"
+    [[ $mode == 160000 && $type == commit ]] || return 1
+    head_repo "$super"
+}
+
 # head_file REL: 0 if REL, relative to $root, is a regular file of HEAD in the repository that
 # holds it (a submodule's HEAD for a path inside one), with HEAD's bytes, reached through no
-# symlink.
+# symlink. The bytes are hashed raw (--no-filters): a clean filter or autocrlf setting could
+# otherwise make other bytes hash to HEAD's blob.
 head_file() {
-    local rel=$1 abs dir base entry mode type blob name
+    local rel=$1 abs dir base top entry mode type blob name
     [[ $rel != /* && /$rel/ != */../* && /$rel/ != */./* ]] || return 1
     abs=$root/$rel
     [[ -f $abs ]] || return 1
     [[ $(realpath -e -- "$abs" 2>/dev/null) == "$(realpath -e -- "$root")/$rel" ]] || return 1
     dir=$(dirname -- "$abs") base=$(basename -- "$abs")
-    entry=$(git -C "$dir" ls-tree HEAD -- "$base" 2>/dev/null) || return 1
+    top=$(head_git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+    head_repo "$top" || return 1
+    entry=$(head_git -C "$dir" ls-tree HEAD -- "$base" 2>/dev/null) || return 1
     read -r mode type blob name <<<"$entry"
     [[ ($mode == 100644 || $mode == 100755) && $type == blob && $name == "$base" ]] || return 1
-    [[ $(git -C "$dir" hash-object -- "$base" 2>/dev/null) == "$blob" ]]
+    [[ $(head_git -C "$dir" hash-object --no-filters -- "$base" 2>/dev/null) == "$blob" ]]
 }
 
 # The cell roots that HEAD's .buckconfig marks `bundled` in [external_cells]: buck2 serves
 # their buckconfig from its own binary, so a location under one is the pinned buck2's.
 bundled_cell_roots() {
-    git -C "$root" show HEAD:.buckconfig 2>/dev/null | awk '
+    head_git -C "$root" show HEAD:.buckconfig 2>/dev/null | awk '
         /^[[:space:]]*\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
         /^[[:space:]]*[#;]/ || !/=/ { next }
         {
@@ -103,8 +123,9 @@ describe_config_file() {
     printf '%s\t%s\t%s\n' "$path" "$sum" "$target"
 }
 
-# Before the daemon starts: buck2 settings files and the checkout's own untracked or linked
-# buckconfig (the shared-cache .buckconfig.local link is the usual one), named with what to do.
+# Right after the knobs are exported, in every form of the node and before any buck2 runs:
+# buck2 settings files and the checkout's own untracked or linked buckconfig (the
+# shared-cache .buckconfig.local link is the usual one), named with what to do.
 refuse_untracked_buck_config() {
     local file found=()
     for file in "$HOME/.bucksettings.toml" "$HOME/.bucksettings.local.toml"; do
@@ -119,7 +140,7 @@ refuse_untracked_buck_config() {
             found+=("$root/$file")
         fi
     done
-    if [[ -e $root/.buckconfig.d && -z $(git -C "$root" ls-tree HEAD -- .buckconfig.d) ]]; then
+    if [[ -e $root/.buckconfig.d && -z $(head_git -C "$root" ls-tree HEAD -- .buckconfig.d) ]]; then
         found+=("$root/.buckconfig.d (not in this commit)")
     fi
     ((${#found[@]} == 0)) && return 0
@@ -132,7 +153,7 @@ refuse_untracked_buck_config() {
 # every location is a HEAD file, a bundled cell's, or the stock settings file, and both stock
 # keys are defined in that file.
 check_buckconfig_sources() {
-    local dump=$1 records=$2 stock=$root/$stock_config_rel values loc bad=() line key want got
+    local dump=$1 records=$2 stock=$root/$stock_config_rel values parsed loc bad=() line key want got
     if ! timeout --foreground -k 5 300 "$buck2" audit config --client-metadata id=hermit-buckconfig-sources \
         --all-cells --location direct >"$dump"; then
         echo "validate-node: \`buck2 audit config\` failed or ran past 300 s (above), so this run cannot show where its buckconfig comes from; nothing ran" >&2
@@ -141,6 +162,13 @@ check_buckconfig_sources() {
     values=$(grep -c '^  (defined at ' "$dump") || true
     if ((values == 0)); then
         echo "validate-node: \`buck2 audit config --location direct\` printed no value with its location ($dump), so this run cannot show where its buckconfig comes from; nothing ran" >&2
+        exit 2
+    fi
+    # The same pattern as the location parse below: a location line it cannot parse would
+    # otherwise skip the per-location rule unseen.
+    parsed=$(grep -c '^  (defined at .*:[0-9]*)$' "$dump") || true
+    if ((parsed != values)); then
+        echo "validate-node: \`buck2 audit config --location direct\` printed $values location lines, but only $parsed have the form '(defined at PATH:LINE)' ($dump), so the others cannot be checked; nothing ran" >&2
         exit 2
     fi
     while read -r loc; do

@@ -8,12 +8,17 @@
 # Tests ci/buck-e2e/buckconfig-sources.sh with a stub buck2 that prints a canned
 # `audit config --all-cells --location direct` dump, in a throwaway git checkout. Each case
 # runs in a subshell, because a refusal exits 2. No real buck2 and no daemon.
-# Run by hand: ci/buck-e2e/test-buckconfig-sources.sh
+# Run by `make lint-check-buck-e2e-buckconfig-sources` (part of `make lint-checks`), or by
+# hand: ci/buck-e2e/test-buckconfig-sources.sh
 # Each case sets root, buck2 and HOME inside its own subshell on purpose, so that no case
 # leaks into the next.
 # shellcheck disable=SC2030,SC2031
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# git reads only what the cases set up: no inherited GIT_* variable (a hook's GIT_DIR, say),
+# and no system or global config (a host clean filter would change what gets hashed).
+while read -r name; do unset "$name"; done < <(compgen -e | grep '^GIT_' || true)
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 # Each signal exits 128+N, and that exit's EXIT trap removes the scratch directory. The trap
 # is installed before mktemp, so an interrupt cannot leak the directory, and it keeps the
 # script's own exit status.
@@ -119,6 +124,72 @@ rm -f -- "$co/shim/.buckconfig.local"
 cp "$co/shim/.buckconfig" "$work/shim.bak"
 expect 2 "tracked file edited" "$work/clean" sh -c "echo '# edited' >>'$co/shim/.buckconfig'"
 cp "$work/shim.bak" "$co/shim/.buckconfig"
+
+# A file of a real submodule passes: HEAD records the submodule as a gitlink, and the file is
+# at the submodule's HEAD.
+sub_src=$work/sub-src
+mkdir -p "$sub_src"
+printf '[sub]\nkey = 1\n' >"$sub_src/.buckconfig"
+git -C "$sub_src" init -q
+git -C "$sub_src" add .buckconfig
+git -C "$sub_src" -c user.name=t -c user.email=t@t commit -q -m sub
+git -C "$co" -c protocol.file.allow=always submodule --quiet add "$sub_src" sub
+git -C "$co" -c user.name=t -c user.email=t@t commit -q -m submodule
+{ clean_dump; printf '[sub]\n    key = 1\n  (defined at sub/.buckconfig:2)\n'; } >"$work/subcell"
+expect 0 "a file of a submodule HEAD records" "$work/subcell" true
+
+# Each case below edits shim/.buckconfig and then makes git vouch for the edited bytes in a
+# way an unguarded check would believe (asserted first, so the case cannot pass vacuously).
+head_blob=$(git -C "$co" rev-parse HEAD:shim/.buckconfig)
+# only_shim_refused NAME: the refusal named shim/.buckconfig and nothing else.
+only_shim_refused() {
+    grep -qF "not this commit's ($co/shim/.buckconfig; see" "$work/case.log" ||
+        { cat "$work/case.log" >&2; fail "$1: the refusal does not name exactly shim/.buckconfig"; }
+}
+vouches() { [[ $(git -C "$co/shim" ls-tree HEAD -- .buckconfig | awk '{print $3}') == "$(git -C "$co/shim" hash-object -- .buckconfig)" ]]; }
+
+# A clean filter that turns the edited bytes back into HEAD's: the bytes are hashed raw.
+echo '# edited' >>"$co/shim/.buckconfig"
+printf 'shim/.buckconfig filter=same\n' >"$co/.git/info/attributes"
+git -C "$co" config filter.same.clean "cat '$work/shim.bak'"
+[[ $(git -C "$co/shim" hash-object -- .buckconfig) == "$head_blob" ]] || fail "the clean filter setup does not make the edited file hash to HEAD's blob"
+expect 2 "tracked file edited behind a clean filter" "$work/clean" true
+only_shim_refused "tracked file edited behind a clean filter"
+git -C "$co" config --unset filter.same.clean
+rm -f -- "$co/.git/info/attributes"
+cp "$work/shim.bak" "$co/shim/.buckconfig"
+
+# A refs/replace entry that swaps HEAD for a commit holding the edited bytes: HEAD is read
+# without replacements.
+echo '# edited' >>"$co/shim/.buckconfig"
+head_sha=$(git -C "$co" rev-parse HEAD)
+edited_blob=$(git -C "$co" hash-object -w --no-filters -- shim/.buckconfig)
+GIT_INDEX_FILE=$work/replace.index git -C "$co" read-tree HEAD
+GIT_INDEX_FILE=$work/replace.index git -C "$co" update-index --cacheinfo "100644,$edited_blob,shim/.buckconfig"
+replaced_tree=$(GIT_INDEX_FILE=$work/replace.index git -C "$co" write-tree)
+replacement=$(git -C "$co" -c user.name=t -c user.email=t@t commit-tree "$replaced_tree" -m replacement)
+git -C "$co" replace "$head_sha" "$replacement"
+vouches || fail "the refs/replace setup does not make HEAD name the edited bytes"
+expect 2 "a refs/replace entry for HEAD" "$work/clean" true
+only_shim_refused "a refs/replace entry for HEAD"
+git -C "$co" replace -d "$head_sha" >/dev/null
+cp "$work/shim.bak" "$co/shim/.buckconfig"
+
+# A nested repository that HEAD does not record as a submodule, whose own HEAD holds the
+# edited bytes.
+echo '# edited' >>"$co/shim/.buckconfig"
+git -C "$co/shim" init -q
+git -C "$co/shim" add .buckconfig
+git -C "$co/shim" -c user.name=t -c user.email=t@t commit -q -m nested
+vouches || fail "the nested repository setup does not hold the edited bytes at its HEAD"
+expect 2 "a file of a nested repository that is not a submodule" "$work/clean" true
+only_shim_refused "a file of a nested repository that is not a submodule"
+rm -rf -- "$co/shim/.git"
+cp "$work/shim.bak" "$co/shim/.buckconfig"
+
+# A location line counted as one but not of the form the parser reads.
+{ clean_dump; printf '[z]\n    w = 1\n  (defined at shim/.buckconfig, line 2)\n'; } >"$work/unparsed"
+expect 2 "a location line the parser cannot read" "$work/unparsed" true
 
 expect 2 "a prelude/ directory in the checkout" "$work/clean" mkdir "$co/prelude"
 rmdir -- "$co/prelude"

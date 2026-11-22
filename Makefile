@@ -256,6 +256,7 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-ingest \
     lint-check-buck-e2e-stock \
     lint-check-buck-e2e-verdict \
+    lint-check-buck-e2e-buckconfig-sources \
     lint-check-buck-e2e-cell \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
@@ -460,6 +461,9 @@ lint-check-buck-e2e-stock:
 
 lint-check-buck-e2e-verdict:
 	python3 ./ci/test_buck_e2e_verdict.py
+
+lint-check-buck-e2e-buckconfig-sources:
+	./ci/buck-e2e/test-buckconfig-sources.sh
 
 lint-check-buck-e2e-cell:
 	python3 ./ci/test_buck_e2e_cell.py

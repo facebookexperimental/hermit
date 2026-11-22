@@ -596,7 +596,7 @@ otherwise load that file, `/etc/buckconfig.d/*`, `/etc/buckconfig` and
 `~/.buckconfig.local`.
 
 How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
-`ci/buck-e2e/test-buckconfig-sources.sh`):
+`ci/buck-e2e/test-buckconfig-sources.sh`, which `make lint-checks` runs):
 
 - **Two knobs, in every form of the node, `--stage-only` included**, for every
   buck2 it runs, its daemon included:
@@ -607,21 +607,29 @@ How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
   buck2 labels both testing knobs; buck2's own open-source CI uses the first for
   the same reason. Any other `BUCK2_TEST_*` variable, or
   `BUCK2_SETTINGS_OVERRIDE`, makes the node exit 2.
-- **Before the daemon starts**, it exits 2 on:
+- **In every form, right after the knobs and before any buck2 runs**, it exits 2
+  on:
   - a buck2 settings file (`.bucksettings.toml` or `.bucksettings.local.toml`)
     in HOME or in the checkout;
   - an untracked or linked `.buckconfig.local` or `.buckconfig.d` in the
     checkout. The shared action cache's link below is one: remove it from a
     checkout used for a Buck-only run.
-- **After the daemon starts**:
-  - it writes each machine-local file's SHA-256 to
+- **In the forms that run cells** (no argument, `--cells-only`):
+  - before the daemon starts, it writes each machine-local file's SHA-256 to
     `buck-invocations/buckconfig-external.tsv`;
-  - it writes the daemon's buckconfig for every cell, with where each value is
-    defined, to `buck-invocations/buckconfig-effective.txt`;
-  - it exits 2 before the stage unless that dump has values, every value comes
-    from a file of HEAD (a submodule's HEAD inside one) with HEAD's bytes and
-    no symlink on its path, from the bundled prelude, or from
-    `stock-runner.buckconfig`, and both of that file's keys are defined there.
+  - after the bounded daemon starts, it writes the daemon's buckconfig for
+    every cell, with where each value is defined, to
+    `buck-invocations/buckconfig-effective.txt`;
+  - it exits 2 before the stage unless that dump has values, every location
+    line in it parses, every value comes from a file of HEAD (a submodule's
+    HEAD inside one) with HEAD's bytes and no symlink on its path, from the
+    bundled prelude, or from `stock-runner.buckconfig`, and both of that
+    file's keys are defined there. HEAD's bytes are compared raw, ignoring any
+    clean filter or `refs/replace` entry, and a file in a nested repository
+    that HEAD does not record as a submodule is not a file of HEAD.
+
+  `--stage-only` starts no bounded daemon, so its buckconfig gets the knobs and
+  the refusal above, but no dump and no per-value check.
 
 `stock-runner.buckconfig` sets two keys:
 
@@ -640,10 +648,11 @@ What the run does not cover:
 - any later buck2 settings layer, which `buck2 audit config` does not show.
   Check for one at each buck2 pin bump.
 
-Buck-only results from before 2026-11-21 are not directly comparable with later
-ones. Those runs took action suspension (`kill_and_retry`), clean-stale, the
-restarter and persistent workers from the host's rollout file. Later runs leave
-each at buck2's default.
+Buck-only results from a commit without this configuration control are not
+directly comparable with results from a commit that has it, whatever the date
+of the run. Those runs took action suspension (`kill_and_retry`), clean-stale,
+the restarter and persistent workers from the host's rollout file. Runs with
+the control leave each at buck2's default.
 
 ## Host prerequisites for Buck validation
 

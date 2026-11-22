@@ -46,16 +46,20 @@
 #     ~/.buckconfig.d/* and ~/.buckconfig.local;
 #   - BUCK2_TEST_EXTRA_EXTERNAL_CONFIG adds stock-runner.buckconfig, which no other mode reads.
 # Any other BUCK2_TEST_* variable, or BUCK2_SETTINGS_OVERRIDE, refuses (exit 2).
-# Before the daemon starts it refuses a buck2 settings file in HOME or the checkout, and an
-# untracked or linked .buckconfig.local or .buckconfig.d in the checkout (the shared action
-# cache link of docs/BUCK2_OSS.md is one). After the daemon starts it:
-#   - writes each machine-local file's sha256 to buck-invocations/buckconfig-external.tsv;
-#   - writes the daemon's buckconfig for every cell, with where each value is defined, to
-#     buck-invocations/buckconfig-effective.txt;
-#   - refuses before the stage unless that dump has values, every value comes from a file of
+# Right after exporting them, in every form, before any buck2 runs, it refuses a buck2
+# settings file in HOME or the checkout, and an untracked or linked .buckconfig.local or
+# .buckconfig.d in the checkout (the shared action cache link of docs/BUCK2_OSS.md is one).
+# The forms that run cells (no argument, --cells-only) also:
+#   - write each machine-local file's sha256 to buck-invocations/buckconfig-external.tsv,
+#     before the daemon starts;
+#   - after the bounded daemon starts, write its buckconfig for every cell, with where each
+#     value is defined, to buck-invocations/buckconfig-effective.txt;
+#   - refuse before the stage unless that dump has values, every value comes from a file of
 #     HEAD (a submodule's HEAD inside one) with HEAD's bytes and no symlink on its path, from
 #     the bundled prelude, or from stock-runner.buckconfig, and both of that file's keys are
 #     defined there.
+# --stage-only starts no bounded daemon, so its buckconfig gets the knobs and the refusal
+# above but no dump or per-value check.
 # ci/buck-e2e/buckconfig-sources.sh holds this code; ci/buck-e2e/test-buckconfig-sources.sh
 # tests it.
 # scripts/validate.rs --buck-s0 runs the no-argument form as ONE node, so the stage's buck2
@@ -227,11 +231,13 @@ await_preflight() {
     step "the preflight passed: $tags"
 }
 
-# buck-stock's buckconfig (above): the knobs go to every buck2 this node runs, in every form.
+# buck-stock's buckconfig (above): the knobs and the untracked-config refusal come before
+# any buck2 this node runs, in every form, --stage-only included.
 # shellcheck source-path=SCRIPTDIR source=buckconfig-sources.sh
 source "$here/buckconfig-sources.sh"
 if [[ ${HERMIT_VALIDATE_E2E_RUNNER:-} == buck-stock ]]; then
     export_stock_buckconfig_env
+    refuse_untracked_buck_config
 fi
 
 if [[ $phase == stage ]]; then
@@ -461,7 +467,6 @@ if [[ $mode == stock ]]; then
     mkdir -p -- "$config_records"
     record_external_buckconfigs >"$config_records/buckconfig-external.tsv"
     step "buck2 skips the machine-local buckconfigs; their sha256 are in $config_records/buckconfig-external.tsv"
-    refuse_untracked_buck_config
     bound_daemon
     check_buckconfig_sources "$config_records/buckconfig-effective.txt" "$config_records/buckconfig-external.tsv"
 fi

@@ -901,6 +901,17 @@ class ValidateNodeTest(unittest.TestCase):
         shutil.copy2(BUCK_E2E / "daemon-bound.sh", checkout / "ci" / "buck-e2e" / "daemon-bound.sh")
         # validate-node sources this on every path; only buck-stock calls its functions.
         shutil.copy2(BUCK_E2E / "buckconfig-sources.sh", checkout / "ci" / "buck-e2e" / "buckconfig-sources.sh")
+        # Every file validate-node sources must be among the copies above: a missing one fails
+        # the node on whichever path reaches it, and every test with it (the copy list is kept
+        # by hand). Each `source` or `.` line must name a file beside the node.
+        node_text = self.node.read_text()
+        source_lines = re.findall(r"^\s*(?:source|\.)\s+(\S+)", node_text, re.MULTILINE)
+        sourced = re.findall(r'^\s*(?:source|\.)\s+"\$here/([^"/]+)"\s*$', node_text, re.MULTILINE)
+        self.assertTrue(sourced, "validate-node sources no file beside it, so this check would check nothing")
+        self.assertEqual(len(sourced), len(source_lines),
+                         f"validate-node sources something other than a file beside it: {source_lines}")
+        self.assertEqual([name for name in sourced if not (checkout / "ci" / "buck-e2e" / name).is_file()], [],
+                         "validate-node sources files this scratch checkout lacks: copy them in setUp")
         for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage"):
             write_executable(checkout / step, FAKE_STEP)
         write_executable(checkout / "ci" / "buck-e2e" / "run", FAKE_RUN)
@@ -963,6 +974,30 @@ class ValidateNodeTest(unittest.TestCase):
                                  env=environment)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertEqual(calls_in(self.calls), [["stage", "--from-cargo"]])
+
+    def stock_stage_only(self):
+        """validate-node --stage-only under buck-stock in the scratch checkout, with a scratch
+        HOME, since the refusal reads HOME's buck2 settings files."""
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        return self.validate_node(None, args=["--stage-only"], runner="buck-stock", HOME=str(home))
+
+    def test_stage_only_under_buck_stock_stages_with_buck_in_a_clean_checkout(self):
+        self.commit_checkout()
+        process = self.stock_stage_only()
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(calls_in(self.calls), [["stage", "--from-buck", str(self.buck2), "--subset", ""]])
+
+    def test_stage_only_under_buck_stock_refuses_a_linked_buckconfig_local_before_the_stage(self):
+        self.commit_checkout()
+        outside = self.root / "outside.buckconfig"
+        outside.write_text("[build]\nexecution_platforms = cache\n")
+        (self.checkout / ".buckconfig.local").symlink_to(outside)
+        process = self.stock_stage_only()
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        self.assertIn(f"{self.checkout}/.buckconfig.local -> {outside}", process.stderr)
+        self.assertIn("(rm .buckconfig.local)", process.stderr)
+        self.assertFalse(self.calls.exists(), "a step ran before the refusal")
 
     def test_cells_only_runs_the_cells_against_inputs_staged_for_head(self):
         self.write_staged_source_sha(self.commit_checkout())
