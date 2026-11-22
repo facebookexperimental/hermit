@@ -31,6 +31,7 @@
 #define ARCH_GET_XCOMP_PERM 0x1022
 #define ARCH_REQ_XCOMP_PERM 0x1023
 #define ARCH_GET_XCOMP_GUEST_PERM 0x1024
+#define ARCH_REQ_XCOMP_GUEST_PERM 0x1025
 
 static int failures;
 
@@ -178,6 +179,9 @@ int main(void) {
           arch_prctl_u64(ARCH_GET_XCOMP_PERM, &perm) == 0 &&
           arch_prctl_u64(ARCH_GET_XCOMP_GUEST_PERM, &guest) == 0);
   check("xcomp perm covers xcr0", (perm & xcr0) == xcr0);
+  check(
+      "xcomp supp and guest perm cover xcr0",
+      (supp & xcr0) == xcr0 && (guest & xcr0) == xcr0);
   errno = 0;
   long req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, 63);
   check("xcomp request beyond the last feature is EINVAL", req == -1 && errno == EINVAL);
@@ -185,6 +189,16 @@ int main(void) {
   req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, 0);
   check(
       "xcomp request for a static feature is EOPNOTSUPP",
+      req == -1 && errno == EOPNOTSUPP);
+  errno = 0;
+  req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_GUEST_PERM, 63);
+  check(
+      "xcomp guest request beyond the last feature is EINVAL",
+      req == -1 && errno == EINVAL);
+  errno = 0;
+  req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_GUEST_PERM, 0);
+  check(
+      "xcomp guest request for a static feature is EOPNOTSUPP",
       req == -1 && errno == EOPNOTSUPP);
 
   return failures ? 1 : 0;

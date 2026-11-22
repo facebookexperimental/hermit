@@ -191,12 +191,35 @@ fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
 }
 
 fn run_replay_case_with_cflags(guest: &str, scenario: Option<&str>, mode: Mode, cflags: &[&str]) {
+    run_replay_case_with(guest, scenario, mode, cflags, &[]);
+}
+
+fn run_replay_case_with_hermit_args(
+    guest: &str,
+    scenario: Option<&str>,
+    mode: Mode,
+    hermit_args: &[&str],
+) {
+    run_replay_case_with(guest, scenario, mode, &[], hermit_args);
+}
+
+fn run_replay_case_with(
+    guest: &str,
+    scenario: Option<&str>,
+    mode: Mode,
+    cflags: &[&str],
+    hermit_args: &[&str],
+) {
     let directory = tempfile::Builder::new()
         .prefix(&format!("replay-{guest}-"))
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the guest build directory");
     let binary = compile_guest(guest, directory.path(), cflags);
-    run_replay(&binary, scenario, mode);
+    let hermit_args = hermit_args
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect::<Vec<_>>();
+    run_replay_with(&binary, scenario, mode, &hermit_args);
 }
 
 fn run_rust_replay_case(guest: &str, mode: Mode) {
@@ -604,23 +627,40 @@ macro_rules! replay_case {
     };
 }
 
-replay_case!(
+macro_rules! replay_case_with_hermit_args {
+    ($name:ident, $guest:literal, $scenario:expr, $mode:expr, $hermit_args:expr) => {
+        #[test]
+        fn $name() {
+            run_replay_case_with_hermit_args($guest, $scenario, $mode, $hermit_args);
+        }
+    };
+}
+
+// This guest asserts x86-64-v2's normalized arch_prctl answers (zero XCOMP
+// masks and EINVAL for permission requests). x86-64-v3 intentionally answers
+// those queries from qualified host XSTATE facts, so name v2 here, as
+// hermit-cli's canonical test profile pin does; these cases test schedule
+// replay, not the host-dependent `--cpu-profile auto` default.
+replay_case_with_hermit_args!(
     chaos_replay_arch_prctl_determinism,
     "arch_prctl_determinism",
     None,
-    Mode::ChaosReplay
+    Mode::ChaosReplay,
+    &["--hermit-arg=--cpu-profile=x86-64-v2"]
 );
-replay_case!(
+replay_case_with_hermit_args!(
     trace_replay_arch_prctl_determinism,
     "arch_prctl_determinism",
     None,
-    Mode::TraceReplay
+    Mode::TraceReplay,
+    &["--hermit-arg=--cpu-profile=x86-64-v2"]
 );
-replay_case!(
+replay_case_with_hermit_args!(
     trace_replay_chaos_arch_prctl_determinism,
     "arch_prctl_determinism",
     None,
-    Mode::TraceReplayChaos
+    Mode::TraceReplayChaos,
+    &["--hermit-arg=--cpu-profile=x86-64-v2"]
 );
 replay_case!(
     chaos_replay_clock_determinism,
@@ -2130,17 +2170,20 @@ rust_replay_case!(
 
 // The internal targets' strict and chaos `hermit run` pairs, for every C
 // guest and scenario above and all 25 tests/rust guests.
-replay_case!(
+// Same x86-64-v2 pin as the arch_prctl schedule-replay cases above.
+replay_case_with_hermit_args!(
     verify_run_strict_arch_prctl_determinism,
     "arch_prctl_determinism",
     None,
-    Mode::Strict
+    Mode::Strict,
+    &["--hermit-arg=--cpu-profile=x86-64-v2"]
 );
-replay_case!(
+replay_case_with_hermit_args!(
     verify_run_chaos_arch_prctl_determinism,
     "arch_prctl_determinism",
     None,
-    Mode::Chaos
+    Mode::Chaos,
+    &["--hermit-arg=--cpu-profile=x86-64-v2"]
 );
 replay_case!(
     verify_run_strict_clock_determinism,

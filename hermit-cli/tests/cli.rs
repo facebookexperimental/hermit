@@ -67050,7 +67050,7 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
         let checks: Vec<&str> = lines.collect();
         assert_eq!(
             checks.len(),
-            if profile == "x86-64-v2" { 2 } else { 21 },
+            if profile == "x86-64-v2" { 2 } else { 24 },
             "{stdout}"
         );
         assert!(
