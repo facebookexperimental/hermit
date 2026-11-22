@@ -14,14 +14,22 @@
 # shellcheck disable=SC2030,SC2031
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+# Each signal exits 128+N, and that exit's EXIT trap removes the scratch directory. The trap
+# is installed before mktemp, so an interrupt cannot leak the directory, and it keeps the
+# script's own exit status.
+work=
+rc=
+for sig in 1 2 3 13 15; do eval "trap 'exit $((sig + 128))' $sig"; done
+trap 'rc=$?; set +e; rm -rf -- "$work"; exit $rc' EXIT
+work=$(mktemp -d) || exit 1
 pass=0
 fail() { echo "test-buckconfig-sources.sh: FAIL: $*" >&2; exit 1; }
 
 # A checkout: a tracked .buckconfig with a bundled prelude cell and a shim cell, a tracked
 # shim/.buckconfig, and the tracked stock settings file.
 co=$work/checkout
+# The cases' HOME, inside the scratch directory, so no case reads this machine's files.
+fake_home=$work/fake-home
 mkdir -p "$co/shim" "$co/ci/buck-e2e"
 printf '[cells]\nroot = .\nshim = shim\nprelude = prelude\n\n[external_cells]\nprelude = bundled\n' >"$co/.buckconfig"
 printf '[buildfile]\nname = BUCK\n' >"$co/shim/.buckconfig"
@@ -67,7 +75,7 @@ expect() {
     set +e
     (
         set -euo pipefail
-        root=$co buck2=$work/buck2 STUB_DUMP=$dump HOME=$work/home
+        root=$co buck2=$work/buck2 STUB_DUMP=$dump HOME=$fake_home
         mkdir -p "$HOME"
         step() { :; }
         # shellcheck source-path=SCRIPTDIR source=buckconfig-sources.sh
@@ -121,8 +129,8 @@ expect 2 "sqlite_dep_file_state not from the stock file" "$work/movedkey" true
 sed 's/status = if_available/status = off/' "$work/clean" >"$work/offkey"
 expect 2 "status not if_available" "$work/offkey" true
 
-expect 2 "a home settings file" "$work/clean" sh -c "mkdir -p '$work/home' && : >'$work/home/.bucksettings.local.toml'"
-rm -f -- "$work/home/.bucksettings.local.toml"
+expect 2 "a home settings file" "$work/clean" sh -c "mkdir -p '$fake_home' && : >'$fake_home/.bucksettings.local.toml'"
+rm -f -- "$fake_home/.bucksettings.local.toml"
 
 expect 0 "clean again after the cases" "$work/clean" true
 
@@ -149,18 +157,18 @@ pass=$((pass + 1))
 pass=$((pass + 1))
 
 # The records of the machine-local files: a present one with its sha256, a missing one absent.
-mkdir -p "$work/home/.buckconfig.d"
-printf '[x]\ny = 1\n' >"$work/home/.buckconfig.d/rollout"
+mkdir -p "$fake_home/.buckconfig.d"
+printf '[x]\ny = 1\n' >"$fake_home/.buckconfig.d/rollout"
 (
-    root=$co HOME=$work/home
+    root=$co HOME=$fake_home
     # shellcheck source-path=SCRIPTDIR source=buckconfig-sources.sh
     source "$here/buckconfig-sources.sh"
     record_external_buckconfigs
 ) >"$work/external.tsv"
 tab=$'\t'
-grep -q "^$work/home/.buckconfig.d/rollout$tab$(sha256sum <"$work/home/.buckconfig.d/rollout" | cut -c1-64)$tab$(stat -c %s "$work/home/.buckconfig.d/rollout")$" "$work/external.tsv" ||
+grep -q "^$fake_home/.buckconfig.d/rollout$tab$(sha256sum <"$fake_home/.buckconfig.d/rollout" | cut -c1-64)$tab$(stat -c %s "$fake_home/.buckconfig.d/rollout")$" "$work/external.tsv" ||
     fail "record_external_buckconfigs: no sha256 line for a present file: $(cat "$work/external.tsv")"
-grep -q "^$work/home/.buckconfig.local${tab}absent$" "$work/external.tsv" ||
+grep -q "^$fake_home/.buckconfig.local${tab}absent$" "$work/external.tsv" ||
     fail "record_external_buckconfigs: no absent line for a missing file"
 pass=$((pass + 1))
 

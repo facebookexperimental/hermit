@@ -899,6 +899,8 @@ class ValidateNodeTest(unittest.TestCase):
         self.checkout = checkout
         shutil.copy2(BUCK_E2E / "stages.py", checkout / "ci" / "buck-e2e" / "stages.py")
         shutil.copy2(BUCK_E2E / "daemon-bound.sh", checkout / "ci" / "buck-e2e" / "daemon-bound.sh")
+        # validate-node sources this on every path; only buck-stock calls its functions.
+        shutil.copy2(BUCK_E2E / "buckconfig-sources.sh", checkout / "ci" / "buck-e2e" / "buckconfig-sources.sh")
         for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage"):
             write_executable(checkout / step, FAKE_STEP)
         write_executable(checkout / "ci" / "buck-e2e" / "run", FAKE_RUN)
