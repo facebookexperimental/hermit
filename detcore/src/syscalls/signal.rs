@@ -3015,8 +3015,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux sends the signal to each process in the set
     /// (`__kill_pgrp_info`, `kill_something_info` in kernel/signal.c), and each
     /// process then picks its receiving thread as a process-directed signal
-    /// does. Detcore models neither the set's membership nor that choice, so
-    /// the call goes through the unsupported-operation policy: a fail-closed
+    /// does. Detcore models process-group membership but does not yet deliver
+    /// the signal to each process in the set
+    /// (https://github.com/facebookexperimental/hermit/issues/429), so the
+    /// call goes through the unsupported-operation policy: a fail-closed
     /// run stops with the policy-refusal status and
     /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
     /// A SIGKILL to another group is forwarded before this point
@@ -3037,8 +3039,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             pid => format!("process group {}", pid.unsigned_abs()),
         };
         let reason = if guest.config().sequentialize_threads {
-            "Detcore does not model process-group membership or each process's receiving \
-             thread (https://github.com/rrnewton/hermit/issues/4046)"
+            "Detcore models process-group membership but does not yet deliver this signal to \
+             each process in the set (https://github.com/facebookexperimental/hermit/issues/429)"
         } else {
             "with threads not sequentialized (--no-sequentialize-threads, --strace-only) it \
              would go to the host kernel as is, and the guest's process group is inherited from \

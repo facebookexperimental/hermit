@@ -4836,8 +4836,9 @@ fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
 /// A reserved signal sent to a process group, by `kill(0)`, `kill(-pgrp)`,
 /// `kill(-1)` or `pidfd_send_signal` with `PIDFD_SIGNAL_PROCESS_GROUP`, stays
 /// refused by name exactly as before A5 step 3c slice 0a, on both in-guest
-/// backends and on ptrace: Detcore does not model process-group membership
-/// (<https://github.com/rrnewton/hermit/issues/4046>,
+/// backends and on ptrace: Detcore models process-group membership but does not
+/// yet deliver a group send to each member
+/// (<https://github.com/facebookexperimental/hermit/issues/429>,
 /// <https://github.com/rrnewton/hermit/issues/4108>), so a fail-closed run stops
 /// with the policy-refusal status at the call. The reserved-signal EPERM is
 /// not put in front of that stopping refusal, which would weaken it. These

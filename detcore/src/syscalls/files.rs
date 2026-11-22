@@ -18623,8 +18623,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if scope == PidfdSignalScope::ProcessGroup {
             tracing::error!(
                 "[detcore, dtid {}] signal {} by pidfd_send_signal with PIDFD_SIGNAL_PROCESS_GROUP \
-                 is not supported: Detcore does not model process-group membership, and the \
-                 guest's process group is inherited from Hermit's \
+                 is not supported: Detcore models process-group membership but does not yet \
+                 deliver a process-group send to each member \
+                 (https://github.com/facebookexperimental/hermit/issues/429), and the guest's \
+                 process group is inherited from Hermit's \
                  (https://github.com/rrnewton/hermit/issues/4108)",
                 guest.thread_state().dettid,
                 signal,
