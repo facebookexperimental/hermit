@@ -15989,6 +15989,17 @@ fn unshare_denied_recognizes_only_kernel_denial_errnos() {
         // the namespaces and the mount succeeded.
         "unshare: failed to execute true: No such file or directory",
         "unshare: failed to execute true: Permission denied",
+        // The right stage with an errno outside the denial set, and a
+        // denial text with anything around it, are not the measured line.
+        "unshare: unshare failed: No such file or directory",
+        "unshare: mount /proc failed: Cannot allocate memory",
+        "unshare: unshare failed: Operation not permitted (ignored)",
+        "unshare: unshare failed: retrying: Operation not permitted",
+        "warning: unshare: unshare failed: Operation not permitted",
+        // Other util-linux stages embed the same errno texts without being
+        // the unshare or proc-mount calls the gate measures.
+        "unshare: setgroups failed: Operation not permitted",
+        "unshare: cannot change root filesystem propagation: Operation not permitted",
         "unshare: unexpected token",
     ] {
         assert!(!unshare_denied(line), "non-denial misread as denial: {line}");
