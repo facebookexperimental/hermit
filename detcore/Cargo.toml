@@ -17,8 +17,9 @@
 # never reaches the shipped `detcore` rlib or its consumers.
 #
 # This invariant is enforced in CI by scripts/check-detcore-backend-abstraction.sh.
-# NOTE: this manifest is autocargo-generated; mirror any change to this
-# commandment in the Buck target's autocargo comment so it survives regeneration.
+# NOTE: this manifest is source (autocargo no longer generates it). The detcore
+# target in detcore/BUCK states the Buck side of this rule beside its deps ("Do
+# NOT add a dependency on reverie-ptrace here!"); keep the two in step.
 # ===========================================================================
 
 [package]

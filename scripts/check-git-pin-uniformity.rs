@@ -74,10 +74,9 @@
 /// that silently permits things is how the original defect got in.
 const KNOWN_FLOATING: &[(&str, &str)] = &[(
     "https://github.com/facebookexperimental/rust-shed",
-    "branch=main since before 2026-08-24; the manifests are autocargo-generated \
-     from Meta's internal Buck targets, so pinning it is an owner decision \
-     rather than a hand edit. Only the lockfile records what was built \
-     (84a82026 at time of writing). Filed separately.",
+    "branch=main since before 2026-08-24; pinning it to a revision is an owner \
+     decision. Only the lockfile records what was built (84a82026 at time of \
+     writing). Filed separately.",
 )];
 
 #[path = "lib/rust_script_prelude.rs"]
