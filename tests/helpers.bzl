@@ -155,7 +155,7 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
         name = "{}_{}".format(target, name_suffix), guest = "$(location :" + target + ")", guest_args = guest_args, env = env, hermit_args = hermit_args, args = args
     )
 
-def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
+def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}, labels = []):
     hermit_host_test(
         name = name,
         args = ["--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)"]
@@ -165,6 +165,7 @@ def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env
         + [guest]
         + guest_args,
         env = env,
+        labels = labels,
         test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
     )
 
@@ -328,7 +329,15 @@ def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations)
         "hermit_chaos_fail_" + name,
         guest = "$(location " + bin_target + ")",
         guest_args = [],
-        args = ["chaos-stress", "--max-iterations-count=" + str(max_iterations)],
+        args = [
+            "chaos-stress",
+            "--max-iterations-count=" + str(max_iterations),
+            # Iterations are independent Hermit processes; four in flight
+            # reduce the search's wall time at the same iteration count
+            # and the same total CPU cost (accounted by the heavyweight
+            # label below). Dev builds can still exceed the timeout.
+            "--jobs=4",
+        ],
         # The CPU profile is pinned because these tests test scheduling,
         # not CPU profiles, and chaos-stress starts one Hermit process
         # per iteration: with no profile named, every process would
@@ -347,4 +356,7 @@ def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations)
             "--max-timeslice=" + str(preempt_interval),
         ],
         env = {},
+        # Four Hermit processes in flight: account the target as
+        # multiple CPU slots, not one.
+        labels = ["heavyweight"],
     )

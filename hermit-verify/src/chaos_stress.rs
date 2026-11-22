@@ -62,6 +62,12 @@ pub struct ChaosStressOpts {
     // Maximum number of iterations performed during the test
     #[clap(long, default_value = "100")]
     max_iterations_count: i32,
+    /// Iterations to run concurrently. Each iteration is an independent
+    /// Hermit process with its own fresh chaos seed; the search stops
+    /// starting new iterations once both a passing and a failing run are
+    /// found, after the iterations already in flight finish.
+    #[clap(long, default_value = "1")]
+    jobs: usize,
     /// Path to a guest program
     #[clap(value_name = "PROGRAM")]
     guest_program: PathBuf,
@@ -140,10 +146,19 @@ fn is_skid_refusal(refusal: &str, stderr: &str) -> bool {
 
 impl ChaosStressOpts {
     /// One `hermit run` of the guest under a fresh chaos seed, its stderr
-    /// passed through as it arrives and kept for [`classify`].
-    fn run_hermit(&self, common_args: &CommonOpts) -> anyhow::Result<RunOutcome> {
+    /// passed through as it arrives and kept for [`classify`]. Every line
+    /// this run prints is tagged with its iteration and seed, so a
+    /// failure under `--jobs` is attributable and its run reproducible.
+    /// With `--jobs` above 1 the guest's stdout is also piped and
+    /// re-emitted tagged; sequentially it is inherited as before.
+    fn run_hermit(
+        &self,
+        common_args: &CommonOpts,
+        run: i32,
+    ) -> anyhow::Result<(RunOutcome, u16)> {
         let mut rng = rand::rng();
         let random_seed: u16 = rng.random();
+        let tag = format!("[run #{run} seed={random_seed}]");
         let hermit_cli_args = Hermit::new()
             .run(self.guest_program.clone(), self.args.clone())
             .hermit_args(self.hermit_arg.clone())
@@ -153,52 +168,99 @@ impl ChaosStressOpts {
 
         let mut command = std::process::Command::new(&common_args.hermit_bin);
         command.args(hermit_cli_args).stderr(Stdio::piped());
-        println!("   {}", display_cmd(&command).white().bold());
+        if self.jobs > 1 {
+            command.stdout(Stdio::piped());
+        }
+        println!("   {tag} {}", display_cmd(&command).white().bold());
         let started = Instant::now();
         let mut child = command.spawn()?;
+        let stdout_tag = tag.clone();
+        let stdout_forwarder = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || -> std::io::Result<()> {
+                let mut reader = std::io::BufReader::new(&mut stdout);
+                let mut line = Vec::new();
+                while reader.read_until(b'\n', &mut line)? > 0 {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(stdout_tag.as_bytes())?;
+                    out.write_all(b" ")?;
+                    out.write_all(&line)?;
+                    line.clear();
+                }
+                Ok(())
+            })
+        });
         let mut stderr = String::new();
         let mut reader = std::io::BufReader::new(child.stderr.take().expect("stderr is piped"));
         let mut line = Vec::new();
         while reader.read_until(b'\n', &mut line)? > 0 {
-            std::io::stderr().write_all(&line)?;
+            let mut out = std::io::stderr().lock();
+            out.write_all(tag.as_bytes())?;
+            out.write_all(b" ")?;
+            out.write_all(&line)?;
             stderr.push_str(&String::from_utf8_lossy(&line));
             line.clear();
         }
         let status = child.wait()?;
+        if let Some(forwarder) = stdout_forwarder {
+            forwarder.join().expect("stdout forwarder panicked")?;
+        }
         let status_text = match status.code() {
             Some(code) => code.to_string(),
             None => status.to_string(),
         };
         println!(
-            "Executed command with status: {status_text} in {:.1?}",
+            "{tag} Executed command with status: {status_text} in {:.1?}",
             started.elapsed()
         );
-        classify(status, &stderr)
+        let outcome = classify(status, &stderr)
+            .map_err(|err| anyhow::anyhow!("{tag} {err}"))?;
+        Ok((outcome, random_seed))
+    }
+
+    /// One search iteration: its guest outcome and how many skid
+    /// refusals were retried on the way to it.
+    fn run_iteration(
+        &self,
+        common_args: &CommonOpts,
+        i: i32,
+    ) -> anyhow::Result<(RunOutcome, u32)> {
+        println!("{}", format!(":: Run #{}...", i).yellow().bold());
+        let mut attempt = 1;
+        let mut skid_retries = 0;
+        let outcome = loop {
+            match self.run_hermit(common_args, i)? {
+                (RunOutcome::SkidRefused(refusal), seed) if attempt < SKID_ATTEMPTS => {
+                    eprintln!(
+                        "[run #{i} seed={seed}] SKID-RETRY attempt {attempt}: {refusal}"
+                    );
+                    skid_retries += 1;
+                    attempt += 1;
+                }
+                (RunOutcome::SkidRefused(refusal), seed) => anyhow::bail!(
+                    "Hermit refused run #{i} seed={seed} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts; verdict {} (not a test failure): {refusal}",
+                    detcore_model::SKID_INFRA_VERDICT
+                ),
+                (outcome, _seed) => break outcome,
+            }
+        };
+        Ok((outcome, skid_retries))
     }
 
     pub fn run(&self, common_args: &CommonOpts) -> anyhow::Result<bool> {
+        if self.jobs == 0 {
+            anyhow::bail!("--jobs must be at least 1");
+        }
         println!("Run at max {} iterations", self.max_iterations_count);
+        if self.jobs > 1 && self.max_iterations_count > 1 {
+            return self.run_parallel(common_args);
+        }
         let mut success_count = 0;
         let mut fail_count = 0;
         let mut skid_retries = 0;
 
         for i in 1..=self.max_iterations_count {
-            println!("{}", format!(":: Run #{}...", i).yellow().bold());
-            let mut attempt = 1;
-            let outcome = loop {
-                match self.run_hermit(common_args)? {
-                    RunOutcome::SkidRefused(refusal) if attempt < SKID_ATTEMPTS => {
-                        eprintln!("SKID-RETRY run #{i} attempt {attempt}: {refusal}");
-                        skid_retries += 1;
-                        attempt += 1;
-                    }
-                    RunOutcome::SkidRefused(refusal) => anyhow::bail!(
-                        "Hermit refused run #{i} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts; verdict {} (not a test failure): {refusal}",
-                        detcore_model::SKID_INFRA_VERDICT
-                    ),
-                    outcome => break outcome,
-                }
-            };
+            let (outcome, retries) = self.run_iteration(common_args, i)?;
+            skid_retries += retries;
             match outcome {
                 RunOutcome::Passed => success_count += 1,
                 RunOutcome::Failed => fail_count += 1,
@@ -216,6 +278,113 @@ impl ChaosStressOpts {
         );
         Ok(false)
     }
+
+    /// The search with `--jobs` iterations in flight. Iteration numbers
+    /// are handed out in order; each still draws its own fresh chaos
+    /// seed, as sequentially. No new iteration starts once both outcomes
+    /// are found or one iteration errors, but iterations already in
+    /// flight finish. The verdict is then decided in iteration order
+    /// ([`ordered_verdict`]), so it cannot depend on which worker
+    /// happened to finish first.
+    fn run_parallel(&self, common_args: &CommonOpts) -> anyhow::Result<bool> {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicI32;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let workers = self.jobs.min(self.max_iterations_count as usize);
+        let results = Mutex::new(
+            (0..self.max_iterations_count)
+                .map(|_| None::<anyhow::Result<(RunOutcome, u32)>>)
+                .collect::<Vec<_>>(),
+        );
+        let next = AtomicI32::new(1);
+        let success_count = AtomicUsize::new(0);
+        let fail_count = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i > self.max_iterations_count {
+                        return;
+                    }
+                    let result = self.run_iteration(common_args, i);
+                    match &result {
+                        Ok((outcome, _retries)) => {
+                            let (successes, failures) = match outcome {
+                                RunOutcome::Passed => (
+                                    success_count.fetch_add(1, Ordering::Relaxed) + 1,
+                                    fail_count.load(Ordering::Relaxed),
+                                ),
+                                RunOutcome::Failed => (
+                                    success_count.load(Ordering::Relaxed),
+                                    fail_count.fetch_add(1, Ordering::Relaxed) + 1,
+                                ),
+                                RunOutcome::SkidRefused(_) => {
+                                    unreachable!("retried in run_iteration")
+                                }
+                            };
+                            if successes > 0 && failures > 0 {
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Err(err) => {
+                            // Printed even when an earlier-indexed pair
+                            // will decide the verdict over this error.
+                            eprintln!("[run #{i}] error: {err:#}");
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    results.lock().unwrap()[(i - 1) as usize] = Some(result);
+                });
+            }
+        });
+        let (found, successes, failures, skid_retries) =
+            ordered_verdict(results.into_inner().unwrap())?;
+        if found {
+            println!("Found a passing and a failing run; {skid_retries} skid refusals retried");
+            return Ok(true);
+        }
+        println!(
+            "{successes} passing and {failures} failing runs; {skid_retries} skid refusals retried"
+        );
+        Ok(false)
+    }
+}
+
+/// The parallel search's verdict, decided in iteration order: scan the
+/// started iterations from #1, counting outcomes in that order. The
+/// search succeeds at the first index by which both a passing and a
+/// failing run have been seen; an error before that index ends the
+/// search with that error, and an error after it does not change the
+/// verdict. Entries past the first not-started iteration are absent,
+/// as sequentially. Returns (found, passes, failures, skid retries)
+/// counted up to the deciding iteration.
+fn ordered_verdict(
+    results: Vec<Option<anyhow::Result<(RunOutcome, u32)>>>,
+) -> anyhow::Result<(bool, usize, usize, u32)> {
+    let mut successes = 0;
+    let mut failures = 0;
+    let mut skid_retries = 0;
+    for entry in results {
+        let Some(result) = entry else { break };
+        let (outcome, retries) = result?;
+        skid_retries += retries;
+        match outcome {
+            RunOutcome::Passed => successes += 1,
+            RunOutcome::Failed => failures += 1,
+            RunOutcome::SkidRefused(_) => unreachable!("retried in run_iteration"),
+        }
+        if successes > 0 && failures > 0 {
+            return Ok((true, successes, failures, skid_retries));
+        }
+    }
+    Ok((false, successes, failures, skid_retries))
 }
 
 #[cfg(test)]
@@ -229,6 +398,32 @@ mod tests {
 
     fn exited(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn the_parallel_verdict_is_decided_in_iteration_order() {
+        let passed = || Some(Ok((RunOutcome::Passed, 0)));
+        let failed = || Some(Ok((RunOutcome::Failed, 0)));
+        let errored = || Some(Err(anyhow::anyhow!("Hermit itself failed")));
+        // Whichever worker finished first at runtime, the indexed
+        // results decide identically: an error past the deciding pair
+        // does not override it, and one before it ends the search.
+        assert_eq!(
+            ordered_verdict(vec![passed(), failed(), errored(), None]).unwrap(),
+            (true, 1, 1, 0)
+        );
+        assert!(
+            ordered_verdict(vec![passed(), errored(), failed(), None]).is_err(),
+            "an error before both outcomes are seen must end the search"
+        );
+        assert_eq!(
+            ordered_verdict(vec![failed(), passed(), None]).unwrap(),
+            (true, 1, 1, 0)
+        );
+        assert_eq!(
+            ordered_verdict(vec![passed(), passed(), None]).unwrap(),
+            (false, 2, 0, 0)
+        );
     }
 
     #[test]

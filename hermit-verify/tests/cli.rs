@@ -165,6 +165,10 @@ esac
 /// `hermit-verify chaos-stress` of `/bin/true` against [`SCRIPTED_HERMIT`]
 /// with OUTCOMES, and the number of Hermit runs it made.
 fn chaos_stress_with(outcomes: &str) -> (Output, u32) {
+    chaos_stress_with_args(outcomes, &[])
+}
+
+fn chaos_stress_with_args(outcomes: &str, extra_args: &[&str]) -> (Output, u32) {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().expect("failed to create a directory for the stand-in");
     let hermit = directory.path().join("hermit");
@@ -173,7 +177,9 @@ fn chaos_stress_with(outcomes: &str) -> (Output, u32) {
     let output = Command::new(env!("CARGO_BIN_EXE_hermit-verify"))
         .arg("--hermit-bin")
         .arg(&hermit)
-        .args(["chaos-stress", "--max-iterations-count", "5", "/bin/true"])
+        .args(["chaos-stress", "--max-iterations-count", "5"])
+        .args(extra_args)
+        .arg("/bin/true")
         .env("OUTCOMES", outcomes)
         .output()
         .expect("failed to run hermit-verify chaos-stress");
@@ -198,7 +204,8 @@ fn chaos_stress_retries_a_skid_refusal_instead_of_counting_it() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("SKID-RETRY run #2 attempt 2: HERMIT_POLICY_REFUSAL"),
+        stderr.lines().any(|line| line.contains("[run #2 seed=")
+            && line.contains("SKID-RETRY attempt 2: HERMIT_POLICY_REFUSAL")),
         "{stderr}"
     );
 }
@@ -213,6 +220,31 @@ fn chaos_stress_finds_a_race_between_guest_outcomes() {
         stdout.contains("Found a passing and a failing run; 1 skid refusals retried"),
         "{stdout}"
     );
+}
+
+#[test]
+fn chaos_stress_parallel_jobs_run_every_iteration() {
+    // The stand-in's run counter is not atomic, so only the aggregate
+    // outcome is asserted: with every run passing, the search must
+    // exhaust its iterations and report all five, whatever order the
+    // workers finished in.
+    let (output, _runs) = chaos_stress_with_args("pass pass pass pass pass", &["--jobs", "2"]);
+    assert!(
+        !output.status.success(),
+        "no failing run was found, so the search must not succeed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("5 passing and 0 failing runs; 0 skid refusals retried"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn chaos_stress_refuses_zero_jobs() {
+    let (output, runs) = chaos_stress_with_args("pass", &["--jobs", "0"]);
+    assert!(!output.status.success());
+    assert_eq!(runs, 0);
 }
 
 #[test]
