@@ -50,14 +50,14 @@ trap 'rc=$?; set +e; [[ -z $work ]] || rm -rf -- "$work"; exit $rc' EXIT
 work=$(mktemp -d "${TMPDIR:-/tmp}/test-cargo-proxy.XXXXXX") || exit 1
 
 # decide DIR ENV...: run cargo_proxy_default for DIR in a clean child started
-# in DIR (when it exists) with only ENV (plus PATH and HOME=$work/home), as
+# in DIR (when it exists) with only ENV (plus PATH and HOME=$work/homedir), as
 # host_fetch runs it, recording its status, stderr and the CARGO_HTTP_PROXY it
 # leaves ("unset" when it leaves none).
 decide() {
     local dir=$1
     shift
     # shellcheck disable=SC2016 # expanded by the child shell
-    env -i PATH="$PATH" HOME="$work/home" "$@" bash -c '
+    env -i PATH="$PATH" HOME="$work/homedir" "$@" bash -c '
         source "$1"
         if [[ -d $2 ]]; then cd "$2" || exit 1; fi
         cargo_proxy_default "$2" 2>"$3/stderr"
@@ -79,8 +79,8 @@ expect() {
 
 # fresh: a new query directory and an empty CARGO_HOME, with no config files.
 fresh() {
-    rm -rf -- "${work:?}/tree" "${work:?}/home"
-    mkdir -p "$work/tree/repo/sub" "$work/tree/cargo-home" "$work/home"
+    rm -rf -- "${work:?}/tree" "${work:?}/homedir"
+    mkdir -p "$work/tree/repo/sub" "$work/tree/cargo-home" "$work/homedir"
     q=$work/tree/repo/sub
     ch=$work/tree/cargo-home
 }
@@ -129,10 +129,10 @@ setter_case "CARGO_HOME/config.toml" cargo-home/config.toml $'[http]\nproxy = "h
 setter_case "CARGO_HOME/config (extensionless)" cargo-home/config 'http.proxy = "http://configured.invalid"'
 
 fresh
-mkdir -p "$work/home/.cargo"
-printf 'http.proxy = "http://configured.invalid"\n' >"$work/home/.cargo/config.toml"
+mkdir -p "$work/homedir/.cargo"
+printf 'http.proxy = "http://configured.invalid"\n' >"$work/homedir/.cargo/config.toml"
 decide "$q" https_proxy=$ENV_PROXY
-expect "CARGO_HOME unset: ~/.cargo/config.toml is read" 0 unset "$work/home/.cargo/config.toml sets"
+expect "CARGO_HOME unset: ~/.cargo/config.toml is read" 0 unset "$work/homedir/.cargo/config.toml sets"
 
 fresh
 printf 'http.proxy = "http://configured.invalid"\n' >"$work/tree/cargo-home/config.toml"
@@ -295,16 +295,16 @@ if ((network)); then
             rustup_home=$(rustup show home)
         fi
         crate=$work/net/crate
-        mkdir -p "$crate/src" "$work/net/home"
+        mkdir -p "$crate/src" "$work/net/homedir"
         printf '[package]\nname = "proxy-probe"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\ncfg-if = "=1.0.0"\n' >"$crate/Cargo.toml"
         : >"$crate/src/lib.rs"
         # Port 9 (discard) on loopback: nothing listens, so a fetch through it
         # fails fast and never leaves the host.
-        printf '[http]\n\tproxy = http://127.0.0.1:9\n' >"$work/net/home/.gitconfig"
+        printf '[http]\n\tproxy = http://127.0.0.1:9\n' >"$work/net/homedir/.gitconfig"
         net_fetch() { # net_fetch LABEL CARGO-HOME [prelude]
             local label=$1 home=$2 prelude=${3:-:}
             # shellcheck disable=SC2016 # expanded by the child shell
-            env -i PATH="$PATH" HOME="$work/net/home" RUSTUP_HOME="$rustup_home" \
+            env -i PATH="$PATH" HOME="$work/net/homedir" RUSTUP_HOME="$rustup_home" \
                 CARGO_HOME="$home" https_proxy="$proxy" \
                 bash -c 'source "$1"; cd "$2" || exit 1; '"$prelude"'; exec "$3" fetch' \
                 net "$HERE/../cargo-proxy.sh" "$crate" "$cargo_bin" \
