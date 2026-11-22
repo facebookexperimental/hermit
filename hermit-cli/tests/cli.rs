@@ -66792,12 +66792,10 @@ fn replay_only_qualifies_a_v3_recording_before_its_container() {
     // pass, reused or measured, and proves nothing.
     let published = fs::read_dir(host_state.path().join("runtime"))
         .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .any(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    name.starts_with("hermit-xinuse-probe-") && name.ends_with(".json")
-                })
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("hermit-xinuse-probe-") && name.ends_with(".json")
+            })
         })
         .unwrap_or(false);
     assert!(
