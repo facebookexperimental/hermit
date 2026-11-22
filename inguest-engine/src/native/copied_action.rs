@@ -108,6 +108,34 @@ pub(super) unsafe fn copied_action(
         let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
         return copied_child_flock_action(operation);
     }
+    // The open family NEVER RUNS NATIVELY IN A COPIED CHILD. Outside that
+    // window, Detcore's shared open handling serializes lookup, answers
+    // rendered files from its model, coordinates blocking FIFO opens, and
+    // reclassifies random devices. A copied pre-exec child cannot enter that
+    // handling, so a native open/openat/creat would instead expose host
+    // filesystem state and timing in exactly the posix_spawn and shell
+    // redirection window. The refusal does not depend on the
+    // unsupported-syscall policy: under the default fail-closed policy the
+    // named policy refusal ends the isolated run; under the
+    // --allow-unsupported-syscalls opt-out it answers EPERM without executing,
+    // which posix_spawn and shells already handle as an ordinary file-action
+    // failure. It is a policy refusal, not an unsupported-syscall result.
+    let open_family_refusal: Option<&[u8]> = match sysno {
+        Sysno::open => Some(
+            b"detcore-dynamorio: policy refusal: refusing open in copied child: native execution would bypass Detcore's shared open handling\n",
+        ),
+        Sysno::openat => Some(
+            b"detcore-dynamorio: policy refusal: refusing openat in copied child: native execution would bypass Detcore's shared open handling\n",
+        ),
+        Sysno::creat => Some(
+            b"detcore-dynamorio: policy refusal: refusing creat in copied child: native execution would bypass Detcore's shared open handling\n",
+        ),
+        _ => None,
+    };
+    if let Some(refusal) = open_family_refusal {
+        emit(refusal);
+        return if strict { 1 } else { -libc::EPERM };
+    }
     // pidfd_getfd NEVER RUNS NATIVELY IN A COPIED CHILD because it is the one native
     // route by which a copied child can reach an open file description that
     // ANOTHER guest process holds a Detcore claim about. A sibling that took
@@ -327,6 +355,11 @@ mod tests {
         DIAGNOSTICS.lock().unwrap().extend_from_slice(bytes);
     }
 
+    fn take_diagnostics() -> String {
+        let bytes = std::mem::take(&mut *DIAGNOSTICS.lock().unwrap());
+        String::from_utf8(bytes).unwrap()
+    }
+
     unsafe fn copied_gate_for_test(sysnum: i64, args: *const u64) -> i32 {
         unsafe {
             copied_action(
@@ -364,7 +397,6 @@ mod tests {
         "close",
         "close_range",
         "connect",
-        "creat",
         "dup",
         "dup2",
         "dup3",
@@ -427,8 +459,6 @@ mod tests {
         "munmap",
         "nanosleep",
         "newfstatat",
-        "open",
-        "openat",
         "pause",
         "pidfd_open",
         "pidfd_send_signal",
@@ -541,6 +571,50 @@ mod tests {
                 0,
                 "{sysno} disposition changed; update this test and issue #1793"
             );
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_open_family_under_every_policy() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        for sysno in [Sysno::open, Sysno::openat, Sysno::creat] {
+            assert!(detcore::is_determinized_syscall(sysno));
+        }
+
+        for (strict, expected) in [(true, 1), (false, -libc::EPERM)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            for sysno in [Sysno::open, Sysno::openat, Sysno::creat] {
+                let _ = take_diagnostics();
+                assert_eq!(
+                    copied_child_action(sysno.id() as i64),
+                    expected,
+                    "{sysno} in a copied child, strict={strict}"
+                );
+                let diagnostic = take_diagnostics();
+                assert!(
+                    diagnostic
+                        .contains(&format!("policy refusal: refusing {sysno} in copied child")),
+                    "{sysno} diagnostic must name the policy refusal: {diagnostic:?}"
+                );
+                assert!(
+                    !diagnostic.contains("unsupported syscall"),
+                    "{sysno} must not be reported as unsupported: {diagnostic:?}"
+                );
+            }
+
+            let _ = take_diagnostics();
+            assert_eq!(
+                copied_child_action(Sysno::getpid.id() as i64),
+                0,
+                "ordinary syscall in a copied child, strict={strict}"
+            );
+            assert!(take_diagnostics().is_empty());
         }
 
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
