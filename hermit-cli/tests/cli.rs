@@ -66667,9 +66667,10 @@ fn replay_only_ignores_an_unused_requested_cpu_profile() {
 /// One half of `record start --verify-strict` under `--cpu-profile x86-64-v3`
 /// into the new directory `run`, replaying `first`'s recording when given:
 /// its exit code, stdout and stderr. With `host_state`, Hermit's
-/// `XDG_CACHE_HOME` is `host_state/cache` and its `TMPDIR` is
-/// `host_state/tmp`, so it finds neither a cached x86-64-v3 qualification nor
-/// one another process published, and measures the XINUSE probe itself.
+/// `XDG_CACHE_HOME`, `TMPDIR` and `XDG_RUNTIME_DIR` are inside
+/// `host_state`, so it finds neither a cached x86-64-v3 qualification
+/// nor a shared verdict another process published in the probe's
+/// coordination directory, and measures the XINUSE probe itself.
 fn v3_verify_half(
     run: &Path,
     first: Option<&Path>,
@@ -66692,7 +66693,11 @@ fn v3_verify_half(
     args.extend(["--cpu-profile", "x86-64-v3", "--", image]);
     let mut command = hermit_command(&args);
     if let Some(host_state) = host_state {
-        for (variable, name) in [("XDG_CACHE_HOME", "cache"), ("TMPDIR", "tmp")] {
+        for (variable, name) in [
+            ("XDG_CACHE_HOME", "cache"),
+            ("TMPDIR", "tmp"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
             let directory = host_state.join(name);
             fs::create_dir_all(&directory).unwrap();
             command.env(variable, directory);
@@ -66736,13 +66741,17 @@ fn replay_only_qualifies_a_v3_recording_before_its_container() {
     }) else {
         return;
     };
-    let host_state = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (_, replay_stderr, second) =
+    // The replay's host state is fresh per attempt, like its run
+    // directory: a refused first attempt measured and published its
+    // verdict there, and the retry the wrapper then makes would reuse
+    // that pass instead of measuring, so it tested nothing.
+    let (_replay_stdout, replay_stderr, (second, host_state)) =
         v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || {
             let run = fresh();
+            let host_state = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let (status, out, err) =
                 v3_verify_half(&run, Some(&first), image, Some(host_state.path()));
-            (status, out, err, run)
+            (status, out, err, (run, host_state))
         })
         .expect("unreachable: the qualification panics first");
     assert!(
@@ -66777,10 +66786,20 @@ fn replay_only_qualifies_a_v3_recording_before_its_container() {
         "{verdict:#}\n{}",
         stderr(&output)
     );
-    let published = fs::read_dir(host_state.path().join("tmp"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .any(|name| name.starts_with("hermit-xinuse-probe-") && name.ends_with(".json"));
+    // Only a real probe run writes the shared verdict (a reused pass
+    // writes nothing), so this is the check that proves the replay
+    // measured; the per-host cache file beside it is written on any
+    // pass, reused or measured, and proves nothing.
+    let published = fs::read_dir(host_state.path().join("runtime"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .any(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with("hermit-xinuse-probe-") && name.ends_with(".json")
+                })
+        })
+        .unwrap_or(false);
     assert!(
         published,
         "the replay reused a verdict instead of measuring:\n{replay_stderr}"
