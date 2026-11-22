@@ -586,6 +586,65 @@ signal, or a breach) the node kills the scope with `cgroup.kill` after
 systemd scope cannot run `--buck-s0` or `--buck-s1`: the node exits 2 before any
 cell runs.
 
+The Buck-only run's buck2 reads only three kinds of configuration: this
+commit's tracked buckconfig files, the buckconfig bundled into buck2 (the
+prelude), and `ci/buck-e2e/stock-runner.buckconfig`.
+
+Why: on a Meta host the internal `buck` wrapper rewrites
+`~/.buckconfig.d/experiments_from_buck_start` from rollout state. buck2 would
+otherwise load that file, `/etc/buckconfig.d/*`, `/etc/buckconfig` and
+`~/.buckconfig.local`.
+
+How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
+`ci/buck-e2e/test-buckconfig-sources.sh`):
+
+- **Two knobs, in every form of the node, `--stage-only` included**, for every
+  buck2 it runs, its daemon included:
+  - `BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1` skips those four sources;
+  - `BUCK2_TEST_EXTRA_EXTERNAL_CONFIG` adds `stock-runner.buckconfig`, which no
+    other mode reads.
+
+  buck2 labels both testing knobs; buck2's own open-source CI uses the first for
+  the same reason. Any other `BUCK2_TEST_*` variable, or
+  `BUCK2_SETTINGS_OVERRIDE`, makes the node exit 2.
+- **Before the daemon starts**, it exits 2 on:
+  - a buck2 settings file (`.bucksettings.toml` or `.bucksettings.local.toml`)
+    in HOME or in the checkout;
+  - an untracked or linked `.buckconfig.local` or `.buckconfig.d` in the
+    checkout. The shared action cache's link below is one: remove it from a
+    checkout used for a Buck-only run.
+- **After the daemon starts**:
+  - it writes each machine-local file's SHA-256 to
+    `buck-invocations/buckconfig-external.tsv`;
+  - it writes the daemon's buckconfig for every cell, with where each value is
+    defined, to `buck-invocations/buckconfig-effective.txt`;
+  - it exits 2 before the stage unless that dump has values, every value comes
+    from a file of HEAD (a submodule's HEAD inside one) with HEAD's bytes and
+    no symlink on its path, from the bundled prelude, or from
+    `stock-runner.buckconfig`, and both of that file's keys are defined there.
+
+`stock-runner.buckconfig` sets two keys:
+
+- `[buck2_resource_control] status = if_available`: the daemon's systemd scope.
+  Without a status key, buck2 follows a version gate that only a machine-local
+  buckconfig sets, and with no gate it turns resource control off.
+- `[buck2] sqlite_dep_file_state = false`: a restarted daemon must not serve
+  actions from outputs an earlier run left behind.
+
+The other Buck modes do not read that file.
+
+What the run does not cover:
+
+- the rest of the node's inherited environment, including other `BUCK2_*`
+  variables;
+- any later buck2 settings layer, which `buck2 audit config` does not show.
+  Check for one at each buck2 pin bump.
+
+Buck-only results from before 2026-11-21 are not directly comparable with later
+ones. Those runs took action suspension (`kill_and_retry`), clean-stale, the
+restarter and persistent workers from the host's rollout file. Later runs leave
+each at buck2's default.
+
 ## Host prerequisites for Buck validation
 
 The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then

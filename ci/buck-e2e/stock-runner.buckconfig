@@ -1,0 +1,20 @@
+# The buck2 settings the Buck-only run sets for itself. ci/buck-e2e/validate-node
+# (buck-stock) passes this file with BUCK2_TEST_EXTRA_EXTERNAL_CONFIG, beside
+# BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1, so no other mode reads it. buck2
+# loads it as an external config, which the project's buckconfigs outrank;
+# validate-node refuses the run unless its config dump shows both keys below
+# defined in this file.
+
+[buck2]
+# Never persist the local dep-file cache across daemon restarts: a restarted
+# daemon would serve actions from outputs an earlier run left behind, outside
+# SOURCE_SHA. buck2 releases from 2026-08-11 on read this key.
+sqlite_dep_file_state = false
+
+[buck2_resource_control]
+# Put the daemon, and every action it runs, in its own systemd scope wherever
+# systemd can make one. Without a status key, buck2 follows a version gate that
+# only a machine-local buckconfig sets, and with no gate it turns resource
+# control off. validate-node bounds that scope and refuses a daemon without one
+# (ci/buck-e2e/daemon-bound.sh).
+status = if_available

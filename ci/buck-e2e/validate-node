@@ -36,6 +36,28 @@
 # inputs: bootstrap/rust-deps-stamp.py check), runs the subset's
 # shell-test twins (//ci/buck-e2e:stock-local, -c hermit_e2e.stock_runner=true, every cell
 # on this host) and ingests their artifacts with ci/buck-e2e/ingest.py --local-listing.
+# Its buck2 reads only this commit's tracked buckconfig, the buckconfig bundled into buck2,
+# and ci/buck-e2e/stock-runner.buckconfig (the daemon's systemd scope, and no persisted
+# dep-file cache). On a Meta host the internal buck wrapper rewrites
+# ~/.buckconfig.d/experiments_from_buck_start from rollout state, and the public buck2 would
+# load it. So in buck-stock, every form of this node, --stage-only included, exports two
+# knobs for every buck2 it runs, its daemon included:
+#   - BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1 skips /etc/buckconfig.d/*, /etc/buckconfig,
+#     ~/.buckconfig.d/* and ~/.buckconfig.local;
+#   - BUCK2_TEST_EXTRA_EXTERNAL_CONFIG adds stock-runner.buckconfig, which no other mode reads.
+# Any other BUCK2_TEST_* variable, or BUCK2_SETTINGS_OVERRIDE, refuses (exit 2).
+# Before the daemon starts it refuses a buck2 settings file in HOME or the checkout, and an
+# untracked or linked .buckconfig.local or .buckconfig.d in the checkout (the shared action
+# cache link of docs/BUCK2_OSS.md is one). After the daemon starts it:
+#   - writes each machine-local file's sha256 to buck-invocations/buckconfig-external.tsv;
+#   - writes the daemon's buckconfig for every cell, with where each value is defined, to
+#     buck-invocations/buckconfig-effective.txt;
+#   - refuses before the stage unless that dump has values, every value comes from a file of
+#     HEAD (a submodule's HEAD inside one) with HEAD's bytes and no symlink on its path, from
+#     the bundled prelude, or from stock-runner.buckconfig, and both of that file's keys are
+#     defined there.
+# ci/buck-e2e/buckconfig-sources.sh holds this code; ci/buck-e2e/test-buckconfig-sources.sh
+# tests it.
 # scripts/validate.rs --buck-s0 runs the no-argument form as ONE node, so the stage's buck2
 # daemon is the cells' daemon: dagrun kills every process carrying a step's DAGRUN_STEP
 # nonce when the step ends, the daemon included, so a daemon never outlives its node.
@@ -204,6 +226,13 @@ await_preflight() {
     done
     step "the preflight passed: $tags"
 }
+
+# buck-stock's buckconfig (above): the knobs go to every buck2 this node runs, in every form.
+# shellcheck source-path=SCRIPTDIR source=buckconfig-sources.sh
+source "$here/buckconfig-sources.sh"
+if [[ ${HERMIT_VALIDATE_E2E_RUNNER:-} == buck-stock ]]; then
+    export_stock_buckconfig_env
+fi
 
 if [[ $phase == stage ]]; then
     cd "$root"
@@ -428,7 +457,13 @@ else
     "${proxy[@]}" ./bootstrap/regenerate-rust-deps
 fi
 if [[ $mode == stock ]]; then
+    config_records=${kept:-$state/work}
+    mkdir -p -- "$config_records"
+    record_external_buckconfigs >"$config_records/buckconfig-external.tsv"
+    step "buck2 skips the machine-local buckconfigs; their sha256 are in $config_records/buckconfig-external.tsv"
+    refuse_untracked_buck_config
     bound_daemon
+    check_buckconfig_sources "$config_records/buckconfig-effective.txt" "$config_records/buckconfig-external.tsv"
 fi
 if [[ $mode == hybrid ]]; then
     step "staging the RE link inputs"
