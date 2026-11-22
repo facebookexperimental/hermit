@@ -1258,17 +1258,57 @@ pub(super) fn rendered_target_fdinfo(offset: u64, mount_id: u64) -> Vec<u8> {
     format!("pos:\t{offset}\nflags:\t00\nmnt_id:\t{mount_id}\nino:\t0\n").into_bytes()
 }
 
+/// The owner and group a user namespace that does not map global root shows
+/// for it: the kernel's default overflow IDs (`DEFAULT_OVERFLOWUID` and
+/// `DEFAULT_OVERFLOWGID`, include/linux/highuid.h).
+pub(super) const UNMAPPED_GLOBAL_ROOT: (u32, u32) = (65534, 65534);
+
 /// The mode, owner and group of the guest's procfs root, `/proc` itself, as
-/// the guest's user namespace sees them, read once: the tool runs in the
-/// guest's mount and user namespaces outside record and replay
-/// ([`GuestProcfs`]), where Detcore serves `/proc` on a placeholder.
+/// every guest sees them: the mode its own stat of `/proc` reads, and global
+/// root, the owner, unmapped ([`UNMAPPED_GLOBAL_ROOT`]). The guest never owns
+/// the host's `/proc`, whatever the runner's euid. A runner with euid 0 maps
+/// global root as the guest's root, so there the guest's own stat reads 0;
+/// guest output must not depend on the host, and every other host shows
+/// global root unmapped. Read once: the tool runs in the guest's mount and
+/// user namespaces outside record and replay ([`GuestProcfs`]), where Detcore
+/// serves `/proc` on a placeholder.
 pub(super) fn guest_procfs_root() -> Result<(u32, u32, u32), Errno> {
+    #[cfg(test)]
+    if let Some(stat) = PROCFS_ROOT_STAND_IN.with(std::cell::Cell::get) {
+        return Ok(guest_view_of_procfs_root(stat));
+    }
     static ROOT: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
     if let Some(root) = ROOT.get() {
         return Ok(*root);
     }
     let stat = GuestProcfs::stat(c"/proc")?;
-    Ok(*ROOT.get_or_init(|| (stat.st_mode, stat.st_uid, stat.st_gid)))
+    Ok(*ROOT.get_or_init(|| guest_view_of_procfs_root((stat.st_mode, stat.st_uid, stat.st_gid))))
+}
+
+/// `/proc`'s mode as the guest's own stat reads it, with global root's owner
+/// and group unmapped whatever that stat read ([`guest_procfs_root`]).
+fn guest_view_of_procfs_root((mode, _, _): (u32, u32, u32)) -> (u32, u32, u32) {
+    (mode, UNMAPPED_GLOBAL_ROOT.0, UNMAPPED_GLOBAL_ROOT.1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The guest's own stat of `/proc` (mode, owner, group) on this test
+    /// thread, standing in for [`GuestProcfs::stat`]
+    /// ([`with_procfs_root_stand_in`]).
+    static PROCFS_ROOT_STAND_IN: std::cell::Cell<Option<(u32, u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with `stat` (mode, owner, group) standing in for the guest's own
+/// stat of `/proc` on this thread, as a runner with euid 0 (owner 0) or any
+/// other runner (the overflow IDs) gives it.
+#[cfg(test)]
+pub(super) fn with_procfs_root_stand_in<R>(stat: (u32, u32, u32), body: impl FnOnce() -> R) -> R {
+    PROCFS_ROOT_STAND_IN.with(|cell| cell.set(Some(stat)));
+    let result = body();
+    PROCFS_ROOT_STAND_IN.with(|cell| cell.set(None));
+    result
 }
 
 /// The metadata Linux gives the procfs file at `path`, owned by `owner`,
@@ -8747,6 +8787,21 @@ fn cmdline_path_overlaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest sees `/proc` owned by global root unmapped, whatever the
+    /// runner's euid: a runner with euid 0 maps global root, so the guest's
+    /// own stat reads 0 there, as on no other host.
+    #[test]
+    fn the_guest_sees_procs_owner_unmapped_whatever_the_runners_euid() {
+        let mode = libc::S_IFDIR | 0o555;
+        for read in [(mode, 0, 0), (mode, 65534, 65534), (mode, 1000, 1000)] {
+            assert_eq!(
+                with_procfs_root_stand_in(read, guest_procfs_root),
+                Ok((mode, 65534, 65534)),
+                "the guest's own stat read {read:?}"
+            );
+        }
+    }
 
     /// A rendered file's `fdinfo` prints its flags in Linux's spelling, the
     /// bytes Detcore's own fdinfo renderer prints for the same values: a bare

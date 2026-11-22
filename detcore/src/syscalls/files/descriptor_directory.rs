@@ -3660,9 +3660,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (or whose number another task holds now) still answers, with the
     /// links its inode was instantiated with, `task` with 2 and no thread
     /// (`proc_task_getattr`), and a process's or a thread's directory owned
-    /// by global root as the guest's user namespace sees it, which is the
-    /// owner of `/proc` itself (`pid_getattr`, `guest_procfs_root`); `task`
-    /// keeps its inode's owner.
+    /// by global root, unmapped on every host as the owner of `/proc` itself
+    /// is (`pid_getattr`, `guest_procfs_root`); `task` keeps its inode's
+    /// owner.
     async fn task_directory_metadata<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3765,8 +3765,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// itself (`spelling`, not followed), as Linux reports it
     /// (`proc_setup_self`, `proc_setup_thread_self`, fs/proc/self.c and
     /// fs/proc/thread_self.c at v6.17): a symbolic link of mode 0777, one
-    /// link, global root's, as the guest's own stat of `/proc` shows that
-    /// owner (`guest_procfs_root`), size 0, procfs's device and blocks, the
+    /// link, global root's, unmapped on every host as the owner of `/proc`
+    /// is (`guest_procfs_root`), size 0, procfs's device and blocks, the
     /// inode number its path keys, and the epoch.
     async fn selector_link_metadata<G: Guest<Self>>(
         &self,
@@ -6576,10 +6576,10 @@ const RWH_WRITE_LIFE_EXTREME: u64 = 5;
 /// the guest's root, with its capabilities in the guest's user namespace,
 /// as it renders every live task's files as owned by it
 /// (`rendered_file_owner`, named approximation): a task's descriptor
-/// directory is its own; `/proc` is global root's, whom the caller may act
-/// as only where the guest's user namespace maps it, as the guest's own stat
-/// of `/proc` shows (`guest_procfs_root`: an unmapped owner reads as the
-/// overflow ID, which no mapped caller has); a system-wide directory is its
+/// directory is its own; `/proc` is global root's, which the guest never acts
+/// as, whatever the runner's euid (`guest_procfs_root` shows global root
+/// unmapped, as the overflow ID, which no mapped caller has, on every host,
+/// a runner with euid 0 included); a system-wide directory is its
 /// owner's as the kernel reports it in the guest's user namespace
 /// (`SystemObject`, from the object the lookup reached: global root, or the root of the
 /// network namespace's owner for `/proc/sys/net`).
@@ -6601,10 +6601,10 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
 /// `vfs_setlease` asks for a lease (the file's owner is the caller's
 /// filesystem uid; `CAP_LEASE` counts only in the initial user namespace):
 /// Detcore takes the caller to be the guest's root, which owns its own task's
-/// descriptor directory (`rendered_file_owner`), and owns `/proc` only where
-/// global root is the guest's root, as the guest's own stat of `/proc` shows
-/// (`guest_procfs_root`: uid 0), and a system-wide directory where its owner
-/// is (`SystemObject`). Read from the same facts as
+/// descriptor directory (`rendered_file_owner`), never `/proc`, whatever the
+/// runner's euid (`guest_procfs_root` shows global root unmapped on every
+/// host, so never uid 0), and a system-wide directory where its owner is
+/// (`SystemObject`). Read from the same facts as
 /// [`placeholder_owner_or_capable`], which also lets a caller act as an owner
 /// its user namespace maps, as `inode_owner_or_capable` does and
 /// `vfs_setlease` does not.
@@ -6730,6 +6730,31 @@ const LOCK_MAND: libc::c_int = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest never owns the host's `/proc`, whatever the runner's euid. A
+    /// runner with euid 0 maps global root as the guest's root, so the
+    /// guest's own stat of `/proc` reads 0 there (`guest_procfs_root`
+    /// standing in at uid 0): still neither the owner's `O_NOATIME`,
+    /// `F_SETFL` `O_NOATIME` and `F_SET_RW_HINT`, nor a lease, exactly as on a
+    /// host whose stat reads the overflow IDs.
+    #[test]
+    fn the_guest_never_owns_the_hosts_proc_whatever_the_runners_euid() {
+        let mode = libc::S_IFDIR | 0o555;
+        for read in [(mode, 0, 0), (mode, 65534, 65534)] {
+            super::super::rendered_procfs::with_procfs_root_stand_in(read, || {
+                assert_eq!(
+                    placeholder_owner_or_capable(&PlaceholderDirectory::Root),
+                    Ok(false),
+                    "owner or capable with /proc read as {read:?}"
+                );
+                assert_eq!(
+                    placeholder_lease_owner(&PlaceholderDirectory::Root),
+                    Ok(false),
+                    "lease owner with /proc read as {read:?}"
+                );
+            });
+        }
+    }
 
     #[test]
     fn a_name_below_a_directory_keeps_what_linux_resolves() {
