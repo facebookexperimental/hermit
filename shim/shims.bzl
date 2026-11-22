@@ -310,9 +310,12 @@ def rust_library(
     test_labels = None,
     test_run_env = None,
     visibility = ["PUBLIC"],
+    # Meta's build adds a Miri-interpreted `<name>-unittest-miri` test; the
+    # open-source build has no Miri toolchain and builds none.
+    unittests_miri = None,
     **kwargs,
 ):
-    _unused = (autocargo, visibility, cpp_deps, cxx_bridge)  # @unused
+    _unused = (autocargo, visibility, cpp_deps, cxx_bridge, unittests_miri)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
     if named_deps:
@@ -366,9 +369,11 @@ def rust_binary(
     test_run_env = None,
     test_rustc_flags = None,
     visibility = ["PUBLIC"],
+    # As for `rust_library`.
+    unittests_miri = None,
     **kwargs,
 ):
-    _unused = (allocator, default_strip_mode, autocargo)  # @unused
+    _unused = (allocator, default_strip_mode, autocargo, unittests_miri)  # @unused
     deps = _fix_deps(deps or [])
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
