@@ -55763,10 +55763,32 @@ fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
 #[test]
 fn cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict() {
     let cache_home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let path = cache_home
-        .path()
-        .join("hermit")
-        .join("cpu-profile-x86-64-v3-probe.json");
+    // The probe cache file is named for the binary that measured it
+    // (`{name}-{binary_suffix}.json`); find the one file a run writes
+    // instead of hardcoding a name the product no longer uses.
+    let probe_cache = || {
+        let entries: Vec<PathBuf> = std::fs::read_dir(cache_home.path().join("hermit"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("cpu-profile-x86-64-v3-probe-")
+                                    && name.ends_with(".json")
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one probe cache file, found {entries:?}"
+        );
+        entries.into_iter().next().unwrap()
+    };
     let args = ["run", "--cpu-profile", "x86-64-v3", "--", "/bin/true"];
     let run = || {
         let mut command = hermit_command(&args);
@@ -55782,6 +55804,7 @@ fn cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict() {
     };
     let warning = "WARNING: qualifying this host for --cpu-profile x86-64-v3";
     assert_eq!(first.matches(warning).count(), 1, "{first}");
+    let path = probe_cache();
     let written = std::fs::read(&path).expect("the first v3 run caches its probe");
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
     let (_, second, ()) = v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, run)
