@@ -12,12 +12,16 @@ finalizer comparison needs only exported files and always runs. The
 profile and root BUCK comparisons read fb-only/liteinst-runtime-profile.bzl
 and BUCK, which ShipIt strips from the GitHub export,
 facebookexperimental/hermit, with every other BUCK and .bzl file until
-dh-2y5z03 V4. There those comparisons are skipped and the run prints one
-line beginning SKIPPED for each. Only an absent file with
-GITHUB_REPOSITORY naming the export skips (BuckLiteralExportSkipControls):
-any other checkout missing the file still fails, a file that is present
-but corrupt still fails, and an export that has the file runs the
-comparison. V4 deletes the skips. In fbsource the Buck test
+dh-2y5z03 V4. There those comparisons are skipped, each skipped test
+printing a "test_packaged_detcore.py: SKIPPED ..." line to stderr. An
+absent file skips only on the
+GitHub export (GITHUB_REPOSITORY naming it) or, in a source-checkout
+script run, where the tree has no fb-only/ directory at all so the
+profile cannot exist there (tree-inapplicable, dh-63q4ko; never under
+Buck, whose resources staging is authoritative). Any other checkout
+missing the file still fails, a file that is present but corrupt still
+fails, and a checkout that has the file runs the comparison. V4
+deletes the export skips. In fbsource the Buck test
 //hermetic_infra/hermit/ci:test_packaged_detcore runs the whole suite
 with every file present as resources, so the comparisons execute there.
 """
@@ -82,29 +86,54 @@ def hermit_root(case):
     return case.enterContext(importlib.resources.as_file(resources))
 
 
-def export_skip_reason(path, name, repository, what):
-    """The SKIPPED line for the GitHub export, or None to run the comparison.
-
-    It skips only when repository is EXPORT_REPOSITORY and nothing at all
-    is at path: any other checkout missing the file still fails, and an
-    export that has it runs the comparison. dh-2y5z03 V4 deletes this skip.
-    """
-    if repository != EXPORT_REPOSITORY:
-        return None
+def _absent(path):
+    """Nothing at all is at path, by lstat: a dangling symlink counts as
+    present (it will fail to read, not skip), for the file and its
+    parent alike."""
     try:
         path.lstat()
     except FileNotFoundError:
+        return True
+    return False
+
+
+def export_skip_reason(path, name, repository, what, script_run=None):
+    """The SKIPPED line for a tree without the file, or None to run it.
+
+    It skips only when nothing at all is at path and either repository
+    is EXPORT_REPOSITORY (the GitHub export; dh-2y5z03 V4 deletes that
+    skip) or, in a source-checkout script run only, the file's parent
+    directory is likewise absent, so the file cannot exist in this
+    tree (an export checkout run as a script names no
+    GITHUB_REPOSITORY; dh-63q4ko). `script_run` says which: True for
+    a script run, False under Buck (whose resources staging is
+    authoritative, so the structural skip never applies there); None
+    (the default) derives it from `not __package__`, the same test
+    hermit_root uses. Any other checkout missing the file still
+    fails, and a checkout that has it runs the comparison.
+    """
+    if script_run is None:
+        script_run = not __package__
+    if not _absent(path):
+        return None
+    if repository == EXPORT_REPOSITORY:
         return (f"SKIPPED on {EXPORT_REPOSITORY}: {name} is absent, because ShipIt "
                 f"strips it from this export; {what} is skipped until dh-2y5z03 V4 "
                 "exports it and deletes this skip")
+    if script_run and _absent(path.parent):
+        return (f"SKIPPED tree-inapplicable: {name} cannot exist in this "
+                f"tree (no {path.parent.name}/ directory, an export without "
+                f"fb-only); {what} is skipped (dh-63q4ko)")
     return None
 
 
-def export_file_text(root, name, repository, what):
-    """The fb-only file `name` below root. On the GitHub export without it,
-    skips the calling comparison instead; a present file is read, so a
-    corrupt one fails the comparison rather than skipping it."""
-    reason = export_skip_reason(root / name, name, repository, what)
+def export_file_text(root, name, repository, what, script_run=None):
+    """The fb-only file `name` below root. Without it, skips the calling
+    comparison where export_skip_reason allows (the GitHub export, or a
+    script-run tree with no fb-only/ at all); a present file is read, so
+    a corrupt one fails the comparison rather than skipping it."""
+    reason = export_skip_reason(root / name, name, repository, what,
+                                script_run=script_run)
     if reason:
         raise unittest.SkipTest(reason)
     return (root / name).read_text()
@@ -270,11 +299,12 @@ def finalizer_literals(case, root):
             "flags": rust_list("BUCK_RUSTC_FLAGS"), "argv": resolved}
 
 
-def profile_literals(case, root, repository):
+def profile_literals(case, root, repository, script_run=None):
     # The profile .bzl: the flag list, the alias platform and its
     # additional (opt) constraints.
     profile = export_file_text(root, PROFILE_NAME, repository,
-                               "the liteinst-runtime profile comparison")
+                               "the liteinst-runtime profile comparison",
+                               script_run=script_run)
     flags = re.search(r"LITEINST_RUNTIME_RUSTC_FLAGS = \[(.*?)\]", profile, re.S)
     case.assertIsNotNone(flags, PROFILE_NAME)
     platform = re.search(r'platform = "([^"]+)"', profile)
@@ -286,11 +316,11 @@ def profile_literals(case, root, repository):
             "additional": re.findall(r'"([^"]*)"', additional.group(1))}
 
 
-def buck_literals(case, root, repository):
+def buck_literals(case, root, repository, script_run=None):
     # The root BUCK: the profiled alias name and the runtime target's
     # declared cpu/os compatibility.
     buck = export_file_text(root, BUCK_NAME, repository,
-                            "the root BUCK comparison")
+                            "the root BUCK comparison", script_run=script_run)
     alias = re.search(r'detcore_liteinst_runtime_alias\(\s*name = "([^"]+)"', buck)
     case.assertIsNotNone(alias, BUCK_NAME)
     compat = re.search(r'name = "detcore-liteinst",.*?target_compatible_with = \[(.*?)\]',
@@ -322,25 +352,25 @@ def check_finalizer_literals(case, root):
                      [record["buck_argv"][1:]])
 
 
-def check_profile_literals(case, root, repository):
-    bzl = profile_literals(case, root, repository)
+def check_profile_literals(case, root, repository, script_run=None):
+    bzl = profile_literals(case, root, repository, script_run=script_run)
     record = buck_fixture_record()
     case.assertEqual(record["buck_platform"], bzl["platform"])
     flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
     case.assertEqual(flags, bzl["flags"])
 
 
-def check_buck_literals(case, root, repository):
-    buck = buck_literals(case, root, repository)
+def check_buck_literals(case, root, repository, script_run=None):
+    buck = buck_literals(case, root, repository, script_run=script_run)
     record = buck_fixture_record()
     case.assertEqual(buck["canonical_target"],
                      "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]")
     case.assertEqual(record["buck_target"], buck["canonical_target"])
 
 
-def check_profile_and_buck_literals(case, root, repository):
-    bzl = profile_literals(case, root, repository)
-    buck = buck_literals(case, root, repository)
+def check_profile_and_buck_literals(case, root, repository, script_run=None):
+    bzl = profile_literals(case, root, repository, script_run=script_run)
+    buck = buck_literals(case, root, repository, script_run=script_run)
     record = buck_fixture_record()
     case.assertEqual(record["buck_constraints"],
                      sorted(buck["compat"] + bzl["additional"]))
@@ -630,7 +660,7 @@ class ReceiptControls(unittest.TestCase):
 
     def test_buck_literals_match_profile(self):
         """The fixture/verifier literals equal the profile .bzl texts.
-        Skipped only on the GitHub export without that file."""
+        Skipped only without that file (export, or a script-run tree with no fb-only/)."""
         check_profile_literals(self, hermit_root(self),
                                os.environ.get("GITHUB_REPOSITORY"))
 
@@ -642,7 +672,7 @@ class ReceiptControls(unittest.TestCase):
 
     def test_buck_literals_match_profile_and_buck_alias(self):
         """The constraints and buck_argv the profile and the root BUCK
-        name together. Skipped only on the GitHub export without one of them."""
+        name together. Skipped only without one of them (export, or a script-run tree with no fb-only/)."""
         check_profile_and_buck_literals(self, hermit_root(self),
                                         os.environ.get("GITHUB_REPOSITORY"))
 
@@ -807,8 +837,9 @@ class ReceiptControls(unittest.TestCase):
 
 
 class BuckLiteralExportSkipControls(unittest.TestCase):
-    """The profile/BUCK comparisons skip only on the export, and only
-    without their file; a present file is compared and can fail."""
+    """The profile/BUCK comparisons skip only without their file, on
+    the export or in a tree whose fb-only/ cannot exist; a present
+    file is compared and can fail."""
 
     def _scratch_root(self, profile=True, buck=True, tamper_profile=False):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -841,10 +872,67 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
             self.assertTrue(reason.startswith("SKIPPED on facebookexperimental/hermit: "), reason)
             self.assertIn(name, reason)
             self.assertIn("dh-2y5z03 V4", reason)
+        # Another repository whose tree could hold the profile (fb-only/
+        # present, file absent) does not skip: the comparison fails.
+        # BUCK's parent is the root itself, which always exists, so the
+        # same holds for it without any directory to create.
+        (root / PROFILE_NAME).parent.mkdir(parents=True)
+        for name in (PROFILE_NAME, BUCK_NAME):
             for other in (None, "rrnewton/hermit", "", "FacebookExperimental/hermit",
                           "facebookexperimental/hermit-fork", "facebookexperimental/hermit "):
                 self.assertIsNone(
                     export_skip_reason(root / name, name, other, "the comparison"), other)
+
+    def test_export_tree_without_fb_only_skips_by_name(self):
+        # A script run in an export checkout names no GITHUB_REPOSITORY,
+        # so the env-gated skip cannot fire; with no fb-only/ at all the
+        # profile cannot exist and skips by name instead (dh-63q4ko).
+        root = self._scratch_root(profile=False, buck=True)
+        self.assertFalse((root / PROFILE_NAME).parent.exists())
+        for other in (None, "rrnewton/hermit", ""):
+            reason = export_skip_reason(
+                root / PROFILE_NAME, PROFILE_NAME, other, "the comparison",
+                script_run=True)
+            self.assertIsNotNone(reason, other)
+            self.assertTrue(reason.startswith("SKIPPED tree-inapplicable: "), reason)
+            self.assertIn(PROFILE_NAME, reason)
+            self.assertIn("dh-63q4ko", reason)
+        with self.assertRaises(unittest.SkipTest) as skipped:
+            check_profile_literals(self, root, None, script_run=True)
+        self.assertTrue(str(skipped.exception).startswith(
+            "SKIPPED tree-inapplicable: "), str(skipped.exception))
+        # The root BUCK can exist in any tree, so it gets no such skip:
+        # its comparison still runs here, and missing it still fails.
+        check_buck_literals(self, root, None)
+        buckless = self._scratch_root(profile=False, buck=False)
+        self.assertIsNone(export_skip_reason(
+            buckless / BUCK_NAME, BUCK_NAME, None, "the comparison"))
+        # A dangling fb-only symlink is present by lstat, not absent:
+        # no structural skip, so the comparison still fails on it.
+        dangling = self._scratch_root(profile=False, buck=True)
+        (dangling / PROFILE_NAME).parent.symlink_to(dangling / "nowhere")
+        self.assertIsNone(export_skip_reason(
+            dangling / PROFILE_NAME, PROFILE_NAME, None, "the comparison",
+            script_run=True))
+
+    def test_package_mode_without_the_profile_still_fails(self):
+        # Under Buck the module runs in its package and ci/BUCK stages
+        # the profile as a resource: a resources tree without it must
+        # fail, never take the script-run structural skip. The run mode
+        # is passed in, so no control changes module globals.
+        root = self._scratch_root(profile=False, buck=True)
+        self.assertFalse((root / PROFILE_NAME).parent.exists())
+        self.assertIsNone(export_skip_reason(
+            root / PROFILE_NAME, PROFILE_NAME, None, "the comparison",
+            script_run=False))
+        # The default (no script_run argument) must derive the mode from
+        # __package__ itself: in package mode it must not skip, in a
+        # script run it must. A hardcoded default fails here under Buck.
+        self.assertEqual(export_skip_reason(
+            root / PROFILE_NAME, PROFILE_NAME, None,
+            "the comparison") is None, bool(__package__))
+        with self.assertRaises(FileNotFoundError):
+            check_profile_literals(self, root, None, script_run=False)
 
     def test_the_export_with_the_file_runs_the_comparison(self):
         root = self._scratch_root(profile=False, buck=False)
@@ -873,7 +961,13 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
             "SKIPPED on facebookexperimental/hermit: "), str(skipped.exception))
         # The BUCK comparison still runs on the same tree.
         check_buck_literals(self, root, EXPORT_REPOSITORY)
-        # A missing profile outside the export is a failure, not a skip.
+        # A missing profile in a tree that could hold it (fb-only/
+        # present) outside the export is a failure, not a skip. The
+        # reason is asserted first, so a skip-shaped regression fails
+        # here instead of escaping assertRaises as a skip.
+        (root / PROFILE_NAME).parent.mkdir(parents=True)
+        self.assertIsNone(export_skip_reason(
+            root / PROFILE_NAME, PROFILE_NAME, None, "the comparison"))
         with self.assertRaises(FileNotFoundError):
             check_profile_literals(self, root, None)
 
@@ -886,6 +980,8 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
             "SKIPPED on facebookexperimental/hermit: "), str(skipped.exception))
         # The profile comparison still runs on the same tree.
         check_profile_literals(self, root, EXPORT_REPOSITORY)
+        self.assertIsNone(export_skip_reason(
+            root / BUCK_NAME, BUCK_NAME, None, "the comparison"))
         with self.assertRaises(FileNotFoundError):
             check_buck_literals(self, root, None)
 
@@ -899,10 +995,31 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
             check_profile_literals(self, tampered, EXPORT_REPOSITORY)
 
 
+class _SkipNamingResult(unittest.TextTestResult):
+    """Name each skip that reaches unittest on stderr: the Makefile
+    runs without -v, which prints no skip reasons. Only real skips
+    print (controls that catch SkipTest on purpose stay silent), once
+    per skipped test."""
+
+    def addSkip(self, test, reason):
+        print(f"test_packaged_detcore.py: {reason}",
+              file=sys.stderr, flush=True)
+        super().addSkip(test, reason)
+
+
+class _SkipNamingRunner(unittest.TextTestRunner):
+    # _makeResult is TextTestRunner's factory hook; assigning the
+    # resultclass attribute directly is rejected by Pyre, whose
+    # resultclass type is the factory signature this override matches.
+    def _makeResult(self) -> unittest.TextTestResult:
+        return _SkipNamingResult(
+            self.stream, self.descriptions, self.verbosity)
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] in ("--write-fixture", "--write-core-fixture"):
         fixture_receipt(sys.argv[2], sys.argv[3], core=sys.argv[1] == "--write-core-fixture")
     elif len(sys.argv) == 4 and sys.argv[1] in ("--write-buck-fixture", "--write-core-buck-fixture"):
         buck_fixture_receipt(sys.argv[2], sys.argv[3], core=sys.argv[1] == "--write-core-buck-fixture")
     else:
-        unittest.main()
+        unittest.main(testRunner=_SkipNamingRunner)
