@@ -469,6 +469,23 @@ fn compare_with_application(
         return compare_recording_and_replay(&run1, directories[1], verify_json, &retain);
     }
     let summary1 = run1.summary();
+    // Where the comparison ends on run 1 alone (run 1 failed, or
+    // `--verify-allow` rejects its status, so `run --verify` would not have
+    // started run 2), the report states run 1's startup claim, as `run
+    // --verify`'s states the claim it records at dispatch, before any
+    // refusal. Once run 2 is read, the pair's claim is stamped instead
+    // (below): the stamp is set once per process, so run 1's monitored claim
+    // stamped any earlier could not be withdrawn when run 2's record makes no
+    // claim.
+    let stamp_run1_startup_claim = || -> Result<(), Error> {
+        if let Some(unmonitored) = record1.startup_unmonitored {
+            record_startup_unmonitored(unmonitored);
+            if let Some(path) = verify_json {
+                write_pending_verification_json(path)?;
+            }
+        }
+        Ok(())
+    };
 
     let VerifyRunOutcome::Completed {
         status: status1,
@@ -478,6 +495,7 @@ fn compare_with_application(
         virtual_timeout_ns: virtual_timeout1,
     } = record1.outcome
     else {
+        stamp_run1_startup_claim()?;
         retain(&[&run1])?;
         return Err(failed_run(
             verify_json,
@@ -498,6 +516,10 @@ fn compare_with_application(
     // model, a virtual timeout) passes `--verify-allow` as `run --verify`'s
     // does (`rejected_first_run`): neither is a guest result, so the default
     // `success` refuses it.
+    if !verify_allow.satisfies(out1.status) {
+        // The status `reject_first_run` refuses, before it writes the report.
+        stamp_run1_startup_claim()?;
+    }
     if let Some(error) =
         reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
     {
@@ -1302,5 +1324,138 @@ mod tests {
             pair_startup_unmonitored(Some(false), Some(true)),
             Err((false, true))
         );
+    }
+
+    /// A saved run 1 with the startup claim `claim` that ends the comparison
+    /// on its own, as `run --verify` ends without starting run 2: its report
+    /// (`no_result_reason` of kind `kind`) states the claim, as `run
+    /// --verify`'s states the claim it records at dispatch, before any
+    /// refusal. Run 2's directory does not exist, so the comparison must end
+    /// before reading it. The claim is set once per process, so each case
+    /// runs in a process of its own.
+    fn assert_run_one_alone_reports_its_startup_claim(
+        backend: &str,
+        claim: bool,
+        outcome: VerifyRunOutcome,
+        verify_allow: VerifyAllow,
+        kind: &str,
+    ) {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let first = parent.path().join("first");
+        let report = parent.path().join("report.json");
+        let mut record = saved_comparison_record(backend, false);
+        record.startup_unmonitored = Some(claim);
+        record.outcome = outcome;
+        write_saved_comparison_control(&first, &record);
+        let result = compare(
+            [&first, &parent.path().join("never-run")],
+            Some(&report),
+            verify_allow,
+            None,
+        );
+        assert!(result.is_err(), "run 1 alone ends the comparison");
+        let value = saved_comparison_report(&report);
+        assert_eq!(value["no_result_reason"]["kind"], kind, "{value}");
+        assert_eq!(value["startup_unmonitored"], claim, "{value}");
+    }
+
+    /// A completed run that exited `code`, ending with `outcome`.
+    fn completed_run(outcome: Option<TerminalOutcome>, code: i32) -> VerifyRunOutcome {
+        let (guest_deadlock, virtual_timeout_ns) = TerminalOutcome::to_fields(outcome);
+        VerifyRunOutcome::Completed {
+            status: RecordedStatus::Exited { code },
+            skid_overshoots: 0,
+            forwarded_syscalls: None,
+            guest_deadlock,
+            virtual_timeout_ns,
+        }
+    }
+
+    #[test]
+    fn a_rejected_run_one_reports_its_startup_claim() {
+        // The in-guest preload route's claim: startup unmonitored.
+        assert_run_one_alone_reports_its_startup_claim(
+            "liteinst",
+            true,
+            completed_run(None, 3),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_deadlocked_run_one_reports_its_startup_claim() {
+        let deadlock = TerminalOutcome::GuestDeadlock;
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            completed_run(Some(deadlock), deadlock.exit_status()),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_virtual_timeout_run_one_reports_its_startup_claim() {
+        let timeout = TerminalOutcome::VirtualTimeout {
+            bound_ns: 1_000_000,
+        };
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            completed_run(Some(timeout), timeout.exit_status()),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_run_one_with_a_determinism_loss_reports_its_startup_claim() {
+        // Refused even under `--verify-allow=both`, which admits a deadlock.
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            VerifyRunOutcome::RunFailed {
+                failure: RunFailure::DeterminismLoss,
+                detail: format!(
+                    "{}the namespace init died",
+                    super::super::run::SAVED_LOSS_DETAIL_PREFIX
+                ),
+            },
+            VerifyAllow::Both,
+            "run_failed",
+        );
+    }
+
+    /// Once run 2 is read, the report states the pair's claim
+    /// (`pair_startup_unmonitored`), not run 1's: beside a record that makes
+    /// no claim, run 1's monitored claim is not the pair's. In a process of
+    /// its own, as the claim is set once per process.
+    #[test]
+    fn a_compared_pair_reports_the_pair_startup_claim_not_run_one_alone() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let directories = [parent.path().join("first"), parent.path().join("second")];
+        let report = parent.path().join("report.json");
+        let mut first = saved_comparison_record("ptrace", false);
+        first.startup_unmonitored = Some(false);
+        write_saved_comparison_control(&directories[0], &first);
+        write_saved_comparison_control(&directories[1], &saved_comparison_record("ptrace", false));
+        let status = compare(
+            [&directories[0], &directories[1]],
+            Some(&report),
+            VerifyAllow::Success,
+            None,
+        )
+        .unwrap();
+        assert!(status.success());
+        let value = saved_comparison_report(&report);
+        assert_eq!(value["verdict"], "matched", "{value}");
+        assert!(value.get("startup_unmonitored").is_none(), "{value}");
     }
 }
