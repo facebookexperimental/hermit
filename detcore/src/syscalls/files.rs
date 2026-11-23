@@ -89,6 +89,7 @@ use crate::types::*;
 pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
+pub(crate) mod entry_mtime;
 pub(crate) mod flock_model;
 pub(crate) mod other_process_procfs;
 #[cfg(test)]
@@ -6855,6 +6856,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut property_copy: Option<PathBuf> = None;
         // A name in the property area the snapshot does not hold.
         let mut property_unknown: Option<String> = None;
+        // Whether the open creates its file, decided in its own turn, after
+        // its grant and just before it runs, so that its directory's mtime and
+        // the new file's follow it (`entry_mtime`). Not boxed here: the model
+        // and the flags decide most opens at once, and it boxes the lookup an
+        // `O_CREAT` open without `O_EXCL` needs.
+        let creates = self.open_creates(guest, call).await;
         let res: Result<i64, Error> = match fifo {
             Some((fifo, fifo_path)) => {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
@@ -7309,6 +7316,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         RawInode::new(stat.st_dev, stat.st_ino),
                         procfs.name(stat.st_dev),
                     )
+                    .await;
+                }
+                // The file this open created, and for a named one its
+                // directory, take the virtual now as their mtime, once any
+                // retired mapping of its inode is gone (`entry_mtime`).
+                if let (Some(creates), Some(stat)) = (creates, &host_stat) {
+                    Box::pin(self.touch_created_by_open(
+                        guest,
+                        call,
+                        creates,
+                        RawInode::new(stat.st_dev, stat.st_ino),
+                    ))
                     .await;
                 }
                 // A descriptor that writes process memory can rewrite the

@@ -12,6 +12,14 @@
 //! virtual mtime moved only on writes, so a build unpacked by `tar` saw its
 //! files ordered by extraction and `make` re-ran autotools steps that a native
 //! build skips.
+//!
+//! A directory's mtime moves when a name is created in it, removed from it or
+//! renamed into or out of it, and a new file, directory, symbolic link or node
+//! reads its creation time
+//! (https://github.com/facebookexperimental/hermit/issues/433). Before this, a
+//! directory kept the mtime it was first seen with and a new object read the
+//! epoch, so `tar --clamp-mtime` archived a directory a build had changed with
+//! another mtime than Linux gives it.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -221,4 +229,95 @@ fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
         "without sequentialization the guest saw the explicit mtime on {} file(s): {seen:?}\nstderr:\n{stderr}",
         seen.len(),
     );
+}
+
+/// The directory mtime guest's last line, printed only when every check
+/// passed.
+const DIRECTORY_MTIMES_PASSED: &str = "directory mtimes follow entries";
+
+fn assert_directory_mtimes_passed(output: &Output, label: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == DIRECTORY_MTIMES_PASSED),
+        "{label}: a check failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// The guest checks Linux's own behavior for each entry-changing call, so it
+/// must pass natively. Under `hermit run --strict` it must pass with bitwise
+/// parity between the two runs of `--verify --verify-strict` (ptrace backend,
+/// info log level, no relaxations), and a recording of it must replay.
+#[test]
+fn directory_mtimes_follow_entries_in_run_and_record_modes() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dir-mtime-entries-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create guest build directory");
+    let guest = build_root.join("dir_mtime_entries");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/dir_mtime_entries.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "directory mtime guest compilation");
+
+    let native = command_output(Command::new(&guest), "native directory mtime guest");
+    assert_directory_mtimes_passed(&native, "native directory mtime guest");
+
+    let report = build_root.join("verify.json");
+    let mut run = Command::new("timeout");
+    run.args(["--kill-after", "5s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+        ])
+        .arg(&report)
+        .args(["--base-env=minimal", "--"])
+        .arg(&guest);
+    let label = "directory mtime guest under hermit run --verify-strict";
+    let output = command_output(run, label);
+    assert_directory_mtimes_passed(&output, label);
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("hermit did not write the verification report"),
+    )
+    .expect("verification report is not JSON");
+    assert_eq!(report["bitwise_parity"], serde_json::Value::Bool(true));
+    let compared = &report["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|n| n > 0) && compared["left"] == compared["right"],
+        "verification compared no INFO messages: {report}"
+    );
+
+    let recording = build_root.join("recording");
+    let _ = fs::remove_dir_all(&recording);
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "5s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args(["--log=info", "record", "start", "--verify"])
+        .arg("--data-dir")
+        .arg(&recording)
+        .arg("--")
+        .arg(&guest);
+    let label = "directory mtime guest record/replay";
+    let output = command_output(record, label);
+    assert_directory_mtimes_passed(&output, label);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("Success: replay matched recording")
+            || stderr.contains("Success: replay matched recording"),
+        "the recording did not replay\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let _ = fs::remove_dir_all(&build_root);
 }

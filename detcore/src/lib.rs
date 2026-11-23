@@ -9012,6 +9012,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             if res.is_ok() && !removed_inodes.is_empty() {
                 self.retire_removed_inodes(guest, removed_inodes).await;
             }
+            // A call that created, removed or renamed a name moves its
+            // directory's virtual mtime, and gives a new object its creation
+            // time, in this turn (`entry_mtime`; an open does so in
+            // `handle_openat`). Not boxed here: it returns at once where the
+            // model is off, and boxes its own lookups where it is on, so that
+            // no other call's future carries them
+            // (`hot_path_futures_stay_small`).
+            if matches!(res, Ok(ret) if ret >= 0) && crate::syscalls::changes_entries(call.number())
+            {
+                self.touch_entries_changed_by(guest, &call).await;
+            }
             if res.is_ok() {
                 for fifo in removed_guest_fifos {
                     crate::fifo_peer::forget_guest_made(fifo);

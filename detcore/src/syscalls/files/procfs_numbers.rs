@@ -435,8 +435,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// of its later mappings stay as they were, and nothing is left behind
     /// if the thread is killed inside the call. Only where neither can hold
     /// them does the call fail (ENOMEM) rather than reach a directory other
-    /// than the one the guest named.
-    async fn stage_translated<G: Guest<Self>>(
+    /// than the one the guest named. Also stages the directory spellings
+    /// `entry_mtime` looks up, which no guest argument holds.
+    pub(super) async fn stage_translated<G: Guest<Self>>(
         guest: &mut G,
         sysno: reverie::syscalls::Sysno,
         values: [usize; 6],

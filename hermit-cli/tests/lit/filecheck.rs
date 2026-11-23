@@ -1,6 +1,10 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// All rights reserved.
-// Licensed under the BSD-style license in the LICENSE file.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 //! The part of LLVM's FileCheck that detcore/tests/lit's fixtures use, and no
 //! more:
@@ -9,8 +13,9 @@
 //!   prefix (`CHECK` unless `--check-prefix` names another);
 //! - patterns of literal text, `{{regex}}`, `[[NAME:regex]]` and `[[NAME]]`.
 //!   A regex is compiled by the `regex` crate, not as FileCheck's POSIX
-//!   extended syntax; the fixtures' seven distinct regexes (`.+`, `[0-9]+`,
-//!   `([ab]+)`, `(1*2+|2*1+)` and the like) mean the same in both;
+//!   extended syntax; the fixtures' eight distinct regexes (`.+`, `[0-9]+`,
+//!   `[1-9][0-9]*`, `([ab]+)`, `(1*2+|2*1+)` and the like) mean the same in
+//!   both;
 //! - FileCheck's default whitespace rule: a run of spaces and tabs, in the
 //!   input and in a pattern's literal text, matches any other such run.
 //!

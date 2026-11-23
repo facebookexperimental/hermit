@@ -447,6 +447,18 @@ fn mount_fresh_tmpfs(mount_point: &Path, replace: bool) {
     assert_eq!(rc, 0, "mount tmpfs: {}", std::io::Error::last_os_error());
 }
 
+/// `CLOCK_REALTIME_COARSE` as (seconds, nanoseconds): Linux stamps a new
+/// inode no earlier than this clock reads before the call (`current_time`).
+fn coarse_realtime() -> (i64, i64) {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) };
+    assert_eq!(rc, 0, "clock_gettime: {}", std::io::Error::last_os_error());
+    (now.tv_sec, now.tv_nsec)
+}
+
 /// Ask the test process to replace the tmpfs, and wait until it has. The
 /// guest opens both FIFOs itself: Detcore refuses I/O on a descriptor it never
 /// saw opened.
@@ -495,15 +507,28 @@ fn reuse_guest(mount_point: &Path, fifos: &Path, reach: FirstReach) {
                 std::io::Write::write_all(&mut File::create(&old).unwrap(), b"x").unwrap();
                 std::fs::remove_file(&old).unwrap();
                 remount(request, done);
+                // A new directory reads its creation time, as on Linux
+                // (https://github.com/facebookexperimental/hermit/issues/433):
+                // no earlier than the coarse clock read just before it is
+                // made, which bounds Linux's stamp from below and which an
+                // inherited mtime, from the removed file's write, precedes;
+                // and no later than a directory made after it with no reuse.
+                let before_new = coarse_realtime();
                 std::fs::create_dir(&new).unwrap();
                 let control = mount_point.join(format!("control-{cycle}"));
                 std::fs::create_dir(&control).unwrap();
-                let mtime = |path: &Path| std::fs::metadata(path).unwrap().mtime_nsec();
-                let seconds = |path: &Path| std::fs::metadata(path).unwrap().mtime();
-                assert_eq!(
-                    (seconds(&new), mtime(&new)),
-                    (seconds(&control), mtime(&control)),
-                    "{reach:?}, cycle {cycle}: the new directory took the removed file's mtime"
+                let mtime = |path: &Path| {
+                    let metadata = std::fs::metadata(path).unwrap();
+                    (metadata.mtime(), metadata.mtime_nsec())
+                };
+                assert!(
+                    before_new <= mtime(&new) && mtime(&new) <= mtime(&control),
+                    "{reach:?}, cycle {cycle}: the new directory does not read its creation time \
+                     (one taken from the removed file would come before the clock): \
+                     {:?} before it was made, {:?} for it, {:?} for a later directory",
+                    before_new,
+                    mtime(&new),
+                    mtime(&control),
                 );
                 continue;
             }
