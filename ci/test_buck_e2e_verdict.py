@@ -855,9 +855,10 @@ sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
 """
 # buck2, for what validate-node asks of it: `log show FILE` prints FILE, which here holds the
 # JSON lines themselves (or fails, with FAKE_BUCK2_LOG_SHOW_FAILS, or never ends, with
-# FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, and
-# exits FAKE_BUCK2_KILL_RC. With FAKE_BUCK2_ORDER set, `log` and `kill` also append their
-# name to that file, so a test can see which the node asked for first.
+# FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, waits
+# until the epoch time FAKE_BUCK2_KILL_UNTIL, when set, and exits FAKE_BUCK2_KILL_RC. With
+# FAKE_BUCK2_ORDER set, `log` and `kill` also append their name to that file, so a test can see
+# which the node asked for first.
 FAKE_NODE_BUCK2 = """#!/bin/sh
 case $1 in
     log)
@@ -868,6 +869,9 @@ case $1 in
     kill)
         if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo kill >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_KILLS:-}" ]; then echo kill >>"$FAKE_BUCK2_KILLS"; fi
+        if [ -n "${FAKE_BUCK2_KILL_UNTIL:-}" ]; then
+            python3 -c 'import sys, time; time.sleep(max(0.0, float(sys.argv[1]) - time.time()))' "$FAKE_BUCK2_KILL_UNTIL"
+        fi
         exit "${FAKE_BUCK2_KILL_RC:-0}" ;;
 esac
 exit 0
@@ -878,9 +882,20 @@ exit 0
 # The sibling step-wall and retention-budget tests retain the total after-exit wall bounds.
 STALLED_SUMMARY_RETENTION_SECONDS = 3
 
+
+def is_assignment(command: str) -> bool:
+    """Whether a traced command is a variable or array assignment, which runs no command."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=\(.*\)", command.strip(), re.S):
+        return True
+    return all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", word, re.S) for word in shlex.split(command))
+
 RECORDS = {
     "re.log": "re console\n", "re.rc": "0\n", "re.test_id": "re\n", "re.times": "1.5\n9.25\n",
-    "re.event-log.pb.zst": "".join(stages_test.two_cells()),
+    # The two cells, one action served from the action cache (inside the cells' time span, so the
+    # stage summary is the two cells'), and buck2's final Result record, as a whole log ends.
+    "re.event-log.pb.zst": "".join(stages_test.two_cells())
+    + stages_test.event(3.5, "SpanEnd", {"ActionExecution": {"execution_kind": 3}}, span=30)
+    + json.dumps({"Result": {}}) + "\n",
     "local.log": "local console\n", "local.rc": "32\n",
 }
 
@@ -901,6 +916,10 @@ class ValidateNodeTest(unittest.TestCase):
         shutil.copy2(BUCK_E2E / "daemon-bound.sh", checkout / "ci" / "buck-e2e" / "daemon-bound.sh")
         # validate-node sources this on every path; only buck-stock calls its functions.
         shutil.copy2(BUCK_E2E / "buckconfig-sources.sh", checkout / "ci" / "buck-e2e" / "buckconfig-sources.sh")
+        # The Buck measurement: validate-node sources the helper, which runs the summarizer
+        # beside it at the node's exit.
+        for name in ("buck-measure.sh", "buck-measure-summarize.py"):
+            shutil.copy2(BUCK_E2E / name, checkout / "ci" / "buck-e2e" / name)
         # Every file validate-node sources must be among the copies above: a missing one fails
         # the node on whichever path reaches it, and every test with it (the copy list is kept
         # by hand). Each `source` or `.` line must name a file beside the node.
@@ -923,7 +942,8 @@ class ValidateNodeTest(unittest.TestCase):
     def node_environment(self, e2e_result_root, runner, added):
         environment = {k: v for k, v in os.environ.items()
                        if k not in ("E2E_RESULT_ROOT", "HERMIT_VALIDATE_BUCK_RETENTION_SECONDS",
-                                    "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS", "DAGRUN_STEP_STARTED_MONOTONIC_NS")}
+                                    "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS", "DAGRUN_STEP_STARTED_MONOTONIC_NS",
+                                    "DAGRUN_OUTER_RUN")}
         environment.update(PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
                            HERMIT_VALIDATE_E2E_RUNNER=runner, HERMIT_VALIDATE_BUCK2=str(self.buck2),
                            VALIDATE_RUN_STATE=str(self.root / "state"), HERMIT_EPOCH="2026-10-05T00:00:00+00:00",
@@ -1085,7 +1105,20 @@ class ValidateNodeTest(unittest.TestCase):
         process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS))
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         kept = self.kept(results)
+        # re, the invocation with an event log, keeps that log and its stage summary; the decoded
+        # JSON lines the Buck measurement counts are not kept (they duplicate the .pb.zst).
         self.assertEqual(sorted(p.name for p in kept.iterdir()), sorted([*RECORDS, "phases.tsv", "re.stages.txt"]))
+        # The node's Buck measurement sidecar: one, typed, named for the node outside dagrun. It
+        # counts re's whole log; the stand-in buck2 runs no daemon, so `buck2 status` names none
+        # and the daemon is recorded as unmeasured, with the reason, never as zero.
+        sidecars = list((kept.parent / "buck-measure").glob("*.json"))
+        self.assertEqual([path.name for path in sidecars], ["e2e.buck_all.json"])
+        record = json.loads(sidecars[0].read_text())
+        self.assertEqual(record["schema"], "hermit-buck-measure/v2")
+        self.assertEqual(record["daemon"], {"placement": "unmeasured",
+                                            "reason": "no buck2 daemon was running when it was measured (`buck2 status`)"})
+        self.assertEqual((record["actions"]["measured"], record["actions"]["total"], record["actions"]["cached"]), (True, 1, 1))
+        self.assertEqual(record["actions"]["decoded_bytes"], len(RECORDS["re.event-log.pb.zst"].encode()))
         for name, text in RECORDS.items():
             self.assertEqual((kept / name).read_text(), text, name)
         self.assertEqual((kept / "re.stages.txt").read_text(), stages_test.StagesTest.summary(
@@ -1169,11 +1202,14 @@ class ValidateNodeTest(unittest.TestCase):
                                  "timeout did not receive only the remaining retention budget")
                 checked_commands.append(argv[5:])
                 if len(checked_commands) > 1:
-                    self.assertCountEqual(
-                        [command[:2] for command in checked_commands],
-                        [[str(self.buck2), "log"],
-                         ["python3", str(self.checkout / "ci/buck-e2e/stages.py")]],
-                        f"commands shared one remaining-time check: {checked_commands}")
+                    # Only the stage-summary pipeline (`buck2 log show | tee the event log for
+                    # the Buck measurement | stages.py`) shares one remaining-time check, each
+                    # of its commands once.
+                    pipeline = [[str(self.buck2), "log"], ["tee", "--"],
+                                ["python3", str(self.checkout / "ci/buck-e2e/stages.py")]]
+                    heads = [command[:2] for command in checked_commands]
+                    self.assertTrue(all(head in pipeline for head in heads) and len(heads) == len({tuple(h) for h in heads}),
+                                    f"commands shared one remaining-time check: {checked_commands}")
                 commands.append(argv[5:])
                 self.assertNotIn(pid, pending, "timeout observer overlapped itself")
                 pending[pid] = {"argv": argv}
@@ -1202,6 +1238,10 @@ class ValidateNodeTest(unittest.TestCase):
                         intervals[key] = observed["start"], observed["end"]
                     del pending[pid]
             elif function in builtins:
+                # A variable assignment (the Buck measurement's count of the logs it is owed)
+                # runs no command.
+                if is_assignment(command):
+                    continue
                 self.assertIn(shlex.split(command)[0], builtins[function],
                               f"retention ran an unbounded or unrecognized command: {command}")
         self.assertIsNotNone(deadline, "retention's deadline was not observed")
@@ -1213,6 +1253,39 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertLess(max(start for start, _end in intervals.values()),
                         min(end for _start, end in intervals.values()),
                         f"summary command intervals did not overlap: {intervals}")
+
+    def assert_measurement_bounded(self, trace, write_cap):
+        """On exit the Buck measurement reads the daemon (within 5 s) before `buck2 kill` and
+        writes its sidecar (within write_cap s) after it; every external command it runs there
+        is bounded by `timeout --foreground`, but for removing its own small work files."""
+        events = []
+        for line in trace.splitlines():
+            if not line.lstrip("+").startswith("retention\t"):
+                continue
+            function, command = line.split("\t", 7)[3], line.split("\t", 7)[7]
+            if function == "on_exit" and shlex.split(command)[-1:] == ["kill"] and str(self.buck2) in command:
+                events.append(("kill", None))
+            if function not in ("buck_measure_daemon", "buck_measure_write"):
+                continue
+            if is_assignment(command):
+                continue
+            words = shlex.split(command)
+            if words[0] == "timeout":
+                self.assertEqual(words[1:4], ["--foreground", "-k", "1"], command)
+                cap = 5 if function == "buck_measure_daemon" else write_cap
+                self.assertLessEqual(Decimal(words[4]), cap, f"{function} ran past its bound: {command}")
+                events.append((function, words[5:6]))
+            else:
+                self.assertIn(words[0], {"local", "[[", "((", "rm", "return", "for", "if", "bm_note", "printf"},
+                              f"{function} ran an unbounded command on the node's exit: {command}")
+        kinds = [kind for kind, _ in events]
+        self.assertIn("kill", kinds, events)
+        self.assertEqual([argv for kind, argv in events if kind == "buck_measure_daemon"], [[str(self.buck2)], ["python3"]],
+                         "the daemon read runs `buck2 status` and reads its placement, once each, bounded")
+        self.assertEqual([argv for kind, argv in events if kind == "buck_measure_write"], [["python3"]],
+                         "the sidecar is written once, bounded")
+        self.assertLess(kinds.index("buck_measure_daemon"), kinds.index("kill"))
+        self.assertLess(kinds.index("kill"), kinds.index("buck_measure_write"))
 
     def test_a_stalled_stage_summary_costs_only_the_summary(self):
         results = self.root / "e2e-results"
@@ -1254,6 +1327,7 @@ class ValidateNodeTest(unittest.TestCase):
                                              BASH_ENV=str(observer), FAKE_RETENTION_TRACE=str(trace), **added)
                 self.assertEqual(process.returncode, run_status, process.stdout + process.stderr)
                 self.assert_retention_deadline_trace(trace.read_text())
+                self.assert_measurement_bounded(trace.read_text(), STALLED_SUMMARY_RETENTION_SECONDS)
                 self.assertIn("validate-node: the stage summary of the re invocation is incomplete", process.stderr)
                 self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
                 self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
@@ -1346,6 +1420,28 @@ class ValidateNodeTest(unittest.TestCase):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
         return process, observed_exit_at
+
+    def test_an_exit_with_no_time_left_discards_the_measurement(self):
+        # The daemon's stop (a stand-in `buck2 kill` that returns 1.5 s before the step's 15 s
+        # wall bound) leaves the sidecar write no time: measure_left needs 2 s of the bound. The
+        # node then writes no sidecar and removes the measurement's work directory, with the
+        # decoded event-log copy it holds, instead of leaving it in $TMPDIR.
+        results = self.root / "e2e-results"
+        scratch = self.root / "tmp"
+        scratch.mkdir()
+        kills = self.root / "kills"
+        wall = 15
+        process, _ended = self.run_as_step(results, wall, FAKE_BUCK2_KILLS=str(kills),
+                                           FAKE_BUCK2_KILL_UNTIL=str(time.time() + wall - 1.5), TMPDIR=str(scratch))
+        stderr = (self.root / "node.stderr").read_text()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+        self.assertIn("validate-node: no time was left before this step's wall bound to write the Buck measurement",
+                      stderr)
+        self.assertEqual(sorted(path.name for path in scratch.glob("buck-measure.*")), [],
+                         "the measurement's work directory was left in $TMPDIR")
+        self.assertEqual(sorted((self.kept(results).parent / "buck-measure").glob("*.json")), [],
+                         "a node with no time left wrote a sidecar")
 
     def test_keeping_the_records_ends_inside_the_steps_wall_bound(self):
         # The step's bound less the 10 s reserve is shorter than the 30 s retention budget, so it

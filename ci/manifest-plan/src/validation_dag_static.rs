@@ -700,11 +700,20 @@ pub(super) fn config() -> DagConfig {
     DagConfig {
         description: "Hermit validation superset; select quick, portable, hosted-portable, full, super, privileged, or hosted-privileged by step label".into(),
         default_step_timeout: 600,
-        resource_caps: BTreeMap::from([("manifest_guest".into(), 20), ("integration_test_binaries.cli".into(), 1), ("integration_test_binaries.hermit_modes".into(), 1)]),
+        resource_caps: BTreeMap::from([("manifest_guest".into(), 20), ("integration_test_binaries.cli".into(), 1), ("integration_test_binaries.hermit_modes".into(), 1), (BUCK_DAEMON_RESOURCE.into(), 1)]),
         steps,
         ..DagConfig::default()
     }
 }
+
+/// One buck2 daemon per checkout: exactly the nodes that may run buck2 take this resource,
+/// capped at 1, so two such nodes of one run never share, or kill, the checkout's daemon,
+/// and the daemon's CPU is attributed to one node (ci/buck-e2e/daemon-bound.sh starts its own
+/// daemon after stopping any already running for the checkout). e2e.buck_cells and the
+/// Buck-only nodes are derived from build.buck_release_artifact and inherit it; e2e.buck_stage,
+/// derived from it too, stages with Cargo and drops it. ci/buck-build-compare.py requires a
+/// measurement sidecar (ci/buck-e2e/buck-measure.sh) from every holder that ran buck2.
+pub(crate) const BUCK_DAEMON_RESOURCE: &str = "buck_daemon";
 
 pub(super) const RUST_SCRIPT_ENVIRONMENT: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "########;
 
@@ -1691,14 +1700,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) : ;; buck) test -n "${HERMIT_VALIDATE_BUCK_DOTSLASH:-}" || { echo 'Buck release mode has no explicit DotSlash launcher' >&2; exit 2; }; ./scripts/build-buck-release.rs --validate-dag-build --dotslash "$HERMIT_VALIDATE_BUCK_DOTSLASH" ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) : ;; buck) test -n "${HERMIT_VALIDATE_BUCK_DOTSLASH:-}" || { echo 'Buck release mode has no explicit DotSlash launcher' >&2; exit 2; }; ./ci/buck-e2e/measure-release-build ./scripts/build-buck-release.rs --validate-dag-build --dotslash "$HERMIT_VALIDATE_BUCK_DOTSLASH" ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"gate.manifest"########],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(BUCK_DAEMON_RESOURCE, 1)],
             est_duration_s: 185.0,
             rss_baseline_bytes: Some(9006452736),
             hard_mem_max_bytes: Some(68719476736),
@@ -1727,7 +1736,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[r########"gate.manifest"########],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(BUCK_DAEMON_RESOURCE, 1)],
             est_duration_s: 5.0,
             rss_baseline_bytes: Some(536870912),
             hard_mem_max_bytes: Some(2147483648),

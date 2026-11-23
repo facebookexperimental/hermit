@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# usage: ci/buck-e2e/measure-release-build CMD...
+#
+# Run the Buck release build of build.buck_release_artifact (CMD: scripts/build-buck-release.rs
+# --validate-dag-build ...) and write its measurement sidecar (ci/buck-e2e/buck-measure.sh),
+# changing nothing it builds or decides: the exit status is CMD's.
+#
+# The release build keeps its own evidence in the directory it creates,
+# ignored/buck2-phase2/builds/build-<sha>-<id>/: buck-build.json-lines.gz (its event log),
+# buck-build.stdout (its --show-output) and buck2-tool-snapshot/buck2 (the buck2 it ran). The
+# sidecar counts that log, hashes those outputs, and reads where the daemon ran from
+# `buck2 status` with that same buck2, which starts no daemon. A run that leaves no new evidence
+# directory, or more than one, writes a sidecar with the daemon and actions unmeasured.
+set -uo pipefail
+
+here=$(dirname -- "${BASH_SOURCE[0]}")
+builds=ignored/buck2-phase2/builds
+# shellcheck source-path=SCRIPTDIR source=buck-measure.sh
+source "$here/buck-measure.sh"
+
+listing() { # the evidence directories that exist now, one per line
+    [[ -d $builds ]] || return 0
+    find "$builds" -mindepth 1 -maxdepth 1 -type d -name 'build-*' -printf '%f\n' 2>/dev/null | sort
+}
+
+before=$(listing) || before=''
+buck_measure_start build.buck_release_artifact '' 'scripts/build-buck-release.rs: bootstrap/buck2 through DotSlash'
+status=0
+"$@" || status=$?
+after=$(listing) || after=''
+created=()
+while IFS= read -r name; do
+    [[ -z $name ]] || created+=("$name")
+done < <(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null)
+bm_expected_event_logs=1
+if ((${#created[@]} == 1)); then
+    evidence=$builds/${created[0]}
+    bm_buck2=$evidence/buck2-tool-snapshot/buck2
+    bm_read_version
+    bm_event_logs+=("$evidence/buck-build.json-lines.gz")
+    bm_show_output=$evidence/buck-build.stdout
+    if [[ -x $bm_buck2 ]]; then
+        buck_measure_daemon 30
+    else
+        bm_daemon_reason="the release build kept no buck2 snapshot at $bm_buck2"
+    fi
+else
+    bm_daemon_reason="the release build created ${#created[@]} evidence directories under $builds, not one"
+fi
+buck_measure_write 120
+exit "$status"

@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
+use crate::validation_dag_static::BUCK_DAEMON_RESOURCE;
 use crate::validation_dag_static::StructuredResultProducerKind;
 
 pub const OUTPUT: &str = "ci/dag/validate.json";
@@ -576,15 +577,33 @@ fn hosted_portable_exclusion_flags() -> String {
     exclusion_flags(HOSTED_PORTABLE_EXCLUDED_BACKENDS)
 }
 
+/// Whether a step's command reaches one of the Buck entry points, the commands that run buck2:
+/// the harvest (ci/harvest-reverie-buck.sh), the release build
+/// (`build-buck-release.rs --validate-dag-build`) and ci/buck-e2e/validate-node in every form but
+/// `--stage-only`, which stages with Cargo (the only runners with a separate stage node,
+/// buck-local and buck-hybrid). `--validate-dag-install`, in the E2E publishers, only installs
+/// the verified binary. This reads the command's text: a step that ran buck2 some other way
+/// would escape it, so it is a backstop for the commands this DAG writes, not a proof.
+fn reaches_buck_entry_point(cmd: &str) -> bool {
+    const VALIDATE_NODE: &str = "ci/buck-e2e/validate-node";
+    cmd.contains("ci/harvest-reverie-buck.sh")
+        || cmd.contains("build-buck-release.rs --validate-dag-build")
+        || cmd
+            .match_indices(VALIDATE_NODE)
+            .any(|(at, _)| !cmd[at + VALIDATE_NODE.len()..].starts_with(" --stage-only"))
+}
+
 fn exclusion_flags(excluded: &[&str]) -> String {
     excluded
         .iter()
         .map(|backend| format!(" --exclude-backend {backend}"))
         .collect()
 }
-// The capacity column is the DAG's one resource_caps entry: a hosted run selects its
-// steps from the same validate.json, so it carries the same 20 slots as a local run.
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 15] = [
+// The capacity column is the step's resource's resource_caps entry: a hosted run selects its
+// steps from the same validate.json, so it carries the same capacities as a local run.
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 16] = [
+    // --buck-release supports the hosted-portable plan; its one buck2 daemon per checkout.
+    ("build.buck_release_artifact", "buck_daemon", 1, 1),
     ("e2e.manifest_applications", "manifest_guest", 1, 20),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 20),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 20),
@@ -3195,6 +3214,9 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     stage.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, with e2e.buck_cells. On the host it runs ci/buck-e2e/stage --from-cargo (ci/buck-e2e/validate-node --stage-only): a Cargo build in the checkout's target/ of the release test-harness and hermit-manifest-plan (target/release), the validate-profile hermit (target/stage-hermit, copied to target/validate/hermit) and detcore-dbt then the install bundle (target/validate), published with ci/publish-hermit-e2e-artifact.sh; then git archive HEAD and the CI-selected fixtures built from it. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It needs no buck2 and no runner, only the pinned Reverie (pre.reverie_pin): it builds nothing in target/ci or target/debug, so it runs beside build.rust_scripts (target/ci/rust-script-build) and setup.manifest_plan (target/debug), and Cargo's per-profile-directory locks keep the three from waiting on each other. Until 2026-10-05 the stage ran inside e2e.buck_cells, after those two and gate.manifest: in the full validation of hermit f53e746779 on a 284-core host they took 202, 34 and 3 seconds before the 422.74-second e2e.buck_cells began.".into();
     stage.labels = vec![FULL_BUCK_E2E_LABEL.into()];
     stage.cmd = BUCK_STAGE_COMMAND.into();
+    // It stages with Cargo and runs no buck2, so it takes no buck_daemon unit: it does not
+    // wait behind the Buck builds.
+    stage.hint.resources.remove(BUCK_DAEMON_RESOURCE);
     stage.deps = vec!["pre.reverie_pin".into()];
     // ci/buck-e2e/stage with its builds side by side (02eba338ab), cold:
     // 143.3 to 144.2 s wall at 32 jobs and 128.6 s at 96, 2276 to 2312 CPU-s.
@@ -5902,11 +5924,31 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 ("manifest_guest".into(), 20),
                 ("integration_test_binaries.cli".into(), 1),
                 ("integration_test_binaries.hermit_modes".into(), 1),
+                ("buck_daemon".into(), 1),
             ])
     {
         return Err(format!(
             "top-level validation policy changed: default_step_timeout={} resource_caps={:?}",
             cfg.default_step_timeout, cfg.resource_caps
+        ));
+    }
+    // One buck2 daemon per checkout: a step takes one buck_daemon unit (capped at 1 above)
+    // exactly when its command reaches a Buck entry point, so two such steps of a run never
+    // share, or kill, the checkout's daemon, its CPU is attributed to one step, and the steps
+    // that hold the unit are the ones ci/buck-build-compare.py requires a measurement from.
+    if let Some(step) = cfg.steps.iter().find(|step| {
+        reaches_buck_entry_point(&step.cmd)
+            != (step.hint.resources.get(BUCK_DAEMON_RESOURCE) == Some(&1))
+    }) {
+        return Err(format!(
+            "{} reaches {} Buck entry point but its buck_daemon units are {:?}: a step takes one exactly when it runs buck2",
+            step.tag(),
+            if reaches_buck_entry_point(&step.cmd) {
+                "a"
+            } else {
+                "no"
+            },
+            step.hint.resources.get(BUCK_DAEMON_RESOURCE)
         ));
     }
     let step = |tag: &str| {
@@ -8824,6 +8866,101 @@ sys.exit(37)
                     "{tag} passes --parity-reference; backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
                 )
             );
+        }
+    }
+
+    /// Exactly the committed steps that run buck2 hold the one buck_daemon unit, in both
+    /// directions: a Buck step that drops it, a step that holds it but runs no buck2, and a
+    /// cap other than 1 are each refused by name.
+    #[test]
+    fn exactly_the_buck_steps_take_the_one_buck_daemon_unit() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        assert_invariants(&committed, &cells).unwrap();
+        assert_eq!(committed.resource_caps.get(BUCK_DAEMON_RESOURCE), Some(&1));
+        let holders: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .filter(|step| step.hint.resources.get(BUCK_DAEMON_RESOURCE) == Some(&1))
+            .map(|step| step.tag())
+            .collect();
+        // The three committed steps that run buck2. e2e.buck_stage stages with Cargo, and the
+        // E2E publishers only install the verified binary.
+        assert_eq!(
+            holders,
+            BTreeSet::from([
+                "build.buck_release_artifact".to_string(),
+                "build.reverie_buck".to_string(),
+                "e2e.buck_cells".to_string(),
+            ])
+        );
+        for tag in [
+            "build.reverie_buck",
+            "e2e.buck_cells",
+            "build.buck_release_artifact",
+        ] {
+            let mut planted = committed.clone();
+            planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .expect("the committed DAG should have this Buck step")
+                .hint
+                .resources
+                .remove(BUCK_DAEMON_RESOURCE);
+            let error = assert_invariants(&planted, &cells).unwrap_err();
+            assert!(
+                error.starts_with(&format!(
+                    "{tag} reaches a Buck entry point but its buck_daemon units are None"
+                )),
+                "{error}"
+            );
+        }
+        for tag in ["e2e.buck_stage", "build.e2e_artifact_in_pinned_root"] {
+            let mut planted = committed.clone();
+            planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .expect("the committed DAG should have this step")
+                .hint
+                .resources
+                .insert(BUCK_DAEMON_RESOURCE.into(), 1);
+            let error = assert_invariants(&planted, &cells).unwrap_err();
+            assert!(
+                error.starts_with(&format!(
+                    "{tag} reaches no Buck entry point but its buck_daemon units are Some(1)"
+                )),
+                "{error}"
+            );
+        }
+        let mut planted = committed.clone();
+        planted.resource_caps.insert(BUCK_DAEMON_RESOURCE.into(), 2);
+        let error = assert_invariants(&planted, &cells).unwrap_err();
+        assert!(
+            error.starts_with("top-level validation policy changed"),
+            "{error}"
+        );
+    }
+
+    /// The command text decides it: validate-node in every form but --stage-only, the
+    /// harvest, and the release build, but not the release install.
+    #[test]
+    fn buck_entry_points_are_the_commands_that_run_buck2() {
+        for cmd in [
+            "./ci/buck-e2e/validate-node --cells-only",
+            "./ci/buck-e2e/validate-node",
+            "case x in buck) ./ci/harvest-reverie-buck.sh ;; esac",
+            "./ci/buck-e2e/measure-release-build ./scripts/build-buck-release.rs --validate-dag-build --dotslash x",
+        ] {
+            assert!(reaches_buck_entry_point(cmd), "{cmd} runs buck2");
+        }
+        for cmd in [
+            "./ci/buck-e2e/validate-node --stage-only",
+            "buck) ./scripts/build-buck-release.rs --validate-dag-install && x ;;",
+            "./ci/run-nextest-counted.sh -p hermit-run",
+        ] {
+            assert!(!reaches_buck_entry_point(cmd), "{cmd} runs no buck2");
         }
     }
 

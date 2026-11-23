@@ -238,6 +238,14 @@ await_preflight() {
 # any buck2 this node runs, in every form, --stage-only included.
 # shellcheck source-path=SCRIPTDIR source=buckconfig-sources.sh
 source "$here/buckconfig-sources.sh"
+# What this node's Buck work costs (B0): where the daemon ran (and, in its systemd scope, its CPU
+# and memory), every action's execution kind, the bootstraps' CPU, which buck2 ran. Record only:
+# a failed measurement costs the sidecar ($E2E_RESULT_ROOT/buck-measure/<DAG step tag>.json),
+# never the node, and it adds no `buck2 kill` and no extra `buck2 log show`. --stage-only runs no
+# buck2 under buck-local and buck-hybrid, the only runners whose DAG has a separate stage node,
+# so it measures nothing.
+# shellcheck source-path=SCRIPTDIR source=buck-measure.sh
+source "$here/buck-measure.sh"
 if [[ ${HERMIT_VALIDATE_E2E_RUNNER:-} == buck-stock ]]; then
     export_stock_buckconfig_env
     refuse_untracked_buck_config
@@ -359,6 +367,19 @@ if [[ -n $kept ]] && ! rm -f -- "$state/work"/{re,local,all,rerun-local,stock}.{
     echo "validate-node: cannot remove an earlier attempt's Buck invocation records from $state/work (above); this run keeps none" >&2
     kept=
 fi
+measure_left() { # $1: a cap (seconds); $2: how many seconds of the stop reserve the measurement may
+    # use. Set left to the cap, or to the time until the step's wall bound less the rest of the
+    # reserve if that is sooner; fail once none is left. Without a wall bound, the cap alone.
+    local cap_us=$(($1 * 1000000)) now=${EPOCHREALTIME/[^0-9]/} room
+    if [[ -n $step_wall_seconds ]]; then
+        room=$((step_end_us + $2 * 1000000 - now))
+        ((room > 0)) || return 1
+        if ((room < cap_us)); then
+            cap_us=$room
+        fi
+    fi
+    printf -v left '%d.%06d' $((cap_us / 1000000)) $((cap_us % 1000000))
+}
 time_left() { # set left to the seconds until the caller's deadline (epoch microseconds); fail once it has passed
     local now=${EPOCHREALTIME/[^0-9]/}
     ((now < deadline)) || return 1
@@ -368,7 +389,17 @@ keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Cop
     # record from $state/work into $kept, with its stage summary. Each command gets what is left
     # before $1 and none starts after it, so a stalled copy or summary costs records, never the
     # node's status or its daemon cleanup.
-    local deadline=$1 left name file
+    # The decoded stream is also teed to the measurement's work directory, where the sidecar counts
+    # its actions and then deletes it: it duplicates the kept .event-log.pb.zst, so it is not kept.
+    # Every invocation that kept an event log owes the sidecar one whole decoded copy, whether or
+    # not the time below reaches it, so a partial count is never written.
+    local deadline=$1 left name file decoded
+    bm_expected_event_logs=0 bm_event_logs=()
+    for name in re local all rerun-local stock; do
+        if [[ -f $state/work/$name.event-log.pb.zst ]]; then
+            bm_expected_event_logs=$((bm_expected_event_logs+1))
+        fi
+    done
     for name in re local all rerun-local stock; do
         for file in "$state/work/$name".{log,rc,test_id,times,event-log.pb.zst}; do
             [[ -f $file ]] || continue
@@ -379,11 +410,17 @@ keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Cop
             timeout --foreground -k 0.5 "$left" cp -- "$file" "$kept/"
         done
         [[ -f $state/work/$name.event-log.pb.zst ]] || continue
+        decoded=/dev/null
+        if [[ -n $bm_work ]]; then
+            decoded=$bm_work/$name.event-log.jsonl
+            bm_event_logs+=("$decoded")
+        fi
         if ! time_left; then
             echo "validate-node: $2 ran out before the $name invocation's stage summary" >&2
             return
         fi
         if ! timeout --foreground -k 0.5 "$left" "$buck2" log show "$state/work/$name.event-log.pb.zst" |
+            timeout --foreground -k 0.5 "$left" tee -- "$decoded" |
             timeout --foreground -k 0.5 "$left" python3 "$here/stages.py" - >"$kept/$name.stages.txt"; then
             echo "validate-node: the stage summary of the $name invocation is incomplete (above)" >&2
         fi
@@ -410,9 +447,23 @@ on_exit() { # keep the invocations' records, then stop the buck2 daemon; the nod
         fi
         keep_invocations "$deadline" "$why"
     fi
+    # The measurement reads where the daemon runs while it still runs, and writes the sidecar once
+    # it is stopped, each within what is left of this step's wall bound (measure_left).
+    local left
+    if [[ -n $bm_work ]] && measure_left 5 2; then
+        buck_measure_daemon "$left"
+    fi
     record_daemon
     "$buck2" kill >/dev/null 2>&1
     kill_daemon_scope
+    if [[ -n $bm_work ]]; then
+        if measure_left "$retention_seconds" $((step_reserve_seconds - 2)); then
+            buck_measure_write "$left"
+        else
+            echo "validate-node: no time was left before this step's wall bound to write the Buck measurement; this node has no sidecar, which the comparison refuses" >&2
+            buck_measure_discard
+        fi
+    fi
     if [[ -n $daemon_breach && -s $daemon_breach ]]; then
         echo "validate-node: fails: $(<"$daemon_breach")" >&2
         ((status != 0)) || exit 1
@@ -449,6 +500,9 @@ trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 trap 'on_signal HUP' HUP
 
+# The sidecar is named by the DAG step this invocation is (DAGRUN_OUTER_RUN); the name given here
+# is used only outside dagrun.
+buck_measure_start "e2e.buck_$phase" "$buck2" HERMIT_VALIDATE_BUCK2
 if [[ $mode == stock ]]; then
     if [[ ! -s shim/third-party/rust/BUCK ]]; then
         echo "validate-node: buck-stock runs no cargo, so it does not generate the third-party rules; shim/third-party/rust/BUCK is missing: generate it once in this checkout with bootstrap/regenerate-rust-deps (slot setup)" >&2
@@ -463,7 +517,7 @@ if [[ $mode == stock ]]; then
     step "using the third-party rules already generated in this checkout for its inputs (sha256 $(sha256sum shim/third-party/rust/BUCK | cut -c1-16))"
 else
     step "regenerating the Buck third-party rules"
-    "${proxy[@]}" ./bootstrap/regenerate-rust-deps
+    buck_measure_bootstrap regenerate-rust-deps "${proxy[@]}" ./bootstrap/regenerate-rust-deps
 fi
 if [[ $mode == stock ]]; then
     config_records=${kept:-$state/work}
@@ -471,6 +525,7 @@ if [[ $mode == stock ]]; then
     record_external_buckconfigs >"$config_records/buckconfig-external.tsv"
     step "buck2 skips the machine-local buckconfigs; their sha256 are in $config_records/buckconfig-external.tsv"
     bound_daemon
+    buck_measure_scope "$daemon_scope"
     check_buckconfig_sources "$config_records/buckconfig-effective.txt" "$config_records/buckconfig-external.tsv"
 fi
 if [[ $mode == hybrid ]]; then

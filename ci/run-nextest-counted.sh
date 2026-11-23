@@ -108,10 +108,18 @@ function configured_cpu_report_path {
 # - else, for a counted DAG step of a validation with a durable result root,
 #   $E2E_RESULT_ROOT/nextest-events/<step>.<attempt>.jsonl, so that two runs can be compared
 #   test by test (each test's typed outcome, in both directions) and a lost test is named.
-#   <step> is the census's name for the step (DAGRUN_TEST_COUNTS_PATH's basename, as in
-#   run_census_check); <attempt> is DAGRUN_STEP_STARTED_MONOTONIC_NS, so a retried step keeps
-#   each attempt's stream instead of being refused for an existing file;
-# - else `-`, none.
+#   <step> is the dagrun step tag (DAGRUN_TEST_COUNTS_PATH's basename without `.json`, for
+#   example `test.detcore_unit`). The census check in run_nextest derives its suite name from
+#   the same basename but also strips a leading `test.` (`detcore_unit`), so a reader that joins
+#   streams to census suites strips it too. <attempt> is DAGRUN_STEP_STARTED_MONOTONIC_NS, so a
+#   retried step keeps each attempt's stream instead of being refused for an existing file;
+# - else `-`, none. A counts path of `-` is not a counted step.
+# Beside a stream kept by that default go the attempt's start marker, <step>.<attempt>.started,
+# written before nextest runs, and its typed per-test results, <step>.<attempt>.results.json: a
+# copy of the result writer's DAGRUN_TEST_COUNTS_PATH file (nextest-test-results.rs, dagrun's
+# structured test results, with runtime skips and SKID-INFRA already typed), which dagrun does
+# not keep. ci/buck-build-compare.py compares runs by those results; the marker makes an attempt
+# that was killed before it published results visible as one without a result.
 function configured_events_path {
     if [[ ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
         if [[ -z $HERMIT_NEXTEST_EVENTS_PATH ]]; then
@@ -119,7 +127,7 @@ function configured_events_path {
             return 2
         fi
         printf '%s\n' "$HERMIT_NEXTEST_EVENTS_PATH"
-    elif [[ -n ${E2E_RESULT_ROOT:-} && -n ${DAGRUN_TEST_COUNTS_PATH:-} ]]; then
+    elif [[ -n ${E2E_RESULT_ROOT:-} && -n ${DAGRUN_TEST_COUNTS_PATH:-} && $DAGRUN_TEST_COUNTS_PATH != - ]]; then
         local step=${DAGRUN_TEST_COUNTS_PATH##*/} attempt=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
         step=${step##*:}
         step=${step%.json}
@@ -144,6 +152,45 @@ function retain_events {
     [[ $destination == - ]] && return 0
     if ! (set -o noclobber; cat -- "$events" >"$destination"); then
         printf 'run-nextest-counted: cannot keep the typed event stream at %s\n' "$destination" >&2
+        return 2
+    fi
+}
+
+# The node's status once its records are kept: a failed keep (2) fails only a run that would
+# otherwise pass.
+function kept_status { # $1: the run's status; $2: the keeping's
+    if (($1 == 0 && $2 != 0)); then
+        printf '%s\n' "$2"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# The start marker and the kept typed results that go beside a default-kept stream (above);
+# `-` for a caller-chosen stream path or none.
+function configured_results_prefix {
+    local events_destination=$1
+    if [[ $events_destination == - || ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
+        printf '%s\n' -
+    else
+        printf '%s\n' "${events_destination%.jsonl}"
+    fi
+}
+
+function mark_attempt_started { # $1: the results prefix, or -
+    [[ $1 == - ]] && return 0
+    if ! (set -o noclobber; : >"$1.started"); then
+        printf 'run-nextest-counted: cannot write the start marker %s.started\n' "$1" >&2
+        return 2
+    fi
+}
+
+function retain_results { # $1: the result writer's file; $2: the results prefix, or -. A writer
+    # that published nothing this attempt leaves nothing to keep: the marker says so.
+    local results=$1 prefix=$2
+    [[ $prefix == - || $results == - || ! -e $results ]] && return 0
+    if ! (set -o noclobber; cat -- "$results" >"$prefix.results.json"); then
+        printf 'run-nextest-counted: cannot keep the typed test results at %s.results.json\n' "$prefix" >&2
         return 2
     fi
 }
@@ -1270,19 +1317,25 @@ PYEOF
     status=0
     HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
     [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
-    # A counted step of a validation keeps its stream under the durable result root, named as
-    # the census names the step, one file per attempt; an explicit path still wins, and
-    # without a result root or a counted step nothing is kept.
-    local kept_root=$scratch/result-root counts=$scratch/counts/run-1:test.detcore_unit.json
+    # A counted step of a validation keeps its stream under the durable result root, named by
+    # its dagrun step tag, one file per attempt; an explicit path still wins and makes no
+    # directory; without a result root or a counted step (a counts path of `-` included)
+    # nothing is kept.
+    local kept_root=$scratch/result-root counts=$scratch/counts/run-1:test.detcore_unit.json got
+    [[ $(E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" \
+        configured_events_path) == "$scratch/asked" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $kept_root ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=- \
+        configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $kept_root ]] || { self_test_failed "$LINENO"; return 1; }
     [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
         DAGRUN_STEP_STARTED_MONOTONIC_NS=41 configured_events_path) == "$kept_root/nextest-events/test.detcore_unit.41.jsonl" ]] || { self_test_failed "$LINENO"; return 1; }
     [[ -d $kept_root/nextest-events ]] || { self_test_failed "$LINENO"; return 1; }
-    [[ $(E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" \
-        configured_events_path) == "$scratch/asked" ]] || { self_test_failed "$LINENO"; return 1; }
     [[ $(unset HERMIT_NEXTEST_EVENTS_PATH E2E_RESULT_ROOT; DAGRUN_TEST_COUNTS_PATH=$counts configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
     [[ $(unset HERMIT_NEXTEST_EVENTS_PATH DAGRUN_TEST_COUNTS_PATH; E2E_RESULT_ROOT=$kept_root configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
-    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
-        DAGRUN_STEP_STARTED_MONOTONIC_NS=not-a-number configured_events_path) =~ ^$kept_root/nextest-events/test\.detcore_unit\.[0-9]+-[0-9]+\.jsonl$ ]] || { self_test_failed "$LINENO"; return 1; }
+    got=$(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
+        DAGRUN_STEP_STARTED_MONOTONIC_NS=not-a-number configured_events_path)
+    [[ $got == "$kept_root/nextest-events/"* && ${got#"$kept_root/nextest-events/"} =~ ^test\.detcore_unit\.[0-9]+-[0-9]+\.jsonl$ ]] || { self_test_failed "$LINENO"; return 1; }
     # Two attempts of one step keep two streams; neither is refused as an existing file.
     local attempt
     for attempt in 41 42; do
@@ -1298,8 +1351,36 @@ PYEOF
         configured_events_path) >/dev/null 2>"$scratch/events-dir-refusal" || status=$?
     [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
     grep -q 'cannot create .* to keep the typed event stream' "$scratch/events-dir-refusal" || { self_test_failed "$LINENO"; return 1; }
+    # Beside a default-kept stream: the attempt's start marker (one per attempt, never replaced)
+    # and a copy of the typed results the writer published; nothing for a caller-chosen path.
+    local prefix=$kept_root/nextest-events/test.detcore_unit.43
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_results_prefix "$prefix.jsonl") == "$prefix" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_results_prefix -) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_results_prefix "$scratch/asked") == - ]] || { self_test_failed "$LINENO"; return 1; }
+    mark_attempt_started - || { self_test_failed "$LINENO"; return 1; }
+    mark_attempt_started "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    [[ -f $prefix.started && ! -s $prefix.started ]] || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    mark_attempt_started "$prefix" 2>"$scratch/marker-refusal" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot write the start marker' "$scratch/marker-refusal" || { self_test_failed "$LINENO"; return 1; }
+    retain_results "$scratch/no-such-results.json" "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $prefix.results.json ]] || { self_test_failed "$LINENO"; return 1; }
+    retain_results - "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    printf '%s' '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":5}' >"$scratch/results.json"
+    retain_results "$scratch/results.json" - || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $prefix.results.json ]] || { self_test_failed "$LINENO"; return 1; }
+    retain_results "$scratch/results.json" "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/results.json" "$prefix.results.json" || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    retain_results "$scratch/results.json" "$prefix" 2>"$scratch/results-refusal" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot keep the typed test results' "$scratch/results-refusal" || { self_test_failed "$LINENO"; return 1; }
+    # A failed keep fails only a passing run: a census no-result (75) or a test failure stands.
+    [[ $(kept_status 0 0) == 0 && $(kept_status 0 2) == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(kept_status 75 2) == 75 && $(kept_status 100 2) == 100 && $(kept_status 1 0) == 1 ]] || { self_test_failed "$LINENO"; return 1; }
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, zero-tests census refusal, case selection (named cases checked against the listing over all whitespace, the case filter ANDed with the node filtersets), CPU reconciliation, refusal controls, event retention, skip classification, skid-infra classification)\n'
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, zero-tests census refusal, case selection (named cases checked against the listing over all whitespace, the case filter ANDed with the node filtersets), CPU reconciliation, refusal controls, event retention, typed-result retention, skip classification, skid-infra classification)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -1386,11 +1467,19 @@ HERMIT_SKID_INFRA_FILE="$cpu_measurement_dir/skid-infra.log"
 if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 ]]; then
     export HERMIT_SKID_INFRA_FILE
 fi
+results_prefix=$(configured_results_prefix "$events_destination")
+keep_status=0
+mark_attempt_started "$results_prefix" || keep_status=2
 nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
     || nextest_status=$?
-retain_events "$events_log" "$events_destination" || nextest_status=2
+# A record that cannot be kept fails a run that would otherwise pass (2). It never replaces a
+# status that already says something else: a census no-result (75), which validate requeues,
+# or a test failure must stay what it is.
+retain_events "$events_log" "$events_destination" || keep_status=2
+retain_results "${DAGRUN_TEST_COUNTS_PATH:--}" "$results_prefix" || keep_status=2
+nextest_status=$(kept_status "$nextest_status" "$keep_status")
 skid_retries=$(wc -l <"$skid_retry_record") || exit $?
 printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
 retry_records=$(wc -l <"$HERMIT_RETRY_RECORD_FILE") || exit $?
