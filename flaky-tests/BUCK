@@ -93,16 +93,28 @@ rust_binary(
     test_labels = [tpx_labels.local_only],
 )
 
-buck_sh_test(
+# The cas_sequence_easy guest completes its CAS handoff (and exits 1)
+# only under one interleaving; this target instead runs it under Hermit
+# chaos-verify over an ordered seed search and passes only on bitwise
+# parity at every tried seed plus both guest outcomes. Remove local_only
+# after a passing HEAD run in fbcode//mode/dev-nosan; then check the
+# target's first continuous coverage-mode run.
+hermit_host_test(
     name = "run_flaky_cas_sequence",
-    args = [],
-    # A deliberately flaky fixture ("Antagonistic schedule reached, failing")
-    # for exercising Hermit's flakiness tooling, not a test that should pass
-    # natively; keep it out of CI.
-    labels = [tpx_labels.local_only],
-    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
-    target_compatible_with = ["ovr_config//cpu:x86_64"],
-    test = ":cas_sequence_easy_bin",
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "$(location :cas_sequence_easy_bin)",
+    ],
+    # The ordered seed search's worst legitimate wall is the full
+    # 32-seed range at the measured per-seed wall (at most 32.4s,
+    # about 1,036s; CPU at most 15.6s per seed). Multiplier 3 sizes
+    # the runner timeout to about 1,800s for that range; the wrapper's
+    # own 1,500s total budget fails by name well inside it.
+    labels = [
+        tpx_labels.local_only,
+        "tpx:timeout-multiplier:3",
+    ],
+    test = "run_flaky_cas_sequence_hermit.sh",
 )
 
 buck_sh_test(
