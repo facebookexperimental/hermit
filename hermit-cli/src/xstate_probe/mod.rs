@@ -100,7 +100,7 @@ impl Case {
 /// Why the host cannot use the v3 profile, as one sentence for the refusal.
 pub type ProbeRefusal = String;
 
-/// How the FPU-reload instability refusal begins. [`Probe::compare`] writes
+/// How the FPU-reload instability refusal begins. `Probe::compare` writes
 /// this constant verbatim as that refusal's lead, so admission, which
 /// recognizes that deterministic refusal by it (to cache it and to name the
 /// host on it), matches the producer's own bytes by construction.
