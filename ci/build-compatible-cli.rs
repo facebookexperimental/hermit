@@ -694,6 +694,43 @@ fn run(args: Args, progress: &mut Progress) -> Result<()> {
         compatibility_rustc::Bundle::read(&input.rustc_second).map_err(anyhow::Error::msg)?;
     let rustc_cohort = compatibility_rustc::cohort(&first, &first_bundle, &second, &second_bundle)
         .map_err(anyhow::Error::msg)?;
+    // Name admitted failures from both cold populations: extension
+    // auxiliaries are not compared between them, so a first-only failure
+    // would otherwise go unnamed. The stamp hash is unaffected.
+    let mut admitted_auxiliary_failures =
+        compatibility_rustc::admitted_auxiliary_failures(&first, &first_bundle, &first_bundle)
+            .map_err(anyhow::Error::msg)?;
+    admitted_auxiliary_failures.extend(
+        compatibility_rustc::admitted_auxiliary_failures(&second, &second_bundle, &second_bundle)
+            .map_err(anyhow::Error::msg)?,
+    );
+    admitted_auxiliary_failures.sort_by(|left, right| {
+        (
+            &left.owner_package,
+            &left.source,
+            &left.output_option,
+            &left.output_relative,
+            left.exit_code,
+        )
+            .cmp(&(
+                &right.owner_package,
+                &right.source,
+                &right.output_option,
+                &right.output_relative,
+                right.exit_code,
+            ))
+    });
+    admitted_auxiliary_failures.dedup();
+    for failure in &admitted_auxiliary_failures {
+        eprintln!(
+            "admitted auxiliary compiler failure: package={} source={} output={}:{} exit_code={}",
+            failure.owner_package,
+            failure.source,
+            failure.output_option,
+            failure.output_relative,
+            failure.exit_code
+        );
+    }
     let core = second.named("hermit-run").map_err(anyhow::Error::msg)?;
     let input_path = args.output.join("actual-build-input.json");
     exclusive(&input_path, &serde_json::to_vec_pretty(&input)?)?;
@@ -795,6 +832,7 @@ fn run(args: Args, progress: &mut Progress) -> Result<()> {
             "sole_target_directory":target,
             "inputs":inputs,"artifact":artifact,"core_stamp":stamp,
             "actual_shared_rustc":rustc_cohort,
+            "admitted_auxiliary_failures":admitted_auxiliary_failures,
             "runtime_qualification":false,"canonical_publisher_attestation":false,
         }))?,
     )?;
@@ -833,5 +871,86 @@ fn main() -> ExitCode {
             eprintln!("compatible CLI build refused: {error:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages_file(lines: &[serde_json::Value]) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-build-compatible-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("messages.jsonl");
+        let text = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, text).unwrap();
+        (directory, path)
+    }
+
+    fn stamp_message(embedded: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "reason": "build-script-executed",
+            "package_id": "core-id",
+            "env": [["HERMIT_CORE_COMPATIBILITY", embedded.to_string()]],
+        })
+    }
+
+    #[test]
+    fn stamp_from_messages_refuses_zero_two_and_unmeasured_stamps() {
+        let measured = stamp_message(serde_json::json!({
+            "availability": "measured",
+            "stamp": {"schema": "fixture"},
+        }));
+        let (directory, path) = messages_file(std::slice::from_ref(&measured));
+        assert_eq!(
+            stamp_from_messages(&path, "core-id").unwrap(),
+            serde_json::json!({"schema": "fixture"})
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let (directory, path) = messages_file(&[]);
+        assert!(
+            stamp_from_messages(&path, "core-id")
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one measured core build script"),
+            "zero stamps must refuse"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let (directory, path) = messages_file(&[measured.clone(), measured]);
+        assert!(
+            stamp_from_messages(&path, "core-id")
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one measured core build script"),
+            "two stamps must refuse"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let unmeasured = stamp_message(serde_json::json!({
+            "availability": "unavailable",
+            "reason": "measurement-not-requested",
+        }));
+        let (directory, path) = messages_file(&[unmeasured]);
+        assert!(
+            stamp_from_messages(&path, "core-id")
+                .unwrap_err()
+                .to_string()
+                .contains("final build has no measured core stamp"),
+            "an unmeasured stamp must refuse"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

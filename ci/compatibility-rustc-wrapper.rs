@@ -1231,8 +1231,16 @@ mod tests {
         );
     }
 
+    // Channel receives below are synchronization points, not ordering
+    // timeouts: the asserted ordering must hold however long a loaded host
+    // takes to schedule the threads. The main thread's two waits carry a
+    // generous WALL deadlock backstop so a regression fails by name here
+    // instead of hanging to the node's outer wall limit. The first
+    // thread's release wait stays blocking; its sender is dropped when
+    // main unwinds.
     #[test]
     fn quota_reservation_progresses_while_another_checked_flush_is_held() {
+        const WALL_DEADLOCK_BACKSTOP: Duration = Duration::from_secs(600);
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
@@ -1247,19 +1255,19 @@ mod tests {
         let first = std::thread::spawn(move || {
             let result = reserve_with_sync(&first_config, 101, |quota| {
                 entered_tx.send(()).map_err(std::io::Error::other)?;
-                release_rx
-                    .recv_timeout(Duration::from_secs(10))
-                    .map_err(std::io::Error::other)?;
+                release_rx.recv().map_err(std::io::Error::other)?;
                 quota.sync_data()
             });
             observed_return.store(true, Ordering::SeqCst);
             result
         });
-        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let entered = entered_rx.recv_timeout(WALL_DEADLOCK_BACKSTOP);
         if let Err(error) = entered {
             let _ = release_tx.send(());
             let result = first.join().unwrap();
-            panic!("first reservation did not reach its flush: {error}; {result:?}");
+            panic!(
+                "WALL deadlock backstop: first reservation did not reach its flush: {error}; {result:?}"
+            );
         }
 
         let (second_tx, second_rx) = mpsc::channel();
@@ -1268,7 +1276,7 @@ mod tests {
             let result = reserve(&second_config, 203);
             let _ = second_tx.send(result);
         });
-        let second_result = second_rx.recv_timeout(Duration::from_secs(5));
+        let second_result = second_rx.recv_timeout(WALL_DEADLOCK_BACKSTOP);
         let returned_before_release = first_returned.load(Ordering::SeqCst);
         let _ = release_tx.send(());
         let first_result = first.join().unwrap();
@@ -1279,7 +1287,9 @@ mod tests {
             "reservation returned before checked flush"
         );
         second_result
-            .expect("second real reservation must finish while the first flush is held")
+            .expect(
+                "WALL deadlock backstop: second real reservation must finish while the first flush is held",
+            )
             .expect("second real reservation must retain the unchanged acquisition bound");
         first_result.expect("first checked flush must complete before reserve returns");
         assert_eq!(fixture.counters(), [304, 2]);

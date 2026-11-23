@@ -275,6 +275,16 @@ fn text(value: &[u8], owner: &str) -> Result<String, String> {
         .map_err(|_| format!("non-UTF8 {owner} cannot be classified without guessing"))
 }
 
+/// One integrity predicate for a captured completion: a recorded exit code
+/// with no signal, no capture error, and unchanged inputs. Success itself is
+/// owned by the typed outcome classifier below, not by capture integrity.
+fn completion_well_formed(completion: &Completion) -> bool {
+    completion.exit_code.is_some()
+        && completion.signal.is_none()
+        && completion.inputs_unchanged
+        && completion.capture_error.is_none()
+}
+
 impl Bundle {
     pub fn read(input: &InputFile) -> Result<Self, String> {
         let bundle: Self = serde_json::from_slice(&input.read(MAX_CAPTURE_BYTES)?)
@@ -296,18 +306,13 @@ impl Bundle {
                 || command.pid != completion.pid
                 || encoded.len() > MAX_COMMAND_BYTES
                 || digest(&encoded) != completion.invocation_sha256
-                || completion.exit_code != Some(0)
-                || completion.signal.is_some()
-                || !completion.inputs_unchanged
-                || completion.capture_error.is_some()
+                || !completion_well_formed(completion)
                 || !full_digest(&command.compiler.sha256)
                 || command.argv.iter().any(|argument| argument.contains(&0))
                 || !path(&command.compiler.path)?.is_absolute()
                 || !path(&command.cwd)?.is_absolute()
             {
-                return Err(
-                    "rustc capture contains an incomplete/failed/changed command".to_owned(),
-                );
+                return Err("rustc capture contains an incomplete/changed command".to_owned());
             }
             let version = std::str::from_utf8(&command.compiler.verbose_version)
                 .map_err(|_| "captured compiler identity is non-UTF8".to_owned())?;
@@ -984,6 +989,75 @@ pub struct Auxiliary {
     arguments: Vec<AuxiliaryArgument>,
 }
 
+/// The named source of a proved auxiliary invocation, for producer output.
+/// Exact bytes remain bound in the `Auxiliary` arguments for core auxiliaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AuxiliarySource {
+    File { relative: Vec<u8> },
+    Stdin,
+}
+
+/// The ownership/output proof every auxiliary invocation must pass, whether
+/// or not its owner is in the measured core closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuxiliaryProof {
+    pub owner_package: String,
+    pub source: AuxiliarySource,
+    pub output_option: String,
+    pub output_relative: Vec<u8>,
+}
+
+/// One admitted nonzero auxiliary outcome, named for retained producer
+/// output. This is a receipt record, never part of the stamp schema. Only
+/// the producer script constructs it; the hermit-cli build script includes
+/// this module for stamp measurement and does not name receipts.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedAuxiliaryFailure {
+    pub owner_package: String,
+    pub source: String,
+    pub output_option: String,
+    pub output_relative: String,
+    pub exit_code: i32,
+}
+
+/// Every captured rustc command falls in exactly one class. The outcome rule
+/// is the single exhaustive match in `require_outcome`; no call site may
+/// interpret an untyped `None` as admission again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Classification {
+    Query,
+    CargoUnit,
+    CoreAuxiliary {
+        auxiliary: Box<Auxiliary>,
+        proof: AuxiliaryProof,
+    },
+    ExtensionAuxiliary {
+        proof: AuxiliaryProof,
+    },
+}
+
+fn require_outcome(class: &Classification, completion: &Completion) -> Result<(), String> {
+    if !completion_well_formed(completion) {
+        return Err("compiler completion is incomplete/changed".to_owned());
+    }
+    match class {
+        Classification::Query if completion.exit_code != Some(0) => {
+            Err("compiler query did not complete successfully".to_owned())
+        }
+        Classification::CargoUnit if completion.exit_code != Some(0) => {
+            Err("actual Cargo compiler command did not succeed".to_owned())
+        }
+        Classification::Query
+        | Classification::CargoUnit
+        | Classification::CoreAuxiliary { .. }
+        | Classification::ExtensionAuxiliary { .. } => Ok(()),
+    }
+}
+
 // autocfg 1.5.1 src/lib.rs:297–303 and620–641: its random namespace
 // prevents temporary probe collisions; the ordinal and every other input
 // remain exact. The actual compiled generator source must have these bytes.
@@ -1061,17 +1135,20 @@ fn autocfg_generator(
     artifact_identity(graph, &generator.id, units[0], core_root)
 }
 
-/// `reference` is a complete actual cold population proving the generator,
-/// not a replacement for this invocation's newly captured input or outcome.
-pub fn auxiliary_for_invocation(
+/// Assign one captured command its one class, by this one function.
+/// Callers may classify the same command again for a different check; the
+/// class is a function of its inputs, so the results agree. `reference` is a complete
+/// actual cold population proving the autocfg generator, not a replacement
+/// for this invocation's newly captured input or outcome.
+pub fn classify(
     graph: &Graph,
     bundle: &Bundle,
     reference: &Bundle,
     command: &Invocation,
-) -> Result<Option<Auxiliary>, String> {
+) -> Result<Classification, String> {
     validate_sysroot_externs(command, &bundle.target_directory)?;
     if compiler_probe(command) {
-        return Ok(None);
+        return Ok(Classification::Query);
     }
     let package = owner(graph, command)?;
     if let Some((_, _, unit)) = actual_source_unit(graph, package, command)? {
@@ -1080,8 +1157,43 @@ pub fn auxiliary_for_invocation(
         {
             return Err("implicit proc_macro is not an actual Cargo proc-macro unit".to_owned());
         }
-        return Ok(None);
+        return Ok(Classification::CargoUnit);
     }
+    let (proof, auxiliary) = prove_auxiliary(graph, bundle, reference, command, package)?;
+    Ok(match auxiliary {
+        Some(auxiliary) => Classification::CoreAuxiliary {
+            auxiliary: Box::new(auxiliary),
+            proof,
+        },
+        None => Classification::ExtensionAuxiliary { proof },
+    })
+}
+
+/// Legacy mapping over `classify` for callers that only need the counted
+/// core-closure auxiliary. Outcome admission must use `classify`, never
+/// interpret this `None` (query, Cargo unit, and extension auxiliary all
+/// map to it here).
+pub fn auxiliary_for_invocation(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+    command: &Invocation,
+) -> Result<Option<Auxiliary>, String> {
+    Ok(match classify(graph, bundle, reference, command)? {
+        Classification::CoreAuxiliary { auxiliary, .. } => Some(*auxiliary),
+        Classification::Query
+        | Classification::CargoUnit
+        | Classification::ExtensionAuxiliary { .. } => None,
+    })
+}
+
+fn prove_auxiliary(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+    command: &Invocation,
+    package: &Package,
+) -> Result<(AuxiliaryProof, Option<Auxiliary>), String> {
     if !command.sysroot_externs.is_empty() {
         return Err(
             "implicit sysroot externs in auxiliary compiler calls are unsupported".to_owned(),
@@ -1173,6 +1285,25 @@ pub fn auxiliary_for_invocation(
     for component in &components[..build] {
         output_scope.push(component.as_os_str());
     }
+    let proof = AuxiliaryProof {
+        owner_package: package.name.clone(),
+        source: match source {
+            CompilerInput::File { canonical_path, .. } => AuxiliarySource::File {
+                relative: bytes(
+                    path(canonical_path)?
+                        .strip_prefix(package.manifest_path.parent().expect("manifest parent"))
+                        .map_err(|_| "auxiliary source is outside its actual package".to_owned())?,
+                ),
+            },
+            CompilerInput::Stdin { .. } => AuxiliarySource::Stdin,
+        },
+        output_option: text(output_option, "auxiliary output option")?,
+        output_relative: bytes(
+            output
+                .strip_prefix(root)
+                .map_err(|error| error.to_string())?,
+        ),
+    };
     let mut arguments = Vec::new();
     let mut index = 0;
     while index < command.argv.len() {
@@ -1249,16 +1380,19 @@ pub fn auxiliary_for_invocation(
     if !graph.closure(&core.id)?.contains(&package.id) {
         // The extension's additional build-script units still require exact
         // ownership/input/output proof, but are not the shared core cohort.
-        return Ok(None);
+        return Ok((proof, None));
     }
-    Ok(Some(Auxiliary {
-        owner: artifact_identity(graph, &package.id, owners[0], core_root)?,
-        output_scope: bytes(&output_scope),
-        compiler: command.compiler.verbose_version.clone(),
-        compiler_sha256: command.compiler.sha256.clone(),
-        source_sha256: source.sha256().to_owned(),
-        arguments,
-    }))
+    Ok((
+        proof,
+        Some(Auxiliary {
+            owner: artifact_identity(graph, &package.id, owners[0], core_root)?,
+            output_scope: bytes(&output_scope),
+            compiler: command.compiler.verbose_version.clone(),
+            compiler_sha256: command.compiler.sha256.clone(),
+            source_sha256: source.sha256().to_owned(),
+            arguments,
+        }),
+    ))
 }
 
 pub fn auxiliary(graph: &Graph, bundle: &Bundle) -> Result<BTreeMap<String, usize>, String> {
@@ -1272,18 +1406,15 @@ pub fn auxiliary_with_reference(
 ) -> Result<BTreeMap<String, usize>, String> {
     let mut result = BTreeMap::new();
     for captured in &bundle.commands {
-        // The original strict successful-command predicate is retained. A
-        // negative compiler probe is not silently reclassified as success.
-        if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
-            return Err(
-                "auxiliary compiler outcome differs from successful captured completion".to_owned(),
-            );
-        }
-        if let Some(actual) =
-            auxiliary_for_invocation(graph, bundle, reference, &captured.invocation)?
-        {
+        // Every command gets its one class here; a negative auxiliary
+        // probe is counted with its exact outcome, never reclassified as
+        // success, and failed queries/Cargo units refuse here so the
+        // producer's final-population path cannot omit the outcome rule.
+        let class = classify(graph, bundle, reference, &captured.invocation)?;
+        require_outcome(&class, &captured.completion)?;
+        if let Classification::CoreAuxiliary { auxiliary, .. } = class {
             let key = serde_json::to_string(&(
-                actual,
+                auxiliary,
                 captured.completion.exit_code,
                 captured.completion.signal,
             ))
@@ -1294,14 +1425,67 @@ pub fn auxiliary_with_reference(
     Ok(result)
 }
 
+/// Every admitted nonzero auxiliary outcome in this bundle, named for the
+/// producer's retained output. Classification refusals propagate; nothing
+/// is listed for successful commands. Only the producer script calls it;
+/// the hermit-cli build script includes this module for stamp measurement.
+#[allow(dead_code)]
+pub fn admitted_auxiliary_failures(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+) -> Result<Vec<AdmittedAuxiliaryFailure>, String> {
+    let mut failures = Vec::new();
+    for captured in &bundle.commands {
+        let class = classify(graph, bundle, reference, &captured.invocation)?;
+        require_outcome(&class, &captured.completion)?;
+        let proof = match &class {
+            Classification::CoreAuxiliary { proof, .. }
+            | Classification::ExtensionAuxiliary { proof } => proof,
+            Classification::Query | Classification::CargoUnit => continue,
+        };
+        if captured.completion.exit_code == Some(0) {
+            continue;
+        }
+        failures.push(AdmittedAuxiliaryFailure {
+            owner_package: proof.owner_package.clone(),
+            source: match &proof.source {
+                AuxiliarySource::File { relative } => {
+                    String::from_utf8_lossy(relative).into_owned()
+                }
+                AuxiliarySource::Stdin => "<stdin>".to_owned(),
+            },
+            output_option: proof.output_option.clone(),
+            output_relative: String::from_utf8_lossy(&proof.output_relative).into_owned(),
+            exit_code: captured.completion.exit_code.expect("well-formed outcome"),
+        });
+    }
+    // Receipt order is by the named failure itself, never bundle order.
+    failures.sort_by(|left, right| {
+        (
+            &left.owner_package,
+            &left.source,
+            &left.output_option,
+            &left.output_relative,
+            left.exit_code,
+        )
+            .cmp(&(
+                &right.owner_package,
+                &right.source,
+                &right.output_option,
+                &right.output_relative,
+                right.exit_code,
+            ))
+    });
+    Ok(failures)
+}
+
 fn queries(bundle: &Bundle) -> Result<BTreeMap<String, usize>, String> {
     let mut result = BTreeMap::new();
     for captured in &bundle.commands {
         let command = &captured.invocation;
         if compiler_probe(command) {
-            if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
-                return Err("compiler query did not complete successfully".to_owned());
-            }
+            require_outcome(&Classification::Query, &captured.completion)?;
             let key = serde_json::to_string(&(
                 &command.argv,
                 &command.context,
@@ -1549,9 +1733,12 @@ pub fn shared(graph: &Graph, bundle: &Bundle) -> Result<BTreeMap<String, Semanti
     let mut result = BTreeMap::new();
     let mut units = BTreeSet::new();
     for captured in &bundle.commands {
-        if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
-            return Err("actual shared compiler command did not succeed".to_owned());
-        }
+        let class = classify(graph, bundle, bundle, &captured.invocation)?;
+        require_outcome(&class, &captured.completion)?;
+        // Keep the per-command for_invocation call for every Cargo unit,
+        // including the core entry binary and extension units: it retains
+        // the response-file and implicit-proc_macro refusals for units
+        // that contribute no shared semantics.
         if let Some(semantics) = for_invocation(graph, bundle, &captured.invocation)? {
             let key = serde_json::to_string(&semantics).map_err(|error| error.to_string())?;
             units.insert((
@@ -2438,6 +2625,48 @@ mod tests {
             auxiliary(&aux_graph, &missing).is_err(),
             "stdin digest must bind exact bytes"
         );
+        // Failed stdin probes are admitted by outcome like file probes, in
+        // both output forms, and named from their proof summaries.
+        let mut failed_stdin = stdin.clone();
+        failed_stdin.commands[0].completion.exit_code = Some(1);
+        assert_eq!(
+            auxiliary(&aux_graph, &failed_stdin)
+                .unwrap()
+                .values()
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            admitted_auxiliary_failures(&aux_graph, &failed_stdin, &stdin).unwrap(),
+            vec![AdmittedAuxiliaryFailure {
+                owner_package: "shared-dependency".to_owned(),
+                source: "<stdin>".to_owned(),
+                output_option: "--out-dir".to_owned(),
+                output_relative: String::new(),
+                exit_code: 1,
+            }]
+        );
+        let mut failed_output_stdin = stdin.clone();
+        failed_output_stdin.commands[0].invocation.argv[6] = b"-o".to_vec();
+        failed_output_stdin.commands[0].invocation.argv[7] = bytes(&out.join("probe.rmeta"));
+        failed_output_stdin.commands[0].completion.exit_code = Some(1);
+        assert_eq!(
+            auxiliary(&aux_graph, &failed_output_stdin)
+                .unwrap()
+                .values()
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            admitted_auxiliary_failures(&aux_graph, &failed_output_stdin, &stdin).unwrap(),
+            vec![AdmittedAuxiliaryFailure {
+                owner_package: "shared-dependency".to_owned(),
+                source: "<stdin>".to_owned(),
+                output_option: "-o".to_owned(),
+                output_relative: "probe.rmeta".to_owned(),
+                exit_code: 1,
+            }]
+        );
         for name in [
             b"autocfg_0123456789abcdef_0".as_slice(),
             b"autocfg_fedcba9876543210_0",
@@ -2470,6 +2699,425 @@ mod tests {
         ] {
             assert!(autocfg_ordinal(invalid).is_none());
         }
+        // Admitted failed auxiliary probes are counted with their exact
+        // outcome, and every other failed class refuses by name.
+        let mut failed_aux = aux_bundle.clone();
+        failed_aux.commands[0].completion.exit_code = Some(1);
+        let failed_measured = auxiliary(&aux_graph, &failed_aux).unwrap();
+        assert_eq!(failed_measured.values().sum::<usize>(), 1);
+        assert_ne!(failed_measured, measured);
+        assert_eq!(
+            auxiliary_with_reference(&aux_graph, &failed_aux, &aux_bundle).unwrap(),
+            failed_measured
+        );
+        failed_aux.commands[0].completion.invocation_sha256 =
+            digest(&serde_json::to_vec(&failed_aux.commands[0].invocation).unwrap());
+        let failed_aux_path = root.join("failed-aux-capture.json");
+        std::fs::write(&failed_aux_path, serde_json::to_vec(&failed_aux).unwrap()).unwrap();
+        assert!(
+            Bundle::read(&input_file(&failed_aux_path)).is_ok(),
+            "a well-formed failed auxiliary capture is integrity-valid"
+        );
+        let mut signaled_aux = failed_aux.clone();
+        signaled_aux.commands[0].completion.signal = Some(9);
+        let signaled_path = root.join("signaled-aux-capture.json");
+        std::fs::write(&signaled_path, serde_json::to_vec(&signaled_aux).unwrap()).unwrap();
+        assert!(
+            Bundle::read(&input_file(&signaled_path))
+                .unwrap_err()
+                .contains("incomplete/changed"),
+            "a signaled completion is never an admitted probe"
+        );
+        // Each remaining integrity clause is planted separately so removing
+        // any one of them from completion_well_formed fails by name.
+        for name in ["capture-error", "inputs-changed", "missing-exit-code"] {
+            let mut planted = failed_aux.clone();
+            let completion = &mut planted.commands[0].completion;
+            match name {
+                "capture-error" => {
+                    completion.capture_error = Some("planted capture error".to_owned())
+                }
+                "inputs-changed" => completion.inputs_unchanged = false,
+                _ => completion.exit_code = None,
+            }
+            let planted_path = root.join(format!("planted-{name}.json"));
+            std::fs::write(&planted_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+            assert!(
+                Bundle::read(&input_file(&planted_path))
+                    .unwrap_err()
+                    .contains("incomplete/changed"),
+                "{name} must refuse at Bundle::read"
+            );
+            assert!(
+                auxiliary_with_reference(&aux_graph, &planted, &aux_bundle)
+                    .unwrap_err()
+                    .contains("incomplete/changed"),
+                "{name} must refuse in the classifier"
+            );
+        }
+        assert_eq!(
+            admitted_auxiliary_failures(&aux_graph, &failed_aux, &aux_bundle).unwrap(),
+            vec![AdmittedAuxiliaryFailure {
+                owner_package: "shared-dependency".to_owned(),
+                source: "probe.rs".to_owned(),
+                output_option: "--out-dir".to_owned(),
+                output_relative: String::new(),
+                exit_code: 1,
+            }]
+        );
+
+        // Failed shared, entry, and query commands refuse on every path,
+        // including the producer's final-population auxiliary check.
+        let mut failed_shared = library_only.clone();
+        failed_shared.commands[2].completion.exit_code = Some(1);
+        assert!(
+            shared(&extension_graph, &failed_shared)
+                .unwrap_err()
+                .contains("actual Cargo compiler command did not succeed")
+        );
+        assert!(
+            auxiliary_with_reference(&extension_graph, &failed_shared, &library_only)
+                .unwrap_err()
+                .contains("actual Cargo compiler command did not succeed")
+        );
+        let planted_path = root.join("planted-failed-shared.json");
+        std::fs::write(&planted_path, serde_json::to_vec(&failed_shared).unwrap()).unwrap();
+        let planted = Bundle::read(&input_file(&planted_path)).unwrap();
+        assert!(shared(&extension_graph, &planted).is_err());
+        assert!(auxiliary_with_reference(&extension_graph, &planted, &library_only).is_err());
+        let mut failed_entry = with_entry.clone();
+        failed_entry
+            .commands
+            .last_mut()
+            .unwrap()
+            .completion
+            .exit_code = Some(1);
+        assert!(shared(&core_graph, &failed_entry).is_err());
+        assert!(auxiliary_with_reference(&core_graph, &failed_entry, &with_entry).is_err());
+        let mut query_capture = aux_bundle.commands[0].clone();
+        query_capture.invocation.argv = vec![b"-vV".to_vec()];
+        query_capture.invocation.source = None;
+        query_capture.completion.exit_code = Some(1);
+        query_capture.completion.invocation_sha256 =
+            digest(&serde_json::to_vec(&query_capture.invocation).unwrap());
+        let query_bundle = Bundle {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            wrapper_sha256: "c".repeat(64),
+            target_directory: target_directory.clone(),
+            commands: vec![query_capture],
+        };
+        assert!(
+            queries(&query_bundle)
+                .unwrap_err()
+                .contains("compiler query did not complete successfully")
+        );
+        assert!(
+            auxiliary_with_reference(&aux_graph, &query_bundle, &aux_bundle)
+                .unwrap_err()
+                .contains("compiler query did not complete successfully")
+        );
+
+        // A core-owned failed probe participates in cohort equality: two
+        // identical failed populations pass, a flipped outcome refuses.
+        let mut cohort_graph = graph_for(false);
+        let core_out = target_directory.join("debug/build/hermit-run-actual/out");
+        cohort_graph
+            .build_outputs
+            .insert("core".to_owned(), [core_out.clone()].into_iter().collect());
+        let core_probe = root.join("hermit-cli/probe.rs");
+        std::fs::write(&core_probe, body).unwrap();
+        let mut core_aux_capture = library_only.commands[2].clone();
+        {
+            let command = &mut core_aux_capture.invocation;
+            command.pid = 999;
+            command.cwd = bytes(&root.join("hermit-cli"));
+            command.context = Context {
+                package: Some("hermit-run".to_owned()),
+                version: Some("0.5.4".to_owned()),
+                manifest_directory: Some(bytes(&root.join("hermit-cli"))),
+            };
+            command.argv[1] = b"probe".to_vec();
+            command.argv[2] = bytes(&core_probe);
+            command.argv[7] = bytes(&core_out);
+            command.source = Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&core_probe),
+                canonical_path: bytes(&core_probe),
+                identity: FileIdentity {
+                    bytes: body.len() as u64,
+                    ..compiler.identity.clone()
+                },
+                bytes: body.to_vec(),
+                sha256: digest(body),
+            });
+            core_aux_capture.completion.pid = 999;
+            core_aux_capture.completion.invocation_sha256 =
+                digest(&serde_json::to_vec(command).unwrap());
+            core_aux_capture.completion.exit_code = Some(1);
+        }
+        let mut cohort_failed = library_only.clone();
+        cohort_failed.commands.push(core_aux_capture.clone());
+        let mut cohort_success = cohort_failed.clone();
+        cohort_success
+            .commands
+            .last_mut()
+            .unwrap()
+            .completion
+            .exit_code = Some(0);
+        assert!(cohort(&cohort_graph, &cohort_failed, &cohort_graph, &cohort_failed).is_ok());
+        assert!(
+            cohort(
+                &cohort_graph,
+                &cohort_failed,
+                &cohort_graph,
+                &cohort_success
+            )
+            .is_err(),
+            "a flipped auxiliary outcome must refuse cohort equality"
+        );
+        assert_eq!(
+            admitted_auxiliary_failures(&cohort_graph, &cohort_failed, &cohort_failed).unwrap(),
+            vec![AdmittedAuxiliaryFailure {
+                owner_package: "hermit-run".to_owned(),
+                source: "probe.rs".to_owned(),
+                output_option: "--out-dir".to_owned(),
+                output_relative: String::new(),
+                exit_code: 1,
+            }]
+        );
+        // Core-closure proof failures refuse, including response files.
+        let mut foreign_core_aux = cohort_failed.clone();
+        foreign_core_aux
+            .commands
+            .last_mut()
+            .unwrap()
+            .invocation
+            .argv[7] = bytes(&target_directory.join("debug/build/foreign-owner/out"));
+        assert!(
+            auxiliary_with_reference(&cohort_graph, &foreign_core_aux, &cohort_failed)
+                .unwrap_err()
+                .contains("build-script out_dir")
+        );
+        let mut response_core_aux = cohort_failed.clone();
+        response_core_aux
+            .commands
+            .last_mut()
+            .unwrap()
+            .invocation
+            .argv
+            .push(b"@response".to_vec());
+        assert!(
+            auxiliary_with_reference(&cohort_graph, &response_core_aux, &cohort_failed)
+                .unwrap_err()
+                .contains("auxiliary response expansion")
+        );
+
+        // An extension-own failed auxiliary is admitted after proof and
+        // named, but not counted in the shared core auxiliary map.
+        let ext_directory = root.join("extension-probe");
+        std::fs::create_dir_all(&ext_directory).unwrap();
+        std::fs::write(
+            ext_directory.join("Cargo.toml"),
+            "[package]\nname = \"extension-probe\"\nversion = \"0.5.4\"\n",
+        )
+        .unwrap();
+        let ext_build = ext_directory.join("build.rs");
+        std::fs::write(&ext_build, b"fn main() {}\n").unwrap();
+        let ext_probe = ext_directory.join("probe.rs");
+        std::fs::write(&ext_probe, body).unwrap();
+        let mut ext_package = package.clone();
+        ext_package.id = "extension".to_owned();
+        ext_package.name = "extension-probe".to_owned();
+        ext_package.manifest_path = ext_directory.join("Cargo.toml");
+        let ext_unit = Unit {
+            package: ext_package.name.clone(),
+            version: ext_package.version.clone(),
+            target: "build-script-build".to_owned(),
+            kind: vec!["custom-build".to_owned()],
+            crate_types: vec!["bin".to_owned()],
+            features: vec![],
+            profile: profile.clone(),
+        };
+        cohort_graph.source_locators.insert(
+            (ext_package.id.clone(), ext_unit.key().unwrap()),
+            super::super::compatibility_graph::SourceLocators {
+                declared: ext_build.clone(),
+                emitted: ext_build,
+            },
+        );
+        cohort_graph
+            .units
+            .insert(ext_package.id.clone(), vec![ext_unit]);
+        let ext_out = target_directory.join("debug/build/extension-probe-actual/out");
+        cohort_graph.build_outputs.insert(
+            ext_package.id.clone(),
+            [ext_out.clone()].into_iter().collect(),
+        );
+        cohort_graph
+            .packages
+            .insert(ext_package.id.clone(), ext_package.clone());
+        let mut ext_capture = core_aux_capture.clone();
+        {
+            let command = &mut ext_capture.invocation;
+            command.pid = 1000;
+            command.cwd = bytes(&ext_directory);
+            command.context = Context {
+                package: Some("extension-probe".to_owned()),
+                version: Some("0.5.4".to_owned()),
+                manifest_directory: Some(bytes(&ext_directory)),
+            };
+            command.argv[2] = bytes(&ext_probe);
+            command.argv[7] = bytes(&ext_out);
+            command.source = Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&ext_probe),
+                canonical_path: bytes(&ext_probe),
+                identity: FileIdentity {
+                    bytes: body.len() as u64,
+                    ..compiler.identity.clone()
+                },
+                bytes: body.to_vec(),
+                sha256: digest(body),
+            });
+            ext_capture.completion.pid = 1000;
+            ext_capture.completion.invocation_sha256 =
+                digest(&serde_json::to_vec(command).unwrap());
+        }
+        let ext_bundle = Bundle {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            wrapper_sha256: "c".repeat(64),
+            target_directory: target_directory.clone(),
+            commands: vec![ext_capture.clone()],
+        };
+        assert!(auxiliary(&cohort_graph, &ext_bundle).unwrap().is_empty());
+        assert_eq!(
+            admitted_auxiliary_failures(&cohort_graph, &ext_bundle, &ext_bundle).unwrap(),
+            vec![AdmittedAuxiliaryFailure {
+                owner_package: "extension-probe".to_owned(),
+                source: "probe.rs".to_owned(),
+                output_option: "--out-dir".to_owned(),
+                output_relative: String::new(),
+                exit_code: 1,
+            }]
+        );
+        let mut ext_foreign = ext_bundle.clone();
+        ext_foreign.commands[0].invocation.argv[7] =
+            bytes(&target_directory.join("debug/build/foreign-owner/out"));
+        assert!(
+            auxiliary_with_reference(&cohort_graph, &ext_foreign, &ext_bundle)
+                .unwrap_err()
+                .contains("build-script out_dir")
+        );
+        // A failed extension-owned Cargo unit is still a Cargo unit: it
+        // contributes no shared semantics, but its failure must refuse.
+        let ext_lib_path = ext_directory.join("lib.rs");
+        std::fs::write(&ext_lib_path, body).unwrap();
+        let ext_lib_unit = Unit {
+            package: ext_package.name.clone(),
+            version: ext_package.version.clone(),
+            target: "extension_probe".to_owned(),
+            kind: vec!["lib".to_owned()],
+            crate_types: vec!["lib".to_owned()],
+            features: vec![],
+            profile: profile.clone(),
+        };
+        cohort_graph.source_locators.insert(
+            (ext_package.id.clone(), ext_lib_unit.key().unwrap()),
+            super::super::compatibility_graph::SourceLocators {
+                declared: ext_lib_path.clone(),
+                emitted: ext_lib_path.clone(),
+            },
+        );
+        cohort_graph.artifacts.insert(
+            ext_out.join("libextension_probe.rlib"),
+            (ext_package.id.clone(), ext_lib_unit.clone()),
+        );
+        cohort_graph
+            .units
+            .get_mut(&ext_package.id)
+            .unwrap()
+            .push(ext_lib_unit);
+        let mut ext_unit_capture = ext_capture.clone();
+        {
+            let command = &mut ext_unit_capture.invocation;
+            command.pid = 1001;
+            command.argv[1] = b"extension_probe".to_vec();
+            command.argv[2] = bytes(&ext_lib_path);
+            command.source = Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&ext_lib_path),
+                canonical_path: bytes(&ext_lib_path),
+                identity: FileIdentity {
+                    bytes: body.len() as u64,
+                    ..compiler.identity.clone()
+                },
+                bytes: body.to_vec(),
+                sha256: digest(body),
+            });
+            ext_unit_capture.completion.pid = 1001;
+            ext_unit_capture.completion.invocation_sha256 =
+                digest(&serde_json::to_vec(command).unwrap());
+        }
+        let ext_unit_bundle = Bundle {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            wrapper_sha256: "c".repeat(64),
+            target_directory: target_directory.clone(),
+            commands: vec![ext_unit_capture.clone()],
+        };
+        assert_eq!(
+            classify(
+                &cohort_graph,
+                &ext_unit_bundle,
+                &ext_unit_bundle,
+                &ext_unit_capture.invocation
+            )
+            .unwrap(),
+            Classification::CargoUnit
+        );
+        assert!(
+            shared(&cohort_graph, &ext_unit_bundle)
+                .unwrap_err()
+                .contains("actual Cargo compiler command did not succeed")
+        );
+        assert!(
+            auxiliary_with_reference(&cohort_graph, &ext_unit_bundle, &ext_bundle)
+                .unwrap_err()
+                .contains("actual Cargo compiler command did not succeed")
+        );
+        // A core-closure probe whose source lies outside its owner package
+        // fails the auxiliary proof by name.
+        let outside_path = root.join("outside-owner.rs");
+        std::fs::write(&outside_path, body).unwrap();
+        let mut outside_capture = core_aux_capture.clone();
+        {
+            let command = &mut outside_capture.invocation;
+            command.argv[2] = bytes(&outside_path);
+            command.source = Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&outside_path),
+                canonical_path: bytes(&outside_path),
+                identity: FileIdentity {
+                    bytes: body.len() as u64,
+                    ..compiler.identity.clone()
+                },
+                bytes: body.to_vec(),
+                sha256: digest(body),
+            });
+            outside_capture.completion.invocation_sha256 =
+                digest(&serde_json::to_vec(command).unwrap());
+        }
+        let outside_bundle = Bundle {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            wrapper_sha256: "c".repeat(64),
+            target_directory: target_directory.clone(),
+            commands: vec![outside_capture],
+        };
+        assert!(
+            auxiliary_with_reference(&cohort_graph, &outside_bundle, &cohort_failed)
+                .unwrap_err()
+                .contains("outside its actual package")
+        );
+
         // The schema cannot retrofit missing old stdin bytes.
         let mut old = serde_json::to_value(&stdin).unwrap();
         old["schema"] = "hermit-actual-rustc-capture/v1".into();
@@ -2632,6 +3280,60 @@ mod tests {
         let mut wrong_name = fixture.command.clone();
         wrong_name.argv[1] = b"different_crate".to_vec();
         assert!(actual_source_unit(&fixture.graph, package, &wrong_name).is_err());
+    }
+
+    #[test]
+    fn classified_failed_query_and_cargo_unit_refuse_in_final_auxiliary_path() {
+        let fixture = source_unit_fixture();
+        std::fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+        )
+        .unwrap();
+        let captured = |command: Invocation| {
+            let completion = Completion {
+                schema: CAPTURE_SCHEMA.to_owned(),
+                invocation_sha256: digest(&serde_json::to_vec(&command).unwrap()),
+                pid: command.pid,
+                exit_code: Some(1),
+                signal: None,
+                inputs_unchanged: true,
+                capture_error: None,
+            };
+            Bundle {
+                schema: CAPTURE_SCHEMA.to_owned(),
+                wrapper_sha256: "c".repeat(64),
+                target_directory: fixture.root.join("target"),
+                commands: vec![Captured {
+                    invocation: command,
+                    completion,
+                }],
+            }
+        };
+        let failed_unit = captured(fixture.command.clone());
+        assert_eq!(
+            classify(&fixture.graph, &failed_unit, &failed_unit, &fixture.command).unwrap(),
+            Classification::CargoUnit
+        );
+        assert!(
+            auxiliary_with_reference(&fixture.graph, &failed_unit, &failed_unit)
+                .unwrap_err()
+                .contains("actual Cargo compiler command did not succeed")
+        );
+
+        let mut query = fixture.command.clone();
+        query.argv = vec![b"-vV".to_vec()];
+        query.source = None;
+        let failed_query = captured(query.clone());
+        assert_eq!(
+            classify(&fixture.graph, &failed_query, &failed_query, &query).unwrap(),
+            Classification::Query
+        );
+        assert!(
+            auxiliary_with_reference(&fixture.graph, &failed_query, &failed_query)
+                .unwrap_err()
+                .contains("compiler query did not complete successfully")
+        );
     }
 
     #[test]
