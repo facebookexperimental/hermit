@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# Census gate for one counted Nextest node: compare this run's listed
-# population against a base (last landed main) population with ci/census-diff.
+# Census gate for one counted Nextest node.
+#
+# Every run checks its own population: a counted node that lists no tests is
+# refused (zero-tests), so an empty collection can never pass as green. (A
+# case-selected node, --case-selected, lists only the cases a --tests run
+# picked; validate's own expected-count guard covers it instead.) A run
+# that is given a base (the last landed main's population) also compares its
+# listed population against it with ci/census-diff, so a test that vanished
+# without a declared drop fails. Only a candidate-versus-main comparison needs
+# that base, and ci-hub supplies it to the validates it runs. A plain run (a
+# person's `make validate`, a fresh clone) has no base and needs none: it
+# reports that the comparison did not run and passes, and its ledger row
+# says census_checked=false, which ci-hub never reads as green evidence.
 #
 # Usage: ci/census-check.sh --candidate-listed FILE [--base-listed FILE]
 #          [--base-dir DIR] [--candidate-outcomes FILE] [--dropped FILE]
-#          [--report-only] [--require-base] [--allow-no-base]
-#          [--case-selected] [--expected-base-commit SHA] [--suite NAME]
+#          [--report-only] [--case-selected] [--expected-base-commit SHA]
+#          [--suite NAME]
 #
 # --base-dir names the adapter's per-suite supply directory
 # (HERMIT_CENSUS_BASE_DIR): one stamped <suite>.listed-ids per suite.
@@ -29,8 +40,8 @@
 #
 #   # census-base: commit=<full sha of that main commit> count=<id count>
 #
-# Freshness is enforced here, not assumed: with --require-base (every
-# counted node) a base without that header is refused
+# Freshness is enforced here, not assumed: a supplied base without that
+# header is refused
 # (census-base-provenance), a header whose count disagrees with the IDs
 # actually in the file is refused as truncated/short
 # (census-base-truncated), and a header commit that differs from
@@ -40,16 +51,13 @@
 # stale (census-base-stale). --report-only is a
 # manual/local debugging aid only; the counted wrapper never passes it.
 #
-# Exit codes: 0 pass, 1 unrecorded disappearance (census-diff), 2 usage /
-# supplied-base refusal (stale, truncated, provenance, suite-missing,
-# missing/empty base file), 75 missing base under --require-base (no base
-# supplied at all: could-not-run, requeue; validate maps node exit 75 to
-# no-result/COULD_NOT_RUN, every other nonzero to a product failure).
+# Exit codes: 0 pass, 1 unrecorded disappearance (census-diff), 2 usage, a
+# zero-tests population, or a supplied-base refusal (stale, truncated,
+# provenance, suite-missing, missing/empty base file). Validate reads every
+# nonzero exit of a counted node as a product failure.
 #
-# With no --base-listed there is no base population in-node (the queue
-# adapter owns the cached base; see HERMIT_CENSUS_BASE_LISTED_IDS in
-# ci/run-nextest-counted.sh): the check reports that and passes, so wiring
-# it into every counted node is safe before the adapter supplies a base.
+# With no base (neither --base-listed nor --base-dir) the comparison does not
+# run: the check reports that by name and passes.
 # With a base, enforcement is the default: an unrecorded disappearance
 # fails naming the missing IDs unless --report-only is given (the counted
 # wrapper passes it only for HERMIT_CENSUS_REPORT_ONLY=1). Additions pass;
@@ -60,7 +68,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 
 base_listed= base_dir= candidate_listed= candidate_outcomes= dropped= suite=nextest
-report_only=0 require_base=0 allow_no_base=0 case_selected=0
+report_only=0 case_selected=0
 expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
 while (($#)); do
     case $1 in
@@ -71,8 +79,6 @@ while (($#)); do
         --dropped) dropped=$2; shift 2 ;;
         --suite) suite=$2; shift 2 ;;
         --report-only) report_only=1; shift ;;
-        --require-base) require_base=1; shift ;;
-        --allow-no-base) allow_no_base=1; shift ;;
         --case-selected) case_selected=1; shift ;;
         --expected-base-commit) expected_base_commit=$2; shift 2 ;;
         *) printf 'census-check: unknown argument %s\n' "$1" >&2; exit 2 ;;
@@ -80,6 +86,13 @@ while (($#)); do
 done
 if [[ -z $candidate_listed && -z $candidate_outcomes ]]; then
     printf 'census-check: --candidate-listed or --candidate-outcomes is required\n' >&2
+    exit 2
+fi
+# Zero tests collected is a failure on every run, base or none: nothing ran,
+# so nothing passed. (A case-selected run lists only the cases its filter
+# picks, and is judged by the rule below instead.)
+if ((! case_selected)) && [[ -n $candidate_listed ]] && ! grep -qv '^[[:space:]]*\(#\|$\)' -- "$candidate_listed" 2>/dev/null; then
+    printf 'census-check: zero-tests: candidate population %s lists no tests; a counted node that collects nothing is refused\n' "$candidate_listed" >&2
     exit 2
 fi
 if ((case_selected)); then
@@ -98,18 +111,7 @@ if [[ -z $base_listed && -n $base_dir ]]; then
     base_listed=$base_dir/$suite.listed-ids
 fi
 if [[ -z $base_listed ]]; then
-    if ((require_base && ! allow_no_base)); then
-        # Missing base is the one could-not-run refusal: the node cannot
-        # determine its population verdict because the queue adapter has
-        # not published a base, which is not a product failure. Exit 75
-        # (EX_TEMPFAIL) so validate classifies the node no-result
-        # (COULD_NOT_RUN) instead of FAILED. Every supplied-base refusal
-        # below (stale/truncated/provenance/suite-missing) and every
-        # vanished-ID FAIL stays a product failure.
-        printf 'census-check: no base population supplied and --require-base is in force; the queue adapter must provide HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR (local runs opt out explicitly with HERMIT_CENSUS_ALLOW_NO_BASE=1)\n' >&2
-        exit 75
-    fi
-    printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR)\n' "$suite" >&2
+    printf 'census %s: no base supplied, so no vanished-test comparison: this run checked its own population; a candidate validate gets its base from ci-hub (HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR)\n' "$suite" >&2
     exit 0
 fi
 # A supplied base must be real: an unreadable or empty base would make every
@@ -120,8 +122,8 @@ if [[ ! -s $base_listed ]]; then
     exit 2
 fi
 # Freshness: the base must prove which commit it was listed at and how
-# many IDs that listing held. A counted node (--require-base) refuses a
-# base with no provenance at all; any stamped base whose declared count
+# many IDs that listing held. A supplied base with no provenance at all is
+# refused; a stamped base whose declared count
 # disagrees with the file is truncated/short, and one stamped with a
 # different commit than expected is stale. All refusals name the file
 # and the check that failed; none degrades to a pass.
@@ -132,8 +134,8 @@ if [[ $base_header =~ $base_header_re ]]; then
     base_commit=${BASH_REMATCH[1]}
     base_declared_count=${BASH_REMATCH[2]}
 fi
-if ((require_base)) && [[ -z $base_commit ]]; then
-    printf 'census-check: census-base-provenance: base population %s has no provenance header ("# census-base: commit=<sha> count=<n>"); counted nodes require a stamped base; refusing\n' "$base_listed" >&2
+if [[ -z $base_commit ]]; then
+    printf 'census-check: census-base-provenance: base population %s has no provenance header ("# census-base: commit=<sha> count=<n>"); a supplied base must be stamped; refusing\n' "$base_listed" >&2
     exit 2
 fi
 if [[ -n $base_commit ]]; then
@@ -173,8 +175,7 @@ fi
 # IDs, duplicate candidate IDs, or malformed outcomes refuse exactly as
 # they would unmarked. A suite that already existed at the base gets no
 # such file from the adapter: its missing base already refused above as
-# census-base-suite-missing (directory supply) or the require-base
-# could-not-run, never as a first base.
+# census-base-suite-missing (directory supply), never as a first base.
 if grep -q '^# census-first-base:' "$base_listed"; then
     marker=$(grep -m1 '^# census-first-base:' "$base_listed")
     count=0

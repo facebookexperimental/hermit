@@ -683,6 +683,13 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// its pass is about a head that is not on any main, and reusing it by tree
 /// would let a candidate's answer stand in for a main run of the same tree.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
+    // A row whose counted nodes compared no test list with main's carries the
+    // census marker (validate.rs add_census_marker). It is not a full pass to
+    // reuse: neither the tree cache nor the selective baseline serves one,
+    // whichever census key it carries.
+    if row.get("census_checked").is_some() || row.get("census_not_checked_reason").is_some() {
+        return false;
+    }
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
             .is_ok_and(|original| {
@@ -1974,6 +1981,32 @@ pub fn self_test() -> Result<String, String> {
     }
     if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_none).is_some() {
         return Err("selective: a baseline absent from this checkout must be REFUSED".into());
+    }
+    // A census-unchecked green is never a baseline, whichever census key it
+    // carries; the same newer row without a marker would win (the control).
+    let newer = |marker: serde_json::Value| {
+        let mut extra =
+            serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs"});
+        if let (Some(o), Some(m)) = (extra.as_object_mut(), marker.as_object()) {
+            o.extend(m.clone());
+        }
+        let mut rows = ledger_rows.clone();
+        rows.push(qualifying(extra));
+        selective_baseline(&rows, None, "mine", &exists_all)
+    };
+    if newer(serde_json::json!({})).as_deref() != Some("eee") {
+        return Err("selective: control: a newer clean green must win".into());
+    }
+    for marker in [
+        serde_json::json!({"census_checked": false, "census_not_checked_reason": "no census base supplied"}),
+        serde_json::json!({"census_checked": false}),
+        serde_json::json!({"census_not_checked_reason": "no census base supplied"}),
+    ] {
+        if newer(marker.clone()).as_deref() != Some("bbb") {
+            return Err(format!(
+                "selective: a census-unchecked green must never be a baseline: {marker}"
+            ));
+        }
     }
     // Each newer green is checked alone, so every refusal is proved by its own
     // row: a consistent Buck green, a non-string builder carrying the Cargo

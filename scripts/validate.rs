@@ -13017,6 +13017,89 @@ fn local_off_the_record_refusal_with(
     None
 }
 
+/// The census base a counted node compares its listed tests against
+/// (ci/census-check.sh): one suite's file, or a per-suite directory. ci-hub
+/// supplies one to every validate it runs; a plain run (a person's
+/// `make validate`, a fresh clone) has neither and needs neither.
+const CENSUS_BASE_ENVS: [&str; 2] = ["HERMIT_CENSUS_BASE_LISTED_IDS", "HERMIT_CENSUS_BASE_DIR"];
+/// The case filter a counted node applies (ci/run-nextest-counted.sh). A
+/// node with one lists only the matching cases, and census-check skips the
+/// base comparison for it (--case-selected).
+const NEXTEST_FILTER_EXPR_ENV: &str = "HERMIT_NEXTEST_FILTER_EXPR";
+/// The one selection mode that selects cases: --tests puts
+/// HERMIT_NEXTEST_FILTER_EXPR into the selected steps' own env
+/// (inject_case_filters). Every other mode, --selected included, runs whole
+/// nodes.
+const CASE_SELECTING_MODE: &str = "tests";
+
+/// Drop a HERMIT_NEXTEST_FILTER_EXPR inherited from the caller, naming it.
+/// Cases are selected only per step, by --tests; an inherited value would
+/// make every counted node list only the matching cases and skip the census
+/// comparison, while the run read as a whole-suite run. Returns whether a
+/// value was dropped.
+fn drop_inherited_case_filter() -> bool {
+    let inherited =
+        std::env::var_os(NEXTEST_FILTER_EXPR_ENV).is_some_and(|value| !value.is_empty());
+    if inherited {
+        eprintln!(
+            "validate: ignoring {NEXTEST_FILTER_EXPR_ENV} from the environment: only --tests \
+             selects cases, per step"
+        );
+    }
+    std::env::remove_var(NEXTEST_FILTER_EXPR_ENV);
+    inherited
+}
+
+/// Why this run's counted test nodes compared no test list with main's, or
+/// None when they did. ci/run-nextest-counted.sh compares a node's listed
+/// tests with the base exactly when one of CENSUS_BASE_ENVS is non-empty and
+/// the node has no HERMIT_NEXTEST_FILTER_EXPR. Every counted node inherits
+/// the driver's environment (host-side directly, pinned-root through
+/// PINNED_ROOT_FORWARDED_ENV), so this reads the same variables; the one
+/// step-level source of a filter is the case-selecting mode. run() drops an
+/// inherited filter first (drop_inherited_case_filter), so in a real run the
+/// filter clause never fires; it keeps the predicate true on its own.
+fn census_not_compared_reason(
+    selection_mode: &str,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    if selection_mode == CASE_SELECTING_MODE {
+        return Some(format!(
+            "{selection_mode} run: its counted nodes listed only the selected cases (a per-step \
+             {NEXTEST_FILTER_EXPR_ENV}), so no test list was compared with main's"
+        ));
+    }
+    if var(NEXTEST_FILTER_EXPR_ENV).is_some_and(|value| !value.is_empty()) {
+        return Some(format!(
+            "{NEXTEST_FILTER_EXPR_ENV} is set: every counted node listed only the matching \
+             cases, so no test list was compared with main's"
+        ));
+    }
+    if CENSUS_BASE_ENVS
+        .iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+    {
+        return None;
+    }
+    Some(format!(
+        "no census base supplied ({}): each counted node checked its own test list, but none \
+         was compared with main's for vanished tests",
+        CENSUS_BASE_ENVS.join(", ")
+    ))
+}
+
+/// Mark a ledger row whose counted nodes compared no test list with main's:
+/// `census_checked: false` and the reason. A row whose nodes did compare
+/// carries neither key. Readers decide what an unchecked row is worth:
+/// ci-hub never reads one as green evidence, and the tree cache and the
+/// selective baseline never reuse one (validate_history::pass_row_qualifies).
+fn add_census_marker(record: &mut serde_json::Value, reason: Option<String>) {
+    if let Some(reason) = reason {
+        record["census_checked"] = serde_json::json!(false);
+        record["census_not_checked_reason"] = serde_json::json!(reason);
+    }
+}
+
 /// Construct the refusal for an unadmitted product run. Production supplies
 /// `lock_admitted` only from [`validate_lock_admission`].
 fn product_front_door_refusal(
@@ -29712,6 +29795,10 @@ fn write_ledger_with_snapshot(
         ),
     };
     add_raw_census(&mut record, census);
+    add_census_marker(
+        &mut record,
+        census_not_compared_reason(&ctx.selection_mode, |name| std::env::var_os(name)),
+    );
     // Fail closed: no census, no green claim — an explicit red signal.
     if !matches!(&retries, Some(Ok(_))) {
         record["landing_signal"] = serde_json::json!("red");
@@ -32126,6 +32213,8 @@ fn run(
     };
     std::env::remove_var(BUILD_MODE_ENV);
     std::env::remove_var(RUN_MODE_ENV);
+    // Cases are selected only per step, by --tests (drop_inherited_case_filter).
+    drop_inherited_case_filter();
     if let Err(error) =
         check_ambient_build_modes(ambient_build_mode.as_deref(), ambient_run_mode.as_deref())
     {
@@ -34787,6 +34876,16 @@ fn run(
                 .into(),
         ),
     }
+    // The census line: whether the counted nodes compared their test lists
+    // with main's (a supplied base), or only checked their own.
+    detail.push(
+        match census_not_compared_reason(plan.selection_mode, |name| std::env::var_os(name)) {
+            Some(reason) => format!("census: {reason}"),
+            None => "census: each counted node compared its test list with main's (the \
+                     supplied base) and checked that it lists tests"
+                .into(),
+        },
+    );
     let individual_test_results_complete = test_summary_errors.is_empty();
     detail.extend(test_summary_errors);
     if args.allow_local_off_the_record_run {
@@ -39239,6 +39338,228 @@ mod scorecard_cutover_tests {
         }
     }
 
+    /// The census predicate over the run's own inputs, with a fake
+    /// environment: no process environment is read or changed.
+    #[test]
+    fn census_comparison_is_judged_from_the_base_the_nodes_were_given() {
+        fn env<'a>(
+            pairs: &'a [(&'a str, &'a str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+            move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        }
+        for base in CENSUS_BASE_ENVS {
+            let pairs = [(base, "/base")];
+            assert_eq!(
+                census_not_compared_reason("full", env(&pairs)),
+                None,
+                "{base}"
+            );
+            // --selected runs whole nodes, so it compares like any other mode.
+            assert_eq!(census_not_compared_reason("selected", env(&pairs)), None);
+            let reason = census_not_compared_reason(CASE_SELECTING_MODE, env(&pairs)).unwrap();
+            assert!(reason.starts_with("tests run:"), "{reason}");
+            // A stray filter in a run with a base: every node lists a subset
+            // and skips the comparison, so the run is not compared.
+            let stray = [(base, "/base"), (NEXTEST_FILTER_EXPR_ENV, "test(=x)")];
+            let reason = census_not_compared_reason("full", env(&stray)).unwrap();
+            assert!(
+                reason.starts_with("HERMIT_NEXTEST_FILTER_EXPR is set"),
+                "{reason}"
+            );
+            let empty = [(base, "/base"), (NEXTEST_FILTER_EXPR_ENV, "")];
+            assert_eq!(census_not_compared_reason("full", env(&empty)), None);
+        }
+        for pairs in [
+            &[][..],
+            &[
+                ("HERMIT_CENSUS_BASE_LISTED_IDS", ""),
+                ("HERMIT_CENSUS_BASE_DIR", ""),
+            ][..],
+            &[("HERMIT_CENSUS_BASE_COMMIT", "a")][..],
+        ] {
+            let reason = census_not_compared_reason("full", env(pairs)).unwrap();
+            assert!(reason.starts_with("no census base supplied"), "{reason}");
+        }
+    }
+
+    /// The marker reaches the ROW WRITTEN TO THE LEDGER FILE through
+    /// write_ledger_with_snapshot, the one funnel every run() path writes its
+    /// row through. Each case runs in a re-executed child, so the variables
+    /// live only there and the shared test harness's environment is never
+    /// changed.
+    #[test]
+    fn a_run_without_a_census_base_says_so_in_its_written_row() {
+        const CHILD: &str = "VALIDATE_CENSUS_MARKER_CHILD";
+        if let Some(expect) = std::env::var_os(CHILD) {
+            let temp = tempfile::tempdir().unwrap();
+            let rows = temp.path().join("rows.jsonl");
+            let mut ctx = context(
+                temp.path(),
+                "full",
+                "census-marker-fixture",
+                HEAD.into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            );
+            ctx.selection_mode = "full".into();
+            ctx.executed_tests = Some(0);
+            ctx.passed_tests = Some(0);
+            write_ledger(
+                &rows,
+                &ctx,
+                &[],
+                &[],
+                &[],
+                &[],
+                &BTreeSet::new(),
+                0.0,
+                75,
+                "",
+                true,
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+            let text = std::fs::read_to_string(&rows).unwrap();
+            let row: serde_json::Value =
+                serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            if expect == "unchecked" || expect == "filtered" {
+                let reason_start = if expect == "unchecked" {
+                    "no census base supplied"
+                } else {
+                    "HERMIT_NEXTEST_FILTER_EXPR is set"
+                };
+                assert_eq!(row["census_checked"], false, "{row}");
+                assert!(
+                    row["census_not_checked_reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with(reason_start)),
+                    "{row}"
+                );
+            } else {
+                assert!(row.get("census_checked").is_none(), "{row}");
+                assert!(row.get("census_not_checked_reason").is_none(), "{row}");
+            }
+            println!("census marker child: {}", expect.to_string_lossy());
+            return;
+        }
+        for (expect, base) in [
+            ("unchecked", None),
+            ("unchecked", Some(("HERMIT_CENSUS_BASE_DIR", ""))),
+            ("checked", Some(("HERMIT_CENSUS_BASE_DIR", "/base-dir"))),
+            (
+                "checked",
+                Some(("HERMIT_CENSUS_BASE_LISTED_IDS", "/base.listed-ids")),
+            ),
+            ("filtered", Some(("HERMIT_CENSUS_BASE_DIR", "/base-dir"))),
+        ] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "scorecard_cutover_tests::a_run_without_a_census_base_says_so_in_its_written_row",
+                    "--nocapture",
+                ])
+                .current_dir(test_source_root())
+                .env(CHILD, expect);
+            for name in CENSUS_BASE_ENVS {
+                command.env_remove(name);
+            }
+            command.env_remove(NEXTEST_FILTER_EXPR_ENV);
+            if let Some((name, value)) = base {
+                command.env(name, value);
+            }
+            if expect == "filtered" {
+                command.env(NEXTEST_FILTER_EXPR_ENV, "test(=stray)");
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "{base:?}: {stdout}{stderr}");
+            assert!(
+                stdout.contains(&format!("census marker child: {expect}")),
+                "{base:?}: {stdout}{stderr}"
+            );
+        }
+    }
+
+    /// run() drops a HERMIT_NEXTEST_FILTER_EXPR inherited from the caller, so a
+    /// stray value cannot narrow every counted node. Run in a re-executed
+    /// child, so the shared test harness's environment is never changed.
+    #[test]
+    fn an_inherited_case_filter_is_dropped_by_name() {
+        const CHILD: &str = "VALIDATE_CASE_FILTER_DROP_CHILD";
+        if let Some(value) = std::env::var_os(CHILD) {
+            let dropped = drop_inherited_case_filter();
+            assert_eq!(dropped, !value.is_empty());
+            assert!(std::env::var_os(NEXTEST_FILTER_EXPR_ENV).is_none());
+            println!("case filter drop child: {dropped}");
+            return;
+        }
+        for (value, dropped) in [("test(=stray)", true), ("", false)] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "scorecard_cutover_tests::an_inherited_case_filter_is_dropped_by_name",
+                    "--nocapture",
+                ])
+                .current_dir(test_source_root())
+                .env(CHILD, value)
+                .env(NEXTEST_FILTER_EXPR_ENV, value)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "{value:?}: {stdout}{stderr}");
+            assert!(
+                stdout.contains(&format!("case filter drop child: {dropped}")),
+                "{value:?}: {stdout}{stderr}"
+            );
+            assert_eq!(
+                stderr.contains("ignoring HERMIT_NEXTEST_FILTER_EXPR from the environment"),
+                dropped,
+                "{value:?}: {stderr}"
+            );
+        }
+    }
+
+    /// The body of a top-level `fn name(` in this file, up to the next
+    /// top-level item: for wiring tests of calls that only a whole run makes.
+    fn top_level_fn_body(name: &str) -> String {
+        let source =
+            std::fs::read_to_string(test_source_root().join("scripts/validate.rs")).unwrap();
+        let start = source
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("no top-level fn {name}"));
+        let rest = &source[start + 1..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map_or(rest.len(), |offset| offset + 1);
+        rest[..end].to_string()
+    }
+
+    /// Wiring: run() itself drops an inherited case filter, before it parses
+    /// any argument, so no run carries one into its nodes.
+    #[test]
+    fn run_drops_an_inherited_case_filter_before_anything_else_reads_it() {
+        let body = top_level_fn_body("run");
+        let drop = body
+            .find("drop_inherited_case_filter();")
+            .expect("run() must call drop_inherited_case_filter()");
+        let parse = body
+            .find("parse_args()")
+            .expect("run() parses its arguments");
+        assert!(
+            drop < parse,
+            "the filter must be dropped before argument parsing"
+        );
+    }
+
     fn frozen_writer_row(selection_mode: &str) -> serde_json::Value {
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = context(
@@ -39371,7 +39692,15 @@ mod scorecard_cutover_tests {
             assert_eq!(retained["e2e_payload"]["overflow_checks"], !release);
 
             // Give the written identity a qualifying green and ask the Cargo key.
+            // The fixture's writer ran without a census base, so its row
+            // carries the census marker, which alone refuses reuse
+            // (validate_history's own bracket proves that); a qualifying
+            // green is a census-checked one, so the marker is dropped here.
             let mut green = row.clone();
+            if let Some(fields) = green.as_object_mut() {
+                fields.remove("census_checked");
+                fields.remove("census_not_checked_reason");
+            }
             for (field, value) in [
                 ("result", serde_json::json!("pass")),
                 ("failures", serde_json::json!(0)),

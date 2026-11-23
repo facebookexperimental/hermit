@@ -704,15 +704,15 @@ fn actual_nextest_results_and_publication_failures() {
         // wrapper otherwise stops at the first failing test by default.
         // The fixture's population is synthetic, so the run's census env
         // (the queue's real base for the candidate) must not leak in:
-        // the command below unsets every HERMIT_CENSUS_BASE_* variable
-        // and keeps only the explicit HERMIT_CENSUS_ALLOW_NO_BASE=1.
+        // the command below unsets every HERMIT_CENSUS_BASE_* variable, so
+        // the wrapper checks the fixture's own population only.
         let command = format!(
             "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
              export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
              export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
              unset HERMIT_CENSUS_BASE_COMMIT HERMIT_CENSUS_BASE_DIR HERMIT_CENSUS_BASE_LISTED_IDS HERMIT_CENSUS_DROPPED_FILE HERMIT_CENSUS_EXPECTED_BASE_COMMIT; \
              printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > {}; {lock}{fault}set +e; \
-             {override_env}HERMIT_CENSUS_ALLOW_NO_BASE=1 HERMIT_NEXTEST_FAIL_FAST=0 NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
+             {override_env}HERMIT_NEXTEST_FAIL_FAST=0 NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
              {} --manifest-path {} --locked --offline \
              --profile ci --lib -j 1 --retries 0 --no-tests fail -E {} >{} 2>{}; \
              fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",

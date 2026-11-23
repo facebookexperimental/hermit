@@ -362,9 +362,13 @@ function run_nextest {
             cleanup_nextest_config
             return 2
         fi
-        # Census gate (phase 3, enforced): diff this run's listed population
-        # against the base (last landed main) population the queue adapter
-        # cached. HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
+        # Census gate: every run refuses a node that lists zero tests; a run
+        # given a base also diffs its listed population against the base (last
+        # landed main) population the queue adapter cached, so a vanished test
+        # fails. Only candidate-versus-main comparisons need that base, and
+        # ci-hub supplies it to the validates it runs; a plain run has none,
+        # needs none, and its ledger row says census_checked=false.
+        # HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
         # file (single-suite selections); HERMIT_CENSUS_BASE_DIR names the
         # adapter's per-suite supply directory (one stamped
         # <suite>.listed-ids per suite) for multi-suite/full-profile nodes,
@@ -379,15 +383,9 @@ function run_nextest {
         # adapter declares one, else this checkout's merge-base with
         # origin/<landing branch> (HERMIT_LANDING_BRANCH,
         # ci/landing-branches.env); a base stamped with another commit, a short/
-        # truncated base, or an unstamped base is refused by name. Since
-        # the count pins were deleted the census is the only disappearance
-        # guard, so a counted node REQUIRES its base: with none supplied
-        # this node exits 75 (could-not-run: the adapter has not published
-        # a base, so no population verdict exists; validate requeues
-        # instead of failing), unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks
-        # an explicit local/standalone run with no adapter. A supplied
-        # but stale/truncated/unstamped base and a vanished ID stay
-        # product failures.
+        # truncated base, or an unstamped base is refused by name. A
+        # supplied but stale/truncated/unstamped base, a vanished ID and a
+        # zero-test population are product failures.
         # HERMIT_CENSUS_REPORT_ONLY is retired in counted nodes (phase-2
         # rollout lever): it is ignored here so a stale adapter setting
         # cannot silently downgrade enforcement; --report-only remains a
@@ -400,7 +398,7 @@ function run_nextest {
         counts_name=${counts_name%.json}
         census_suite=${counts_name#test.}
         [[ -n $census_suite && $census_suite != "$counts_name" ]] || census_suite=${counts_name:-nextest}
-        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base --suite "$census_suite")
+        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --suite "$census_suite")
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
         [[ -n ${HERMIT_CENSUS_BASE_DIR:-} ]] && census_args+=(--base-dir "$HERMIT_CENSUS_BASE_DIR")
         # Case-selected runs list a subset, never the suite population:
@@ -408,7 +406,6 @@ function run_nextest {
         # full base (or refusing for want of one).
         [[ -n ${HERMIT_NEXTEST_FILTER_EXPR:-} ]] && census_args+=(--case-selected)
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
-        [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
         local expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
         if [[ -z $expected_base_commit ]]; then
             local landing_branch_name
@@ -430,15 +427,8 @@ function run_nextest {
         if (( census_status != 0 )); then
             printf 'run-nextest-counted: census gate refused this listed population (see census FAIL lines above)\n' >&2
             cleanup_nextest_config
-            # Exit 75 is the missing-base could-not-run refusal only
-            # (census-check.sh under --require-base with no base supplied):
-            # propagate it so validate classifies this node no-result
-            # (COULD_NOT_RUN/requeue) instead of a product failure. Every
-            # other census refusal (stale/truncated/provenance base,
-            # vanished ID) stays a product failure (return 1).
-            if (( census_status == 75 )); then
-                return 75
-            fi
+            # Every census refusal (zero tests, a stale/truncated/unstamped
+            # base, a vanished ID) is a product failure.
             return 1
         fi
     fi
@@ -835,7 +825,7 @@ PYEOF
     set +e
     inventory="$scratch/wrapper-inventory.json"
     binary_map="$scratch/wrapper-binary-map.json"
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
         run_nextest "$scratch/wrapper-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/wrapper-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme)
@@ -911,7 +901,7 @@ PYEOF
     attempts="$scratch/reresolve-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
         HERMIT_PREPARED_NEXTEST_REQUIRED=1 \
         run_nextest "$scratch/reresolve-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/reresolve-cpu.json" \
@@ -956,7 +946,7 @@ PYEOF
     inventory_wrong_name=1
     mkdir "$scratch/attribution-attempts"
     status=0
-    TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
+    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
         run_nextest "$scratch/attribution-events" "$wall_multiplier" "$cpu_wrapper" \
         "$scratch/attribution-attempts" "$binary_map" "$inventory" "$scratch/attribution-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
@@ -974,7 +964,7 @@ PYEOF
     attempts="$scratch/launch-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
         run_nextest "$scratch/launch-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/launch-cpu.json" \
         --profile ci --locked -p suite -j 1 --retries 2 -- --skip skipme) || status=$?

@@ -164,7 +164,10 @@ def _check(tmp_path, base_ids, cand_ids=None, cand_outcomes=None,
     import uuid
     root = tmp_path / uuid.uuid4().hex
     root.mkdir(parents=True)
-    (root / "base.listed-ids").write_text("".join(f"{i}\n" for i in base_ids))
+    # Every supplied base carries the provenance stamp census-check requires.
+    (root / "base.listed-ids").write_text(
+        f"# census-base: commit={SHA_A} count={len(base_ids)}\n"
+        + "".join(f"{i}\n" for i in base_ids))
     args = ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids")]
     if cand_outcomes is not None:
         (root / "cand.outcomes.json").write_text(
@@ -226,27 +229,38 @@ def test_wired_missing_base_file_fails_closed(tmp_path):
     assert r.returncode == 2 and "absent.listed-ids" in r.stderr and "refusing" in r.stderr
 
 
-def test_wired_require_base_without_base_fails(tmp_path):
-    # Counted nodes require their base since the pins were deleted; only an
-    # explicit local opt-out may run baseless. A missing base is the one
-    # could-not-run refusal: exit 75 (EX_TEMPFAIL) so validate classifies
-    # the node no-result/COULD_NOT_RUN (requeue) instead of FAILED. Every
-    # supplied-base refusal and every vanished ID stays a product failure
-    # (see the mapping test below).
-    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null",
-                        "--require-base"], capture_output=True, text=True)
-    assert r.returncode == 75 and "require-base" in r.stderr
-    r2 = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null",
-                         "--require-base", "--allow-no-base"],
-                        capture_output=True, text=True)
-    assert r2.returncode == 0 and "report-only" in r2.stderr
+def test_wired_zero_tests_fail_with_or_without_a_base(tmp_path):
+    # A counted node that collects nothing is refused on every run: with no
+    # base (a plain run), with a base, and when its listing is missing.
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    empty = root / "cand.listed-ids"
+    empty.write_text("# a comment is not a test\n\n")
+    for extra in ([], ["--base-listed", "/dev/null"]):
+        r = subprocess.run(["bash", str(CHECK), "--candidate-listed", str(empty)] + extra,
+                           capture_output=True, text=True)
+        assert r.returncode == 2 and "zero-tests" in r.stderr, (extra, r.stderr)
+    r = _check_stamped(tmp_path, ["pkg/bin/a"], [])
+    assert r.returncode == 2 and "zero-tests" in r.stderr
+    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", str(root / "absent")],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "zero-tests" in r.stderr
 
 
-def test_wired_exit_code_mapping_no_base_75_supplied_refusals_fail(tmp_path):
-    # The exit-code contract the counted wrapper and validate rely on:
-    # missing base (require-base, nothing supplied) is 75 could-not-run;
-    # a supplied-but-wrong base and a vanished ID are product failures
-    # (never 75, so a genuine red can never become a requeue).
+def test_wired_removed_base_options_are_unknown(tmp_path):
+    # No run requires a base any more, so the options that required or
+    # waived one are gone, and a stale caller is refused by name.
+    for option in ("--require-base", "--allow-no-base"):
+        r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null", option],
+                           capture_output=True, text=True)
+        assert r.returncode == 2 and f"unknown argument {option}" in r.stderr
+
+
+def test_wired_exit_code_mapping_supplied_refusals_fail(tmp_path):
+    # The exit-code contract the counted wrapper and validate rely on: no
+    # base passes (0); a supplied-but-wrong base is refused (2) and a
+    # vanished ID fails (1), both product failures.
     r = _check_stamped(tmp_path, ["pkg/bin/a"], ["pkg/bin/a"], commit=SHA_B)
     assert r.returncode == 2 and "census-base-stale" in r.stderr
     r = _check_stamped(tmp_path, ["pkg/bin/a", "pkg/bin/b"],
@@ -263,7 +277,7 @@ SHA_B = "b" * 40
 
 
 def _check_stamped(tmp_path, base_ids, cand_ids, commit=SHA_A, declared=None,
-                   expected=SHA_A, require=True, first_base=False):
+                   expected=SHA_A, first_base=False):
     import uuid
     root = tmp_path / uuid.uuid4().hex
     root.mkdir(parents=True)
@@ -276,8 +290,6 @@ def _check_stamped(tmp_path, base_ids, cand_ids, commit=SHA_A, declared=None,
     (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
     args = ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
             "--candidate-listed", str(root / "cand.listed-ids")]
-    if require:
-        args.append("--require-base")
     if expected is not None:
         args += ["--expected-base-commit", expected]
     return subprocess.run(args, capture_output=True, text=True)
@@ -304,9 +316,9 @@ def test_wired_truncated_base_refused_by_name(tmp_path):
     assert "count=3" in r.stderr and "holds 2" in r.stderr
 
 
-def test_wired_require_base_without_provenance_refused(tmp_path):
-    # The plain (unstamped) wired path still works manually, but a counted
-    # node requiring its base refuses a base with no provenance header.
+def test_wired_base_without_provenance_refused(tmp_path):
+    # Every supplied base must carry its provenance header: an unstamped
+    # base is refused, never compared as if it were current.
     r = _check(tmp_path, ["pkg/bin/a"], cand_ids=["pkg/bin/a"])
     assert r.returncode == 0
     import uuid
@@ -316,7 +328,7 @@ def test_wired_require_base_without_provenance_refused(tmp_path):
     (root / "cand.listed-ids").write_text("pkg/bin/a\n")
     r2 = subprocess.run(
         ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
-         "--candidate-listed", str(root / "cand.listed-ids"), "--require-base"],
+         "--candidate-listed", str(root / "cand.listed-ids")],
         capture_output=True, text=True)
     assert r2.returncode == 2 and "census-base-provenance" in r2.stderr
 
@@ -334,8 +346,7 @@ def _check_base_dir(tmp_path, suite, base_ids, cand_ids, commit=SHA_A,
         + "".join(f"{i}\n" for i in base_ids))
     (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
     args = ["bash", str(CHECK), "--base-dir", str(root / "base-dir"),
-            "--suite", suite, "--candidate-listed", str(root / "cand.listed-ids"),
-            "--require-base"]
+            "--suite", suite, "--candidate-listed", str(root / "cand.listed-ids")]
     if expected is not None:
         args += ["--expected-base-commit", expected]
     return subprocess.run(args, capture_output=True, text=True)
@@ -376,7 +387,7 @@ def test_wired_base_dir_missing_suite_refused_by_name(tmp_path):
     r = subprocess.run(
         ["bash", str(CHECK), "--base-dir", str(root / "base-dir"),
          "--suite", "nosuchsuite",
-         "--candidate-listed", str(root / "cand.listed-ids"), "--require-base"],
+         "--candidate-listed", str(root / "cand.listed-ids")],
         capture_output=True, text=True)
     assert r.returncode == 2 and "census-base-suite-missing" in r.stderr
     assert "nosuchsuite" in r.stderr
@@ -418,14 +429,14 @@ def test_wired_first_base_malformed_outcomes_fails(tmp_path):
     r = subprocess.run(
         ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
          "--candidate-outcomes", str(root / "cand.outcomes.json"),
-         "--require-base", "--expected-base-commit", SHA_A],
+         "--expected-base-commit", SHA_A],
         capture_output=True, text=True)
     assert r.returncode == 1 and "malformed" in r.stderr
 
 
 def test_wired_case_selected_is_named_not_refused(tmp_path):
     # A case-selected candidate is a subset, not the population: the
-    # check names the treatment and passes even under --require-base
+    # check names the treatment and passes
     # with no base supplied.
     import uuid
     root = tmp_path / uuid.uuid4().hex
@@ -433,7 +444,7 @@ def test_wired_case_selected_is_named_not_refused(tmp_path):
     (root / "cand.listed-ids").write_text("pkg/bin/a\n")
     r = subprocess.run(
         ["bash", str(CHECK), "--candidate-listed", str(root / "cand.listed-ids"),
-         "--require-base", "--case-selected", "--suite", "mysuite"],
+         "--case-selected", "--suite", "mysuite"],
         capture_output=True, text=True)
     assert r.returncode == 0 and "case-selected" in r.stderr
     assert "mysuite" in r.stderr
@@ -441,15 +452,21 @@ def test_wired_case_selected_is_named_not_refused(tmp_path):
 
 def test_provenance_header_is_not_a_base_id(tmp_path):
     # census-diff fed a stamped base directly must not diff the header.
-    r = _check_stamped(tmp_path, ["a"], ["a"], require=False, expected=None)
+    r = _check_stamped(tmp_path, ["a"], ["a"], expected=None)
     assert r.returncode == 0 and "added=0" in r.stdout, (
         r.returncode, r.stdout, r.stderr)
 
 
-def test_wired_no_base_is_report_only_and_passes(tmp_path):
-    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null"],
+def test_wired_no_base_reports_and_passes(tmp_path):
+    # A plain run has no base: it checks its own population, names the
+    # comparison it did not make, and passes.
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "cand.listed-ids").write_text("pkg/bin/a\n")
+    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", str(root / "cand.listed-ids")],
                        capture_output=True, text=True)
-    assert r.returncode == 0 and "report-only" in r.stderr
+    assert r.returncode == 0 and "no vanished-test comparison" in r.stderr, r.stderr
 
 
 def test_declared_drop_passes_and_unreasoned_skip_fails(tmp_path):

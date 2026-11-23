@@ -1105,46 +1105,15 @@ fn counted_run(
     paths: &RunPaths,
 ) -> Command {
     let mut command = Command::new(root.join("ci/run-nextest-counted.sh"));
-    // The counted wrapper's census compares the listed population
-    // against the queue adapter's per-suite base, keyed by the suite
-    // its counts report is named for; this run's report is named for
-    // the node (`RunPaths::all`), so the key is the node's own. Arm
-    // that census only when the supplied base actually holds this
-    // node's row: no landed base records it yet (the inner listing
-    // was scratch-only until now), and an armed census with no row
-    // refuses census-base-suite-missing before any test executes.
-    // Until a base records the row, scrub the supply and keep only
-    // the explicit named opt-out, as the nextest fixture does; the
-    // ledger's own name-by-name check of the listed population
-    // against the suite source and its gap rows still applies.
-    let census_armed = env::var_os("HERMIT_CENSUS_BASE_DIR")
-        .filter(|dir| !dir.is_empty())
-        .is_some_and(|dir| {
-            Path::new(&dir)
-                .join(format!("{}.listed-ids", declaration.node))
-                .is_file()
-        });
-    if census_armed {
-        println!(
-            "kvm-gap-ledger: census armed for suite {} (base holds its row)",
-            declaration.node
-        );
-    } else {
-        println!(
-            "kvm-gap-ledger: census not armed for suite {} (supplied base holds no row for it yet); inner run uses HERMIT_CENSUS_ALLOW_NO_BASE=1",
-            declaration.node
-        );
-        for variable in [
-            "HERMIT_CENSUS_BASE_COMMIT",
-            "HERMIT_CENSUS_BASE_DIR",
-            "HERMIT_CENSUS_BASE_LISTED_IDS",
-            "HERMIT_CENSUS_DROPPED_FILE",
-            "HERMIT_CENSUS_EXPECTED_BASE_COMMIT",
-        ] {
-            command.env_remove(variable);
-        }
-        command.env("HERMIT_CENSUS_ALLOW_NO_BASE", "1");
-    }
+    // The counted wrapper's census compares the listed population against
+    // the queue adapter's per-suite base, keyed by the suite its counts
+    // report is named for; this run's report is named for the node
+    // (`RunPaths::all`), so the key is the node's own. The inner run inherits
+    // the supplied base like every other counted node: the landed base now
+    // records this node's row, and a supply without it refuses
+    // census-base-suite-missing like any other node's, instead of comparing
+    // nothing while the ledger row says it compared. A run given no base
+    // checks its own population only.
     command
         .args(nextest_args)
         .env("HERMIT_TEST_BACKEND", declaration.backend)
