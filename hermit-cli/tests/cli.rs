@@ -74767,7 +74767,8 @@ fn the_rt_sigpending_rows_record_and_replay() {
     // corrected word is therefore not claimed.
     let _guard = hermit_run_guard();
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
-    for (mode, line) in [("pending-mt-tgkill", "pending 1")] {
+    let (mode, line) = ("pending-mt-tgkill", "pending 1");
+    {
         let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
         let args = [
