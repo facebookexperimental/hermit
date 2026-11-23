@@ -4,6 +4,7 @@
 # This build configuration is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "hermit_host_test")
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
@@ -52,16 +53,20 @@ rust_binary(
     target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
-buck_sh_test(
+# The hello_race guest is deliberately racy natively (it exits 1 on the
+# antagonistic schedule); this target instead runs it under Hermit
+# chaos-verify and passes only on Hermit's determinism verdict, mirroring
+# hermit_modes::hello_race_chaos_verify. Remove local_only after a
+# passing HEAD run in fbcode//mode/dev-nosan; then check the target's
+# first continuous coverage-mode run.
+hermit_host_test(
     name = "run_hello_race",
-    args = [],
-    # A deliberately racy fixture ("Antagonistic schedule reached, failing")
-    # for exercising Hermit's flakiness tooling, not a test that should pass
-    # natively; keep it out of CI.
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "$(location :hello_race)",
+    ],
     labels = [tpx_labels.local_only],
-    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
-    target_compatible_with = ["ovr_config//cpu:x86_64"],
-    test = ":hello_race",
+    test = "run_hello_race_hermit.sh",
 )
 
 rust_binary(
