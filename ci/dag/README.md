@@ -297,9 +297,14 @@ there. The hosted selections keep their host copies, which their buckets
 consume, and the opt-in Buck route still prepares guests on the host
 (`e2e.buck_stage`). Before any node runs, `scripts/validate.rs` refuses by name
 a selection whose host guest-preparing node lacks a tool it needs
-(`scripts/lib/validate_host_tools.rs`). The strict
-compatibility rows, which run host-installed programs the image does not
-carry, reach the pinned-root binary through `build.host_hermit_link`.
+(`scripts/lib/validate_host_tools.rs`). Of the focused
+strict compatibility buckets, which still run host-installed copies on
+the host, only `rrcompat` reaches the pinned-root binary through
+`build.host_hermit_link`: `portablecompat` runs its lane's pinned-root
+release build from `ignored/hermetic/split/target/release/hermit`, and
+`supercompat` runs `super.build_release_hermit`'s host release build at
+`target/release/hermit`. The full bucket runs in the pinned root and
+needs no link.
 `lint.clippy`, `doc.rustdoc` and `doc.doctests` stay in the dev profile: in the
 validate profile they rebuild units whose build scripts, `hermit-install`'s
 among them, rewrite `target/install_pkg` and `target/validate` under running
@@ -352,8 +357,9 @@ runtime output.
 
 Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs. Portable
 strict compatibility is committed as one fixture producer,
-`compatprep.fixtures`, plus one manifest bucket, `e2e.manifest_compat`, which
-runs the 189 rows of `tests/e2e/manifests/compat.yaml` on the host; it is
+`compatprep.fixtures_in_pinned_root`, plus one manifest bucket,
+`e2e.manifest_compat`, which runs the rows of
+`tests/e2e/manifests/compat.yaml` in the pinned root; it is
 selected by that name like any other bucket.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The

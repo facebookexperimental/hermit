@@ -6401,9 +6401,12 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.cmd
                 ));
             }
-            // A host-run bucket (programs the pinned image does not carry)
-            // reaches the same published artifact through the host pointer
-            // build.host_hermit_link writes and verifies.
+            // The rrcompat host-run bucket reaches the same published
+            // artifact through the host pointer
+            // build.host_hermit_link writes and verifies; the other
+            // focused compat buckets run their own release builds
+            // instead
+            // (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-u6do9t.md).
             let host_run = hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
                 .contains(&consumer.tag().as_str());
             if consumer

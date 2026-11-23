@@ -1265,8 +1265,10 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 /// image carries every program its rows name (measured delta before the
 /// move: 25 programs, about 2.0 GiB of closure, dominated by clang and the
 /// JDK), so it runs in the pinned root like the other e2e buckets. The
-/// focused run types below still run on the host against their own Hermit
-/// builds, by their own descriptions.
+/// focused run types below still run on the host: `portablecompat` and
+/// `supercompat` against their own release Hermit builds, and `rrcompat`
+/// against the validation's shared build through `build.host_hermit_link`,
+/// by their own descriptions.
 pub const HOST_MANIFEST_RUNS: &[&str] = &[
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
@@ -1320,11 +1322,16 @@ pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
 /// Route the local host consumers of the Hermit producers to the pinned-root
 /// build.
 ///
-/// The focused compatibility run types exercise host-installed programs that
-/// the pinned image does not carry, so they, and the fixtures they read, still
-/// run on the host. They reach the one Hermit through build.host_hermit_link,
-/// which
-/// links the host's target/ci/hermit to the pinned root's published binary; that
+/// The focused compatibility run types exercise host-installed programs.
+/// The pinned image now carries every program their rows name, but they,
+/// and the fixtures they read, still run on the host until those buckets
+/// move into the pinned root or are retired
+/// (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-u6do9t.md).
+/// In the committed DAG, only `rrcompat` reaches the validation's one
+/// Hermit through `build.host_hermit_link`, which links the host's
+/// target/ci/hermit to the pinned root's published binary;
+/// `portablecompat` instead runs its lane's pinned-root release build
+/// and `supercompat` runs super's own host release build. The linked
 /// binary runs on the host because its loader and libraries are the host nix
 /// store paths the image was built from. No local host step may depend on the
 /// workspace build itself.

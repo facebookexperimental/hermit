@@ -1,7 +1,20 @@
 schema: 3
 bucket: compat
-# The portable strict compatibility corpus: real programs installed on the
-# validation host, each run under Hermit's verify. The verify cells of the rows
+# The portable strict compatibility corpus: real programs, each run under
+# Hermit's verify. A row names a command, often by an absolute path such
+# as /bin/echo or /usr/bin/ruby, but not which filesystem supplies it:
+# the program at that path, and its libraries, come from the filesystem
+# the node that runs the row is in. The full validation's bucket,
+# e2e.manifest_compat, runs in the pinned root, so its cells use the
+# pinned image's copies. Buckets that run on a host use that host's
+# copies, and they do not all run the same selection: portablecompat
+# uses this bucket's selector but omits the in-guest LiteInst cells;
+# supercompat runs only the heavy rows' ptrace verify cells; rrcompat
+# runs only the replay cells; and e2e.manifest_compat_on_host, the
+# hosted twin, runs only the replay and ptrace verify cells. Which of
+# the focused buckets run on the host is HOST_MANIFEST_RUNS in
+# ci/manifest-plan/src/validation_dag.rs; the hosted twin carries the
+# hosted-portable label instead. The verify cells of the rows
 # labelled sabre-compat-only, and every row's SaBRe cell (`focused`), belong to
 # the SaBRe run type alone; the full validation runs the ptrace verify cells of
 # the other rows (since 2026-10-13 only rustc, javac, java, node and timeout;
