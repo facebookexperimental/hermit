@@ -222,6 +222,33 @@ fn record_test_skip(test: &str, reason: &str, require_env: &str) {
     );
 }
 
+/// The opt-in for a test fixture that escalates through sudo. Nothing sets
+/// it by default, so an ordinary run never asks for root: without it such a
+/// test runs no sudo command at all, not even a `sudo -n true` probe, and
+/// records a named skip. A host whose owner allows test sudo sets it to 1.
+const ALLOW_SUDO_ENV: &str = "HERMIT_TEST_ALLOW_SUDO";
+
+/// Whether `test` may run its sudo fixture, decided before any sudo command
+/// runs: `HERMIT_TEST_ALLOW_SUDO=1` opts in; unset, it records `test`'s
+/// named skip (a failure when `require_env` is set) and answers false; any
+/// other value is ambiguous and fails by name rather than skip or escalate.
+fn sudo_fixture_opted_in(test: &str, require_env: &str) -> bool {
+    match std::env::var_os(ALLOW_SUDO_ENV) {
+        None => {
+            record_test_skip(
+                test,
+                &format!("escalates through sudo, so it runs only when {ALLOW_SUDO_ENV}=1 opts in"),
+                require_env,
+            );
+            false
+        }
+        Some(value) if value == "1" => true,
+        Some(_) => panic!(
+            "{ALLOW_SUDO_ENV} must be unset or 1; {test} escalates through sudo and takes no other value"
+        ),
+    }
+}
+
 /// Compile a `tests/c/` program into `build_root` under `name`.
 fn compile_c_guest(build_root: &Path, name: &str) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -337,11 +364,14 @@ fn autofs_missing_name_is_enoent_under_hermit() {
 /// primitives Hermit's pre-trigger holds rely on and Hermit's own
 /// behavior for unlisted keys. Needs passwordless sudo (autofs has no
 /// `FS_USERNS_MOUNT`, so an unprivileged user namespace cannot mount
-/// it); belongs in the privileged lane and records a named skip
-/// elsewhere.
+/// it), and runs only where `HERMIT_TEST_ALLOW_SUDO=1` opts in to that;
+/// everywhere else it runs no sudo command and records a named skip.
 #[test]
 fn autofs_privileged_fixture_measures_triggers_and_eloop_notice() {
     let test = "autofs_privileged_fixture_measures_triggers_and_eloop_notice";
+    if !sudo_fixture_opted_in(test, "HERMIT_REQUIRE_AUTOFS_FIXTURE") {
+        return;
+    }
     let sudo_ok = Command::new("sudo")
         .args(["-n", "true"])
         .status()
@@ -462,4 +492,106 @@ echo "AUTOFS-FIXTURE-PASS"
         }
     }
     assert_invoker_owned(&work, unsafe { libc::geteuid() });
+}
+
+/// The privileged autofs fixture runs no sudo command without the opt-in,
+/// not even its `sudo -n true` probe, and records a named skip that names
+/// `HERMIT_TEST_ALLOW_SUDO`; with the opt-in set to 1 the probe is the first
+/// sudo command it runs, and any other value fails by name. Each leg runs the
+/// fixture in a child copy of this test binary whose PATH holds only a
+/// stand-in `sudo` that logs its arguments and exits 1, so no real sudo is
+/// reachable from the child whatever the code under test does, and a probe
+/// that does run finds sudo refused and skips before the privileged part.
+#[test]
+fn sudo_fixture_runs_no_sudo_command_without_the_opt_in() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = "autofs_privileged_fixture_measures_triggers_and_eloop_notice";
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sudo-opt-in-{}", std::process::id()));
+    let bin = root.join("bin");
+    assert!(
+        !bin.as_os_str().as_encoded_bytes().contains(&b':'),
+        "the stand-in directory must be one PATH entry: {}",
+        bin.display()
+    );
+    fs::create_dir_all(&bin).expect("failed to create the stand-in sudo directory");
+    let stand_in = bin.join("sudo");
+    fs::write(
+        &stand_in,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SUDO_STAND_IN_LOG\"\nexit 1\n",
+    )
+    .expect("failed to write the stand-in sudo");
+    fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755))
+        .expect("failed to make the stand-in sudo executable");
+    let this_binary = std::env::current_exe().expect("failed to locate this test binary");
+    // Run the fixture with HERMIT_TEST_ALLOW_SUDO as `opt_in` (removed when
+    // None); answer its output, the stand-in's call log and its skip sidecar.
+    let run_leg = |leg: &str, opt_in: Option<&str>| {
+        let log = root.join(format!("{leg}.sudo-calls"));
+        let sidecar = root.join(format!("{leg}.skips"));
+        fs::write(&sidecar, "").expect("failed to create the skip sidecar");
+        let mut child = Command::new(&this_binary);
+        child
+            .args(["--exact", fixture, "--nocapture", "--test-threads=1"])
+            .env("PATH", &bin)
+            .env("SUDO_STAND_IN_LOG", &log)
+            .env("HERMIT_TEST_SKIP_FILE", &sidecar)
+            .env_remove("HERMIT_TEST_ALLOW_SUDO")
+            .env_remove("HERMIT_REQUIRE_AUTOFS_FIXTURE");
+        if let Some(value) = opt_in {
+            child.env("HERMIT_TEST_ALLOW_SUDO", value);
+        }
+        let output = child
+            .output()
+            .expect("failed to run the fixture in a child test process");
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        let skips = fs::read_to_string(&sidecar).expect("failed to read the skip sidecar");
+        (output, calls, skips)
+    };
+    let skip_prefix = format!("HERMIT-TEST-SKIP: {fixture}\t");
+
+    let (output, calls, skips) = run_leg("unset", None);
+    assert!(
+        calls.is_empty(),
+        "without HERMIT_TEST_ALLOW_SUDO the fixture ran sudo with arguments:\n{calls}"
+    );
+    assert!(
+        output.status.success(),
+        "the fixture failed without the opt-in: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        skips.lines().count() == 1
+            && skips.starts_with(&skip_prefix)
+            && skips.contains("HERMIT_TEST_ALLOW_SUDO=1"),
+        "without the opt-in the fixture must record one skip naming HERMIT_TEST_ALLOW_SUDO=1:\n{skips}"
+    );
+
+    let (output, calls, skips) = run_leg("opted-in", Some("1"));
+    assert_eq!(
+        calls, "-n true\n",
+        "with the opt-in the fixture's first sudo command must be its probe"
+    );
+    assert!(
+        output.status.success()
+            && skips.lines().count() == 1
+            && skips.starts_with(&skip_prefix)
+            && skips.contains("needs passwordless sudo"),
+        "a refused probe must record the passwordless-sudo skip: {}\nskips:\n{skips}",
+        output.status
+    );
+
+    let (output, calls, _) = run_leg("ambiguous", Some("yes"));
+    assert!(
+        calls.is_empty(),
+        "an ambiguous HERMIT_TEST_ALLOW_SUDO ran sudo with arguments:\n{calls}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("HERMIT_TEST_ALLOW_SUDO must be unset or 1"),
+        "an ambiguous HERMIT_TEST_ALLOW_SUDO must fail by name: {}\nstderr:\n{stderr}",
+        output.status
+    );
 }

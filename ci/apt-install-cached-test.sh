@@ -42,6 +42,8 @@ hasf() { if grep -qF -- "$2" "$1"; then echo 0; else echo 1; fi; }
 lacks() { if grep -q -- "$2" "$1"; then echo 1; else echo 0; fi; }
 
 work=$(mktemp -d)
+# Every path below hangs off $work, and the stubs in it stand in for root.
+[[ -n $work && -d $work ]] || { echo "apt-install-cached-test: FAIL - mktemp -d made no work directory" >&2; exit 1; }
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin"
 
@@ -136,6 +138,12 @@ esac
 exit 0
 EOF
 chmod +x "$work/bin/"*
+# A stub sudo that is missing or not executable would let PATH lookup fall
+# through to the host's real sudo, so no case runs unless the stub resolves.
+if [[ $(PATH="$work/bin:$PATH" type -P sudo) != "$work/bin/sudo" ]]; then
+    echo "apt-install-cached-test: FAIL - the stub sudo does not resolve first on PATH; refusing to run cases that would reach the host's sudo" >&2
+    exit 1
+fi
 
 # fresh: reset all per-case state and the environment the script reads.
 fresh() {

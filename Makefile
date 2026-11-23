@@ -58,12 +58,12 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 			exit 1; \
 		fi
 
-# `install-deps` is the "install everything this repo needs to build" entrypoint,
-# so it opts into best-effort auto-installation of the native build toolchain via
-# INSTALL_BUILD_TOOLS. Target-specific variables propagate to prerequisites, so
-# the transitive `check-build-tools` prereq sees this and installs before it
-# asserts. `validate`/`release-core` do NOT set it and therefore only assert.
-install-deps: INSTALL_BUILD_TOOLS := 1
+# `install-deps` is the "install everything this repo needs to build" entrypoint.
+# It never installs system packages on its own: its transitive `check-build-tools`
+# prerequisite fails, naming what is missing, unless the caller passes
+# INSTALL_BUILD_TOOLS=1, the only switch that runs `install-build-tools` (which
+# installs through sudo). Nothing in this Makefile sets that variable, so `make`,
+# `make build` and `make install-deps` never escalate unless asked to.
 install-deps: install-hooks check-submodules ## Build and stage the first-party LiteInst runtimes
 	@echo 'make: building the first-party LiteInst runtimes (release profile)'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
@@ -233,6 +233,7 @@ LINT_CHECK_TARGETS := \
     lint-check-image-provenance \
     lint-check-retry-fetch \
     lint-check-apt-install-cached \
+    lint-check-build-tools-opt-in \
     lint-check-pinned-root-cache \
     lint-check-checker-scheduling \
     lint-check-early-artifact-gate \
@@ -361,6 +362,9 @@ lint-check-retry-fetch:
 
 lint-check-apt-install-cached:
 	./ci/apt-install-cached-test.sh
+
+lint-check-build-tools-opt-in:
+	./scripts/test-build-tools-opt-in.sh
 
 lint-check-pinned-root-cache:
 	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
@@ -543,10 +547,11 @@ help: ## Show this help (the list of make targets)
 # fails to SPAWN cmake and panics with the cryptic "failed to configure
 # DynamoRIO: No such file or directory (os error 2)" — an ENOENT on the cmake
 # executable, not a missing source tree (a missing source instead makes cmake
-# exit non-zero). `make install-deps` sets INSTALL_BUILD_TOOLS=1 to best-effort
-# install the toolchain first; every other entrypoint asserts only and fails
-# fast with an actionable message. On a warm box the tools are present and this
-# is a no-op.
+# exit non-zero). Only a caller's explicit INSTALL_BUILD_TOOLS=1 runs
+# `install-build-tools` (through sudo) first; otherwise every entrypoint,
+# `make build` included, asserts only and fails fast naming the missing
+# packages and that opt-in. On a warm box the tools are present and this is a
+# no-op.
 check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler) is present
 	@detect() { \
 		miss=; \
@@ -565,24 +570,40 @@ check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler)
 		missing="$$(detect)"; \
 	fi; \
 	if [ -n "$$missing" ]; then \
+		apt=; dnf=; \
+		case "$$missing" in *cmake*) apt=cmake; dnf=cmake;; esac; \
+		case "$$missing" in *C-compiler*|*C++-compiler*) apt="$${apt:+$$apt }build-essential";; esac; \
+		case "$$missing" in *C-compiler*) dnf="$${dnf:+$$dnf }gcc";; esac; \
+		case "$$missing" in *C++-compiler*) dnf="$${dnf:+$$dnf }gcc-c++";; esac; \
 		echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
 		echo "  The DBT backend builds DynamoRIO from source with CMake; without" >&2; \
 		echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
-		echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
-		echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
-		echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
-		echo "  or run 'make install-deps', which installs them automatically." >&2; \
+		echo "  DynamoRIO: No such file or directory\". Install the missing package(s):" >&2; \
+		echo "    Debian/Ubuntu: $$apt" >&2; \
+		echo "    Fedora/RHEL:   $$dnf" >&2; \
+		if [ "$(INSTALL_BUILD_TOOLS)" = 1 ]; then \
+			echo "  INSTALL_BUILD_TOOLS=1 ran the installer, and they are still missing (see its warnings above)." >&2; \
+		else \
+			echo "  or rerun with INSTALL_BUILD_TOOLS=1 (for example 'make INSTALL_BUILD_TOOLS=1 build')," >&2; \
+			echo "  which runs the installer with sudo. Nothing sets it for you." >&2; \
+		fi; \
 		exit 1; \
 	fi; \
 	echo "make: build tools OK -- cmake, a C compiler and a C++ compiler are all on PATH"
 
 # Best-effort install of the native build toolchain via the platform package
-# manager. Invoked only from the `install-deps` path (INSTALL_BUILD_TOOLS=1).
-# Uses non-interactive sudo so it never hangs on a password prompt in an
-# automated context; if privileges or a package manager are unavailable it warns
-# and returns success, leaving check-build-tools to emit the actionable error.
-install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the platform package manager
-	@echo "install-deps: ensuring native build toolchain (cmake + C/C++ compiler) is installed..."; \
+# manager, through sudo. It runs only when the caller passes
+# INSTALL_BUILD_TOOLS=1: check-build-tools calls it then, and a direct
+# `make install-build-tools` without that opt-in refuses. Uses non-interactive
+# sudo so it never hangs on a password prompt in an automated context; if
+# privileges or a package manager are unavailable it warns and returns success,
+# leaving check-build-tools to emit the actionable error.
+install-build-tools: ## With INSTALL_BUILD_TOOLS=1 only: install cmake + a C/C++ toolchain through sudo and the package manager
+	@if [ "$(INSTALL_BUILD_TOOLS)" != 1 ]; then \
+		echo "install-build-tools: refused -- it installs system packages through sudo, so it runs only when the caller passes INSTALL_BUILD_TOOLS=1" >&2; \
+		exit 1; \
+	fi; \
+	echo "install-build-tools: INSTALL_BUILD_TOOLS=1 -- installing the native build toolchain (cmake + C/C++ compiler)..."; \
 		SUDO=; \
 		if [ "$$(id -u)" != 0 ]; then \
 			if command -v sudo >/dev/null 2>&1; then SUDO="sudo -n"; \
