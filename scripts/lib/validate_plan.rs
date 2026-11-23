@@ -281,12 +281,14 @@ mod tests {
             // peak producer wall across 22 full validations, rounded up to the
             // next 300 s bucket. Its CPU cap is unchanged; its memory cap went
             // from 6 to 10 GiB on 2026-10-16 with width 16 and the release
-            // build beside the test-harness build (a 6.4-6.5 GiB cold peak).
+            // build beside the test-harness build (a 6.4-6.5 GiB cold peak),
+            // and to 13 GiB on 2026-11-22, when cold fresh-clone builds
+            // peaked at 8.2 and 8.3 GiB.
             (
                 "build.rust_scripts".to_string(),
                 1200,
                 7200,
-                Some(10_737_418_240),
+                Some(13_958_643_712),
             ),
             // 6 GiB hard cap since 2026-11-05 (#5165): retained runs sat
             // at the former 4-GiB cap (set 2026-09-30 from a 2.53-GiB cold

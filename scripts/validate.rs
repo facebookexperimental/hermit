@@ -13661,10 +13661,11 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let committed = committed_rust_script_producer(root)?;
     if committed.timeout != RUST_SCRIPT_PRODUCER_WALL_SECONDS
         || committed.cpu_timeout != 7200
-        // Width 16 and the 7/10-GiB memory pair since 2026-10-16, when the
-        // producer began overlapping its release build with the other phases.
-        || committed.hint.rss_baseline_bytes != Some(7 * 1024 * 1024 * 1024)
-        || committed.hint.hard_mem_max_bytes != Some(10 * 1024 * 1024 * 1024)
+        // Width 16 since 2026-10-16, when the producer began overlapping its
+        // release build with the other phases. The 9/13-GiB memory pair since
+        // 2026-11-22: cold fresh-clone builds peaked at 8.2 and 8.3 GiB.
+        || committed.hint.rss_baseline_bytes != Some(9 * 1024 * 1024 * 1024)
+        || committed.hint.hard_mem_max_bytes != Some(13 * 1024 * 1024 * 1024)
         || committed.hint.preferred_inner_jobs != Some(16)
     {
         return Err(format!(
