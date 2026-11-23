@@ -21,7 +21,10 @@ that source bind to read-only; validation nodes explicitly make it writable.
 Output and target volumes are separate and writable. `--cgroups=disabled` keeps
 the container and its monitor inside the caller's resource group, so the outer
 node accounts for and terminates their descendants. The wrapper does not add
-an independent container resource policy.
+an independent container resource policy. `--init` makes Podman's own init
+(catatonit, from the host) the container's PID 1 and the command its child, so
+orphans the command's descendants leave, such as Hermit's detached KVM teardown
+helper, are reaped instead of piling up as zombies under the command.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest

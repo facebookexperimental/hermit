@@ -745,6 +745,23 @@ env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 # --pull=never: the exact digest must already be in the local store; the run
 # never fetches it, so a missing image fails here rather than being pulled.
+#
+# --init: the payload must not be the init of the container's PID namespace.
+# Without it, taskset, the node's `exec bash -c` guard and the wrappers it runs
+# exec down to the payload itself (test-harness, for every E2E bucket), so the
+# payload is PID 1. The kernel re-parents every orphan in the namespace to that
+# init (kernel/exit.c, find_new_reaper), and an orphan that exits stays a
+# zombie until its init waits for it. test-harness waits only for the
+# children it started, and must: its runner waits for each leader by PID and
+# reads that leader's rusage, which a blanket wait(-1) would steal. Hermit's
+# KVM VM teardown helper (hermit-vm-reap) is deliberately detached so the VM
+# destroy stays off the CLI's exit path, so every KVM run leaves one orphan,
+# which stays a zombie under test-harness until the node ends. --init runs
+# Podman's own init (catatonit, from the host's containers.conf init_path; not
+# from the image, so --pull=never and the pinned digest are unchanged) as
+# PID 1 and the payload as its child: it reaps every orphan, forwards the
+# signals Podman proxies to the payload, and exits with the payload's status
+# (128 + the signal number when a signal killed it).
 
 # A container runtime can widen the task affinity even with cgroups disabled.
 # Restore the actual caller's set inside the container before executing the
@@ -794,6 +811,7 @@ done <<< "$proc_status"
 
 exec podman run --rm \
     --pull=never \
+    --init \
     --cgroups=disabled \
     --privileged \
     --hostname=hermetic-container.local \

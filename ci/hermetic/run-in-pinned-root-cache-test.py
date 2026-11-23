@@ -463,6 +463,23 @@ class CargoCacheMounts(unittest.TestCase):
         )
         self.assertLess(argv.index("GIT_OPTIONAL_LOCKS=0"), image)
 
+    def test_payload_is_not_the_container_init(self):
+        # The payload is exec'd as PID 1 of the container's PID namespace
+        # unless Podman runs an init above it, and every orphan in the
+        # namespace is then re-parented to the payload, which waits only for
+        # its own children: one zombie per KVM run under test-harness. --init
+        # must be a `podman run` option, before the image; after it, it would
+        # be a payload argument.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        self.assertEqual(argv[0], "run")
+        self.assertEqual(argv.count("--init"), 1)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("--init"), image)
+
     def test_payload_uses_cargo_checksum_freshness(self):
         # Every pinned-root container shares /src/target, and Cargo marks a
         # unit dirty when its prior build used checksum freshness and this
