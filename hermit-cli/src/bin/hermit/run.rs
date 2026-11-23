@@ -2053,7 +2053,10 @@ pub struct RunOpts {
     /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is refused before
     /// the guest starts: clock syscalls would return host time, which reaches the guest unbound,
     /// so the run could not be reproduced from its command line (`hermit record` reproduces a
-    /// host-time run). On the ptrace backend, `--strict` also refuses to run when the host's
+    /// host-time run). `--debug-futex-mode=external` is refused before the guest starts too:
+    /// it ends every futex wait at an instant the host decides, so a sibling's `FUTEX_WAKE`
+    /// could be admitted at another point in a rerun. On the ptrace backend, `--strict` also
+    /// refuses to run when the host's
     /// performance counters fail Reverie's validation, because the virtual clock counts retired
     /// branches and cannot be exact;
     /// with `--max-timeslice=disabled` Detcore uses no branch count, so that run is not refused
@@ -6750,6 +6753,197 @@ fn strict_refuses_host_time_by_every_route() {
     );
     validate(&["--from", host_time.as_str()]).expect("the manifest validates without --strict");
     refused(&["--from", strict.as_str()], "--from");
+}
+
+/// `--strict` refuses `--debug-futex-mode=external` by name
+/// (`strict-external-futex-mode`): that mode admits a futex wake at a
+/// host-timed instant. Validation refuses it whether the options come from the
+/// command line, a `--config` file or a `--from` manifest, as a policy
+/// refusal: the CLI exits `HERMIT_POLICY_REFUSAL_EXIT` (122) with the
+/// `HERMIT_POLICY_REFUSAL class=policy-refusal` line. Each route accepts the
+/// mode without `--strict`, and `--strict` accepts the precise and polling
+/// modes, so the refusal is the combination's.
+///
+/// `--allow-unsupported-syscalls` never lifts it. On every route the opt-in
+/// cannot even be combined with `--strict`: clap refuses the pair before
+/// validation, as it did before this refusal existed. The refusal itself does
+/// not consult the opt-in either, so options that hold both still get it by
+/// name.
+#[test]
+fn strict_refuses_the_external_futex_mode_by_every_route() {
+    use clap::CommandFactory as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    // Validates `hermit run ARGS -- /bin/true`, expanded as `main` expands a
+    // `--config` or `--from` before parsing.
+    let validate = |run: &[&str]| -> Result<(), Error> {
+        let argv: Vec<std::ffi::OsString> = ["hermit", "run"]
+            .iter()
+            .chain(run)
+            .chain(&["--", "/bin/true"])
+            .map(std::ffi::OsString::from)
+            .collect();
+        let argv = crate::app::run_config::expand_argv(&crate::app::Args::command(), &argv)?
+            .unwrap_or(argv);
+        let matches = crate::app::Args::command().try_get_matches_from(&argv)?;
+        let mut args = crate::app::args_from_matches_with_clock(&matches, || {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600)
+        })?;
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
+            panic!("{argv:?} is not a `run` command");
+        };
+        run.validate_args_with_perf_support(true)
+    };
+    let refused_by_name = |result: Result<(), Error>, route: &str| {
+        let error = result.expect_err(route);
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(
+                "--strict refuses --debug-futex-mode=external (strict-external-futex-mode):"
+            ) && message.contains("host-timed")
+                && message.contains("--allow-unsupported-syscalls does not lift this refusal"),
+            "{route}: {message}"
+        );
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{route}: not a policy refusal: {message}"
+        );
+        // What the CLI reports for it: the status and the stderr class line.
+        assert_eq!(
+            crate::app::failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            "{route}: {message}"
+        );
+        assert_eq!(
+            crate::app::classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal",
+            "{route}: {message}"
+        );
+    };
+    let refused = |run: &[&str], route: &str| refused_by_name(validate(run), route);
+    // The opt-in beside `--strict`: clap's conflict, before validation.
+    let conflicts = |run: &[&str], route: &str| {
+        let error = validate(run).expect_err(route);
+        let message = format!("{error:#}");
+        assert_eq!(
+            error.downcast_ref::<clap::Error>().map(clap::Error::kind),
+            Some(clap::error::ErrorKind::ArgumentConflict),
+            "{route}: {message}"
+        );
+        assert!(
+            message.contains("--strict") && message.contains("--allow-unsupported-syscalls"),
+            "{route}: {message}"
+        );
+    };
+
+    // The command line: only the combination is refused.
+    validate(&["--strict"]).expect("--strict with the default futex mode validates");
+    validate(&["--strict", "--debug-futex-mode=precise"])
+        .expect("--strict with the precise futex mode validates");
+    validate(&["--strict", "--debug-futex-mode=polling"])
+        .expect("--strict with the polling futex mode validates");
+    validate(&["--debug-futex-mode=external"])
+        .expect("the external futex mode without --strict validates");
+    refused(&["--strict", "--debug-futex-mode=external"], "command line");
+    conflicts(
+        &[
+            "--strict",
+            "--debug-futex-mode=external",
+            "--allow-unsupported-syscalls",
+        ],
+        "command line, with --allow-unsupported-syscalls",
+    );
+
+    // A `--config` file, alone and with `--strict` or the opt-in from the
+    // command line.
+    let config = |name: &str, strict: bool, allow: bool| {
+        let path = directory.path().join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "schema: {}\nrun:\n  strict: {strict}\n  debug-futex-mode: external\n  \
+                 allow-unsupported-syscalls: {allow}\n",
+                crate::app::run_config::SCHEMA
+            ),
+        )
+        .unwrap();
+        path.to_str().expect("config path is UTF-8").to_owned()
+    };
+    let (strict, strict_allowed, debugging) = (
+        config("strict", true, false),
+        config("strict-allowed", true, true),
+        config("debugging", false, false),
+    );
+    validate(&["--config", debugging.as_str()]).expect("the config validates without --strict");
+    refused(&["--config", strict.as_str()], "--config");
+    refused(
+        &["--strict", "--config", debugging.as_str()],
+        "--strict on the command line, --debug-futex-mode=external in --config",
+    );
+    conflicts(
+        &["--config", strict_allowed.as_str()],
+        "--config, with allow-unsupported-syscalls",
+    );
+    conflicts(
+        &[
+            "--strict",
+            "--allow-unsupported-syscalls",
+            "--config",
+            debugging.as_str(),
+        ],
+        "--strict and the opt-in on the command line, the mode in --config",
+    );
+
+    // A `--from` manifest holding the same options.
+    let manifest = |config: &str, name: &str| {
+        let loaded = crate::app::run_config::read(Path::new(config)).unwrap();
+        let (global, run) = crate::app::run_config::to_manifest_parts(&loaded).unwrap();
+        let manifest = crate::app::manifest::Manifest::new(
+            hermit::Id::unique(),
+            crate::app::manifest::Kind::InputsOnly,
+            crate::app::manifest::Command {
+                program: Some("/bin/true".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            crate::app::manifest::Inputs {
+                global,
+                run,
+                host_drawn: Default::default(),
+            },
+        );
+        let at = directory
+            .path()
+            .join(name)
+            .join(crate::app::manifest::MANIFEST_NAME);
+        crate::app::manifest::write(&at, &manifest).unwrap();
+        at.parent().unwrap().to_str().unwrap().to_owned()
+    };
+    let (strict, strict_allowed, debugging) = (
+        manifest(&strict, "strict-manifest"),
+        manifest(&strict_allowed, "strict-allowed-manifest"),
+        manifest(&debugging, "debugging-manifest"),
+    );
+    validate(&["--from", debugging.as_str()]).expect("the manifest validates without --strict");
+    refused(&["--from", strict.as_str()], "--from");
+    conflicts(
+        &["--from", strict_allowed.as_str()],
+        "--from, with allow-unsupported-syscalls",
+    );
+
+    // Options that hold the opt-in beside `--strict` without passing through
+    // clap are refused by name: the refusal does not read the opt-in.
+    let mut options = RunOpts::parse_from([
+        "fakehermit",
+        "--strict",
+        "--debug-futex-mode=external",
+        "fakeprog",
+    ]);
+    options.allow_unsupported_syscalls = true;
+    refused_by_name(
+        options.validate_args_with_perf_support(true),
+        "--strict and the opt-in set together",
+    );
 }
 
 #[test]
@@ -15455,6 +15649,7 @@ impl RunOpts {
         // (`validate_args`, and the tests that validate without the timer
         // probe) reaches it here.
         self.refuse_strict_with_host_time()?;
+        self.refuse_strict_with_external_futex_mode()?;
         // Before the image is resolved, which this refusal does not need.
         self.refuse_exclusive_rewrite_in_an_image()?;
         self.resolve_image_default_program()?;
@@ -21042,6 +21237,38 @@ impl RunOpts {
                  which reaches the guest unbound (nothing records it for a rerun to reproduce). \
                  Remove --no-virtualize-time, or run without --strict; hermit record can \
                  reproduce a host-time run.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `--strict` refuses `--debug-futex-mode=external`, by the name
+    /// `strict-external-futex-mode`. That mode sends every futex wait to the
+    /// external pool (`BlockingMode::External`), where it ends when the host
+    /// completes it: a sibling's `FUTEX_WAKE`, an inside cause, is admitted at
+    /// a host-timed instant that nothing in the schedule fixes, so a rerun of
+    /// the same command line can order the wake differently. Without
+    /// `--strict` the mode stays a debugging aid, outside any determinism
+    /// claim.
+    ///
+    /// It reads the resolved configuration, so the flag, a `--config` key and a
+    /// `--from` manifest are refused alike, before anything is launched. No
+    /// option overrides it: `--allow-unsupported-syscalls` lifts refusals of
+    /// guest calls, never of Hermit's own configuration.
+    ///
+    /// A [`PolicyRefusal`]: Hermit worked and stopped the run on purpose, so it
+    /// exits `HERMIT_POLICY_REFUSAL_EXIT` (122) with the
+    /// `HERMIT_POLICY_REFUSAL class=policy-refusal` line, not as a failure.
+    fn refuse_strict_with_external_futex_mode(&self) -> Result<(), Error> {
+        if self.strict
+            && self.det_opts.det_config.debug_futex_mode == detcore::BlockingMode::External
+        {
+            return Err(Error::new(PolicyRefusal).context(
+                "--strict refuses --debug-futex-mode=external (strict-external-futex-mode): \
+                 every futex wait would go to the external pool and end when the host completes \
+                 it, so a sibling's FUTEX_WAKE would be admitted at a host-timed instant that no \
+                 rerun reproduces. Use --debug-futex-mode=precise (the default) or polling, or \
+                 run without --strict; --allow-unsupported-syscalls does not lift this refusal.",
             ));
         }
         Ok(())

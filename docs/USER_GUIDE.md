@@ -172,8 +172,10 @@ the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
 starts instead of drawing that input from the host. `--strict` also refuses
 `--no-virtualize-time`, whether it is given on the command line, in a
 `--config` file or by a `--from` manifest: clock syscalls would return host
-time, which nothing records for a rerun to reproduce. That refusal is a policy
-refusal (exit 122, with the stderr line
+time, which nothing records for a rerun to reproduce. It refuses
+`--debug-futex-mode=external` by the same routes, and no option overrides it:
+that debugging mode ends a futex wait at a host-timed instant. Each refusal is
+a policy refusal (exit 122, with the stderr line
 `HERMIT_POLICY_REFUSAL class=policy-refusal`). `hermit record` reproduces a
 host-time run.
 
@@ -1384,7 +1386,7 @@ that their order decides the failure.
 
 | Option | Effect |
 | --- | --- |
-| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), do not use `--seed-from=SystemRandom`, and keep virtual time (`--no-virtualize-time` is refused). |
+| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), do not use `--seed-from=SystemRandom`, and keep virtual time (`--no-virtualize-time` is refused); `--debug-futex-mode=external` is refused too. |
 | `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--untrap-passthrough-syscalls` | Off by default. Lets `getppid`, `umask`, `getgroups`, `capget`, `sched_get_priority_max`, `sched_get_priority_min` and `get_robust_list`, which Detcore always passes through unchanged and which never wait, run without a tracer stop. They then charge no virtual time, log no DETLOG line, are not counted in the run summary (its syscall histogram says so) and end no timeslice, so the clock, schedule, turn numbers and log differ from a run without the flag, the same way in every run with it. Ptrace backend only; refused with `--strict`, `--namespace-only`, without RCB time (`--max-timeslice=disabled`, `--no-rcb-time`, or a host without usable performance counters), with a preemption record to write or replay (`--record-preemptions`, `--record-preemptions-to`, `--replay-preemptions-from`, `--replay-schedule-from`, whether given on the command line, in a `--config` file or by a `--from` manifest), `--happens-before`, `--verify-run` and in `hermit analyze`. |

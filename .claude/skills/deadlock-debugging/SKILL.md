@@ -216,7 +216,7 @@ Use alternate modes only for differential diagnosis:
 timeout 30s target/release/hermit --log debug run --strict \
   --debug-futex-mode polling -- COMMAND [ARGS...] 2> /tmp/futex-polling.log
 
-timeout 30s target/release/hermit --log debug run --strict \
+timeout 30s target/release/hermit --log debug run \
   --debug-futex-mode external -- COMMAND [ARGS...] 2> /tmp/futex-external.log
 ```
 

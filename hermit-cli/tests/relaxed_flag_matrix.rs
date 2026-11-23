@@ -448,6 +448,110 @@ fn invalid_matrix_states_are_rejected_without_panicking() {
     }
 }
 
+/// `--strict` refuses `--debug-futex-mode=external` before the guest starts,
+/// by the name `strict-external-futex-mode`: that mode admits a futex wake at
+/// a host-timed instant. The refusal is a policy refusal (exit
+/// `HERMIT_POLICY_REFUSAL_EXIT` and the `HERMIT_POLICY_REFUSAL
+/// class=policy-refusal` line) with no guest output, from the command line and
+/// from a `--config` file. `--allow-unsupported-syscalls` does not lift it:
+/// beside `--strict` the opt-in is a usage error (exit 2), and the guest does
+/// not run either. Without `--strict` the mode still runs the guest as a
+/// debugging aid, and `--strict` still runs it in the precise and polling
+/// modes.
+#[test]
+fn strict_refuses_the_external_futex_mode_before_the_guest_runs() {
+    const MARKER: &str = "external-futex-mode-guest-ran";
+    let directory = tempfile::tempdir().expect("failed to create a config directory");
+    let strict_config = directory.path().join("strict.yaml");
+    fs::write(
+        &strict_config,
+        "schema: hermit-run-config/v2\nrun:\n  strict: true\n  debug-futex-mode: external\n",
+    )
+    .expect("failed to write a run config");
+    let strict_config = strict_config.to_str().expect("config path is UTF-8");
+    let run = |args: &[&str]| -> Output {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", KILL_AFTER, "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("run")
+            .args(args)
+            .args(["--", "/bin/echo", MARKER]);
+        hermit_test::configure_guest_execution(&mut command);
+        hermit_test::hermit_output(&format!("{command:?}"), &mut command)
+    };
+
+    let refused: [&[&str]; 2] = [
+        &["--strict", "--debug-futex-mode=external"],
+        &["--config", strict_config],
+    ];
+    for args in refused {
+        let output = run(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?} was not refused as a policy refusal\n{}",
+            bounded_output(&output),
+        );
+        assert!(
+            stderr.contains(
+                "--strict refuses --debug-futex-mode=external (strict-external-futex-mode):"
+            ) && stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{args:?} was not refused by name\n{}",
+            bounded_output(&output),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?}: the refused guest ran\n{}",
+            bounded_output(&output),
+        );
+    }
+
+    let args = [
+        "--strict",
+        "--debug-futex-mode=external",
+        "--allow-unsupported-syscalls",
+    ];
+    let output = run(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{args:?} was not refused as a usage error\n{}",
+        bounded_output(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+        "{args:?} was not refused for the conflict\n{}",
+        bounded_output(&output),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "{args:?}: the refused guest ran\n{}",
+        bounded_output(&output),
+    );
+
+    let ran: [&[&str]; 3] = [
+        &["--debug-futex-mode=external"],
+        &["--strict", "--debug-futex-mode=precise"],
+        &["--strict", "--debug-futex-mode=polling"],
+    ];
+    for args in ran {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{args:?} did not run the guest\n{}",
+            bounded_output(&output),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{MARKER}\n"),
+            "{args:?}\n{}",
+            bounded_output(&output),
+        );
+    }
+}
+
 #[test]
 #[ignore = "occasional e2e: exhaustive ptrace flag matrix requires mount namespaces"]
 fn meaningful_flag_combinations_run_without_crashing() {
