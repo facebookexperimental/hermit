@@ -4173,11 +4173,41 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
     })
 }
 
+/// The CPUs the machine Detcore presents has in sysfs: how many, and whether
+/// each has a `cache` directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SysfsCpus {
+    /// How many CPUs (`Config::virtual_cpu_count`): `cpuN` for each N below.
+    pub(crate) count: u32,
+    /// Whether each CPU has its `cache` directory. On a GenuineIntel CPU
+    /// Linux builds that directory from CPUID leaf 4 alone
+    /// (`populate_cache_leaves`), and a CPU whose leaf 4 lists no cache has
+    /// none: `init_cache_level` is -ENOENT for zero leaves
+    /// (arch/x86/kernel/cpu/cacheinfo.c in v7.3). False where Detcore
+    /// answers the guest's CPUID instruction from a virtual table, which
+    /// lists none (`Detcore::sysfs_cpus`).
+    pub(crate) caches: bool,
+}
+
+#[cfg(test)]
+impl SysfsCpus {
+    /// `count` CPUs, each with the host's `cache` directory.
+    pub(crate) fn with_caches(count: u32) -> Self {
+        Self {
+            count,
+            caches: true,
+        }
+    }
+}
+
 /// Whether `name`, an entry of the directory at the canonical path
 /// `directory`, is absent from the machine Detcore presents: a CPU or
-/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
-/// CPUs does not have, and every NUMA node name, because that machine is
-/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
+/// cpufreq policy numbered `cpus.count` or more, which a machine with that
+/// many CPUs does not have; a CPU's `cache` directory where its CPUID lists
+/// no cache ([`SysfsCpus::caches`],
+/// https://github.com/facebookexperimental/hermit/issues/438); and every
+/// NUMA node name, because that machine is a kernel built without NUMA
+/// (https://github.com/rrnewton/hermit/issues/5269).
 /// Without `drivers/base/node.o` Linux registers no node subsystem, so the
 /// `node` directory itself is missing from `/sys/devices/system` and from
 /// `/sys/bus` — not an empty directory — and neither a memory block nor a
@@ -4187,7 +4217,7 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
 /// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
 /// and libnuma counts them and probes `/sys/devices/system/node`, which a
 /// kernel without NUMA does not have.
-pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
+pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: SysfsCpus) -> bool {
     match (directory.to_str(), name) {
         // The node directory itself, in each of its two parents.
         (Some("/sys/devices/system" | "/sys/bus"), b"node") => return true,
@@ -4205,6 +4235,10 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
     // node subsystem no CPU is registered on a node (`register_cpu`'s
     // `register_cpu_under_node` is a `CONFIG_NUMA` stub returning 0).
     if cpu_backlink_directory(directory) {
+        // The CPU's `cache` directory, which Linux builds from CPUID leaf 4.
+        if name == b"cache" {
+            return !cpus.caches;
+        }
         return name
             .strip_prefix(b"node")
             .is_some_and(|node| !node.is_empty() && node.iter().all(u8::is_ascii_digit));
@@ -4216,11 +4250,11 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
             // The processor driver's link to each CPU it binds. (A node's
             // links to its CPUs went with the node directory.)
             | "/sys/bus/cpu/drivers/processor",
-        ) => (b"cpu", cpus),
+        ) => (b"cpu", cpus.count),
         // Inside the node directories themselves, should a listing of one
         // ever be filtered: no node is present.
         Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 0),
-        Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
+        Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus.count),
         // A memory block's link to the node it belongs to: none, without NUMA.
         Some(directory)
             if directory
@@ -4250,9 +4284,9 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
 /// `/sys/devices/system/node/node0/cpulist`. `None` where no component is
 /// absent, for a relative path, and at a `..` (the kernel's to resolve,
 /// through any link before it). A lookup of the prefix, or of a name below
-/// it, finds nothing, as on the machine with `cpus` CPUs and no NUMA that
-/// the listings, `online` and `sched_getaffinity` describe.
-pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf> {
+/// it, finds nothing, as on the machine with `cpus` and no NUMA that the
+/// listings, `online` and `sched_getaffinity` describe.
+pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: SysfsCpus) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
         return None;
@@ -9630,7 +9664,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             (
                 "/sys/devices/system/cpu/cpu0",
                 &["node0", "node2", "node999"],
-                &["node", "nodex", "online", "topology"],
+                &["node", "nodex", "online", "topology", "cache"],
             ),
             (
                 "/sys/bus/cpu/devices/cpu0",
@@ -9656,13 +9690,21 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         ] {
             for name in absent {
                 assert!(
-                    is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                    is_absent_cpu_entry(
+                        Path::new(directory),
+                        name.as_bytes(),
+                        SysfsCpus::with_caches(1)
+                    ),
                     "{directory}/{name}"
                 );
             }
             for name in kept {
                 assert!(
-                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                    !is_absent_cpu_entry(
+                        Path::new(directory),
+                        name.as_bytes(),
+                        SysfsCpus::with_caches(1)
+                    ),
                     "{directory}/{name}"
                 );
             }
@@ -9682,7 +9724,11 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/sys/devices/system/cpu/cpu3", "topology", false),
         ] {
             assert_eq!(
-                is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 4),
+                is_absent_cpu_entry(
+                    Path::new(directory),
+                    name.as_bytes(),
+                    SysfsCpus::with_caches(4)
+                ),
                 absent,
                 "{directory}/{name}"
             );
@@ -9694,7 +9740,11 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/tmp", "cpu1"),
         ] {
             assert!(
-                !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                !is_absent_cpu_entry(
+                    Path::new(directory),
+                    name.as_bytes(),
+                    SysfsCpus::with_caches(1)
+                ),
                 "{directory}/{name}"
             );
         }
@@ -9771,7 +9821,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ),
         ] {
             assert_eq!(
-                absent_cpu_entry_prefix(Path::new(path), 1).as_deref(),
+                absent_cpu_entry_prefix(Path::new(path), SysfsCpus::with_caches(1)).as_deref(),
                 Some(Path::new(prefix)),
                 "{path}"
             );
@@ -9788,8 +9838,95 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             "sys/devices/system/cpu/cpu1",
             "/tmp/cpu1/x",
         ] {
-            assert_eq!(absent_cpu_entry_prefix(Path::new(path), 1), None, "{path}");
+            assert_eq!(
+                absent_cpu_entry_prefix(Path::new(path), SysfsCpus::with_caches(1)),
+                None,
+                "{path}"
+            );
         }
+    }
+
+    /// On a machine whose CPUs' CPUID lists no leaf-4 cache, as every virtual
+    /// table's does, each CPU's `cache` directory is absent, by every spelling
+    /// of the CPU's directory, and so is everything below it: Linux builds
+    /// that directory from leaf 4 alone (`init_cache_level` is -ENOENT for
+    /// zero leaves, arch/x86/kernel/cpu/cacheinfo.c in v7.3;
+    /// https://github.com/facebookexperimental/hermit/issues/438). A machine
+    /// whose CPUs keep the host's caches keeps the directory.
+    #[test]
+    fn a_cpu_whose_cpuid_lists_no_cache_has_no_cache_directory() {
+        let none = SysfsCpus {
+            count: 2,
+            caches: false,
+        };
+        let kept = SysfsCpus::with_caches(2);
+        for directory in [
+            "/sys/devices/system/cpu/cpu0",
+            "/sys/devices/system/cpu/cpu1",
+            "/sys/bus/cpu/devices/cpu1",
+            "/sys/bus/cpu/drivers/processor/cpu0",
+        ] {
+            assert!(
+                is_absent_cpu_entry(Path::new(directory), b"cache", none),
+                "{directory}"
+            );
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), b"cache", kept),
+                "{directory}"
+            );
+            // The CPU's other entries stay.
+            for name in ["topology", "online", "cpufreq", "caches"] {
+                assert!(
+                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), none),
+                    "{directory}/{name}"
+                );
+            }
+        }
+        // Only a CPU's own directory: no other `cache` entry is the CPU's.
+        for directory in [
+            "/sys/devices/system/cpu",
+            "/sys/devices/system/cpu/cpu0/topology",
+            "/sys/devices/system/cpu/cpu0/cache",
+            "/sys/kernel/mm",
+            "/tmp",
+        ] {
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), b"cache", none),
+                "{directory}"
+            );
+        }
+        for (path, prefix) in [
+            (
+                "/sys/devices/system/cpu/cpu0/cache",
+                "/sys/devices/system/cpu/cpu0/cache",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu1/cache/index0/size",
+                "/sys/devices/system/cpu/cpu1/cache",
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0/cache/index3/shared_cpu_list",
+                "/sys/bus/cpu/devices/cpu0/cache",
+            ),
+            // A CPU the machine does not have is absent first.
+            (
+                "/sys/devices/system/cpu/cpu2/cache/index0/size",
+                "/sys/devices/system/cpu/cpu2",
+            ),
+        ] {
+            assert_eq!(
+                absent_cpu_entry_prefix(Path::new(path), none).as_deref(),
+                Some(Path::new(prefix)),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            absent_cpu_entry_prefix(
+                Path::new("/sys/devices/system/cpu/cpu1/cache/index0/size"),
+                kept
+            ),
+            None
+        );
     }
 
     /// A device's NUMA attribute is absent where its subsystem's devices have

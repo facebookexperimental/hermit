@@ -1081,8 +1081,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
                 return None;
             }
-            let prefix =
-                crate::procfs::absent_cpu_entry_prefix(&observed, self.cfg.virtual_cpu_count())?;
+            let prefix = crate::procfs::absent_cpu_entry_prefix(&observed, self.sysfs_cpus(guest))?;
             let parent = prefix.parent()?;
             if !is_on_sysfs(parent) {
                 return None;
@@ -1520,18 +1519,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether the sysfs object at `path`, the kernel's path for it in the
     /// tool's view, is one the machine Detcore presents does not have, or is
-    /// below one: a CPU or node entry of the directories that list them
-    /// ([`crate::procfs::absent_cpu_entry_prefix`]), or a device's NUMA
+    /// below one: a CPU, node or CPU cache entry of the directories that list
+    /// them ([`crate::procfs::absent_cpu_entry_prefix`]), or a device's NUMA
     /// attribute that a kernel without NUMA does not register
     /// ([`crate::procfs::absent_device_attribute_prefix`]).
-    pub(crate) fn is_absent_sysfs_object(&self, path: &Path) -> bool {
-        self.absent_sysfs_prefix(path).is_some()
+    pub(crate) fn is_absent_sysfs_object<G: Guest<Self>>(&self, guest: &G, path: &Path) -> bool {
+        self.absent_sysfs_prefix(guest, path).is_some()
     }
 
     /// The prefix of `path` that ends at the object
     /// [`Self::is_absent_sysfs_object`] finds absent.
-    fn absent_sysfs_prefix(&self, path: &Path) -> Option<PathBuf> {
-        crate::procfs::absent_cpu_entry_prefix(path, self.cfg.virtual_cpu_count())
+    fn absent_sysfs_prefix<G: Guest<Self>>(&self, guest: &G, path: &Path) -> Option<PathBuf> {
+        crate::procfs::absent_cpu_entry_prefix(path, self.sysfs_cpus(guest))
             .or_else(|| crate::procfs::absent_device_attribute_prefix(path))
     }
 
@@ -1727,7 +1726,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(_) => true,
             },
         };
-        let cpus = self.cfg.virtual_cpu_count();
+        let cpus = self.sysfs_cpus(guest);
         let own_entries = self.own_procfs_entries(guest);
         absent_on_walk(
             &named,
@@ -1758,7 +1757,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &syscalls::Openat,
         object: &Path,
     ) -> Error {
-        let dashed = self.absent_sysfs_prefix(object).and_then(|prefix| {
+        let dashed = self.absent_sysfs_prefix(guest, object).and_then(|prefix| {
             dashed_spelling(
                 prefix.parent()?,
                 &prefix,

@@ -989,6 +989,69 @@ fn proc_cpuinfo_is_deterministic() {
     });
 }
 
+/// What the guest's shell finds of cpu0's `cache` directory, by listing cpu0
+/// (`listed=`, getdents) and by looking the directory and a file below it up
+/// (`looked-up=`, `size=`, stat), run once with CPUID virtualized under the
+/// table `--cpu-profile=auto` selects, or with the host's CPUID
+/// (`host_cpuid`).
+///
+/// The guest is the host's own shell, so the virtual run names auto: on a
+/// userland whose C library declares x86-64-v3 (CentOS 10), the guest's
+/// loader refuses to start under the x86-64-v2 table, before the probe runs.
+/// Every virtual table lists no leaf-4 cache, so auto keeps the absence this
+/// test asserts. With the host's CPUID the loader checks the host's CPU, so
+/// that control keeps the x86-64-v2 name.
+fn cpu0_cache_directory_seen(host_cpuid: bool) -> String {
+    let _guard = hermit_run_lock();
+    let script = "listed=absent; \
+        for entry in /sys/devices/system/cpu/cpu0/*; do \
+        [ \"${entry##*/}\" = cache ] && listed=present; done; echo \"listed=$listed\"; \
+        if [ -e /sys/devices/system/cpu/cpu0/cache ]; then echo looked-up=present; \
+        else echo looked-up=absent; fi; \
+        if [ -e /sys/devices/system/cpu/cpu0/cache/index0/size ]; then echo size=present; \
+        else echo size=absent; fi";
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args(["--log=error", "run", "--base-env=minimal"]);
+    if host_cpuid {
+        command.args(["--no-virtualize-cpuid", "--cpu-profile=x86-64-v2"]);
+    } else {
+        command.arg("--cpu-profile=auto");
+    }
+    command.args(["--max-timeslice=disabled", "--", "/bin/sh", "-c", script]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "cache probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("cache probe output should be UTF-8")
+}
+
+/// Where Detcore answers CPUID from a virtual table, cpu0 has no `cache`
+/// directory, as Linux has none for that CPU: on GenuineIntel Linux builds
+/// it from CPUID leaf 4 alone, and the virtual tables' leaf 4 lists no
+/// cache, so `init_cache_level` is -ENOENT (arch/x86/kernel/cpu/cacheinfo.c
+/// in v7.3). The host's directory described the host's caches, which
+/// differ from host to host and contradict the virtual CPUID
+/// (https://github.com/facebookexperimental/hermit/issues/438). With the
+/// host's CPUID the host's directory stays.
+#[test]
+fn a_virtual_cpu_has_no_cache_directory() {
+    const ABSENT: &str = "listed=absent\nlooked-up=absent\nsize=absent\n";
+    assert_eq!(cpu0_cache_directory_seen(false), ABSENT);
+    assert_eq!(cpu0_cache_directory_seen(false), ABSENT);
+    if Path::new("/sys/devices/system/cpu/cpu0/cache/index0/size").exists() {
+        assert_eq!(
+            cpu0_cache_directory_seen(true),
+            "listed=present\nlooked-up=present\nsize=present\n"
+        );
+    }
+}
+
 #[test]
 fn sys_cpu_lists_report_one_virtual_cpu() {
     // Batched by flag set, two launches each: the CPU-list and mask

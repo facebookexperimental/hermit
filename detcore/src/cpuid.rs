@@ -339,6 +339,28 @@ impl InterceptedCpuid {
             })
             .collect()
     }
+
+    /// How many caches this table's leaf 4 lists, counted as Linux counts a
+    /// GenuineIntel CPU's (every virtual table is one): the subleaves before
+    /// the first whose cache type is null (`find_num_cache_leaves`,
+    /// arch/x86/kernel/cpu/cacheinfo.c in v7.3). Linux builds a CPU's sysfs
+    /// `cache` directory from these leaves alone, so a CPU with none has no
+    /// such directory (`init_cache_level` is -ENOENT).
+    pub fn cache_leaves(&self) -> u32 {
+        count_cache_leaves(|subleaf| self.cpuid(4, subleaf).unwrap_or(cpuid_result(0, 0, 0, 0)))
+    }
+}
+
+/// The most leaf-4 subleaves [`count_cache_leaves`] looks at: more than any
+/// CPU lists, so that a table whose leaf 4 never ends still answers.
+const MAX_CACHE_LEAVES: u32 = 64;
+
+/// How many leaf-4 subleaves `leaf4` answers before the first whose cache
+/// type (EAX bits 4-0) is null, at most [`MAX_CACHE_LEAVES`].
+fn count_cache_leaves(leaf4: impl Fn(u32) -> CpuIdResult) -> u32 {
+    (0..MAX_CACHE_LEAVES)
+        .take_while(|&subleaf| leaf4(subleaf).eax & 0x1f != 0)
+        .count() as u32
 }
 
 /// Whether CPUID's answer to `leaf` names the CPU that executes it: leaf 1's
@@ -1377,6 +1399,32 @@ mod tests {
             probe_cases: 33,
             probe_forced_exit: false,
         }
+    }
+
+    /// Every virtual table's leaf 4 lists no cache: subleaf 0's cache type
+    /// is null, so Linux builds no sysfs `cache` directory for its CPU
+    /// (https://github.com/facebookexperimental/hermit/issues/438). A leaf 4
+    /// that lists caches counts them up to its null subleaf.
+    #[test]
+    fn virtual_tables_list_no_leaf4_cache() {
+        for table in [
+            InterceptedCpuid::new(),
+            InterceptedCpuid::legacy_v2(),
+            InterceptedCpuid::v3(&epyc_9d85()),
+        ] {
+            assert_eq!(table.cache_leaves(), 0, "{:?}", table.profile);
+        }
+        // An L1d, an L1i, a unified L2 and a unified L3 (EAX's type in bits
+        // 4-0, level in bits 7-5), then the null subleaf.
+        let caches = [0x121, 0x122, 0x143, 0x163, 0];
+        let listed = |subleaf: u32| {
+            cpuid_result(caches.get(subleaf as usize).copied().unwrap_or(0), 0, 0, 0)
+        };
+        assert_eq!(count_cache_leaves(listed), 4);
+        assert_eq!(
+            count_cache_leaves(|_| cpuid_result(0x121, 0, 0, 0)),
+            MAX_CACHE_LEAVES
+        );
     }
 
     #[test]

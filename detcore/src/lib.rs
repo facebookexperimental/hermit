@@ -1357,6 +1357,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
     }
 
+    /// The CPUs the machine Detcore presents has in sysfs
+    /// (`procfs::SysfsCpus`): `--virtual-cpus` of them, and none with a
+    /// `cache` directory where the guest's CPUID instruction is answered from
+    /// a virtual table, whose leaf 4 lists no cache
+    /// (`InterceptedCpuid::cache_leaves`), as Linux builds no such directory
+    /// for that CPU (https://github.com/facebookexperimental/hermit/issues/438).
+    /// Where the instruction is answered from the host's CPUID (the
+    /// host-no-rdrand profile) or reaches the host (`--no-virtualize-cpuid`, a
+    /// backend without CPUID interception), the host's directories stay.
+    pub(crate) fn sysfs_cpus<G: Guest<Self>>(&self, guest: &G) -> procfs::SysfsCpus {
+        let virtual_table = self.rendered_files(guest).cpuinfo
+            && self.cfg.cpu_profile != detcore_model::cpu_profile::CpuProfile::HostNoRdrand;
+        procfs::SysfsCpus {
+            count: self.cfg.virtual_cpu_count(),
+            caches: !(virtual_table && self.virtual_cpuid().cache_leaves() == 0),
+        }
+    }
+
     /// Linux's `commit_creds` clears the caller's parent-death signal when a
     /// credential change moves its effective or filesystem user or group id,
     /// or grows its permitted capabilities (`commit_creds::clears_parent_death`,

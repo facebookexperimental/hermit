@@ -1898,7 +1898,9 @@ pub struct Config {
     /// `getcpu`, CPUID's APIC IDs, `/proc/cpuinfo`, `/proc/stat`, a task's
     /// `Cpus_allowed` and `/sys/devices/system/cpu` (its CPU lists, `cpuN`
     /// directories, topology and cache files) all describe the same N
-    /// single-core sockets on one NUMA node. `sched_setaffinity` follows
+    /// single-core sockets on one NUMA node. Where CPUID comes from a
+    /// virtual table, whose leaf 4 lists no cache, no CPU has a `cache`
+    /// directory, as on Linux. `sched_setaffinity` follows
     /// Linux: a mask with none of the N CPUs is EINVAL. The host must list
     /// at least N CPUs under `/sys/devices/system/cpu`. Without this flag the
     /// guest sees Hermit's historical single CPU, whose `sched_setaffinity`

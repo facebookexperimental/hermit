@@ -7213,7 +7213,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let sysfs_object = self.opened_sysfs_object(guest, fd, identity.as_ref());
                 if let Some(object) = sysfs_object
                     .as_deref()
-                    .filter(|object| self.is_absent_sysfs_object(object))
+                    .filter(|object| self.is_absent_sysfs_object(guest, object))
                 {
                     guest.thread_state().remove_fd(fd);
                     let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
@@ -20323,7 +20323,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
-            let cpus = self.cfg.virtual_cpu_count();
+            let cpus = self.sysfs_cpus(guest);
             // A user bind over a sysfs path keeps its own names. Ask the
             // opened descriptor, not its path in the tool's mount namespace.
             let has_absent_cpu = entries
