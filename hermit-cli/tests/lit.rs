@@ -380,11 +380,11 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 29 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
+    // 31 main.{rs,c,go} files, 51 .lit, 6 .test and 2 scheduler scripts.
     // fifo_jump_replay (main.c + hermit-run.lit) joined with the guest-poll
     // replay work: 82 + 2 = 84. PR 4614's chaos_schedule_replay fixture: 85.
-    // stblocks (main.rs + 2 .lit): 88.
-    assert_eq!(fixtures.len(), 88, "{fixtures:#?}");
+    // stblocks (main.rs + 2 .lit): 88. rt_sigpending (main.c + 1 .lit): 90.
+    assert_eq!(fixtures.len(), 90, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -405,7 +405,8 @@ fn every_lit_fixture_is_within_the_supported_subset() {
     }
     // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts
     // 47 (fifo_jump_replay adds two); stblocks' strict .lit adds one: 48.
-    assert_eq!(checked, 48);
+    // rt_sigpending adds nineteen (main.c 9 + hermit-run.lit 10): 67.
+    assert_eq!(checked, 67);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
@@ -551,6 +552,8 @@ lit_cases! {
     lit_networking_hermit_run => "networking/hermit-run.lit",
     lit_rt_sigaction_main => "rt_sigaction/main.c",
     lit_rt_sigaction_hermit_run => "rt_sigaction/hermit-run.lit",
+    lit_rt_sigpending_main => "rt_sigpending/main.c",
+    lit_rt_sigpending_hermit_run => "rt_sigpending/hermit-run.lit",
     lit_rt_sigprocmask_main => "rt_sigprocmask/main.c",
     lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
     lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
