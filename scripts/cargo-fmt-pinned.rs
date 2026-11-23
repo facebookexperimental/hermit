@@ -24,9 +24,10 @@
 //!    before this script).
 //!
 //! Either way the script runs that toolchain's own `bin/rustfmt` and
-//! `bin/cargo-fmt` by absolute path, with `RUSTFMT` set to the former for the
-//! latter: neither PATH, CARGO_HOME nor an inherited `RUSTFMT` picks the
-//! formatter, and `--self-test` runs the same two executables as the check.
+//! `bin/cargo-fmt` by absolute path, with `RUSTFMT` set, for the latter, to a
+//! wrapper that runs the former: neither PATH, CARGO_HOME nor an inherited
+//! `RUSTFMT` picks the formatter, and `--self-test` runs the same two
+//! executables as the check.
 //!
 //! Neither, or a formatter whose `rustfmt --version` is not the pinned line,
 //! exits 2 before anything is formatted. The rustfmt on PATH is never used.
@@ -34,6 +35,19 @@
 //! lint.rustfmt refuses there rather than check with the image's stable
 //! rustfmt, until <https://github.com/rrnewton/hermit/issues/5397> packages
 //! the pinned formatter in the image.
+//!
+//! cargo fmt runs rustfmt once per edition and returns the first nonzero exit
+//! code among those runs, so a rustfmt killed by a signal (an abort on a
+//! failed allocation, an out-of-memory kill), which leaves no exit code,
+//! counts as a pass: the diffs it printed fail nothing, and the file it was
+//! formatting goes unchecked. Every cargo fmt run therefore sets `RUSTFMT` to
+//! a generated wrapper (`.tmp-rustfmt-gate-PID-N.rustfmt`, written into the
+//! repository root like the configuration below and removed afterwards) that
+//! runs the pinned rustfmt with its arguments and output unchanged and exits
+//! with the shell's status for it: rustfmt's own exit code, or 128 plus the
+//! signal number for a death by signal, which it names on stderr. A formatter
+//! process this script runs directly and that dies by a signal is reported
+//! the same way.
 //!
 //! Files whose bytes cannot change yet (another file pins their sha256) are
 //! listed in `ci/rustfmt-exclusions.txt`, one `PATH REASON` per
@@ -82,12 +96,15 @@ mod rust_script_prelude;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -109,6 +126,8 @@ const ROOT_CONFIG: &str = "rustfmt.toml";
 const GATE_CONFIG_PREFIX: &str = ".tmp-rustfmt-gate-";
 /// The one reason an entry may give, followed by `FILE[ and FILE...]`.
 const PINNED_IN: &str = "sha256-pinned in ";
+/// The variable that names the pinned rustfmt to the rustfmt wrapper.
+const WRAPPED_RUSTFMT_ENV: &str = "CARGO_FMT_PINNED_RUSTFMT";
 
 /// One `ci/rustfmt-exclusions.txt` entry.
 #[derive(Debug, PartialEq, Eq)]
@@ -666,28 +685,112 @@ impl Resolved {
     }
 
     /// `cargo fmt` with the pinned formatter: the pinned cargo-fmt by path,
-    /// with RUSTFMT set to the pinned rustfmt, overriding any inherited value.
-    /// The cargo that cargo-fmt runs for `cargo metadata` only lists packages.
-    fn cargo_fmt(&self) -> Command {
+    /// with RUSTFMT set to `wrapper` and the wrapper's variable to the pinned
+    /// rustfmt, both overriding any inherited value. The cargo that cargo-fmt
+    /// runs for `cargo metadata` only lists packages.
+    fn cargo_fmt(&self, wrapper: &RustfmtWrapper) -> Command {
         let mut command = Command::new(&self.cargo_fmt);
-        command.env("RUSTFMT", &self.rustfmt);
+        command
+            .env("RUSTFMT", &wrapper.path)
+            .env(WRAPPED_RUSTFMT_ENV, &self.rustfmt);
         command
     }
 }
 
+/// The rustfmt wrapper (see the module documentation): runs the rustfmt that
+/// [`WRAPPED_RUSTFMT_ENV`] names with the wrapper's arguments, and exits with
+/// the shell's status for that run, naming a death by signal on stderr.
+fn rustfmt_wrapper_script() -> String {
+    format!(
+        "#!/bin/sh\n\
+         \"${{{WRAPPED_RUSTFMT_ENV}:?}}\" \"$@\"\n\
+         status=$?\n\
+         if [ \"$status\" -gt 128 ]; then\n    \
+         echo \"cargo-fmt-pinned: ${WRAPPED_RUSTFMT_ENV} ended with status $status (signal \
+         $((status - 128))) before checking every file it was given\" >&2\n\
+         fi\n\
+         exit \"$status\"\n"
+    )
+}
+
+/// A generated rustfmt wrapper, removed when dropped.
+struct RustfmtWrapper {
+    path: PathBuf,
+}
+
+impl Drop for RustfmtWrapper {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Writes the rustfmt wrapper into `dir` as `.tmp-rustfmt-gate-PID-N.rustfmt`
+/// (`.tmp*` keeps it out of git), executable by its owner. N numbers this
+/// process's wrappers: the unit tests run self-tests concurrently.
+fn write_rustfmt_wrapper(dir: &Path) -> Result<RustfmtWrapper, String> {
+    static WRAPPERS: AtomicUsize = AtomicUsize::new(0);
+    let path = dir.join(format!(
+        "{GATE_CONFIG_PREFIX}{}-{}.rustfmt",
+        std::process::id(),
+        WRAPPERS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let wrapper = RustfmtWrapper { path };
+    file.write_all(rustfmt_wrapper_script().as_bytes())
+        .map_err(|error| format!("{}: {error}", wrapper.path.display()))?;
+    Ok(wrapper)
+}
+
+/// The exit code to report for a formatter process `program` ended with:
+/// its own, or for a death by signal, which leaves none, 128 plus the signal
+/// number, as a shell reports it, named on stderr.
+fn exit_code(status: ExitStatus, program: &Path) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    match status.signal() {
+        Some(signal) => {
+            eprintln!(
+                "cargo-fmt-pinned: {} was killed by signal {signal}",
+                program.display()
+            );
+            128 + signal
+        }
+        None => {
+            eprintln!(
+                "cargo-fmt-pinned: {} ended with neither an exit code nor a signal ({status})",
+                program.display()
+            );
+            1
+        }
+    }
+}
+
 /// `cargo fmt ARGS` in `dir` with the pinned formatter, as the check runs it.
-fn cargo_fmt_in(resolved: &Resolved, args: &[OsString], dir: &Path) -> Command {
-    let mut command = resolved.cargo_fmt();
+fn cargo_fmt_in(
+    resolved: &Resolved,
+    wrapper: &RustfmtWrapper,
+    args: &[OsString],
+    dir: &Path,
+) -> Command {
+    let mut command = resolved.cargo_fmt(wrapper);
     command.args(args).current_dir(dir);
     command
 }
 
-/// Runs [`cargo_fmt_in`] with the caller's output streams; its exit status.
+/// Runs [`cargo_fmt_in`] with the caller's output streams, its rustfmt
+/// wrapper in `dir`; its exit status.
 fn run_cargo_fmt(resolved: &Resolved, args: &[OsString], dir: &Path) -> Result<i32, String> {
-    let status = cargo_fmt_in(resolved, args, dir)
+    let wrapper = write_rustfmt_wrapper(dir)?;
+    let status = cargo_fmt_in(resolved, &wrapper, args, dir)
         .status()
         .map_err(|error| format!("cannot run {}: {error}", resolved.cargo_fmt.display()))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(exit_code(status, &resolved.cargo_fmt))
 }
 
 /// The line rustfmt's `-v` prints for each file it formats.
@@ -713,12 +816,13 @@ fn run_workspace_members(
     };
     let mut cargo_args = with_gate_config(scoped, &config.path)?;
     cargo_args.push("-v".into());
-    let output = cargo_fmt_in(resolved, &cargo_args, root)
+    let wrapper = write_rustfmt_wrapper(root)?;
+    let output = cargo_fmt_in(resolved, &wrapper, &cargo_args, root)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
         .map_err(|error| format!("cannot run {}: {error}", resolved.cargo_fmt.display()))?;
-    let members_code = output.status.code().unwrap_or(1);
+    let members_code = exit_code(output.status, &resolved.cargo_fmt);
     let reached = reached_files(&output.stdout, root, &mut std::io::stdout())?;
     if reached.is_empty() {
         return Err(
@@ -752,7 +856,7 @@ fn run_workspace_members(
             .current_dir(root)
             .status()
             .map_err(|error| format!("cannot run {}: {error}", resolved.rustfmt.display()))?;
-        files_code = status.code().unwrap_or(1);
+        files_code = exit_code(status, &resolved.rustfmt);
     }
     Ok(if members_code != 0 {
         members_code
@@ -907,6 +1011,7 @@ fn check_identity(found: &str, pin: &Pin, formatter: &Formatter) -> Result<(), S
 fn self_test(formatter: &Resolved, root: &Path) -> Result<(), String> {
     const BAD: &str = "use std::{fs, path::Path};\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
     const GOOD: &str = "use std::fs;\nuse std::path::Path;\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
+    let wrapper = write_rustfmt_wrapper(root)?;
     // One directory per call: the unit tests run self-tests concurrently.
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let scratch = env::temp_dir().join(format!(
@@ -932,7 +1037,7 @@ fn self_test(formatter: &Resolved, root: &Path) -> Result<(), String> {
                 .map(OsString::from)
                 .collect();
             args.push(root.join("rustfmt.toml").into_os_string());
-            let status = cargo_fmt_in(formatter, &args, &dir)
+            let status = cargo_fmt_in(formatter, &wrapper, &args, &dir)
                 .output()
                 .map_err(|error| format!("cannot run {}: {error}", formatter.cargo_fmt.display()))?
                 .status;
@@ -1439,9 +1544,10 @@ mod tests {
         fs::remove_dir_all(lenient).unwrap();
     }
 
-    /// The command that formats names the pinned cargo-fmt by absolute path
-    /// and sets RUSTFMT to the pinned rustfmt, so the child cannot inherit
-    /// another one; a toolchain root missing either executable is refused.
+    /// The command that formats names the pinned cargo-fmt by absolute path,
+    /// sets RUSTFMT to the rustfmt wrapper and the wrapper's variable to the
+    /// pinned rustfmt, so the child cannot inherit another one; a toolchain
+    /// root missing either executable is refused.
     #[test]
     fn the_formatting_command_binds_both_pinned_executables() {
         let root = fake_toolchain("bound", "x", "exit 0");
@@ -1449,14 +1555,19 @@ mod tests {
         let canonical = fs::canonicalize(&root).unwrap();
         assert_eq!(resolved.rustfmt, canonical.join("bin/rustfmt"));
         assert_eq!(resolved.cargo_fmt, canonical.join("bin/cargo-fmt"));
-        let command = resolved.cargo_fmt();
+        let wrapper = write_rustfmt_wrapper(&root).unwrap();
+        let command = resolved.cargo_fmt(&wrapper);
         assert_eq!(Path::new(command.get_program()), resolved.cargo_fmt);
         assert!(resolved.cargo_fmt.is_absolute());
-        let rustfmt = command
-            .get_envs()
-            .find(|(name, _)| *name == "RUSTFMT")
-            .and_then(|(_, value)| value);
-        assert_eq!(rustfmt, Some(resolved.rustfmt.as_os_str()));
+        let env = |wanted: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == wanted)
+                .and_then(|(_, value)| value)
+        };
+        assert_eq!(env("RUSTFMT"), Some(wrapper.path.as_os_str()));
+        assert_eq!(env(WRAPPED_RUSTFMT_ENV), Some(resolved.rustfmt.as_os_str()));
+        drop(wrapper);
         fs::remove_file(root.join("bin/cargo-fmt")).unwrap();
         let error = Formatter::Toolchain(root.clone()).resolve().unwrap_err();
         assert!(error.contains("has no"), "{error}");
@@ -1588,6 +1699,71 @@ mod tests {
             "{error}"
         );
         fs::remove_dir_all(toolchain).unwrap();
+    }
+
+    /// The rustfmt wrapper passes rustfmt's arguments, output and exit code
+    /// through, turns a death by signal into 128 plus the signal number,
+    /// named on stderr, refuses to run when no rustfmt is named, and is
+    /// removed when dropped.
+    #[test]
+    fn the_rustfmt_wrapper_fails_a_rustfmt_killed_by_a_signal() {
+        let dir = env::temp_dir().join(format!("cargo-fmt-pinned-wrapper-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let wrapper = write_rustfmt_wrapper(&dir).unwrap();
+        let run = |label: &str, script: &str| {
+            let rustfmt = dir.join(label);
+            executable(&rustfmt, script);
+            Command::new(&wrapper.path)
+                .args(["--check", "a b.rs"])
+                .env(WRAPPED_RUSTFMT_ENV, &rustfmt)
+                .output()
+                .unwrap()
+        };
+        for code in [0, 1] {
+            let output = run(
+                &format!("exit-{code}"),
+                &format!("#!/bin/sh\nprintf '%s|' \"$@\"\nexit {code}\n"),
+            );
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "--check|a b.rs|");
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // SIGKILL, as an out-of-memory kill sends it.
+        let output = run("killed", "#!/bin/sh\necho partial\nkill -KILL $$\n");
+        assert_eq!(output.status.code(), Some(128 + 9));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "partial\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ended with status 137 (signal 9)"),
+            "{stderr}"
+        );
+        let output = Command::new(&wrapper.path)
+            .env_remove(WRAPPED_RUSTFMT_ENV)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{}", output.status);
+        let path = wrapper.path.clone();
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        drop(wrapper);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A formatter process the script runs directly that dies by a signal
+    /// reports 128 plus the signal number, never success; an exit code is
+    /// reported as it is.
+    #[test]
+    fn a_formatter_killed_by_a_signal_never_reads_as_success() {
+        let status = |script: &str| Command::new("sh").args(["-c", script]).status().unwrap();
+        let rustfmt = Path::new("rustfmt");
+        assert_eq!(exit_code(status("kill -KILL $$"), rustfmt), 128 + 9);
+        assert_eq!(exit_code(status("exit 0"), rustfmt), 0);
+        assert_eq!(exit_code(status("exit 3"), rustfmt), 3);
     }
 
     /// Every malformed entry is refused by line: a tab anywhere, no reason, a
