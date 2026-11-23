@@ -363,6 +363,55 @@ const SHIPPED_EXPORT_CPU_SECONDS: u64 = 35;
 // as for the other measured allowances.
 const POST_CRASH_RECOVERED_LINEAGE_WRAPPER_NAME: &str = "hermit-post-crash-recovered-lineage-cpu";
 const POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS: u64 = 41;
+// hermit-run::cli KVM signal family (node privileged-test.cli_kvm), measured
+// 2026-11-22 at Hermit 8da0bfc6 on the measurement host named in
+// docs/TESTING_ENVIRONMENTS.md: uncensored counted runs at a diagnostic CPU
+// multiplier of 8 (measurement only) — the three runnable tests and the
+// sibling-exit test had 10 solo (-j1) + 5 full-node (-j8) first attempts
+// each; the temporary-mask and kernel-sent tests had 5 full-node first
+// attempts here (the temporary-mask test's 20 solo runs at nearby heads
+// and the validation history complete their samples, CPU-cap kills at
+// 22 seconds counting only as lower bounds). User time is tight in every
+// regime; system time carries the variance and tracks host contention (the
+// sibling-exit first-attempt median as gauge: 6.07 over all validation,
+// 13.00 in the 12 runs that ran the runnable tests, 14.05 solo and 12.29
+// at node width here). Each CPU
+// cap below is ceil(1.5 * the largest uncensored completion), or, where a
+// cap stop censors that maximum, half again on the stop (the file's
+// censored rule, marked per test); wall is eight times the cap, as for
+// the other measured allowances.
+// run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: current record
+// 162 attempts, 142 passes (maximum 21.809; node maximum here 18.82) and
+// 20 cap stops at 22.02-24.021, so censored, half again on 24.021 -> 37
+// (from a censored lower bound, not a measured maximum).
+// ..._by_pidfd_match_linux: cap stop at 24.02 above its 23.15 largest
+// completion, so censored, half again -> 37 (likewise a lower bound).
+// ..._by_sigqueue_or_tgsigqueue_match_linux: largest 24.50 -> 37 (the
+// censored rule on its 24.02 stop gives the same).
+// run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses:
+// node largest 22.355 (n=5, median 19.999) -> 34; validation first
+// attempts p90 21.59 (n=30) with cap stops at 22.012 and 22.054, plus
+// 22.32 and 22.342 on retries (the censored rule gives 34 as well).
+// run_kvm_a_sibling_may_exit_while_its_signal_is_taken: validation
+// maximum 20.594 -> 31; last-10 first-attempt p90 19.44 passes the 14.7
+// inclusion threshold (solo maximum here 17.00, node p90 13.68).
+// ..._by_kill_tgkill_or_tkill_match_linux (3 runnable cases): combined n=15
+// median 27.11, largest 40.61, so the formula gives 61, above the owner's
+// 60-second maximum: 60 at the cap (1.48x the largest against the usual
+// 1.5x, 2.21x the median, the family's weakest regression trip). The
+// per-call split in dh-r0v58y restores the full formula margin.
+const KVM_TMPMASK_WRAPPER_NAME: &str = "hermit-kvm-tmpmask-cpu";
+const KVM_TMPMASK_CPU_SECONDS: u64 = 37;
+const KVM_XPROC_KILL_WRAPPER_NAME: &str = "hermit-kvm-xproc-kill-cpu";
+const KVM_XPROC_KILL_CPU_SECONDS: u64 = 60;
+const KVM_XPROC_PIDFD_WRAPPER_NAME: &str = "hermit-kvm-xproc-pidfd-cpu";
+const KVM_XPROC_PIDFD_CPU_SECONDS: u64 = 37;
+const KVM_XPROC_SIGQUEUE_WRAPPER_NAME: &str = "hermit-kvm-xproc-sigqueue-cpu";
+const KVM_XPROC_SIGQUEUE_CPU_SECONDS: u64 = 37;
+const KVM_KERNEL_SENT_WRAPPER_NAME: &str = "hermit-kvm-kernel-sent-cpu";
+const KVM_KERNEL_SENT_CPU_SECONDS: u64 = 34;
+const KVM_SIBLING_EXIT_WRAPPER_NAME: &str = "hermit-kvm-sibling-exit-cpu";
+const KVM_SIBLING_EXIT_CPU_SECONDS: u64 = 31;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -431,7 +480,7 @@ const PMU_SCHEDULE_OFFSET_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance
     wall_seconds: None,
 };
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 46] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 52] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -760,6 +809,54 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 46] = [
         test: "post_crash::a_recovered_lineage_does_not_take_another_crashs_switch",
         cpu_seconds: POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS,
         wall_seconds: Some(8 * POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_TMPMASK_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux",
+        cpu_seconds: KVM_TMPMASK_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_TMPMASK_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_XPROC_KILL_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux",
+        cpu_seconds: KVM_XPROC_KILL_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_XPROC_KILL_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_XPROC_PIDFD_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_guest_signals_to_another_process_by_pidfd_match_linux",
+        cpu_seconds: KVM_XPROC_PIDFD_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_XPROC_PIDFD_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_XPROC_SIGQUEUE_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_guest_signals_to_another_process_by_sigqueue_or_tgsigqueue_match_linux",
+        cpu_seconds: KVM_XPROC_SIGQUEUE_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_XPROC_SIGQUEUE_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_KERNEL_SENT_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses",
+        cpu_seconds: KVM_KERNEL_SENT_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_KERNEL_SENT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: KVM_SIBLING_EXIT_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "run_kvm_a_sibling_may_exit_while_its_signal_is_taken",
+        cpu_seconds: KVM_SIBLING_EXIT_CPU_SECONDS,
+        wall_seconds: Some(8 * KVM_SIBLING_EXIT_CPU_SECONDS),
     },
 ];
 
@@ -1625,7 +1722,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains defaults with prepared selected measured floors. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains defaults with prepared selected measured floors. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), full descriptor-table IO ({FULL_TABLE_IO_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), post-crash recovered lineage ({POST_CRASH_RECOVERED_LINEAGE_CPU_SECONDS}s), KVM temporary-mask wait ({KVM_TMPMASK_CPU_SECONDS}s), KVM cross-process kill ({KVM_XPROC_KILL_CPU_SECONDS}s at the 60-second owner maximum), KVM cross-process pidfd ({KVM_XPROC_PIDFD_CPU_SECONDS}s), KVM cross-process sigqueue ({KVM_XPROC_SIGQUEUE_CPU_SECONDS}s), KVM kernel-sent signal ({KVM_KERNEL_SENT_CPU_SECONDS}s), KVM sibling exit ({KVM_SIBLING_EXIT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every one of those 52 measured allowances gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -3967,7 +4064,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 46);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 52);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
@@ -4256,16 +4353,17 @@ mod tests {
                 );
             }
         }
-        // The largest cap remains 51 regardless of the stack rows (the
-        // recalibrated poll-deadline cap; see ESI_POLL_DEADLINE_CPU_SECONDS).
-        // All shipped allowances are owned now, so exercise the wall-less
-        // separation on a synthetic copy of the 51 s poll-deadline allowance.
-        let mut poll_deadline = *MEASURED_CPU_ALLOWANCES
+        // No shipped allowance is wall-less now (the largest cap is the
+        // 60-second KVM cross-process kill allowance), so exercise the
+        // wall-less separation on a synthetic wall-less copy of the first
+        // 51-second row (the Detcore stack callback; the poll-deadline rows
+        // share its 51, see ESI_POLL_DEADLINE_CPU_SECONDS).
+        let mut wall_less = *MEASURED_CPU_ALLOWANCES
             .iter()
             .find(|a| a.cpu_seconds == ESI_POLL_DEADLINE_CPU_SECONDS)
             .unwrap();
-        poll_deadline.wall_seconds = None;
-        for selected in [&[poll_deadline][..]] {
+        wall_less.wall_seconds = None;
+        for selected in [&[wall_less][..]] {
             assert!(
                 scaled_config_with_allowances(
                     &source.replace("57s", "53s"),
