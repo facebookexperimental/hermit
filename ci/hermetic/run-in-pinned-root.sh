@@ -762,6 +762,22 @@ env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
 # PID 1 and the payload as its child: it reaps every orphan, forwards the
 # signals Podman proxies to the payload, and exits with the payload's status
 # (128 + the signal number when a signal killed it).
+#
+# /bin/env --default-signal: the payload must start with no signal blocked and
+# every signal at its default action, as it did as PID 1 before --init.
+# catatonit leaves SIGTSTP, SIGTTIN and SIGTTOU blocked in the child it starts
+# (pinned image, /proc/self/status: SigBlk 0x380000 with --init, 0 without;
+# SigIgn the same either way). The blocked mask survives fork and execve, so
+# every process the payload started inherited it, and the cli tests that
+# compare a zombie's /proc/<pid>/stat signal fields with Linux's answer
+# failed. With no signal named, the image's GNU env unblocks every signal and
+# resets its action to the default, then execs, adding no process. Resetting
+# the actions as well keeps the start state fixed whatever an init or caller
+# ignores (execve resets only caught handlers: fs/exec.c begin_new_exec ->
+# kernel/signal.c flush_signal_handlers). glibc reserves signals 32 and 33 for
+# its threads library and sigaction refuses to change them, so a caller that
+# ignores them still passes that to the payload, as before --init; glibc's
+# sigprocmask never leaves them blocked.
 
 # A container runtime can widen the task affinity even with cgroups disabled.
 # Restore the actual caller's set inside the container before executing the
@@ -837,5 +853,6 @@ exec podman run --rm \
     -e "CARGO_TARGET_DIR=$effective_target_in" \
     -w "$workdir_in" \
     "$digest" \
+    /bin/env --default-signal \
     /bin/taskset --cpu-list "$caller_affinity" \
     "$@"

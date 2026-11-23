@@ -25,6 +25,9 @@ an independent container resource policy. `--init` makes Podman's own init
 (catatonit, from the host) the container's PID 1 and the command its child, so
 orphans the command's descendants leave, such as Hermit's detached KVM teardown
 helper, are reaped instead of piling up as zombies under the command.
+catatonit leaves SIGTSTP, SIGTTIN and SIGTTOU blocked in that child, so the
+command runs under `/bin/env --default-signal`, which starts it with every
+signal at its default action and none blocked, as it was before `--init`.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,16 @@ def repository_neutral_env():
     }
 
 
+def signal_masks(status):
+    """The SigBlk and SigIgn masks of a /proc/<pid>/status text, as integers."""
+    masks = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in ("SigBlk", "SigIgn"):
+            masks[key] = int(value.strip(), 16)
+    return masks
+
+
 class CargoCacheMounts(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="hermit-pinned-root-cache-")
@@ -87,7 +98,7 @@ class CargoCacheMounts(unittest.TestCase):
         fake = self.root / "tools/podman"
         fake.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, pathlib, sys\n"
+            "import json, os, pathlib, signal, sys\n"
             "with open(os.environ['PINNED_ROOT_CAPTURE'], 'a') as out:\n"
             "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_WRITE_AGENT_UTILS_STATE') == '1':\n"
@@ -97,6 +108,10 @@ class CargoCacheMounts(unittest.TestCase):
             "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
             "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_EXEC_PAYLOAD') == '1':\n"
             "    os.sched_setaffinity(0, json.loads(os.environ['PINNED_ROOT_RUNTIME_AFFINITY']))\n"
+            "    leftover = json.loads(os.environ.get('PINNED_ROOT_RUNTIME_SIGNALS', '{}'))\n"
+            "    signal.pthread_sigmask(signal.SIG_BLOCK, leftover.get('block', []))\n"
+            "    for number in leftover.get('ignore', []):\n"
+            "        signal.signal(number, signal.SIG_IGN)\n"
             "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
             "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
@@ -312,7 +327,7 @@ class CargoCacheMounts(unittest.TestCase):
             self.assertEqual(
                 calls[1], ["image", "inspect", "--format", "{{.Id}}", calls[0][-1]]
             )
-            self.assertEqual(calls[2][-6], calls[0][-1])
+            self.assertEqual(calls[2][-8], calls[0][-1])
             mounts = [
                 calls[2][i + 1]
                 for i, value in enumerate(calls[2])
@@ -438,9 +453,11 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-6:],
+            argv[-8:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/env",
+                "--default-signal",
                 "/bin/taskset",
                 "--cpu-list",
                 ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -479,6 +496,54 @@ class CargoCacheMounts(unittest.TestCase):
             "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
         )
         self.assertLess(argv.index("--init"), image)
+
+    def test_payload_starts_with_default_signal_actions_and_none_blocked(self):
+        # Under --init the payload is catatonit's child, and catatonit leaves
+        # SIGTSTP, SIGTTIN and SIGTTOU blocked there. The blocked mask survives
+        # execve, so every process the payload started inherited it, and the
+        # cli tests that compare a zombie's /proc/<pid>/stat signal fields with
+        # Linux's answer failed. The fake runtime leaves those three blocked,
+        # and also leaves three actions ignored (being Python, it ignores
+        # SIGPIPE and SIGXFSZ itself as well), before it execs the payload.
+        # The payload must see no signal blocked and none of 1-31 or 34-64
+        # ignored; for 32 and 33 it keeps exactly this test's own setting.
+        # glibc reserves signals 32 and 33 for its threads library, and sigaction refuses to change them.
+        reserved = (1 << 31) | (1 << 32)
+        own = signal_masks(Path("/proc/self/status").read_text())
+        result, calls = self.invoke(
+            command=["cat", "/proc/self/status"],
+            extra_env={
+                "PINNED_ROOT_EXEC_PAYLOAD": "1",
+                "PINNED_ROOT_RUNTIME_AFFINITY": json.dumps(
+                    sorted(os.sched_getaffinity(0))
+                ),
+                "PINNED_ROOT_RUNTIME_SIGNALS": json.dumps(
+                    {
+                        "block": [signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU],
+                        "ignore": [signal.SIGPIPE, signal.SIGXFSZ, signal.SIGTERM],
+                    }
+                ),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        masks = signal_masks(result.stdout)
+        self.assertEqual(sorted(masks), ["SigBlk", "SigIgn"], result.stdout)
+        ignored = masks["SigIgn"]
+        self.assertEqual(
+            {
+                "SigBlk": f"{masks['SigBlk']:016x}",
+                "SigIgn 1-31": f"{ignored & 0x7FFFFFFF:016x}",
+                "SigIgn 32-33": f"{ignored & reserved:016x}",
+                "SigIgn 34-64": f"{ignored >> 33:016x}",
+            },
+            {
+                "SigBlk": f"{0:016x}",
+                "SigIgn 1-31": f"{0:016x}",
+                "SigIgn 32-33": f"{own['SigIgn'] & reserved:016x}",
+                "SigIgn 34-64": f"{0:016x}",
+            },
+        )
 
     def test_payload_uses_cargo_checksum_freshness(self):
         # Every pinned-root container shares /src/target, and Cargo marks a
@@ -686,9 +751,11 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-6:],
+            argv[-8:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/env",
+                "--default-signal",
                 "/bin/taskset",
                 "--cpu-list",
                 ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -1400,9 +1467,11 @@ class CargoCacheMounts(unittest.TestCase):
                     "/src/nested module",
                 )
                 self.assertEqual(
-                    argv[-6:],
+                    argv[-8:],
                     [
                         "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "/bin/env",
+                        "--default-signal",
                         "/bin/taskset",
                         "--cpu-list",
                         ",".join(map(str, sorted(os.sched_getaffinity(0)))),

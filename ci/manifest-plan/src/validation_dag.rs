@@ -7011,11 +7011,13 @@ if args == ['image', 'exists', 'fixture@sha256:000000000000000000000000000000000
 assert args[0] == 'run', args
 boundary = args.index('fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000')
 command = args[boundary + 1:]
-# Authenticate and execute the real affinity prefix before checking the
-# unchanged guard/payload tail; accepting any CPU list would hide widening.
+# Authenticate and execute the real signal-reset and affinity prefixes before
+# checking the unchanged guard/payload tail; accepting any CPU list would hide
+# widening.
+assert command[:2] == ['/bin/env', '--default-signal'], command
 expected_affinity = ','.join(map(str, sorted(os.sched_getaffinity(0))))
-assert command[:3] == ['/bin/taskset', '--cpu-list', expected_affinity], command
-affinity_prefix, command = command[:3], command[3:]
+assert command[2:5] == ['/bin/taskset', '--cpu-list', expected_affinity], command
+prefix, command = command[:5], command[5:]
 assert command[:2] == ['bash', '-c'] and command[3] == 'bash', command
 assert command[2] in json.loads((root / 'guards.json').read_text()), command
 # No ambient NEXTEST_TEST_THREADS leakage: emulate only explicitly forwarded
@@ -7033,7 +7035,7 @@ for name in ['assert-no-network.sh', 'assert-build-dependencies.sh']:
     original = '/src/ci/hermetic/' + name
     assert command[2].count(original) == 1
     command[2] = command[2].replace(original, shlex.quote(str(root / 'ci/hermetic' / name)))
-completed = subprocess.run(affinity_prefix + command, cwd=root, env=env, timeout=5)
+completed = subprocess.run(prefix + command, cwd=root, env=env, timeout=5)
 sys.exit(completed.returncode)
 "##,
         );
@@ -7127,9 +7129,10 @@ sys.exit(37)
                 .iter()
                 .position(|arg| arg == "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap();
-            // The fake Podman authenticates and executes all three taskset
-            // arguments; these assertions still address the original payload.
-            let payload = &calls[1][boundary + 4..];
+            // The fake Podman authenticates and executes the two signal-reset
+            // and three taskset arguments; these assertions still address the
+            // original payload.
+            let payload = &calls[1][boundary + 6..];
             assert_eq!(payload[4], unwrapped);
             if step.jobs_env.as_deref() == Some("NEXTEST_TEST_THREADS") {
                 assert_eq!(
