@@ -8649,6 +8649,106 @@ mod focused_only_tests {
 }
 
 #[cfg(test)]
+mod scorecard_corpus_tests {
+    use super::*;
+
+    /// The readers are exactly the committed nodes that run the commands tier
+    /// of the scorecard self-test or the script unit tests.
+    #[test]
+    fn the_corpus_readers_are_the_committed_commands_tier_and_script_test_nodes() {
+        let (committed, _, _) = load_committed_validation_dag(&test_source_root()).unwrap();
+        let readers = committed
+            .steps
+            .iter()
+            .filter(|step| reads_scorecard_corpus(step))
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            "check.script_unit_tests",
+            "check.script_unit_tests_on_host",
+            "quick-super-selftest.scorecard_commands",
+            "selftest.scorecard_commands",
+        ]
+        .map(String::from)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(readers, expected);
+    }
+
+    /// The lookup follows scorecard.rs's order, and finds nothing for a
+    /// fresh clone.
+    #[test]
+    fn an_existing_ledger_is_found_where_the_scorecard_looks() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("work/hermit");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let none = |_: &str| None;
+        assert_eq!(existing_test_ledger(&checkout, none), None);
+        let sibling = temp.path().join("work/hermit_test_ledger");
+        std::fs::create_dir_all(sibling.join(".git")).unwrap();
+        assert_eq!(existing_test_ledger(&checkout, none), Some(sibling));
+        let env = |name: &str| match name {
+            TEST_LEDGER_ROOT_ENV => Some(std::ffi::OsString::from("/explicit")),
+            PARENT_ENV => Some(std::ffi::OsString::from("/parent")),
+            _ => None,
+        };
+        assert_eq!(
+            existing_test_ledger(&checkout, env),
+            Some(PathBuf::from("/explicit"))
+        );
+        let parent_only = |name: &str| (name == PARENT_ENV).then(|| "/parent".into());
+        assert_eq!(
+            existing_test_ledger(&checkout, parent_only),
+            Some(PathBuf::from("/parent/hermit_test_ledger"))
+        );
+    }
+
+    /// A failed or nonsensical fetch is an error naming what happened; the
+    /// refusal names the readers and the remedy.
+    #[test]
+    fn a_failed_fetch_refuses_by_name_with_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        };
+        let failing = script(
+            "fail.sh",
+            "echo 'fatal: unable to access github.com' >&2; exit 128",
+        );
+        let error = prepare_scorecard_corpus(&failing, temp.path()).unwrap_err();
+        assert!(error.contains("unable to access github.com"), "{error}");
+        let nonsense = script("nonsense.sh", "echo /nonexistent");
+        let error = prepare_scorecard_corpus(&nonsense, temp.path()).unwrap_err();
+        assert!(error.contains("not a prepared repository"), "{error}");
+        let good = script(
+            "good.sh",
+            "d=\"$1/corpus\"; mkdir -p \"$d/.git\"; echo \"$d\"",
+        );
+        let dir = prepare_scorecard_corpus(&good, temp.path()).unwrap();
+        assert!(dir.join(".git").is_dir(), "{}", dir.display());
+        let readers = vec!["quick-super-selftest.scorecard_commands".to_string()];
+        let summary = scorecard_corpus_refusal("quick", &readers, "git exited 128");
+        let text = format!("{:?}", summary.detail);
+        for needle in [
+            "refused by: scorecard self-test corpus",
+            "quick-super-selftest.scorecard_commands",
+            "git exited 128",
+            "https://github.com/rrnewton/hermit_test_ledger.git",
+            TEST_LEDGER_ROOT_ENV,
+            SCORECARD_CORPUS_PREPARER,
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert_eq!(summary.exit_code, 75);
+    }
+}
+
+#[cfg(test)]
 mod all_unless_level_tests {
     use super::*;
 
@@ -13094,6 +13194,130 @@ fn local_off_the_record_refusal_with(
         ));
     }
     None
+}
+
+/// The script that fetches exactly the pinned hermit_test_ledger objects the
+/// scorecard self-test reads (SELF_TEST_CORPUS in scorecard.rs), anonymously,
+/// and prints the directory it prepared.
+const SCORECARD_CORPUS_PREPARER: &str = "ci/prepare-scorecard-self-test-corpus.sh";
+/// Where scorecard.rs reads that corpus when it is outside the parent workspace.
+const TEST_LEDGER_ROOT_ENV: &str = "DEV_HERMIT_TEST_LEDGER_ROOT";
+
+/// A node that reads the scorecard self-test corpus: the commands tier of the
+/// scorecard self-test, or the script unit tests, which run that tier too.
+fn reads_scorecard_corpus(step: &Step) -> bool {
+    step.cmd
+        .contains("test-harness selftest scorecard_commands")
+        || step.cmd.contains("./scripts/run-script-tests.sh")
+}
+
+/// The ledger scorecard.rs's ledger_root would read without fetching, in its
+/// own order: DEV_HERMIT_TEST_LEDGER_ROOT, then
+/// $DEV_HERMIT_PARENT/hermit_test_ledger, then a hermit_test_ledger checkout
+/// beside an ancestor of the checkout. None for a fresh clone.
+fn existing_test_ledger(
+    root: &Path,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = var(TEST_LEDGER_ROOT_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
+    if let Some(parent) = var(PARENT_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(parent).join("hermit_test_ledger"));
+    }
+    root.ancestors()
+        .map(|parent| parent.join("hermit_test_ledger"))
+        .find(|path| path.join(".git").exists())
+}
+
+/// Fetch the pinned corpus into a fresh directory under `scratch` with
+/// SCORECARD_CORPUS_PREPARER, which verifies every object it fetched.
+fn prepare_scorecard_corpus(preparer: &Path, scratch: &Path) -> Result<PathBuf, String> {
+    let parent = scratch.join("hermit-scorecard-corpus");
+    std::fs::create_dir_all(&parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let output = Command::new(preparer)
+        .arg(&parent)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", preparer.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr.lines().rev().take(3).collect::<Vec<_>>();
+        return Err(format!(
+            "{} exited with {}: {}",
+            preparer.display(),
+            output.status,
+            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let dir = PathBuf::from(&printed);
+    if printed.is_empty() || !dir.join(".git").exists() {
+        return Err(format!(
+            "{} printed {printed:?}, which is not a prepared repository",
+            preparer.display()
+        ));
+    }
+    Ok(dir)
+}
+
+/// The refusal for a corpus that is missing and could not be fetched.
+fn scorecard_corpus_refusal(profile: &str, readers: &[String], error: &str) -> Box<RunSummary> {
+    Box::new(RunSummary::refused(
+        75,
+        profile,
+        "scorecard self-test corpus",
+        vec![
+            format!(
+                "{} need the pinned hermit_test_ledger objects, none was found, and fetching \
+                 them failed: {error}",
+                readers.join(", ")
+            ),
+            format!(
+                "remedy: clone https://github.com/rrnewton/hermit_test_ledger.git and export \
+                 {TEST_LEDGER_ROOT_ENV}=<that checkout>, or run `{SCORECARD_CORPUS_PREPARER} DIR` \
+                 and export {TEST_LEDGER_ROOT_ENV}=<the directory it prints>"
+            ),
+        ],
+    ))
+}
+
+/// Before any node runs: a selected node that reads the scorecard self-test
+/// corpus needs the pinned hermit_test_ledger objects. Inside the dev-hermit
+/// harness they are its checkout. A fresh clone has none, so they are fetched
+/// anonymously into this run's TMPDIR and DEV_HERMIT_TEST_LEDGER_ROOT is
+/// exported to the nodes (they all run on the host). If the fetch fails, the
+/// run refuses at once, naming the remedy, instead of failing those nodes as
+/// product failures minutes later. A boxing re-exec inherits the exported
+/// variable, so it never fetches twice.
+fn admit_scorecard_corpus(
+    root: &Path,
+    cfg: &DagConfig,
+    second: Option<&DagConfig>,
+    profile: &str,
+) -> Result<(), Box<RunSummary>> {
+    let readers = std::iter::once(cfg)
+        .chain(second)
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter(|step| reads_scorecard_corpus(step))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if readers.is_empty() || existing_test_ledger(root, |name| std::env::var_os(name)).is_some() {
+        return Ok(());
+    }
+    match prepare_scorecard_corpus(&root.join(SCORECARD_CORPUS_PREPARER), &std::env::temp_dir()) {
+        Ok(dir) => {
+            eprintln!(
+                "validate: no hermit_test_ledger checkout here; fetched its pinned scorecard \
+                 self-test corpus into {} for {}",
+                dir.display(),
+                readers.join(", ")
+            );
+            std::env::set_var(TEST_LEDGER_ROOT_ENV, &dir);
+            Ok(())
+        }
+        Err(error) => Err(scorecard_corpus_refusal(profile, &readers, &error)),
+    }
 }
 
 /// The census base a counted node compares its listed tests against
@@ -33523,6 +33747,16 @@ fn run(
     if let Err(summary) = validate_pinned_image::admit(&root, &execution_plan, &plan.profile) {
         return *summary;
     }
+    // A selected node that reads the scorecard self-test corpus gets it now,
+    // before any node runs, or the run refuses here by name with the remedy.
+    if let Err(summary) = admit_scorecard_corpus(
+        &root,
+        &execution_plan.cfg,
+        execution_plan.second.as_ref(),
+        &plan.profile,
+    ) {
+        return *summary;
+    }
 
     match run_timeout {
         Some(secs) => eprintln!(
@@ -39636,6 +39870,28 @@ mod scorecard_cutover_tests {
         assert!(
             drop < parse,
             "the filter must be dropped before argument parsing"
+        );
+    }
+
+    /// Wiring: run() admits the scorecard self-test corpus among its pre-node
+    /// admissions, after the host tools and before boxing and the DAG.
+    #[test]
+    fn run_admits_the_scorecard_corpus_before_any_node_runs() {
+        let body = top_level_fn_body("run");
+        let corpus = body
+            .find("admit_scorecard_corpus(")
+            .expect("run() must call admit_scorecard_corpus");
+        let tools = body
+            .find("validate_host_tools::admit(")
+            .expect("run() admits host tools");
+        let boxing = body.find("resolve_cgroups(").expect("run() boxes the run");
+        assert!(
+            tools < corpus,
+            "the corpus admission follows the host-tool admission"
+        );
+        assert!(
+            corpus < boxing,
+            "the corpus is admitted before boxing and the DAG"
         );
     }
 
