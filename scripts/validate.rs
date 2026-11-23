@@ -40389,6 +40389,65 @@ mod scorecard_cutover_tests {
         );
     }
 
+    // Every claim, granted or refused, releases its locks while a forked child
+    // still holds duplicates of their descriptors.
+    #[test]
+    fn a_claim_releases_its_locks_while_a_child_holds_their_descriptors() {
+        let sandbox = tempfile::tempdir().unwrap();
+        assert_eq!(
+            validate_runtime::runner_lock_inherited_descriptor_self_test(sandbox.path()),
+            Ok(3)
+        );
+    }
+
+    // The cross-runner test beside sibling threads that spawn without pause, as
+    // a full run of this test binary has them. Each spawn forks the descriptor
+    // table and the child keeps the duplicates until it execs, so a lock that a
+    // claim merely closed stayed held and the next claim was refused: the
+    // cross-runner test failed in every full run and passed alone.
+    #[test]
+    fn the_invocation_lock_is_one_lock_across_runners_while_siblings_spawn() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawned = std::sync::Arc::new(AtomicUsize::new(0));
+        let spawners: Vec<_> = (0..8)
+            .map(|_| {
+                let (stop, spawned) = (stop.clone(), spawned.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                        spawned.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while spawned.load(Ordering::Relaxed) < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let started = spawned.load(Ordering::Relaxed);
+        let failures: Vec<_> = (0..16)
+            .filter_map(|_| {
+                let sandbox = tempfile::tempdir().unwrap();
+                match validate_runtime::runner_lock_self_test(sandbox.path()) {
+                    Ok(4) => None,
+                    other => Some(other),
+                }
+            })
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert!(
+            started >= 8,
+            "the sibling spawners had not started: {started}"
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     #[test]
     fn versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock() {
         let temp = tempfile::tempdir().unwrap();

@@ -782,11 +782,11 @@ pub fn claim_active_marker() {
 
 /// A held, kernel-backed exclusive lock on this checkout's validate slot.
 pub struct InvocationLock {
-    _file: File,
+    _file: LockFile,
     /// The `target/validation` lock a runner that drives `target/` also holds
     /// ([`legacy_invocation_lock_path`]); released with this value.
-    _legacy: Option<File>,
-    guard: File,
+    _legacy: Option<LockFile>,
+    guard: LockFile,
     holder: PathBuf,
     record: InvocationHolderRecord,
 }
@@ -798,9 +798,48 @@ impl Drop for InvocationLock {
         // contender while this guard is held.
         if flock_exclusive(self.guard.as_raw_fd()).is_ok() {
             let _ = std::fs::remove_file(&self.holder);
+            if let Some(legacy) = &self._legacy {
+                flock_unlock(legacy.as_raw_fd());
+            }
             flock_unlock(self._file.as_raw_fd());
             flock_unlock(self.guard.as_raw_fd());
         }
+    }
+}
+
+/// A file this process uses as an `flock` lock, unlocked with `LOCK_UN` when
+/// it is dropped rather than left to the close.
+///
+/// A close releases an `flock` only when it closes the last descriptor of the
+/// lock's open file description (flock(2)). Every spawn from this process forks
+/// the whole descriptor table, and the child keeps those duplicates until it
+/// execs; close-on-exec closes them only then. So a lock that is merely closed
+/// while a sibling thread spawns stays held by that child, and the next claim
+/// in this checkout is refused although nothing holds the slot. A parallel
+/// test binary spawns constantly, which made the cross-runner test fail in
+/// every full run. `LOCK_UN` on any of the duplicates releases the lock at
+/// once, so every claim, refused or granted, releases what it locked.
+struct LockFile(File);
+
+impl LockFile {
+    fn open(path: &Path, create: bool) -> io::Result<LockFile> {
+        std::fs::OpenOptions::new()
+            .create(create)
+            .append(true)
+            .open(path)
+            .map(LockFile)
+    }
+}
+
+impl AsRawFd for LockFile {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        flock_unlock(self.0.as_raw_fd());
     }
 }
 
@@ -1112,11 +1151,7 @@ fn acquire_invocation_lock_with_hook(
     let lock_path = dir.join("validate-invocation.lock");
     let holder = invocation_holder_path(root);
     let guard_path = invocation_holder_guard_path(root);
-    let guard = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&guard_path)
-    {
+    let guard = match LockFile::open(&guard_path, true) {
         Ok(file) => file,
         Err(error) => {
             return LockOutcome::SafetyRefusal(format!(
@@ -1151,11 +1186,7 @@ fn acquire_invocation_lock_with_hook(
             ));
         }
     }
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&lock_path)
-    {
+    let file = match LockFile::open(&lock_path, true) {
         Ok(f) => f,
         Err(e) => {
             return LockOutcome::Unavailable(format!("cannot open {}: {e}", lock_path.display()));
@@ -1241,11 +1272,7 @@ fn acquire_invocation_lock_with_hook(
                 }
             }
         }
-        match std::fs::OpenOptions::new()
-            .create(!buck_stock)
-            .append(true)
-            .open(&path)
-        {
+        match LockFile::open(&path, !buck_stock) {
             Ok(legacy) => {
                 if !flock_nb(legacy.as_raw_fd()) {
                     return LockOutcome::Busy {
@@ -1313,13 +1340,23 @@ pub(crate) fn runner_lock_self_test(sandbox: &Path) -> Result<usize, String> {
             Err(format!("runner lock: {what}: {e}"))
         }
     };
+    // A claim that must be granted names the refusal it got instead, so the two
+    // free Buck-only claims below cannot fail with one indistinguishable line.
+    let granted = |outcome: LockOutcome, what: &str| match outcome {
+        LockOutcome::Acquired(lock) => Ok(lock),
+        LockOutcome::Busy { detail, .. } => Err(format!(
+            "runner lock: {what} must be granted; refused: {}",
+            detail.join("; ")
+        )),
+        LockOutcome::SafetyRefusal(e) | LockOutcome::Unavailable(e) => {
+            Err(format!("runner lock: {what} must be granted; {e}"))
+        }
+    };
     let target = sandbox.join("target");
     let _ = std::fs::remove_dir_all(&target);
     let mut refusals = 0usize;
 
-    let LockOutcome::Acquired(buck) = claim(true) else {
-        return Err("runner lock: a free Buck-only claim must be granted".into());
-    };
+    let buck = granted(claim(true), "a free Buck-only claim")?;
     if target.exists() {
         return Err("runner lock: a Buck-only claim created target/".into());
     }
@@ -1330,9 +1367,7 @@ pub(crate) fn runner_lock_self_test(sandbox: &Path) -> Result<usize, String> {
     refusals += 1;
     drop(buck);
 
-    let LockOutcome::Acquired(cargo) = claim(false) else {
-        return Err("runner lock: a free Cargo-runner claim must be granted".into());
-    };
+    let cargo = granted(claim(false), "a free Cargo-runner claim")?;
     let legacy_path = legacy_invocation_lock_path(sandbox);
     let probe = std::fs::OpenOptions::new()
         .create(true)
@@ -1360,9 +1395,10 @@ pub(crate) fn runner_lock_self_test(sandbox: &Path) -> Result<usize, String> {
     refusals += 1;
     flock_unlock(probe.as_raw_fd());
     // Where target/validation exists, a Buck-only holder holds it too.
-    let LockOutcome::Acquired(buck) = claim(true) else {
-        return Err("runner lock: a free Buck-only claim must be granted".into());
-    };
+    let buck = granted(
+        claim(true),
+        "a free Buck-only claim where target/validation exists",
+    )?;
     if flock_nb(probe.as_raw_fd()) {
         return Err(
             "runner lock: a Buck-only holder left the existing target/validation lock free".into(),
@@ -1371,6 +1407,142 @@ pub(crate) fn runner_lock_self_test(sandbox: &Path) -> Result<usize, String> {
     drop(buck);
     let _ = std::fs::remove_dir_all(&target);
     Ok(refusals)
+}
+
+/// Each claim releases its locks although a child of this process still holds
+/// duplicates of their descriptors, as a sibling thread's spawn leaves them
+/// until the child execs ([`LockFile`]). The claim hook stands in for that
+/// spawn: it duplicates every descriptor this process has open in `sandbox`
+/// while the claim holds its locks, and keeps the duplicates open to the end.
+/// Returns the number of claims granted beside them.
+pub(crate) fn runner_lock_inherited_descriptor_self_test(sandbox: &Path) -> Result<usize, String> {
+    use std::os::fd::AsFd;
+    let fail = |what: String| format!("inherited descriptor: {what}");
+    let root = std::fs::canonicalize(sandbox).map_err(|e| fail(e.to_string()))?;
+    let control = root.join("control.lock");
+    let contender_locks = || {
+        LockFile::open(&control, true)
+            .map(|file| flock_nb(file.as_raw_fd()))
+            .map_err(|e| fail(e.to_string()))
+    };
+
+    // Negative control: on this host a lock that is only closed stays held while
+    // a duplicate lives, so the claims below are not passing by default.
+    let closed = File::create(&control).map_err(|e| fail(e.to_string()))?;
+    if !flock_nb(closed.as_raw_fd()) {
+        return Err(fail("a free control lock was refused".into()));
+    }
+    let copy = closed
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| fail(e.to_string()))?;
+    drop(closed);
+    if contender_locks()? {
+        return Err(fail(
+            "a closed lock was released although a duplicate of its descriptor lived".into(),
+        ));
+    }
+    // LOCK_UN through any duplicate releases it at once.
+    flock_unlock(copy.as_raw_fd());
+    if !contender_locks()? {
+        return Err(fail(
+            "LOCK_UN through a duplicate left the lock held".into(),
+        ));
+    }
+    drop(copy);
+
+    // The real claims, Cargo runner first so target/validation exists for both.
+    let mut kept: Vec<(PathBuf, std::os::fd::OwnedFd)> = Vec::new();
+    let mut granted = 0usize;
+    for buck_stock in [false, true, false] {
+        let mut stand_in = Ok(());
+        let outcome =
+            acquire_invocation_lock_with_hook(&root, "self-test", "inherited", buck_stock, || {
+                stand_in = duplicate_descriptors_in(&root, &mut kept);
+            });
+        let LockOutcome::Acquired(lock) = outcome else {
+            return Err(fail(format!(
+                "claim {} (Buck-only: {buck_stock}) was refused although every earlier claim \
+                 had ended; only the duplicates its stand-in spawn kept remained",
+                granted + 1
+            )));
+        };
+        stand_in?;
+        drop(lock);
+        granted += 1;
+    }
+    // A stand-in that duplicated nothing would make the claims above vacuous.
+    for path in [
+        invocation_lock_root(&root).join("validate-invocation.lock"),
+        invocation_holder_guard_path(&root),
+        legacy_invocation_lock_path(&root),
+    ] {
+        if !kept.iter().any(|(target, _)| *target == path) {
+            return Err(fail(format!(
+                "the stand-in spawn duplicated no descriptor of {}",
+                path.display()
+            )));
+        }
+    }
+
+    // A refused claim releases what it locked by dropping its lock files, so a
+    // dropped LockFile must release its lock with a duplicate still open.
+    let dropped = LockFile::open(&control, true).map_err(|e| fail(e.to_string()))?;
+    if !flock_nb(dropped.as_raw_fd()) {
+        return Err(fail("a free control lock was refused".into()));
+    }
+    let copy = dropped
+        .0
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| fail(e.to_string()))?;
+    drop(dropped);
+    if !contender_locks()? {
+        return Err(fail(
+            "a dropped lock file left its lock to a duplicate".into(),
+        ));
+    }
+    drop(copy);
+    Ok(granted)
+}
+
+/// Duplicate, close-on-exec, every descriptor this process has open on a file
+/// under `root`, as a fork at this instant would.
+fn duplicate_descriptors_in(
+    root: &Path,
+    kept: &mut Vec<(PathBuf, std::os::fd::OwnedFd)>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir("/proc/self/fd")
+        .map_err(|e| format!("inherited descriptor: /proc/self/fd: {e}"))?;
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Another thread's descriptor may close between the listing and here;
+        // one under `root` belongs to the claim, which holds it open.
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        if !target.starts_with(root) {
+            continue;
+        }
+        // SAFETY: `fd` names a file under `root`, which only the claim that
+        // called this hook has open, and it stays open until the hook returns.
+        let copy = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map_err(|e| {
+                format!(
+                    "inherited descriptor: cannot duplicate {}: {e}",
+                    target.display()
+                )
+            })?;
+        kept.push((target, copy));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ box-wide live-run registry
@@ -2734,6 +2906,9 @@ pub fn self_test() -> Result<String, String> {
         LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
     }
     let runner_refusals = runner_lock_self_test(&sandbox)?;
+    let inherited_sandbox = sandbox.join("inherited-descriptors");
+    std::fs::create_dir_all(&inherited_sandbox).map_err(|e| format!("lock: {e}"))?;
+    let inherited_grants = runner_lock_inherited_descriptor_self_test(&inherited_sandbox)?;
 
     // ---- registry census: live vs stale vs CPU-active ----
     let reg = sandbox.join("runs");
@@ -2868,7 +3043,8 @@ pub fn self_test() -> Result<String, String> {
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
          {lock_safety_refuse} safety-refuse, {runner_refusals} cross-runner refuse (the shared \
-         lock; a Buck-only claim creates no target/), \
+         lock; a Buck-only claim creates no target/), {inherited_grants} granted beside a \
+         forked child's duplicates of the earlier claims' lock descriptors, \
          registry registration 1 success / 1 lock-refuse / 1 write-refuse / 1 \
          create-before-flock race-refuse, census 1 live / 1 stale-reaped, burner peer \
          1 cpu-active / 4 idle (the CPU-bounded burn read active though starved to \
