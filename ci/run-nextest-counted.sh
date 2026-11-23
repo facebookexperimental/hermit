@@ -678,7 +678,21 @@ function self_test_failed { # $1: the line ($LINENO) of the assertion that faile
 function self_test {
     local scratch got expected status=0 wall_multiplier cpu_wrapper fixture_binary attempts
     local binary_map inventory launch_failure=0 empty_listing=0 inventory_wrong_name=0
-    local ordinary_attempts ordinary_inventory
+    local ordinary_attempts ordinary_inventory inherited
+    # The verdict depends on this tree alone. Each case sets every input it
+    # exercises, so an inherited one can only change what a case tests: a
+    # validation's census base (HERMIT_CENSUS_BASE_DIR) arms the census gate
+    # against the fixture's own suite and refuses it. So clear, on entry, every
+    # inherited variable in the namespaces this wrapper and its helpers read
+    # (HERMIT_, NEXTEST_, DAGRUN_, E2E_), except the three that choose how a
+    # rust-script helper is started, never what it decides: a validation runs
+    # this self-test with prebuilt helpers.
+    while IFS= read -r inherited; do
+        case $inherited in
+            HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED|HERMIT_RUST_SCRIPT_ARTIFACT_ROOT|HERMIT_REAL_RUST_SCRIPT) ;;
+            HERMIT_*|NEXTEST_*|DAGRUN_*|E2E_*) unset "$inherited" ;;
+        esac
+    done < <(compgen -e)
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
