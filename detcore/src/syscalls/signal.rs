@@ -161,6 +161,23 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
     }
 }
 
+/// The pending word in the first `prefix.len()` bytes the kernel wrote for
+/// an `rt_sigpending` with a short `sigsetsize`: the little-endian low
+/// bytes, zero above the prefix. Bytes past the prefix are never read, so a
+/// short buffer at a page end cannot fault here where Linux succeeded.
+fn kernel_sigset_from_prefix(prefix: &[u8]) -> KernelSigset {
+    let mut bytes = [0u8; KERNEL_SIGSET_SIZE];
+    let take = prefix.len().min(KERNEL_SIGSET_SIZE);
+    bytes[..take].copy_from_slice(&prefix[..take]);
+    KernelSigset::from_le_bytes(bytes)
+}
+
+/// The bytes a corrected `rt_sigpending` word may write back: at most the
+/// `min(sigsetsize, 8)` bytes the kernel wrote, never past them.
+fn sigpending_corrected_bytes(kept: KernelSigset, sigsetsize: usize) -> Vec<u8> {
+    kept.to_le_bytes()[..sigsetsize.min(KERNEL_SIGSET_SIZE)].to_vec()
+}
+
 /// The mask Linux installs when a call names `mask` as the signal mask to sleep
 /// under (`rt_sigsuspend`, `ppoll`, `pselect6`): `set_current_blocked` drops
 /// `SIGKILL` and `SIGSTOP`, which can never be blocked.
@@ -5397,7 +5414,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         // queued (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
         act_on_pending_real_time(guest, pending, REAL_TIME_SIGNALS, 0).await;
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+        // Linux never queues a copy it discarded when the signal was sent
+        // (`sig_ignored`, kernel/signal.c), so `do_sigpending`'s union of
+        // the private and shared queues cannot contain one. Under ptrace
+        // the host kernel queues such a copy for the tracer anyway, so
+        // subtract the discarded-at-send record from the set the kernel
+        // just wrote, per queue as every other pending check does
+        // (`threads::without_discarded`,
+        // https://github.com/rrnewton/hermit/issues/4293). Only where the
+        // record is kept; elsewhere the kernel's answer stands.
+        // Linux copies only `sigsetsize` bytes (0..=8 succeeds), so the
+        // correction reads and writes back at most that prefix; a size-0
+        // call touches nothing and is skipped entirely.
+        let written = call.sigsetsize().min(KERNEL_SIGSET_SIZE);
+        if result == 0
+            && written > 0
+            && crate::scheduler::discarded_at_send::records(guest.config())
+            && let Some(set) = call.set()
+        {
+            let out = AddrMut::<u8>::from_raw(set.as_raw()).ok_or(Errno::EFAULT)?;
+            let mut prefix = vec![0u8; written];
+            guest.memory().read_exact(out, &mut prefix)?;
+            let reported = kernel_sigset_from_prefix(&prefix);
+            if reported & crate::scheduler::discarded_at_send::STANDARD_SIGNALS != 0 {
+                let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
+                let kept =
+                    crate::syscalls::threads::without_discarded(guest, &state, reported, 0).await;
+                if kept != reported {
+                    guest
+                        .memory()
+                        .write_exact(out, &sigpending_corrected_bytes(kept, written))?;
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// A delivered signal may run a handler, whose return restores, through an
@@ -7593,6 +7644,19 @@ mod tests {
         assert_eq!(validate_kernel_sigset_size(7), Err(Errno::EINVAL));
         assert_eq!(validate_kernel_sigset_size(8), Ok(()));
         assert_eq!(validate_kernel_sigset_size(16), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn sigpending_correction_is_bounded_to_the_kernel_written_prefix() {
+        // SIGURG (23) is byte 2, bit 6 of the little-endian word.
+        let urg = 1_u64 << (libc::SIGURG - 1);
+        assert_eq!(kernel_sigset_from_prefix(&urg.to_le_bytes()[..4]), urg);
+        assert_eq!(kernel_sigset_from_prefix(&urg.to_le_bytes()[..2]), 0);
+        assert_eq!(kernel_sigset_from_prefix(&[]), 0);
+        // Clearing the word writes only the prefix; size 0 writes nothing.
+        assert_eq!(sigpending_corrected_bytes(0, 4), vec![0u8; 4]);
+        assert_eq!(sigpending_corrected_bytes(0, 0), Vec::<u8>::new());
+        assert_eq!(sigpending_corrected_bytes(u64::MAX, 9), vec![0xffu8; 8]);
     }
 
     #[test]

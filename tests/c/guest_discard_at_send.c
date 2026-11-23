@@ -138,6 +138,14 @@
  *       As sigpipe-take, with the discarded SIGPIPE sent while the thread
  *       waits for it in sigtimedwait for 300 ms (EAGAIN), SIGPIPE unblocked
  *       in its own mask, so the take finds the discarded copy still queued.
+ *   pending-mt-kill, pending-blocked, pending-mt-tgkill,
+ *   pending-ign-mt-kill, pending-late-handler, pending-coalesce,
+ *   pending-short, pending-zero
+ *       rt_sigpending reads: a discarded process-directed copy reads 0
+ *       in the blocked worker that sent it; kept private/shared copies
+ *       read 1; a kept private copy beside a discarded shared one reads
+ *       1; raw short (4) and zero sigsetsize reads clear only the
+ *       kernel-written prefix / touch nothing.
  *   signalfd-inread
  *       A thread blocks SIGUSR2, leaves SIGUSR1 unblocked, and reads a
  *       blocking signalfd for both; main sends it SIGUSR1 while SIG_IGN,
@@ -911,6 +919,73 @@ static int run_armed(void) {
   return 0;
 }
 
+static void *pending_worker(void *unused) {
+  (void)unused;
+  int sig = is("pending-ign-mt-kill") ? SIGUSR1 : SIGURG;
+  mask(SIG_BLOCK, sig);
+  atomic_store(&ready, 1);
+  if (is("pending-mt-tgkill")) {
+    while (!atomic_load(&sent)) {
+      sched_yield();
+    }
+  } else {
+    /* Main releases us once it is running unblocked, as in the lit
+     * guest: the reader must be this blocked worker. */
+    while (!atomic_load(&sent)) {
+      sched_yield();
+    }
+    if (is("pending-coalesce")) {
+      pthread_kill(pthread_self(), sig);
+    }
+    kill(getpid(), sig);
+    if (is("pending-late-handler")) {
+      set_action(sig, on_signal);
+    }
+  }
+  if (is("pending-short") || is("pending-zero")) {
+    long size = is("pending-short") ? 4 : 0;
+    unsigned char buffer[8];
+    memset(buffer, 0xaa, sizeof(buffer));
+    long ret = syscall(SYS_rt_sigpending, buffer, size);
+    if (size == 0) {
+      printf("%s: ret %ld first %d\n", mode, ret, buffer[0]);
+    } else {
+      printf("%s: ret %ld pendingbyte %d suffix %d\n", mode, ret, buffer[2],
+             buffer[4]);
+    }
+    return NULL;
+  }
+  sigset_t pending;
+  sigpending(&pending);
+  printf("%s: pending %d\n", mode, sigismember(&pending, sig) == 1);
+  return NULL;
+}
+
+static int run_pending(void) {
+  if (is("pending-blocked")) {
+    mask(SIG_BLOCK, SIGURG);
+    kill(getpid(), SIGURG);
+    sigset_t pending;
+    sigpending(&pending);
+    printf("%s: pending %d\n", mode, sigismember(&pending, SIGURG) == 1);
+    return 0;
+  }
+  if (is("pending-ign-mt-kill")) {
+    set_action(SIGUSR1, SIG_IGN);
+  }
+  pthread_t thread;
+  pthread_create(&thread, NULL, pending_worker, NULL);
+  while (!atomic_load(&ready)) {
+    sched_yield();
+  }
+  if (is("pending-mt-tgkill")) {
+    pthread_kill(thread, SIGURG);
+  }
+  atomic_store(&sent, 1);
+  pthread_join(thread, NULL);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s MODE\n", argv[0]);
@@ -918,6 +993,9 @@ int main(int argc, char **argv) {
   }
   mode = argv[1];
   setvbuf(stdout, NULL, _IONBF, 0);
+  if (starts("pending-")) {
+    return run_pending();
+  }
   if (starts("armed-")) {
     return run_armed();
   }

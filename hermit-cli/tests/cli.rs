@@ -74737,6 +74737,64 @@ fn the_discarded_at_send_rows_record_and_replay() {
     }
 }
 
+/// The `rt_sigpending` reader of the discarded-at-send record: a
+/// discarded process-directed copy reads 0 in the blocked worker that
+/// sent it, kept copies read 1, and raw short/zero `sigsetsize` reads
+/// touch only the kernel-written prefix. L2 (ptrace) via
+/// `assert_discard_at_send_rows`, plus record/replay below.
+#[test]
+fn a_rt_sigpending_reads_only_kept_copies() {
+    assert_discard_at_send_rows(&[
+        ("pending-mt-kill", "pending 0", None),
+        ("pending-blocked", "pending 1", None),
+        ("pending-mt-tgkill", "pending 1", None),
+        ("pending-ign-mt-kill", "pending 0", None),
+        ("pending-late-handler", "pending 0", None),
+        ("pending-coalesce", "pending 1", None),
+        ("pending-short", "ret 0 pendingbyte 0 suffix 170", None),
+        ("pending-zero", "ret 0 first 170", None),
+    ]);
+}
+
+#[test]
+fn the_rt_sigpending_rows_record_and_replay() {
+    // Only the tgkill row records: every discarded row sends with
+    // `kill(getpid(), ...)`, and `hermit record start` refuses that
+    // syscall by name ("unsupported syscall: kill", measured on
+    // pending-mt-kill and pending-short), so a discarded-at-send
+    // sigpending correction cannot be recorded today. That exclusion is
+    // the recorded reason the plan allows; replay parity for the
+    // corrected word is therefore not claimed.
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    for (mode, line) in [("pending-mt-tgkill", "pending 1")] {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            data_dir_arg.as_str(),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: {line}\n"),
+            "{mode}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: replay matched recording."),
+            "{mode}: replay did not match:\n{log}"
+        );
+    }
+}
+
 /// On KVM, whose guest thread IDs do not name host tasks, the
 /// discarded-at-send record is not kept, and `rt_sigtimedwait` writes its
 /// siginfo as on ptrace: the Claude implementation review of

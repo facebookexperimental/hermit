@@ -1,0 +1,19 @@
+RUN: %hermit run -- %me discarded | FileCheck --check-prefix=DISCARDED %s
+DISCARDED: discarded: SIGURG pending 0
+RUN: %hermit run -- %me shared-blocked | FileCheck --check-prefix=SHARED %s
+SHARED: shared-blocked: SIGURG pending 1
+RUN: %hermit run -- %me private-blocked | FileCheck --check-prefix=PRIVATE %s
+PRIVATE: private-blocked: SIGURG pending 1
+RUN: %hermit run -- %me caught-blocked | FileCheck --check-prefix=CAUGHT %s
+CAUGHT: caught-blocked: SIGURG pending 1 handled 1
+RUN: %hermit run -- %me pending-ign | FileCheck --check-prefix=IGN %s
+IGN: pending-ign: SIGUSR1 pending 0
+RUN: %hermit run -- %me pending-late-handler | FileCheck --check-prefix=LATE %s
+LATE: pending-late-handler: SIGURG pending 0
+RUN: %hermit run -- %me pending-coalesce | FileCheck --check-prefix=COALESCE %s
+COALESCE: pending-coalesce: SIGURG pending 1
+RUN: %hermit run -- %me pending-short | FileCheck --check-prefix=SHORT %s
+SHORT: pending-short: ret 0 pendingbyte 0 suffix 170
+RUN: %hermit run -- %me pending-zero | FileCheck --check-prefix=ZERO %s
+ZERO: pending-zero: ret 0 first 170
+RUN: %hermit run --strict --verify --verify-strict -- %me discarded | FileCheck --check-prefix=DISCARDED %s
