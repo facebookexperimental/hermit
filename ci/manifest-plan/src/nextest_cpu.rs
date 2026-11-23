@@ -152,6 +152,71 @@ pub fn listed_identities(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(identities)
 }
 
+/// The result ID of one test, as run records print it and as
+/// `validate --tests` names it: `<package>$<test>` for a library's unit
+/// tests, and `<package>::<binary name>$<test>` for every other target kind
+/// (bin, test, bench, example, proc-macro). It is not nextest's binary ID:
+/// a bin target's is `<package>::bin/<name>`, and a proc-macro's is the bare
+/// package. A stress run appends `@stress-<index>` to the binary part.
+pub fn displayed_test_id(
+    package: &str,
+    binary_name: &str,
+    test: &str,
+    suite_kind: &str,
+    stress_index: Option<u64>,
+) -> String {
+    let stress = stress_index.map_or_else(String::new, |index| format!("@stress-{index}"));
+    let display_binary = if suite_kind == "lib" {
+        format!("{package}{stress}")
+    } else {
+        format!("{package}::{binary_name}{stress}")
+    };
+    format!("{display_binary}${test}")
+}
+
+/// The named case IDs that this inventory does not list, in the order
+/// given, each once.
+///
+/// A case ID is a run record's result ID ([`displayed_test_id`], what
+/// validate --tests names). It is listed when a suite lists that test with
+/// filter-match `matches` and the suite's package-name, binary-name and kind
+/// give that ID: the population [`listed_count`] counts. A named case
+/// outside it cannot run, so a case-selected run refuses it by name rather
+/// than pass with it unrun.
+pub fn unlisted_cases<'a>(
+    bytes: &[u8],
+    cases: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>, String> {
+    BinaryMap::from_nextest_inventory(bytes)?;
+    let inventory: NextestInventory =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut listed = std::collections::BTreeSet::new();
+    for suite in inventory.rust_suites.into_values() {
+        for (test, case) in suite.testcases {
+            match case.filter_match.status.as_str() {
+                "matches" => {
+                    listed.insert(displayed_test_id(
+                        &suite.package,
+                        &suite.binary_name,
+                        &test,
+                        &suite.kind,
+                        None,
+                    ));
+                }
+                "mismatch" => {}
+                status => return Err(format!("unknown Nextest filter status {status:?}")),
+            }
+        }
+    }
+    let mut unlisted: Vec<String> = Vec::new();
+    for case in cases {
+        if !listed.contains(case) && !unlisted.iter().any(|seen| seen == case) {
+            unlisted.push(case.to_string());
+        }
+    }
+    Ok(unlisted)
+}
+
 pub const BUDGET_SCHEMA: u64 = 1;
 pub const CALIBRATION_PATH: &str = ".config/nextest-budgets.json";
 

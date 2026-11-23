@@ -2,9 +2,11 @@
 # Census gate for one counted Nextest node.
 #
 # Every run checks its own population: a counted node that lists no tests is
-# refused (zero-tests), so an empty collection can never pass as green. (A
-# case-selected node, --case-selected, lists only the cases a --tests run
-# picked; validate's own expected-count guard covers it instead.) A run
+# refused (zero-tests), so an empty collection can never pass as green. That
+# includes a case-selected node (--case-selected), whose filter lists only the
+# cases a --tests run picked: a filter that matches nothing is refused too.
+# (The counted wrapper refuses earlier, naming them, when a case validate
+# --tests named is not listed.) A run
 # that is given a base (the last landed main's population) also compares its
 # listed population against it with ci/census-diff, so a test that vanished
 # without a declared drop fails. Only a candidate-versus-main comparison needs
@@ -27,10 +29,13 @@
 # given (the adapter supplies it only for single-suite selections).
 #
 # --case-selected names the case-selected treatment: HERMIT_NEXTEST_FILTER_EXPR
-# selects individual cases, so the candidate listing is a subset, never
-# the suite population; the full-population comparison does not apply
+# selects individual cases, and the counted wrapper ANDs it with the node's
+# own filtersets (nextest would OR separate ones), so the candidate listing
+# is a subset of the node's population, never the whole of it; the
+# full-population comparison does not apply
 # and the check reports that by name instead of refusing for want of a
-# base. The disappearance guard binds full-suite counted nodes.
+# base. The disappearance guard binds full-suite counted nodes. The
+# zero-tests refusal still applies.
 #
 # Base contract (queue-adapter-owned, recorded here as the review point):
 # the base is the .listed-ids of a full counted run at the last landed
@@ -88,10 +93,9 @@ if [[ -z $candidate_listed && -z $candidate_outcomes ]]; then
     printf 'census-check: --candidate-listed or --candidate-outcomes is required\n' >&2
     exit 2
 fi
-# Zero tests collected is a failure on every run, base or none: nothing ran,
-# so nothing passed. (A case-selected run lists only the cases its filter
-# picks, and is judged by the rule below instead.)
-if ((! case_selected)) && [[ -n $candidate_listed ]] && ! grep -qv '^[[:space:]]*\(#\|$\)' -- "$candidate_listed" 2>/dev/null; then
+# Zero tests collected is a failure on every run, base or none, case-selected
+# or not: nothing ran, so nothing passed.
+if [[ -n $candidate_listed ]] && ! grep -qv '^[[:space:]]*\(#\|$\)' -- "$candidate_listed" 2>/dev/null; then
     printf 'census-check: zero-tests: candidate population %s lists no tests; a counted node that collects nothing is refused\n' "$candidate_listed" >&2
     exit 2
 fi

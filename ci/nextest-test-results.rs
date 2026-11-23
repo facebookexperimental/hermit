@@ -26,10 +26,12 @@ use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
+use nextest_cpu::displayed_test_id;
 use nextest_cpu::listed_count;
 use nextest_cpu::listed_identities;
 use nextest_cpu::read_attempt_records;
 use nextest_cpu::read_binary_map;
+use nextest_cpu::unlisted_cases;
 use nextest_cpu::write_binary_map_atomic;
 use nextest_cpu::write_report_atomic;
 use serde::Deserialize;
@@ -46,7 +48,7 @@ mod nextest_cpu;
 
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n       nextest-test-results.rs --listed-ids NEXTEST_INVENTORY_JSON OUTPUT\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. It is required with BINARY_MAP. Without a binary map it is optional, and overlapping same-name suites refuse."
+        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n       nextest-test-results.rs --listed-ids NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --unlisted-cases NEXTEST_INVENTORY_JSON [CASE_ID...]\n\n--unlisted-cases prints, one per line, each named case ID that the inventory does not list; it prints nothing when all are listed. A case ID is a result ID as run records print it: <package>$<test name> for a library unit test, <package>::<binary name>$<test name> for every other target.\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. It is required with BINARY_MAP. Without a binary map it is optional, and overlapping same-name suites refuse."
     );
 }
 
@@ -94,22 +96,6 @@ fn test_identity(name: &str, line: usize) -> Result<((String, String), String, u
         test.to_string(),
         attempts,
     ))
-}
-
-fn displayed_test_id(
-    package: &str,
-    binary: &str,
-    test: &str,
-    suite_kind: &str,
-    stress_index: Option<u64>,
-) -> String {
-    let stress = stress_index.map_or_else(String::new, |index| format!("@stress-{index}"));
-    let display_binary = if suite_kind == "lib" {
-        format!("{package}{stress}")
-    } else {
-        format!("{package}::{binary}{stress}")
-    };
-    format!("{display_binary}${test}")
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1238,6 +1224,18 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
             .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
         let listed = listed_count(&bytes)?;
         println!("{listed}");
+        return Ok(());
+    }
+    if first == "--unlisted-cases" {
+        let inventory = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing NEXTEST_INVENTORY_JSON".to_string())?;
+        let cases: Vec<String> = args.by_ref().collect();
+        let bytes = fs::read(&inventory)
+            .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
+        for case in unlisted_cases(&bytes, cases.iter().map(String::as_str))? {
+            println!("{case}");
+        }
         return Ok(());
     }
     if first == "--listed-ids" {
@@ -3414,6 +3412,115 @@ mod tests {
         assert_eq!(
             listed_identities(inventory).unwrap().len() as u64,
             listed_count(inventory).unwrap()
+        );
+    }
+
+    #[test]
+    fn unlisted_cases_names_each_selected_case_the_listing_lacks() {
+        // validate --tests names cases by result ID (displayed_test_id):
+        // <package>$<test> for a library's unit tests, and
+        // <package>::<binary name>$<test> for every other kind. That is not
+        // nextest's binary ID: a bin's is <package>::bin/<name> and a
+        // proc-macro's is the bare package. Here the library and the bin
+        // share a binary name and a test name, as hermit-run's do.
+        let inventory = br#"{
+            "rust-suites": {
+                "hermit-run": {
+                    "package-name": "hermit-run",
+                    "binary-id": "hermit-run",
+                    "binary-name": "hermit",
+                    "kind": "lib",
+                    "binary-path": "/tmp/lib-binary",
+                    "testcases": {
+                        "passes": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "shared": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "filtered": {"ignored": false, "filter-match": {"status": "mismatch"}}
+                    }
+                },
+                "hermit-run::bin/hermit": {
+                    "package-name": "hermit-run",
+                    "binary-id": "hermit-run::bin/hermit",
+                    "binary-name": "hermit",
+                    "kind": "bin",
+                    "binary-path": "/tmp/bin-binary",
+                    "testcases": {
+                        "tests::bin_test": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "shared": {"ignored": false, "filter-match": {"status": "mismatch"}}
+                    }
+                },
+                "hermit-run::cli": {
+                    "package-name": "hermit-run",
+                    "binary-id": "hermit-run::cli",
+                    "binary-name": "cli",
+                    "kind": "test",
+                    "binary-path": "/tmp/cli-binary",
+                    "testcases": {
+                        "cli::runs": {"ignored": false, "filter-match": {"status": "matches"}}
+                    }
+                },
+                "hermit-macros": {
+                    "package-name": "hermit-macros",
+                    "binary-id": "hermit-macros",
+                    "binary-name": "hermit_macros",
+                    "kind": "proc-macro",
+                    "binary-path": "/tmp/macro-binary",
+                    "testcases": {
+                        "expands": {"ignored": false, "filter-match": {"status": "matches"}}
+                    }
+                }
+            }
+        }"#;
+        let unlisted = |cases: &[&str]| unlisted_cases(inventory, cases.iter().copied()).unwrap();
+        // Real, listed cases of every kind: nothing is named.
+        assert!(
+            unlisted(&[
+                "hermit-run$passes",
+                "hermit-run$shared",
+                "hermit-run::hermit$tests::bin_test",
+                "hermit-run::cli$cli::runs",
+                "hermit-macros::hermit_macros$expands",
+            ])
+            .is_empty()
+        );
+        assert!(unlisted(&[]).is_empty());
+        // Each of these is named, in order, once: a nonexistent test; a
+        // test the filter left out; the bin's same-name test, which the
+        // filter left out while the library's is listed; a library test
+        // named in the bin's form; nextest's binary ID for a bin and for a
+        // proc-macro in place of the result ID; a wrong binary; and an ID
+        // with no test part.
+        assert_eq!(
+            unlisted(&[
+                "hermit-run$no_such_test",
+                "hermit-run$passes",
+                "hermit-run$filtered",
+                "hermit-run::hermit$shared",
+                "hermit-run::hermit$passes",
+                "hermit-run::bin/hermit$tests::bin_test",
+                "hermit-macros$expands",
+                "hermit-run::other$cli::runs",
+                "hermit-run$no_such_test",
+                "hermit-run",
+            ]),
+            [
+                "hermit-run$no_such_test",
+                "hermit-run$filtered",
+                "hermit-run::hermit$shared",
+                "hermit-run::hermit$passes",
+                "hermit-run::bin/hermit$tests::bin_test",
+                "hermit-macros$expands",
+                "hermit-run::other$cli::runs",
+                "hermit-run",
+            ]
+        );
+        // An unknown filter status refuses, as it does for the count.
+        let unknown = String::from_utf8(inventory.to_vec())
+            .unwrap()
+            .replace("\"mismatch\"", "\"surprise\"");
+        assert!(
+            unlisted_cases(unknown.as_bytes(), ["hermit-run$passes"])
+                .unwrap_err()
+                .contains("unknown Nextest filter status")
         );
     }
 

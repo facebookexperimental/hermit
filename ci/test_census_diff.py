@@ -450,6 +450,23 @@ def test_wired_case_selected_is_named_not_refused(tmp_path):
     assert "mysuite" in r.stderr
 
 
+def test_wired_case_selected_listing_nothing_is_refused(tmp_path):
+    # A case filter that matches nothing collects zero tests: that is
+    # refused like any empty collection, never passed as "not applicable",
+    # with or without a base.
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "cand.listed-ids").write_text("")
+    for extra in ([], ["--base-listed", str(root / "missing.listed-ids")]):
+        r = subprocess.run(
+            ["bash", str(CHECK), "--candidate-listed", str(root / "cand.listed-ids"),
+             "--case-selected", "--suite", "mysuite", *extra],
+            capture_output=True, text=True)
+        assert r.returncode == 2, (extra, r.returncode, r.stderr)
+        assert "zero-tests" in r.stderr and "not applicable" not in r.stderr, r.stderr
+
+
 def test_provenance_header_is_not_a_base_id(tmp_path):
     # census-diff fed a stamped base directly must not diff the header.
     r = _check_stamped(tmp_path, ["a"], ["a"], expected=None)

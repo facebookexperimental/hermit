@@ -1032,8 +1032,9 @@ enum Focused {
     },
     /// `--tests node::case[,...]`: run only the named test cases (plus the
     /// upstream steps those nodes need). The map is node tag -> case IDs as
-    /// they appear in per-node results (`<crate>::<binary>$<test name>` for
-    /// nextest producers; see `case_filter_expr`).
+    /// they appear in per-node results (`<package>$<test name>` or
+    /// `<package>::<binary name>$<test name>` for nextest producers; see
+    /// `case_filter_expr`).
     TestCases {
         cases: std::collections::BTreeMap<String, Vec<String>>,
     },
@@ -1888,6 +1889,12 @@ fn usage() -> &'static str {
      \x20                  test.cli::hermit-run::cli$some_test; IDs are listed in a\n\
      \x20                  run record's test_cases vector. Only nextest nodes can\n\
      \x20                  be sliced by case; any other node fails loudly by name.\n\
+     \x20                  A named case its node does not list fails that node\n\
+     \x20                  by name before any test runs, never a zero-test pass;\n\
+     \x20                  the selection narrows the node's own filter, never\n\
+     \x20                  widens it. A package or binary name nextest does not\n\
+     \x20                  know fails the node earlier, at nextest's filter\n\
+     \x20                  parser (exit 2), which names it.\n\
      \x20 --tests-file <path>            Same selection, one node::case ID per line\n\
      \x20                  ('#' comments and blank lines are ignored).\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
@@ -13332,28 +13339,36 @@ const CENSUS_BASE_ENVS: [&str; 2] = ["HERMIT_CENSUS_BASE_LISTED_IDS", "HERMIT_CE
 /// node with one lists only the matching cases, and census-check skips the
 /// base comparison for it (--case-selected).
 const NEXTEST_FILTER_EXPR_ENV: &str = "HERMIT_NEXTEST_FILTER_EXPR";
+/// The case IDs a --tests run names for one counted node, space-separated
+/// (inject_case_filters). ci/run-nextest-counted.sh fails the node, before
+/// any test runs, when one of them is not in the node's listing, naming it:
+/// a name that matches nothing can never pass with zero tests run.
+const NEXTEST_SELECTED_CASES_ENV: &str = "HERMIT_NEXTEST_SELECTED_CASES";
 /// The one selection mode that selects cases: --tests puts
 /// HERMIT_NEXTEST_FILTER_EXPR into the selected steps' own env
 /// (inject_case_filters). Every other mode, --selected included, runs whole
 /// nodes.
 const CASE_SELECTING_MODE: &str = "tests";
 
-/// Drop a HERMIT_NEXTEST_FILTER_EXPR inherited from the caller, naming it.
-/// Cases are selected only per step, by --tests; an inherited value would
-/// make every counted node list only the matching cases and skip the census
-/// comparison, while the run read as a whole-suite run. Returns whether a
-/// value was dropped.
+/// Drop a case selection inherited from the caller (HERMIT_NEXTEST_FILTER_EXPR
+/// or HERMIT_NEXTEST_SELECTED_CASES), naming each. Cases are selected only
+/// per step, by --tests; an inherited filter would make every counted node
+/// list only the matching cases and skip the census comparison while the run
+/// read as a whole-suite run, and inherited case names would fail every
+/// counted node that does not list them. Returns whether a value was dropped.
 fn drop_inherited_case_filter() -> bool {
-    let inherited =
-        std::env::var_os(NEXTEST_FILTER_EXPR_ENV).is_some_and(|value| !value.is_empty());
-    if inherited {
-        eprintln!(
-            "validate: ignoring {NEXTEST_FILTER_EXPR_ENV} from the environment: only --tests \
-             selects cases, per step"
-        );
+    let mut dropped = false;
+    for name in [NEXTEST_FILTER_EXPR_ENV, NEXTEST_SELECTED_CASES_ENV] {
+        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            eprintln!(
+                "validate: ignoring {name} from the environment: only --tests selects cases, \
+                 per step"
+            );
+            dropped = true;
+        }
+        std::env::remove_var(name);
     }
-    std::env::remove_var(NEXTEST_FILTER_EXPR_ENV);
-    inherited
+    dropped
 }
 
 /// Why this run's counted test nodes compared no test list with main's, or
@@ -15391,13 +15406,49 @@ mod case_selection_tests {
     }
 
     #[test]
-    fn filter_expr_uses_binary_and_exact_test_name() {
+    fn filter_expr_matches_each_result_id_form_exactly() {
+        // A library unit test's result ID is <package>$<test>: its package
+        // and kind(lib). The library's binary name (hermit_detcore) differs
+        // from its package.
         assert_eq!(
-            case_filter_expr("hermit-run::cli$cli::some_test").as_deref(),
-            Some("(binary(cli) & test(=cli::some_test))")
+            case_filter_expr("hermit-detcore$scheduler::tests::picks").as_deref(),
+            Some("(package(=hermit-detcore) & kind(lib) & test(=scheduler::tests::picks))")
         );
-        assert_eq!(case_filter_expr("no-dollar-sign"), None);
-        assert_eq!(case_filter_expr("a::b$"), None);
+        // Every other kind's is <package>::<binary name>$<test>: an
+        // integration test, a bin whose binary name is its library's too
+        // (so the library is excluded), and a proc-macro, whose nextest
+        // binary ID is the bare package.
+        for (case, expr) in [
+            (
+                "hermit-run::cli$cli::some_test",
+                "(package(=hermit-run) & binary(=cli) & not kind(lib) & test(=cli::some_test))",
+            ),
+            (
+                "hermit-run::hermit$tests::parses",
+                "(package(=hermit-run) & binary(=hermit) & not kind(lib) & test(=tests::parses))",
+            ),
+            (
+                "hermit-macros::hermit_macros$expands",
+                "(package(=hermit-macros) & binary(=hermit_macros) & not kind(lib) & \
+                 test(=expands))",
+            ),
+        ] {
+            assert_eq!(case_filter_expr(case).as_deref(), Some(expr), "{case}");
+        }
+        for case in [
+            "no-dollar-sign",
+            "a::b$",
+            "$name",
+            "::cli$name",
+            "pkg::$name",
+            "pkg::a::b$name",
+            // nextest's binary ID for a bin is not a result ID.
+            "pkg::bin/x$name",
+            "pkg$two words",
+            "pkg@stress-1$name",
+        ] {
+            assert_eq!(case_filter_expr(case), None, "{case}");
+        }
     }
 
     #[test]
@@ -15602,26 +15653,48 @@ mod case_selection_tests {
         assert!(error.contains("e2e.manifest_compat"), "{error}");
         assert!(error.contains("cannot select cases"), "{error}");
 
-        let cases = parse_case_ids(["test.cli::hermit-run::cli$some_test"].into_iter()).unwrap();
+        let cases = parse_case_ids(
+            [
+                "test.cli::hermit-run::cli$some_test",
+                "test.cli::hermit-run::cli$no_such_test",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
         inject_case_filters(&mut steps, &cases).unwrap();
         let cli = steps.iter().find(|s| s.tag() == "test.cli").unwrap();
         assert_eq!(
-            cli.env
-                .get("HERMIT_NEXTEST_FILTER_EXPR")
-                .map(String::as_str),
-            Some("(binary(cli) & test(=some_test))")
+            cli.env.get(NEXTEST_FILTER_EXPR_ENV).map(String::as_str),
+            Some(
+                "(package(=hermit-run) & binary(=cli) & not kind(lib) & test(=some_test)) | \
+                 (package(=hermit-run) & binary(=cli) & not kind(lib) & test(=no_such_test))"
+            )
         );
+        // The counted wrapper checks these names against the node's listing
+        // and fails the node naming any it does not list
+        // (ci/run-nextest-counted.sh, check_selected_cases_listed).
         assert_eq!(
-            cli.env.get("NEXTEST_EXPECTED_EXECUTED").map(String::as_str),
-            Some("1")
+            cli.env.get(NEXTEST_SELECTED_CASES_ENV).map(String::as_str),
+            Some("hermit-run::cli$some_test hermit-run::cli$no_such_test")
         );
+        // The wrapper derives the executed count from its own listing; a
+        // count injected here would be ignored, so none is.
+        assert!(!cli.env.contains_key("NEXTEST_EXPECTED_EXECUTED"));
+        // A node with no named case gets neither variable.
+        let other = steps
+            .iter()
+            .find(|s| s.tag() == "test.hermit_unit")
+            .unwrap();
+        assert!(!other.env.contains_key(NEXTEST_FILTER_EXPR_ENV));
+        assert!(!other.env.contains_key(NEXTEST_SELECTED_CASES_ENV));
     }
 }
 
 /// Parse `node::case` test-case IDs into node tag -> case IDs. A case ID is
 /// the runner's result ID as printed in run records (`test_cases` vector):
-/// `<crate>::<binary>$<test name>` for nextest producers. Node tags contain
-/// no `::`, so the first `::` is the separator.
+/// for nextest producers `<package>$<test name>` (a library unit test) or
+/// `<package>::<binary name>$<test name>`. Node tags contain no `::`, so
+/// the first `::` is the separator.
 fn parse_case_ids<'a>(
     entries: impl Iterator<Item = &'a str>,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
@@ -15657,23 +15730,46 @@ fn parse_case_ids<'a>(
     Ok(cases)
 }
 
-/// The nextest filter expression selecting exactly one recorded case ID
-/// (`<crate>::<binary>$<test name>`), or None if the ID is not nextest-shaped.
+/// The nextest filter expression selecting exactly one recorded case ID, or
+/// None if the ID is not nextest-shaped. A case ID is the run record's
+/// result ID (displayed_test_id in ci/manifest-plan/src/nextest_cpu.rs):
+/// `<package>$<test name>` for a library's unit tests and
+/// `<package>::<binary name>$<test name>` for every other target kind. The
+/// part before `$` is not nextest's binary ID (a bin's is
+/// `<package>::bin/<name>`, a proc-macro's the bare package), so the
+/// expression matches the parts the ID names: the package and kind(lib) for
+/// the library form; the package, binary(=<name>) and not kind(lib) for the
+/// rest. A library and a bin may share a binary name (hermit-run's are both
+/// `hermit`), so the second form must exclude the library. A package or
+/// binary name nextest does not know is refused by nextest's filter parser,
+/// which names it, before anything is listed.
 fn case_filter_expr(case: &str) -> Option<String> {
-    let (prefix, name) = case.split_once('$')?;
-    let binary = prefix.rsplit("::").next()?;
-    if binary.is_empty()
+    let (binary, name) = case.split_once('$')?;
+    let (package, binary_name) = match binary.split_once("::") {
+        Some((package, binary_name)) => (package, Some(binary_name)),
+        None => (binary, None),
+    };
+    let target_name = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    if !target_name(package)
+        || binary_name.is_some_and(|binary_name| !target_name(binary_name))
         || name.is_empty()
-        || !binary
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '$'))
     {
         return None;
     }
-    Some(format!("(binary({binary}) & test(={name}))"))
+    Some(match binary_name {
+        None => format!("(package(={package}) & kind(lib) & test(={name}))"),
+        Some(binary_name) => format!(
+            "(package(={package}) & binary(={binary_name}) & not kind(lib) & test(={name}))"
+        ),
+    })
 }
 
 /// Inject the case filter for every selected node. Only nextest nodes can
@@ -15701,22 +15797,26 @@ fn inject_case_filters(
             let Some(expr) = case_filter_expr(case) else {
                 return Err(format!(
                     "node {} cannot select case {case:?}: it is not a nextest result ID \
-                     (<crate>::<binary>$<test name>); select case IDs from a run record's \
-                     test_cases vector",
+                     (<package>$<test name> for a library unit test, \
+                     <package>::<binary name>$<test name> otherwise); select case IDs \
+                     from a run record's test_cases vector",
                     step.tag()
                 ));
             };
             exprs.push(expr);
         }
+        // The counted wrapper ANDs this with the node's own filtersets
+        // (nextest ORs separate -E options), so the selection only narrows
+        // the node's population.
         step.env
-            .insert("HERMIT_NEXTEST_FILTER_EXPR".to_string(), exprs.join(" | "));
-        // The counted wrapper refuses when the executed count differs from
-        // the expectation, so a case that does not exist in this node fails
-        // loudly instead of silently passing with zero tests run.
-        step.env.insert(
-            "NEXTEST_EXPECTED_EXECUTED".to_string(),
-            node_cases.len().to_string(),
-        );
+            .insert(NEXTEST_FILTER_EXPR_ENV.to_string(), exprs.join(" | "));
+        // The counted wrapper checks every named case against the node's
+        // `nextest list` before any test runs and fails the node, naming
+        // each case it does not list, so a case that does not exist here,
+        // or that the node's own filter excludes, can never pass unrun.
+        // (Its executed == listed rule then makes every named case run.)
+        step.env
+            .insert(NEXTEST_SELECTED_CASES_ENV.to_string(), node_cases.join(" "));
     }
     Ok(())
 }
@@ -39804,9 +39904,11 @@ mod scorecard_cutover_tests {
         }
     }
 
-    /// run() drops a HERMIT_NEXTEST_FILTER_EXPR inherited from the caller, so a
-    /// stray value cannot narrow every counted node. Run in a re-executed
-    /// child, so the shared test harness's environment is never changed.
+    /// run() drops a case selection inherited from the caller
+    /// (HERMIT_NEXTEST_FILTER_EXPR, HERMIT_NEXTEST_SELECTED_CASES), so a stray
+    /// value can neither narrow every counted node nor fail every node that
+    /// does not list the stray names. Run in a re-executed child, so the
+    /// shared test harness's environment is never changed.
     #[test]
     fn an_inherited_case_filter_is_dropped_by_name() {
         const CHILD: &str = "VALIDATE_CASE_FILTER_DROP_CHILD";
@@ -39814,10 +39916,17 @@ mod scorecard_cutover_tests {
             let dropped = drop_inherited_case_filter();
             assert_eq!(dropped, !value.is_empty());
             assert!(std::env::var_os(NEXTEST_FILTER_EXPR_ENV).is_none());
+            assert!(std::env::var_os(NEXTEST_SELECTED_CASES_ENV).is_none());
             println!("case filter drop child: {dropped}");
             return;
         }
-        for (value, dropped) in [("test(=stray)", true), ("", false)] {
+        for (filter, cases, dropped) in [
+            ("test(=stray)", "", true),
+            ("", "pkg$stray", true),
+            ("test(=stray)", "pkg$stray", true),
+            ("", "", false),
+        ] {
+            let child = if dropped { "1" } else { "" };
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -39825,22 +39934,29 @@ mod scorecard_cutover_tests {
                     "--nocapture",
                 ])
                 .current_dir(test_source_root())
-                .env(CHILD, value)
-                .env(NEXTEST_FILTER_EXPR_ENV, value)
+                .env(CHILD, child)
+                .env(NEXTEST_FILTER_EXPR_ENV, filter)
+                .env(NEXTEST_SELECTED_CASES_ENV, cases)
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(output.status.code(), Some(0), "{value:?}: {stdout}{stderr}");
+            let label = format!("{filter:?} {cases:?}");
+            assert_eq!(output.status.code(), Some(0), "{label}: {stdout}{stderr}");
             assert!(
                 stdout.contains(&format!("case filter drop child: {dropped}")),
-                "{value:?}: {stdout}{stderr}"
+                "{label}: {stdout}{stderr}"
             );
-            assert_eq!(
-                stderr.contains("ignoring HERMIT_NEXTEST_FILTER_EXPR from the environment"),
-                dropped,
-                "{value:?}: {stderr}"
-            );
+            for (name, value) in [
+                (NEXTEST_FILTER_EXPR_ENV, filter),
+                (NEXTEST_SELECTED_CASES_ENV, cases),
+            ] {
+                assert_eq!(
+                    stderr.contains(&format!("ignoring {name} from the environment")),
+                    !value.is_empty(),
+                    "{label}: {stderr}"
+                );
+            }
         }
     }
 

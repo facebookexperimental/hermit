@@ -60,7 +60,7 @@ const FIXTURE_BUILD_PREFIX: &str = "real-nextest-build-";
 ///
 /// The harness retains its log directory on purpose, so the small evidence
 /// files stay. The generated crate and its Cargo target directory are only
-/// inputs to the five cases, and the target directory is a complete Cargo
+/// inputs to its cases, and the target directory is a complete Cargo
 /// build of about 1.7 GiB. Kept in the retained directory, it leaked: one host
 /// held 70 of them using 43.5e9 bytes
 /// (https://github.com/rrnewton/hermit/issues/3622), and after the first fix
@@ -589,12 +589,26 @@ fn actual_nextest_results_and_publication_failures() {
     fs::create_dir_all(fixture.join("src")).unwrap();
     fs::write(fixture.join("Cargo.toml"), concat!(
         "[package]\nname = \"hermit-run\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
-        "[lib]\nname = \"hermit_structured_results_fixture\"\n[workspace]\n",
+        "[lib]\nname = \"hermit_structured_results_fixture\"\n",
+        "[[bin]]\nname = \"hermit_structured_results_fixture\"\npath = \"src/main.rs\"\n",
+        "[workspace]\n",
     )).unwrap();
     fs::write(fixture.join("src/lib.rs"), concat!(
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
+    // A bin sharing the library's binary name and its test name `passes`, as
+    // hermit-run's library and bin are both `hermit`. Only the case-selection
+    // cases build it (--bins); every other case runs --lib.
+    fs::write(
+        fixture.join("src/main.rs"),
+        concat!(
+            "fn main() {}\n",
+            "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
+            "#[test]\nfn bin_only() { assert_eq!(2 + 2, 4); }\n",
+        ),
+    )
+    .unwrap();
     // The canonical .config/nextest.toml names the `cli` test binary of
     // package `hermit-run`, and nextest refuses a config whose package() or
     // binary() matcher names nothing in the workspace. So the fixture package is
@@ -992,6 +1006,209 @@ fn actual_nextest_results_and_publication_failures() {
             .unwrap(),
         )
         .unwrap();
+    }
+    // validate --tests (dh-71wz9z). Each step below is the counted runner
+    // command a nextest node runs, with its case selection injected by
+    // validate's own parse_case_ids and inject_case_filters, exactly as a
+    // --tests run injects it; real nextest then runs it on the fixture crate
+    // (--lib --bins, as test.hermit_unit runs hermit-run). That crate's
+    // library is named hermit_structured_results_fixture, not after its
+    // package, and its bin shares that binary name and the test name
+    // `passes`. So the library case hermit-run$passes and the bin case
+    // hermit-run::hermit_structured_results_fixture$passes must each run
+    // exactly their own test. Each row: the node's own -E (empty for none),
+    // the named cases, and the cases the node must refuse by name (empty when
+    // it must pass, running exactly the named cases).
+    const LIB_PASSES: &str = "hermit-run$passes";
+    const BIN_PASSES: &str = "hermit-run::hermit_structured_results_fixture$passes";
+    const NONEXISTENT: &str = "hermit-run$no_such_test";
+    for (name, node_filter, named, unlisted) in [
+        ("case-selected-lib", "", &[LIB_PASSES][..], &[][..]),
+        ("case-selected-bin", "", &[BIN_PASSES][..], &[][..]),
+        (
+            "case-selected-nonexistent",
+            "",
+            &[NONEXISTENT][..],
+            &[NONEXISTENT][..],
+        ),
+        (
+            "case-selected-real-and-nonexistent",
+            "",
+            &[LIB_PASSES, NONEXISTENT][..],
+            &[NONEXISTENT][..],
+        ),
+        // The node's own filter lists only the bin's two tests. A named case
+        // outside it is refused by name, never added to the run; one inside
+        // it runs alone, not the node's whole population.
+        (
+            "case-selected-outside-node-filter",
+            "kind(bin)",
+            &[LIB_PASSES][..],
+            &[LIB_PASSES][..],
+        ),
+        (
+            "case-selected-inside-node-filter",
+            "kind(bin)",
+            &[BIN_PASSES][..],
+            &[][..],
+        ),
+    ] {
+        let expected_class = if unlisted.is_empty() {
+            NodeClassification::Pass
+        } else {
+            NodeClassification::ProductFailure
+        };
+        let case = root.join(name);
+        fs::create_dir_all(case.join("tmp")).unwrap();
+        // No --no-tests and no -E beyond the node's own: as in a DAG node,
+        // the runner's only case selection is the injected environment.
+        let node_filter_args = if node_filter.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " -E {}",
+                super::super::validate_plan::shell_quote(node_filter)
+            )
+        };
+        let command = format!(
+            "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
+             export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
+             export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
+             unset HERMIT_CENSUS_BASE_COMMIT HERMIT_CENSUS_BASE_DIR HERMIT_CENSUS_BASE_LISTED_IDS HERMIT_CENSUS_DROPPED_FILE HERMIT_CENSUS_EXPECTED_BASE_COMMIT; \
+             set +e; HERMIT_NEXTEST_FAIL_FAST=0 HERMIT_NEXTEST_CPU_REPORT_PATH={} \
+             {} --manifest-path {} --locked --offline --profile ci --lib --bins{node_filter_args} -j 1 --retries 0 >{} 2>{}; \
+             fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",
+            quoted(&source),
+            quoted(&source.join("ci/rust-script-bin")),
+            quoted(&source.join("target/ci/rust-scripts")),
+            quoted(&target),
+            quoted(&case.join("tmp")),
+            quoted(&case.join("cpu.json")),
+            quoted(&source.join("ci/run-nextest-counted.sh")),
+            quoted(&fixture.join("Cargo.toml")),
+            quoted(&case.join("producer.stdout")),
+            quoted(&case.join("producer.stderr")),
+            quoted(&case.join("producer.stdout")),
+            quoted(&case.join("producer.stderr")),
+        );
+        let mut step = step_with_caps(
+            "fixture",
+            name,
+            "real Nextest case-selection fixture",
+            command,
+            Vec::new(),
+            180,
+            300,
+            2 * 1024 * 1024 * 1024,
+        );
+        step.result_manifests = Some(vec![dagrun::model::ResultManifest::StructuredTestResults(
+            dagrun::model::StructuredTestResultsManifest::current(step.tag()),
+        )]);
+        let ids: Vec<String> = named
+            .iter()
+            .map(|case| format!("{}::{case}", step.tag()))
+            .collect();
+        let cases = super::super::parse_case_ids(ids.iter().map(String::as_str)).unwrap();
+        let mut steps = vec![step];
+        super::super::inject_case_filters(&mut steps, &cases).unwrap();
+        assert_eq!(
+            steps[0]
+                .env
+                .get(super::super::NEXTEST_SELECTED_CASES_ENV)
+                .map(String::as_str),
+            Some(named.join(" ").as_str())
+        );
+        let cfg = DagConfig {
+            steps,
+            ..Default::default()
+        };
+        fs::create_dir_all(case.join("ci/dag")).unwrap();
+        let dag = dag_to_json(&cfg);
+        let dag_path = case.join("ci/dag/validate.json");
+        fs::write(&dag_path, &dag).unwrap();
+        fs::write(
+            case.join("ci/expected-e2e-plan.json"),
+            "{\"schema\":1,\"cells\":[]}",
+        )
+        .unwrap();
+        let plan = finish_committed_selection(
+            Plan {
+                cfg,
+                profile: "full".into(),
+                ..Plan::default()
+            },
+            dag_path,
+            dag.into_bytes(),
+        );
+        let result = run_lane_once(
+            &plan.cfg,
+            1,
+            true,
+            0,
+            None,
+            &seeded_lane_log(case.join("driver.log")),
+            Some(deadline),
+            false,
+        );
+        assert!(
+            result.complete && !result.run_timed_out,
+            "{name}: incomplete fixture; evidence {}",
+            case.display()
+        );
+        assert_eq!(result.outcomes.len(), 1);
+        let outcome = &result.outcomes[0];
+        let stderr = fs::read_to_string(case.join("producer.stderr")).unwrap();
+        assert_eq!(
+            node_classification(outcome, &result.attempts),
+            expected_class,
+            "{name}: {stderr}"
+        );
+        if unlisted.is_empty() {
+            // Exactly the named cases ran and passed: not the same-name test
+            // of the other target, and not the rest of the node's population.
+            assert_eq!(outcome.returncode, Some(0), "{name}: {stderr}");
+            assert!(!stderr.contains("case-unmatched"), "{name}: {stderr}");
+            let rows: BTreeMap<String, bool> = outcome
+                .test_results
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|row| (row.id.clone(), row.passed))
+                .collect();
+            assert_eq!(
+                rows,
+                named
+                    .iter()
+                    .map(|case| (case.to_string(), true))
+                    .collect::<BTreeMap<_, _>>(),
+                "{name}: {stderr}"
+            );
+            assert_eq!(
+                outcome.executed_tests,
+                Some(named.len() as u64),
+                "{name}: {stderr}"
+            );
+        } else {
+            // Refused before any test ran, naming exactly the unlisted cases.
+            assert_eq!(outcome.returncode, Some(1), "{name}: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "run-nextest-counted: case-unmatched: validate --tests named {} of {} case(s)",
+                    unlisted.len(),
+                    named.len()
+                )),
+                "{name}: {stderr}"
+            );
+            for case in named {
+                assert_eq!(
+                    stderr.contains(&format!("\n  {case}\n")),
+                    unlisted.contains(case),
+                    "{name}: {stderr}"
+                );
+            }
+            assert!(outcome.executed_tests.is_none(), "{name}: {stderr}");
+            assert!(!case.join("cpu.json").exists(), "{name}: a test ran");
+        }
     }
     assert_eq!(git_text(&source, &["rev-parse", "HEAD"]), original_head);
     assert!(

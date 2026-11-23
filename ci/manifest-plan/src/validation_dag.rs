@@ -725,9 +725,14 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     // read them. Without forwarding, pinned-root nodes always fail fast.
     "HERMIT_E2E_FAIL_FAST",
     "HERMIT_NEXTEST_FAIL_FAST",
-    // validate --tests sets this on case-selected nextest steps; forwarded
-    // only when set, it carries the case filter into the pinned root.
+    // validate --tests sets these on case-selected nextest steps; forwarded
+    // only when set, they carry the case filter and the named cases into the
+    // pinned root, where the counted wrapper fails the node, naming them,
+    // when a named case is not listed. Without forwarding, a hermetic node
+    // would never see the names and a case that matches nothing would pass
+    // with zero tests run.
     "HERMIT_NEXTEST_FILTER_EXPR",
+    "HERMIT_NEXTEST_SELECTED_CASES",
     "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
     "HERMIT_VALIDATE_BUCK_DOTSLASH",
     "HERMIT_VALIDATE_BUILD_MODE",

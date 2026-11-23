@@ -270,6 +270,7 @@ LINT_CHECK_TARGETS := \
     lint-check-conformance-test-counts \
     lint-check-recount-pins \
     lint-check-census-diff \
+    lint-check-run-nextest-counted \
     lint-check-runner-guard \
     lint-check-no-sve \
     lint-check-detcore-backend-abstraction-test
@@ -501,6 +502,11 @@ lint-check-recount-pins:
 
 lint-check-census-diff:
 	python3 ./ci/test_census_diff.py
+
+# The counted Nextest runner's own self-test (fake nextest, the real CPU
+# wrapper): typed counts, case selection, the census gate and refusals.
+lint-check-run-nextest-counted:
+	./ci/run-nextest-counted.sh --self-test
 
 lint-check-runner-guard:
 	python3 ./ci/test_runner_guard.py
