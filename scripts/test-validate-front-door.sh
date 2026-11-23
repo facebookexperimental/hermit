@@ -27,6 +27,11 @@
 #               DAG's pre.submodules node owns that check).
 #   cost        the decision is measured in CPU seconds (load-invariant, so it
 #               holds on a loaded host), never in wall time.
+#   fetch       before the driver is exec'd, a failed fetch of its Cargo
+#               dependencies stops the run (exit 75) naming Cargo's words and
+#               the remedy, and the driver never starts; a TLS failure names
+#               CARGO_NET_GIT_FETCH_WITH_CLI; a fetch past its WALL bound is
+#               named as such.
 #   make        `make validate` (dry run) hands the front door
 #               --all-unless-level and then ARGS unchanged, so the driver's own
 #               parser decides whether ARGS names a level.
@@ -831,6 +836,96 @@ run_detached_unbounded() {
     printf '%s\n' "$rc"
 }
 
+# ---------------------------------------------------------------- driver fetch
+
+# fetch_cases: a standalone checkout whose driver is a rust-script, with a fake
+# rust-script (prints a package for --package, else runs the stub driver) and a
+# fake cargo (fails `cargo fetch` as FAKE_CARGO_FAIL says) on PATH.
+fetch_cases() {
+    local fetch=$TMP/fetch fake=$TMP/fetch-bin log out rc mode
+    plant_checkout "$fetch" no
+    sed -i '1s|.*|#!/usr/bin/env rust-script|' "$fetch/hermit/scripts/validate.rs"
+    mkdir -p "$fake" "$TMP/fetch-pkg"
+    printf '[package]\nname = "driver"\n' >"$TMP/fetch-pkg/Cargo.toml"
+    cat >"$fake/rust-script" <<FAKE
+#!/usr/bin/env bash
+if [[ \$1 == --package ]]; then printf '%s\n' "$TMP/fetch-pkg"; exit 0; fi
+exec bash "\$@"
+FAKE
+    cat >"$fake/cargo" <<'FAKE'
+#!/usr/bin/env bash
+[[ $1 == fetch ]] || exit 64
+case ${FAKE_CARGO_FAIL:-} in
+    ssl) printf 'error: failed to get `dagrun` as a dependency\n  [60] SSL peer certificate or SSH remote key was not OK\n' >&2; exit 101 ;;
+    net) printf 'error: failed to get `serde` as a dependency\n  Could not resolve host: index.crates.io\n' >&2; exit 101 ;;
+    silent) exit 1 ;;
+esac
+exit 0
+FAKE
+    # A fake timeout records how it was called and, for the slow case, reports
+    # the bound expired (exit 124) without running cargo.
+    cat >"$fake/timeout" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$STUB_LOG/timeout-args"
+[[ ${FAKE_CARGO_FAIL:-} == slow ]] && exit 124
+exec /usr/bin/timeout "$@"
+FAKE
+    chmod +x "$fake/rust-script" "$fake/cargo" "$fake/timeout"
+    for mode in ssl net silent slow ok; do
+        log=$(new_log)
+        out=$log/out
+        rc=0
+        "${clean_env[@]}" PATH="$fake:$PATH" STUB_LOG="$log" FAKE_CARGO_FAIL="$mode" \
+            "$fetch/hermit/scripts/validate-front-door.sh" -- --all >"$out" 2>&1 || rc=$?
+        case $mode in
+            ssl)
+                if ((rc == 75)) && [[ ! -e $log/driver ]] && grep -q 'Cargo could not fetch' "$out" \
+                    && grep -q 'SSL peer certificate' "$out" && grep -q 'CARGO_NET_GIT_FETCH_WITH_CLI=true' "$out"; then
+                    pass "fetch: a TLS failure fetching the driver's dependencies refuses at once, naming CARGO_NET_GIT_FETCH_WITH_CLI"
+                else
+                    fail "fetch: a TLS failure fetching the driver's dependencies" "rc=$rc" "$(cat "$out")"
+                fi
+                ;;
+            net)
+                if ((rc == 75)) && [[ ! -e $log/driver ]] && grep -q 'Could not resolve host' "$out" \
+                    && grep -q 'give Cargo network access' "$out" && ! grep -q CARGO_NET_GIT_FETCH_WITH_CLI "$out"; then
+                    pass "fetch: any other fetch failure refuses at once with Cargo's words and the network remedy"
+                else
+                    fail "fetch: any other fetch failure" "rc=$rc" "$(cat "$out")"
+                fi
+                ;;
+            silent)
+                # A fetch that fails with nothing on stderr: under errexit and
+                # pipefail the empty log must not end the script before the
+                # remedy and exit 75.
+                if ((rc == 75)) && [[ ! -e $log/driver ]] && grep -q 'Cargo could not fetch' "$out" \
+                    && grep -q 'the fetch exited 1 with no output on stderr' "$out" \
+                    && grep -q 'give Cargo network access' "$out"; then
+                    pass "fetch: a fetch that fails silently still refuses at once with the network remedy"
+                else
+                    fail "fetch: a fetch that fails silently" "rc=$rc" "$(cat "$out")"
+                fi
+                ;;
+            slow)
+                if ((rc == 75)) && [[ ! -e $log/driver ]] && grep -q 'did not finish within 300 s (WALL)' "$out" \
+                    && [[ $(cat "$log/timeout-args" 2>/dev/null) == "--kill-after=10s 300s cargo fetch --manifest-path "* ]]; then
+                    pass "fetch: a fetch past its 300 s WALL bound refuses at once, named as such"
+                else
+                    fail "fetch: a fetch past its WALL bound" "rc=$rc" "timeout args: $(cat "$log/timeout-args" 2>/dev/null)" "$(cat "$out")"
+                fi
+                ;;
+            ok)
+                if ((rc == 0)) && [[ $(cat "$log/driver" 2>/dev/null) == "--all" ]] \
+                    && [[ $(cat "$log/timeout-args" 2>/dev/null) == "--kill-after=10s 300s cargo fetch --manifest-path "* ]]; then
+                    pass "fetch: fetched dependencies start the driver"
+                else
+                    fail "fetch: fetched dependencies start the driver" "rc=$rc" "$(cat "$out")"
+                fi
+                ;;
+        esac
+    done
+}
+
 # ---------------------------------------------------------------- make target
 
 # make_cases: `make validate ARGS=...` (dry run) runs the front door with
@@ -900,6 +995,7 @@ main() {
     cost_cases
     route_cases
     control_cases
+    fetch_cases
     make_cases
     printf '%d case(s), %d failed, %d skipped\n' "$cases" "$failures" "$skips"
     ((failures == 0))

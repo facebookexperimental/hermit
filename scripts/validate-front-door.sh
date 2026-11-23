@@ -58,6 +58,12 @@
 set -euo pipefail
 
 readonly AGENT_REFUSED_EXIT=75
+# The WALL backstop of the front door's own fetch of the driver's Cargo
+# dependencies (fetch_driver_dependencies). Cargo's network timeouts bound each
+# request, but nothing else bounds the whole fetch. On the 2026-11-22 fresh
+# clones the whole cold driver build, its fetch included, ended within 72-160 s;
+# 300 s is a generous backstop, not an estimate.
+readonly DRIVER_FETCH_WALL_SECONDS=300
 
 # Executables whose presence among the ancestors makes the caller an agent,
 # matched against /proc/PID/comm and the basenames of argv[0] and argv[1]
@@ -276,10 +282,65 @@ section() {
 # exited; a process that keeps the lock alive keeps the directory, never the
 # reverse.
 #
+# Driver dependencies: before the driver is exec'd, Cargo fetches its
+# dependencies (fetch_driver_dependencies), so a fetch failure stops the run at
+# once with a named reason and remedy instead of ending a build in a raw Cargo
+# error. On a host behind a TLS-intercepting proxy, Cargo's built-in Git cannot
+# fetch a git dependency (agent-utils) without net.git-fetch-with-cli; measured
+# on a fresh clone with an empty Cargo home on 2026-11-22.
+#
 # with-proxy: ci-hub runs the driver under with-proxy, because nodes such as
 # setup.pinned_root_fetch fetch from crates.io and GitHub, and a host may have
 # no direct egress. Every route outside a ci-hub unit, which already carries
 # it, does the same when with-proxy exists.
+# fetch_driver_dependencies LAUNCHER...: when the driver is a rust-script,
+# fetch the dependencies of the package rust-script generates for it, with the
+# same launcher the driver will run under. A failure exits 75 (could not run)
+# naming Cargo's own last lines and the remedy; anything else that keeps the
+# package from being generated is left to the driver's build to report.
+fetch_driver_dependencies() {
+    local -a launcher=("$@")
+    local first pkg log
+    first=$(head -n 1 scripts/validate.rs 2>/dev/null || true)
+    [[ $first == '#!'*rust-script* ]] || return 0
+    command -v rust-script >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 || return 0
+    pkg=$(rust-script --package ./scripts/validate.rs 2>/dev/null) || return 0
+    [[ -f $pkg/Cargo.toml ]] || return 0
+    log=$(mktemp "${TMPDIR:-/tmp}/validate-driver-fetch.XXXXXX")
+    local status=0
+    "${launcher[@]}" timeout --kill-after=10s "${DRIVER_FETCH_WALL_SECONDS}s" \
+        cargo fetch --manifest-path "$pkg/Cargo.toml" >/dev/null 2>"$log" || status=$?
+    if ((status == 0)); then
+        rm -f -- "$log"
+        return 0
+    fi
+    if ((status == 124 || status == 137)); then
+        printf 'validate: REFUSED: Cargo'"'"'s fetch of the validation driver'"'"'s dependencies did not finish within %s s (WALL), so the driver cannot be built; nothing has run\n' \
+            "$DRIVER_FETCH_WALL_SECONDS" >&2
+        printf 'validate: remedy: check this host'"'"'s network path to crates.io and GitHub (a proxy goes in ~/.cargo/config.toml [http] proxy or https_proxy), then retry\n' >&2
+        rm -f -- "$log"
+        exit 75
+    fi
+    printf 'validate: REFUSED: Cargo could not fetch the validation driver'"'"'s dependencies, so the driver cannot be built; nothing has run. Cargo said:\n' >&2
+    # Under errexit and pipefail, grep's status 1 for a log with no nonblank
+    # line would end the script here, before the remedy and exit 75; a fetch
+    # that fails silently is reported as such instead.
+    local said
+    said=$(grep -v '^[[:space:]]*$' "$log" | tail -n 6) || true
+    if [[ -n $said ]]; then
+        printf '%s\n' "$said" | sed 's/^/    /' >&2
+    else
+        printf '    (nothing: the fetch exited %s with no output on stderr)\n' "$status" >&2
+    fi
+    if grep -qiE 'ssl|certificate' "$log"; then
+        printf 'validate: remedy: behind a TLS-intercepting proxy, Cargo'"'"'s built-in Git does not trust the proxy'"'"'s certificate; set CARGO_NET_GIT_FETCH_WITH_CLI=true (or net.git-fetch-with-cli = true in ~/.cargo/config.toml) so Cargo fetches with git, then retry\n' >&2
+    else
+        printf 'validate: remedy: give Cargo network access to crates.io and GitHub (a proxy goes in ~/.cargo/config.toml [http] proxy or https_proxy), then retry\n' >&2
+    fi
+    rm -f -- "$log"
+    exit 75
+}
+
 run_validate() {
     local root=$1
     shift
@@ -311,6 +372,7 @@ run_validate() {
     [[ -z ${TMPDIR:-} ]] || caller_tmp=$(realpath -m -- "$TMPDIR")
     if [[ -n $caller_tmp && $caller_tmp != "$real_root" && $caller_tmp != "$real_root"/* ]]; then
         section "${shown}scripts/validate.rs $(shell_quote_args "$@"): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
+        fetch_driver_dependencies "${launcher[@]}"
         exec "${launcher[@]}" ./scripts/validate.rs "$@"
     fi
     local tmp_parent run_tmp
@@ -330,6 +392,7 @@ run_validate() {
         hermit-validate-tmpdir-reaper "$run_tmp/.owner" "$run_tmp" 9>&- </dev/null >/dev/null 2>&1
     export TMPDIR=$run_tmp
     section "${shown}scripts/validate.rs $(shell_quote_args "$@") with TMPDIR=$run_tmp (outside the checkout, removed once the driver and everything it started have exited): rebuilds the driver if its sources changed (release build: 35 s for the driver alone, ~80 s after a typical pull), then runs the selected profile, whose first node pre.submodules verifies every submodule pin; gates the verdict"
+    fetch_driver_dependencies "${launcher[@]}"
     exec "${launcher[@]}" ./scripts/validate.rs "$@"
 }
 
