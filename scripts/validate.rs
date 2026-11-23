@@ -1170,6 +1170,10 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
 const HUMAN_OFF_THE_RECORD_OPTION: &str = "--human-off-the-record";
+/// `make validate`'s default: --all unless this invocation names a level.
+/// The driver's own parser decides, so an option value that happens to be a
+/// level word (`--only quick ...`, `--baseline full`) names no level.
+const ALL_UNLESS_LEVEL_OPTION: &str = "--all-unless-level";
 /// The `make validate` front door, whose `--classify` mode is the one
 /// implementation of the agent-or-human routing decision.
 const FRONT_DOOR_SCRIPT: &str = "scripts/validate-front-door.sh";
@@ -1899,6 +1903,10 @@ fn usage() -> &'static str {
      \x20 --envelope-compare FILE       Measure, then fail if any count regressed below FILE.\n\
      \x20 --all, --full-run             Assert the COMPLETE suite explicitly (overrides\n\
      \x20                               the selective default; the landing form).\n\
+     \x20 --all-unless-level            --all, unless this invocation names a level\n\
+     \x20                               (quick, portable-only, full, super, --quick,\n\
+     \x20                               --portable, --portable-only or VALIDATE_LEVEL).\n\
+     \x20                               `make validate` passes it, so ARGS=--quick runs quick.\n\
      \n\
      Other options:\n\
      \x20 --allow-local-off-the-record-run\n\
@@ -2120,6 +2128,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         buck2: None,
     };
     let mut e2e_runner_explicit = false;
+    let mut all_unless_level = false;
     let mut label_pr_explicit = false;
     let mut shallow = false;
     let mut selective = false;
@@ -2253,6 +2262,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 shallow = true;
             }
             "--all" | "--full-run" => args.force_full = true,
+            ALL_UNLESS_LEVEL_OPTION => all_unless_level = true,
             ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION => {
                 args.allow_local_off_the_record_run = true;
                 args.label_pr = false;
@@ -2470,6 +2480,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
         }
         i += 1;
+    }
+    // `make validate` passes --all-unless-level in place of --all: once
+    // every argument is parsed, a level the parser saw wins; otherwise the
+    // run is the complete full suite, exactly as with --all.
+    if all_unless_level && !args.level_explicit {
+        args.force_full = true;
     }
     // An explicit `--label-pr` with no level or focused mode implies
     // `--all`: publishing a receipt requires the complete full run, so a
@@ -8629,6 +8645,69 @@ mod focused_only_tests {
             ["build.manifest_guests", "cpuid.faulting", "no.such_node"].map(String::from),
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod all_unless_level_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, u8> {
+        parse_argv(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    /// `make validate` passes --all-unless-level in place of --all. With no
+    /// level it is exactly --all; a level, in any spelling, runs that level;
+    /// a level word that is an option's value names no level.
+    #[test]
+    fn all_unless_level_is_all_until_the_parser_sees_a_level() {
+        for rest in [&[][..], &["--keep-going"][..], &["--baseline", "full"][..]] {
+            let with_all = parse(&[&["--all"][..], rest].concat()).unwrap();
+            let unless = parse(&[&[ALL_UNLESS_LEVEL_OPTION][..], rest].concat()).unwrap();
+            assert!(unless.force_full, "{rest:?}");
+            assert_eq!(unless.level, Level::Full, "{rest:?}");
+            assert!(unless.focused.is_none(), "{rest:?}");
+            assert_eq!(
+                (unless.force_full, unless.level, unless.baseline.is_some()),
+                (
+                    with_all.force_full,
+                    with_all.level,
+                    with_all.baseline.is_some()
+                ),
+                "{rest:?}"
+            );
+        }
+        let dag = parse(&[ALL_UNLESS_LEVEL_OPTION, "--write-constructed-dag", "quick"]).unwrap();
+        assert!(dag.force_full && dag.level == Level::Full);
+        for (spelling, level) in [
+            ("--quick", Level::Quick),
+            ("quick", Level::Quick),
+            ("--portable", Level::PortableOnly),
+            ("--portable-only", Level::PortableOnly),
+            ("portable-only", Level::PortableOnly),
+            ("super", Level::Super),
+            ("full", Level::Full),
+        ] {
+            let args = parse(&[ALL_UNLESS_LEVEL_OPTION, spelling, "--keep-going"]).unwrap();
+            assert!(!args.force_full, "{spelling}");
+            assert_eq!(args.level, level, "{spelling}");
+        }
+        // A focused mode whose lane value is a level word is refused, as with
+        // --all, instead of being read as the quick level.
+        assert_eq!(
+            parse(&["--all", "--only", "quick", "e2e.manifest_compat"]).err(),
+            Some(2)
+        );
+        assert_eq!(
+            parse(&[
+                ALL_UNLESS_LEVEL_OPTION,
+                "--only",
+                "quick",
+                "e2e.manifest_compat"
+            ])
+            .err(),
+            Some(2)
+        );
     }
 }
 

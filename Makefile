@@ -125,8 +125,11 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # a dev-hermit parent it refuses an agent toward `ci-hub validate-run` and runs
 # a human's validate in place, off the record; it then starts scripts/validate.rs,
 # whose first DAG node (pre.submodules) verifies the submodule pins (see --help).
-validate: ## Run the full validation suite (agents are routed to ci-hub; pass flags via ARGS)
-	@./scripts/validate-front-door.sh -- --all $(ARGS)
+# --all-unless-level makes the driver run the full suite unless ARGS names a
+# level, so `make validate ARGS=--quick` runs quick; the driver's own parser
+# decides what ARGS names.
+validate: ## Run the full validation suite, or the level ARGS names (agents are routed to ci-hub; pass flags via ARGS)
+	@./scripts/validate-front-door.sh -- --all-unless-level $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)

@@ -27,6 +27,9 @@
 #               DAG's pre.submodules node owns that check).
 #   cost        the decision is measured in CPU seconds (load-invariant, so it
 #               holds on a loaded host), never in wall time.
+#   make        `make validate` (dry run) hands the front door
+#               --all-unless-level and then ARGS unchanged, so the driver's own
+#               parser decides whether ARGS names a level.
 #
 # The human route needs a caller with no agent ancestor even when an agent runs
 # this test, so those cases detach with `setsid -f` under `env -i`: the child
@@ -47,6 +50,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # A mutant can be substituted to show that these cases bite.
 FRONT_DOOR=${VALIDATE_FRONT_DOOR_UNDER_TEST:-$ROOT/scripts/validate-front-door.sh}
+MAKEFILE=${VALIDATE_MAKEFILE_UNDER_TEST:-$ROOT/Makefile}
 # The CPU budget for one routing decision. Measured 0.06 CPU s at load ~190
 # (host in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts"); a compile
 # of the driver costs 100+ CPU seconds.
@@ -827,6 +831,32 @@ run_detached_unbounded() {
     printf '%s\n' "$rc"
 }
 
+# ---------------------------------------------------------------- make target
+
+# make_cases: `make validate ARGS=...` (dry run) runs the front door with
+# exactly `-- --all-unless-level` and then ARGS, word for word. The level
+# decision is the driver's (scripts/validate.rs all_unless_level_tests); the
+# Makefile must not make one of its own, by filtering ARGS or adding --all.
+make_cases() {
+    local args got rc want
+    for args in "" --keep-going --quick quick "--quick --keep-going" "--only quick e2e.manifest_compat" \
+        "--baseline full" "--write-constructed-dag quick"; do
+        rc=0
+        # An independent make: under a parent make (`make lint-checks`) the
+        # inherited MAKEFLAGS make the child warn about the jobserver on stderr.
+        # Only stdout is compared; stderr is shown on a failure.
+        got=$(env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL \
+            make -n -s --no-print-directory -f "$MAKEFILE" -C "$ROOT" validate ARGS="$args" 2>"$TMP/make-stderr") || rc=$?
+        want="./scripts/validate-front-door.sh -- --all-unless-level${args:+ $args}"
+        # make leaves a trailing space when ARGS is empty; words are compared.
+        if ((rc == 0)) && [[ $(printf '%s' "$got" | tr -s ' ' | sed 's/ $//') == "$want" ]]; then
+            pass "make: ARGS='$args' hands the front door --all-unless-level, then ARGS unchanged"
+        else
+            fail "make: ARGS='$args'" "rc=$rc" "want: $want" "got: $got" "stderr: $(cat "$TMP/make-stderr")"
+        fi
+    done
+}
+
 # Rerun this whole suite with TMPDIR inside a planted dev-hermit parent: the
 # environment the driver gives check.lint_checks on a human's local run. It must
 # still pass; before the scratch root moved under /tmp, its standalone case was
@@ -870,6 +900,7 @@ main() {
     cost_cases
     route_cases
     control_cases
+    make_cases
     printf '%d case(s), %d failed, %d skipped\n' "$cases" "$failures" "$skips"
     ((failures == 0))
 }
