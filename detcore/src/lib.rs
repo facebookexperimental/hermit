@@ -7551,11 +7551,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The inodes whose last name this call removes, stat'ed before it runs
             // and retired once it succeeds, so that a host reusing one cannot hand
             // a new file the old file's number
-            // (https://github.com/rrnewton/hermit/issues/3840).
-            let removed_inodes = if may_name_files {
+            // (https://github.com/rrnewton/hermit/issues/3840). For a rename the
+            // same lookups tell whether it can change any name (`entry_mtime`).
+            let crate::syscalls::NameRemovals {
+                retired: removed_inodes,
+                rename_target,
+            } = if may_name_files {
                 self.last_names_removed_by(guest, &call).await
             } else {
-                Vec::new()
+                crate::syscalls::NameRemovals::default()
             };
             // The guest-made FIFOs whose name this call removes, forgotten once it
             // succeeds (https://github.com/rrnewton/hermit/issues/2203).
@@ -9021,7 +9025,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // (`hot_path_futures_stay_small`).
             if matches!(res, Ok(ret) if ret >= 0) && crate::syscalls::changes_entries(call.number())
             {
-                self.touch_entries_changed_by(guest, &call).await;
+                self.touch_entries_changed_by(guest, &call, rename_target)
+                    .await;
             }
             if res.is_ok() {
                 for fifo in removed_guest_fifos {

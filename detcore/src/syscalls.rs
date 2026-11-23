@@ -20,6 +20,7 @@ pub(crate) use files::status_published_sigblk;
 pub(crate) mod guest_siginfo;
 pub mod helpers;
 
+pub(crate) use files::NameRemovals;
 pub(crate) use files::SyscallCwd;
 pub(crate) use files::descriptor_directory::SendInspection;
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`

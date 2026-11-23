@@ -2080,6 +2080,18 @@ pub(crate) fn removes_a_name(sysno: Sysno) -> bool {
     }
 }
 
+/// What [`Detcore::last_names_removed_by`] found before a call ran.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NameRemovals {
+    /// The host inodes whose last name the call removes, for
+    /// [`Detcore::retire_removed_inodes`] once it succeeds.
+    pub(crate) retired: Vec<RawInode>,
+    /// For a rename other than an exchange, what the lookups saw of its
+    /// target (see [`entry_mtime::RenameTarget`]); `None` for every other
+    /// call and where they cannot tell.
+    pub(crate) rename_target: Option<entry_mtime::RenameTarget>,
+}
+
 /// Whether a call numbered `sysno` can be acted on by any of the file and
 /// descriptor checks `Detcore::handle_syscall_event` makes before it
 /// dispatches the call: the names it removes ([`removes_a_name`]), the
@@ -5698,9 +5710,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it is a directory or a file with one link (see [`retires_on_removal`]).
     /// Each name is stat'ed with an injected `fstatat(AT_SYMLINK_NOFOLLOW)`
     /// before the call runs; a name that does not resolve removes nothing.
-    /// Pass the result to [`Self::retire_removed_inodes`] if the call
-    /// succeeds. Only with virtualized metadata, the only mode that numbers
-    /// inodes.
+    /// Pass the `retired` inodes to [`Self::retire_removed_inodes`] if the
+    /// call succeeds. For a rename the same lookups also tell whether it can
+    /// change any name (`rename_target`, which the entry-mtime model reads
+    /// instead of looking the old name up again after the call). Only with
+    /// virtualized metadata, the only mode that numbers inodes.
     ///
     /// Nothing is retired without sequentialized threads. Only then do the
     /// lookups, the call and the retirement run in one turn; otherwise another
@@ -5712,36 +5726,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: &Syscall,
-    ) -> Vec<RawInode> {
+    ) -> NameRemovals {
         if !guest.config().virtualize_metadata || !guest.config().sequentialize_threads {
-            return Vec::new();
+            return NameRemovals::default();
         }
         // The name removed, and for a rename the source, which replaces
         // nothing when it is the target's own file (`rename(a, a)`, or two
         // links of one file).
         let Some((removed, source)) = removed_names(call, true) else {
-            return Vec::new();
+            return NameRemovals::default();
         };
         // Every path the call reads, which the lookups must leave unchanged.
         let inputs = [removed.1, source.and_then(|source| source.1)];
         let Some(path) = removed.1 else {
-            return Vec::new();
+            return NameRemovals::default();
         };
-        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
-            return Vec::new();
+        let stat = match Self::inject_lstatat(guest, removed.0, path, inputs).await {
+            Ok(stat) => stat,
+            Err(errno) => {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target: source
+                        .and_then(|_| entry_mtime::RenameTarget::from_lookups(Err(errno), None)),
+                };
+            }
         };
         let inode = RawInode::new(stat.st_dev, stat.st_ino);
-        if let Some((dirfd, Some(path))) = source
-            && Self::inject_lstatat(guest, dirfd, path, inputs)
-                .await
-                .is_ok_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
-        {
-            return Vec::new();
+        let mut rename_target = None;
+        if let Some((dirfd, source_path)) = source {
+            let looked_up = match source_path {
+                Some(path) => Some(
+                    Self::inject_lstatat(guest, dirfd, path, inputs)
+                        .await
+                        .map(|source| RawInode::new(source.st_dev, source.st_ino)),
+                ),
+                None => None,
+            };
+            rename_target = entry_mtime::RenameTarget::from_lookups(Ok(inode), looked_up);
+            if rename_target == Some(entry_mtime::RenameTarget::SameFile) {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target,
+                };
+            }
         }
-        if retires_on_removal(&stat) {
+        let retired = if retires_on_removal(&stat) {
             vec![inode]
         } else {
             Vec::new()
+        };
+        NameRemovals {
+            retired,
+            rename_target,
         }
     }
 

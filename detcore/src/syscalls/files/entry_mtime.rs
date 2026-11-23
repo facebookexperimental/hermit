@@ -40,7 +40,12 @@
 //! lookups put theirs (`Detcore::stat_with_fallback`), so neither maps a page
 //! on the common path. An `O_CREAT` open is decided in `handle_openat`, in the
 //! open's turn: it creates its file where the name did not resolve just before
-//! the open ran (`Detcore::open_creates`).
+//! the open ran (`Detcore::open_creates`). Whether a rename changed nothing
+//! (two names of one file) comes from the lookups inode retirement already
+//! makes before every rename but an exchange (`Detcore::last_names_removed_by`,
+//! [`RenameTarget`]); only an exchange, or a rename one of whose lookups failed
+//! otherwise than with the target's `ENOENT`, looks its names up again after
+//! the call.
 //!
 //! Only with virtualized metadata, the only mode with virtual mtimes, and
 //! sequentialized threads: otherwise another guest thread could rename a
@@ -237,6 +242,40 @@ pub(crate) enum OpenCreates {
     Unnamed,
 }
 
+/// What the lookups `Detcore::last_names_removed_by` makes before a rename
+/// (other than an exchange) runs saw of its target, which tells after a
+/// successful call whether it changed any name: `vfs_rename` changes nothing
+/// between two names of one file, and that needs an existing target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameTarget {
+    /// The target did not resolve (`ENOENT`): the rename moved its file.
+    Absent,
+    /// The target is the source's own file: the rename changed nothing.
+    SameFile,
+    /// The target is another file, which the rename replaced.
+    Other,
+}
+
+impl RenameTarget {
+    /// What the pre-call lookups tell: the target's inode, and the source's
+    /// where the target resolved and the source was looked up. `None` where
+    /// a lookup failed otherwise than with the target's `ENOENT`, or the
+    /// source was not looked up, which leaves the question to a lookup
+    /// after the call ([`Detcore::rename_changed_nothing`]).
+    pub(crate) fn from_lookups(
+        target: Result<RawInode, Errno>,
+        source: Option<Result<RawInode, Errno>>,
+    ) -> Option<Self> {
+        match (target, source) {
+            (Err(Errno::ENOENT), _) => Some(Self::Absent),
+            (Err(_), _) => None,
+            (Ok(target), Some(Ok(source))) if source == target => Some(Self::SameFile),
+            (Ok(_), Some(Ok(_))) => Some(Self::Other),
+            (Ok(_), Some(Err(_)) | None) => None,
+        }
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Whether this run keeps directory and new-object mtimes as Linux does
     /// (see the module documentation).
@@ -248,6 +287,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// After `call` succeeded, in its turn: the object it created, then each
     /// directory whose entries it changed, take the virtual now as their mtime
     /// (see the module documentation). A lookup that fails touches nothing.
+    /// `rename_target` is what the lookups before a rename saw of its target
+    /// (`Detcore::last_names_removed_by`), `None` for every other call.
     ///
     /// The post-call hook awaits this unboxed. Without the model, or for a
     /// call that changes no name, it returns before it allocates or looks
@@ -258,6 +299,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: &Syscall,
+        rename_target: Option<RenameTarget>,
     ) {
         if !Self::models_entry_mtimes(guest) {
             return;
@@ -265,12 +307,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(change) = entry_change(call) else {
             return;
         };
-        Box::pin(self.touch_entry_change(guest, change)).await;
+        Box::pin(self.touch_entry_change(guest, change, rename_target)).await;
     }
 
     /// The lookups and touches [`Self::touch_entries_changed_by`] makes for
-    /// the change `change`, once the model and the call are admitted.
-    async fn touch_entry_change<G: Guest<Self>>(&self, guest: &mut G, change: EntryChange<'_>) {
+    /// the change `change`, once the model and the call are admitted, with
+    /// what the lookups before a rename saw of its target (`rename_target`).
+    async fn touch_entry_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        change: EntryChange<'_>,
+        rename_target: Option<RenameTarget>,
+    ) {
         let names = match change {
             EntryChange::Created(name) => {
                 if let Ok(object) = self
@@ -283,7 +331,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             EntryChange::Changed(name) => [Some(name), None],
             EntryChange::Renamed { old, new, flags } => {
-                if self.rename_changed_nothing(guest, old, new, flags).await {
+                if self
+                    .rename_changed_nothing(guest, old, new, flags, rename_target)
+                    .await
+                {
                     return;
                 }
                 [Some(old), Some(new)]
@@ -313,19 +364,32 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether a rename that succeeded changed nothing, as Linux renames
     /// nothing between two names of one file (`vfs_rename`), with the flags
-    /// `flags`. Its old name then still names a file, where a rename that
-    /// moved one has removed it; after an exchange both names hold the one
-    /// file they held before. A rename that leaves a whiteout always moved its
-    /// file, and a lookup that fails counts as a change.
+    /// `flags`. A rename that leaves a whiteout always moved its file. Where
+    /// the lookups before the call tell (`known`, from
+    /// `Detcore::last_names_removed_by`: every rename but an exchange, unless
+    /// a lookup failed otherwise than with the target's `ENOENT`), no lookup
+    /// is injected. Otherwise its old name still names a file, where a rename
+    /// that moved one has removed it; after an exchange both names hold the
+    /// one file they held before. A lookup that fails counts as a change.
     async fn rename_changed_nothing<G: Guest<Self>>(
         &self,
         guest: &mut G,
         old: Name<'_>,
         new: Name<'_>,
         flags: u32,
+        known: Option<RenameTarget>,
     ) -> bool {
         if flags & libc::RENAME_WHITEOUT != 0 {
             return false;
+        }
+        // An exchange swaps two existing names, which the target's lookup
+        // alone cannot settle; its pre-call lookups are never made.
+        if flags & libc::RENAME_EXCHANGE == 0 {
+            match known {
+                Some(RenameTarget::SameFile) => return true,
+                Some(RenameTarget::Absent | RenameTarget::Other) => return false,
+                None => {}
+            }
         }
         let Ok(at_old) = self
             .lookup_name(guest, old, AtFlags::AT_SYMLINK_NOFOLLOW)
@@ -531,8 +595,8 @@ mod tests {
             for (metadata, sequential) in [(false, true), (true, false), (false, false)] {
                 for sysno in all_pinned_syscalls().filter(|sysno| changes_entries(*sysno)) {
                     let mut guest = thread(metadata, sequential);
-                    tool.touch_entries_changed_by(&mut guest, &Syscall::from_raw(sysno, args))
-                        .await;
+                    let call = Syscall::from_raw(sysno, args);
+                    tool.touch_entries_changed_by(&mut guest, &call, None).await;
                     assert!(guest.injected().is_empty(), "{sysno}");
                 }
                 for flags in [
@@ -561,7 +625,7 @@ mod tests {
             }
             let mut guest = thread(true, true);
             let null = Syscall::from_raw(Sysno::unlinkat, SyscallArgs::new(3, 0, 0, 0, 0, 0));
-            tool.touch_entries_changed_by(&mut guest, &null).await;
+            tool.touch_entries_changed_by(&mut guest, &null, None).await;
             assert!(guest.injected().is_empty());
         });
     }
@@ -581,9 +645,11 @@ mod tests {
             dirfd: libc::AT_FDCWD,
             path: PathPtr::from_ptr(spelled.as_ptr()).unwrap(),
         };
-        let entries = std::mem::size_of_val(&tool.touch_entries_changed_by(&mut guest, &call));
+        let entries =
+            std::mem::size_of_val(&tool.touch_entries_changed_by(&mut guest, &call, None));
         let change = entry_change(&call).unwrap();
-        let entries_boxed = std::mem::size_of_val(&tool.touch_entry_change(&mut guest, change));
+        let entries_boxed =
+            std::mem::size_of_val(&tool.touch_entry_change(&mut guest, change, None));
         let open = std::mem::size_of_val(&tool.open_creates(&mut guest, syscalls::Openat::new()));
         let open_boxed =
             std::mem::size_of_val(&tool.creates_unless_name_resolves(&mut guest, name));
@@ -664,5 +730,31 @@ mod tests {
         }
         let null = Syscall::from_raw(Sysno::unlinkat, SyscallArgs::new(3, 0, 0, 0, 0, 0));
         assert!(entry_change(&null).is_none());
+    }
+
+    #[test]
+    fn a_renames_pre_call_lookups_settle_it_only_when_they_succeeded() {
+        let one = RawInode::new(7, 100);
+        let other = RawInode::new(7, 200);
+        let lookup = RenameTarget::from_lookups;
+        // No target: whatever the source, the rename moved its file.
+        assert_eq!(lookup(Err(Errno::ENOENT), None), Some(RenameTarget::Absent));
+        assert_eq!(
+            lookup(Err(Errno::ENOENT), Some(Ok(one))),
+            Some(RenameTarget::Absent)
+        );
+        // The target is the source's own file: vfs_rename changes nothing.
+        assert_eq!(lookup(Ok(one), Some(Ok(one))), Some(RenameTarget::SameFile));
+        // Another file, the same inode number on another device included.
+        assert_eq!(lookup(Ok(one), Some(Ok(other))), Some(RenameTarget::Other));
+        assert_eq!(
+            lookup(Ok(one), Some(Ok(RawInode::new(8, 100)))),
+            Some(RenameTarget::Other)
+        );
+        // Anything else leaves the question to the lookups after the call.
+        assert_eq!(lookup(Err(Errno::EACCES), None), None);
+        assert_eq!(lookup(Err(Errno::ENOTDIR), Some(Ok(one))), None);
+        assert_eq!(lookup(Ok(one), Some(Err(Errno::ENOENT))), None);
+        assert_eq!(lookup(Ok(one), None), None);
     }
 }

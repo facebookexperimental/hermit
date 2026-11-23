@@ -14,6 +14,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::Sysno;
 
+use super::NameRemovals;
 use super::may_name_file_or_descriptor;
 use super::procfs_levels;
 use super::removed_names;
@@ -126,10 +127,9 @@ fn every_prefiltered_call_is_one_each_check_answers_trivially() {
             let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
             guest.config.virtualize_metadata = true;
             guest.config.sequentialize_threads = true;
-            assert!(
-                tool.last_names_removed_by(&mut guest, &call)
-                    .await
-                    .is_empty(),
+            assert_eq!(
+                tool.last_names_removed_by(&mut guest, &call).await,
+                NameRemovals::default(),
                 "{sysno}"
             );
             assert!(
@@ -231,10 +231,9 @@ fn a_representative_call_of_each_check_still_reaches_it() {
             InjectGuest::<NoopTool>::new(Err(reverie::Errno::ENOMEM)).with_registers(no_scratch());
         guest.config.virtualize_metadata = true;
         guest.config.sequentialize_threads = true;
-        assert!(
-            tool.last_names_removed_by(&mut guest, &unlink)
-                .await
-                .is_empty()
+        assert_eq!(
+            tool.last_names_removed_by(&mut guest, &unlink).await,
+            NameRemovals::default()
         );
         let injected = guest.injected();
         assert_eq!(injected.first().map(|(sysno, _)| *sysno), Some(Sysno::mmap));
