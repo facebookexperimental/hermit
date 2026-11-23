@@ -6584,21 +6584,82 @@ cleared-caps refusal names {} starved step(s)",
         }
         // A host-run manifest bucket does not enter the pinned root at all;
         // the consumer check above requires exactly that.
-        for step in full.cfg.steps.iter().filter(|step| {
-            step.tag().ends_with("_in_pinned_root")
-                || (validation_step_identity(step) == ValidationStepIdentity::ManifestRun
-                    && !hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
-                        .contains(&step.tag().as_str()))
-        }) {
-            if !step
-                .cmd
-                .contains("/src/ci/hermetic/assert-build-dependencies.sh")
-            {
+        // Family-mapped test nodes run the test-node guard instead of the
+        // build guard (exactly where validate_pinned_image maps the tag to
+        // a family image); every other pinned-root node keeps the build
+        // guard. Neither guard substitutes for the other.
+        let pinned_guard_ok = |step: &Step| {
+            if hermit_manifest_plan::validation_dag::family_image_reference(&step.tag()).is_some() {
+                step.cmd
+                    .contains("/src/ci/hermetic/assert-test-dependencies.sh")
+            } else {
+                step.cmd
+                    .contains("/src/ci/hermetic/assert-build-dependencies.sh")
+            }
+        };
+        let pinned_guard_steps: Vec<&Step> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| {
+                step.tag().ends_with("_in_pinned_root")
+                    || (validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                        && !hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
+                            .contains(&step.tag().as_str()))
+            })
+            .collect();
+        for step in &pinned_guard_steps {
+            if !pinned_guard_ok(step) {
                 return Err(format!(
-                    "full-plan bracket: pinned-root node {} can start without the build-dependency assertion: {}",
+                    "full-plan bracket: pinned-root node {} can start without its dependency assertion: {}",
                     step.tag(),
                     step.cmd
                 ));
+            }
+        }
+        // Red controls on cloned steps (the plan itself is not mutated):
+        // a planted family node with neither guard, and a planted
+        // unmapped node carrying only the test-node guard, must both be
+        // refused by the same per-step check.
+        {
+            let mut family_step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| s.tag() == "e2e.manifest_system_utils")
+                .ok_or("full-plan bracket: family-mapped system-utils node disappeared")?
+                .clone();
+            family_step.cmd = family_step.cmd.replace(
+                "/src/ci/hermetic/assert-test-dependencies.sh",
+                "/src/ci/hermetic/assert-no-network.sh",
+            );
+            if pinned_guard_ok(&family_step) {
+                return Err(
+                    "full-plan bracket: planted family node without either guard was accepted"
+                        .into(),
+                );
+            }
+            let mut unmapped_step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| {
+                    s.cmd
+                        .contains("/src/ci/hermetic/assert-build-dependencies.sh")
+                        && hermit_manifest_plan::validation_dag::family_image_reference(&s.tag())
+                            .is_none()
+                })
+                .ok_or("full-plan bracket: no unmapped build-guarded node to plant")?
+                .clone();
+            unmapped_step.cmd = unmapped_step.cmd.replace(
+                "/src/ci/hermetic/assert-build-dependencies.sh",
+                "/src/ci/hermetic/assert-test-dependencies.sh",
+            );
+            if pinned_guard_ok(&unmapped_step) {
+                return Err(
+                    "full-plan bracket: planted unmapped node with only the test-node guard was accepted"
+                        .into(),
+                );
             }
         }
         for tag in [
