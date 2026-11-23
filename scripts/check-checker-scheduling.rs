@@ -68,13 +68,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
          guard's default.",
     ),
     (
-        "scripts/check-detcore-backend-abstraction-test.sh",
-        "Named only inside a comment at check-detcore-backend-abstraction.sh:264. \
-         Passes when run by hand. It looks like the self-test arm of that checker \
-         and most likely wants to be invoked by it; that is a change to that \
-         checker, not to this list.",
-    ),
-    (
         "scripts/stress-test.sh",
         "A stress FRAMEWORK, not a checker. It matches only because the suffix rule \
          adopted `-test.sh`, and over-inclusion by a convention is exactly what an \

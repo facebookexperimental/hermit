@@ -19,6 +19,13 @@ fail() {
     echo "check-detcore-backend-abstraction-test.sh: FAIL — $*" >&2
     failures=$((failures + 1))
 }
+# Show the lint's own output under a failure, so its cause is on the page.
+show_output() {
+    local line
+    while IFS= read -r line; do
+        printf '    | %s\n' "$line" >&2
+    done <<< "$1"
+}
 
 if [[ ! -x $LINT ]]; then
     fail "$LINT is missing or not executable"
@@ -31,7 +38,13 @@ scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 cp -a "$REPO_ROOT/detcore" "$scratch/detcore"
 mkdir -p "$scratch/ci/dag"
-printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' > "$scratch/Cargo.toml"
+# The lint derives its prohibited crates from the workspace members' manifests
+# and refuses a workspace that names none, exiting 2 before the budget guard.
+# detcore/Cargo.toml names none: detcore's one backend dependency,
+# reverie-ptrace, is a dev-dependency of its test-only package
+# hermit-detcore-tests (detcore/tests/Cargo.toml), a member of the real
+# workspace. So the fixture lists that package too.
+printf '[workspace]\nmembers = ["detcore", "detcore/tests"]\nresolver = "2"\n' > "$scratch/Cargo.toml"
 
 write_dag() {
     python3 - "$scratch/ci/dag/validate.json" "$1" <<'PYEOF'
@@ -55,21 +68,26 @@ with open(path, "w", encoding="utf-8") as handle:
 PYEOF
 }
 
-# A budget that comfortably covers the derived work must be accepted.
+# A budget that comfortably covers the derived work must be accepted, and the
+# lint must then pass. A run that stops before the budget guard has tested
+# nothing, so it fails here rather than reading as an acceptance.
 write_dag 600
 if output=$("$LINT" --repo-root "$scratch" 2>&1); then
-    if ! grep -q "budget: 600s declared covers" <<< "$output"; then
-        fail "a sufficient budget was accepted but not reported"
-    else
-        note "OK — a sufficient 600s budget is accepted and reported"
-    fi
+    status=0
 else
     status=$?
-    if grep -q "BUDGETED FOR LESS WORK" <<< "$output"; then
-        fail "a sufficient 600s budget was refused as insufficient"
-    else
-        note "OK — sufficient budget accepted (lint exited $status on unrelated fixture grounds)"
-    fi
+fi
+if grep -q "BUDGETED FOR LESS WORK" <<< "$output"; then
+    fail "a sufficient 600s budget was refused as insufficient"
+    show_output "$output"
+elif ! grep -q "budget: 600s declared covers" <<< "$output"; then
+    fail "the lint exited $status without reaching the budget guard, so the sufficient budget was never checked"
+    show_output "$output"
+elif ((status != 0)); then
+    fail "a sufficient 600s budget was accepted, but the lint then exited $status"
+    show_output "$output"
+else
+    note "OK — a sufficient 600s budget is accepted and reported"
 fi
 
 # A budget that cannot cover the derived work must be refused, and must say so
@@ -77,13 +95,17 @@ fi
 write_dag 1
 if output=$("$LINT" --repo-root "$scratch" 2>&1); then
     fail "a 1s budget was accepted for work that cannot fit in it"
+    show_output "$output"
 else
     if ! grep -q "BUDGETED FOR LESS WORK THAN IT DERIVES" <<< "$output"; then
         fail "an insufficient budget was refused without naming the budget as the cause"
+        show_output "$output"
     elif ! grep -q "THIS IS NOT A TIMEOUT" <<< "$output"; then
         fail "an insufficient budget was refused without distinguishing itself from a timeout"
+        show_output "$output"
     elif ! grep -qE "Raise check.backend_abstraction .* to at least [0-9]+" <<< "$output"; then
         fail "an insufficient budget was refused without naming the value to set"
+        show_output "$output"
     else
         note "OK — an insufficient budget is refused, named as a budget, with the value to set"
     fi
