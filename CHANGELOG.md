@@ -7,6 +7,11 @@ branches from 0.5.0.
 
 ## Unreleased
 
+- The Buck and release builds now compile the opt-in in-guest exec-stop
+  launcher (`--in-guest-exec-stop` on the in-guest-trap backend), matching
+  the Cargo build. Installations still ship no private runtime package,
+  so the flag continues to refuse by name until a qualified package is
+  installed.
 - `hermit run --no-pin-threads` keeps a run with a timeslice unpinned: Linux
   places the tracer and guest threads and may migrate them, and no CPU is
   reserved. It is for measuring whether a run stays deterministic unpinned.

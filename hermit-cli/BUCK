@@ -81,6 +81,17 @@ LIBHERMIT_TEST_DEPS = [
     "//hermetic_infra/reverie:reverie-liteinst-exec-stop" if dep == "//hermetic_infra/reverie:reverie-liteinst" else dep for dep in LIBHERMIT_DEPS
 ]
 
+# libhermit's production dependencies: the shared list with
+# reverie-liteinst built against the one reverie-inguest of Cargo's
+# `exec-stop-launcher` build (reverie:reverie-liteinst-exec-stop-private),
+# plus that feature's direct loader and digest dependencies. The inguest
+# crate itself comes through named_deps, as in the test harnesses.
+LIBHERMIT_PROD_DEPS = [dep for dep in LIBHERMIT_DEPS if dep != "//hermetic_infra/reverie:reverie-liteinst"] + [
+    "fbsource//third-party/rust:sha2-010",
+    "//hermetic_infra/reverie:reverie-liteinst-exec-stop-private",  # @manual name:reverie_liteinst
+    "//hermetic_infra/reverie:reverie-loader",
+]
+
 LIBHERMIT_ENV = {
     # src/bin/hermit/version.rs reports it in `hermit --version`. Both trees
     # share this file, and each keeps its release values in its own
@@ -183,9 +194,9 @@ rust_library(
             },
             # The OSS package's backend features (Cargo.toml), declared but
             # empty, which keeps `cfg(feature = ...)` known to clippy's
-            # `-D warnings` in fb-only/ci.sh. Of those backends fbsource builds
-            # only LiteInst, whose dependencies the Buck targets list
-            # unconditionally.
+            # `-D warnings` in fb-only/ci.sh. Of those backends fbsource
+            # builds LiteInst and its exec-stop launcher, whose dependencies
+            # the Buck targets list unconditionally.
             "features": {
                 "dbt": [],
                 "default": [],
@@ -220,11 +231,21 @@ rust_library(
     },
     crate = "hermit",
     env = LIBHERMIT_ENV,
-    # The LiteInst backend, as upstream's Buck build of this library. Each
-    # target spells out its features: the open-source tree's
+    # The LiteInst backend and its exec-stop launcher, as upstream's Cargo
+    # build of this library with both features. Each target spells out its
+    # features: the open-source tree's
     # scripts/check-buck-reindeer-features.rs reads only literal lists.
-    features = ["liteinst"],
-    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    features = [
+        "exec-stop-launcher",
+        "liteinst",
+    ],
+    named_deps = {
+        "reverie": "//hermetic_infra/reverie:reverie",
+        # Cargo's `exec-stop-launcher` dependency on reverie-inguest with
+        # `exec-stop` and `loader-private-runtime`, unified with
+        # reverie-liteinst's dependency as in LIBHERMIT_PROD_DEPS.
+        "reverie_inguest": "//hermetic_infra/reverie:reverie-inguest-exec-stop-private",
+    },
     # The LiteInst backing descriptor and the in-guest entry symbols are
     # per-image link contracts that only a final binary link can resolve, so
     # this library must not become a shared object.
@@ -233,7 +254,7 @@ rust_library(
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     # :libhermit-unittest below, which needs the prefixed source layout.
     unittests = False,
-    deps = LIBHERMIT_DEPS,
+    deps = LIBHERMIT_PROD_DEPS,
 )
 
 # libhermit's unit tests, the application's (src/bin/hermit) included.
@@ -328,7 +349,7 @@ rust_binary(
 hermit_release_targets(
     srcs = LIBHERMIT_SRCS,
     unstamped_env = LIBHERMIT_ENV,
-    deps = LIBHERMIT_DEPS,
+    deps = LIBHERMIT_PROD_DEPS,
 )
 
 # The hermit-release aliases exist only in the open-source build; see

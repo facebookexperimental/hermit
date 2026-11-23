@@ -31,6 +31,7 @@ def hermit_release_targets(srcs, deps, unstamped_env):
     release_features = (
         {
             "features": [
+                "exec-stop-launcher",
                 "liteinst",
             ]
         }
@@ -38,6 +39,7 @@ def hermit_release_targets(srcs, deps, unstamped_env):
         else {
             "features": [
                 "buck-release-provenance",
+                "exec-stop-launcher",
                 "liteinst",
             ]
         }
@@ -73,7 +75,11 @@ def hermit_release_targets(srcs, deps, unstamped_env):
         autocargo = {"ignore_rule": True},
         crate = "hermit",
         env = release_build_env,
-        named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+        named_deps = {
+            "reverie": "//hermetic_infra/reverie:reverie",
+            # As :libhermit: the `exec-stop-launcher` inguest dependency.
+            "reverie_inguest": "//hermetic_infra/reverie:reverie-inguest-exec-stop-private",
+        },
         # As :libhermit: its link contracts need a final binary link.
         preferred_linkage = "static",
         # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
