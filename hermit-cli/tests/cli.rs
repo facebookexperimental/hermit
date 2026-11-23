@@ -15886,8 +15886,7 @@ fn unshare_probe(form: &[&str]) -> (UnshareProbe, String) {
 /// admits), then the user-namespace form. A host with neither — unprivileged
 /// in its container's user namespace, under a masked /proc — denies both.
 fn own_pid_namespace_admission() -> &'static OwnPidNamespaceAdmission {
-    static ADMISSION: std::sync::OnceLock<OwnPidNamespaceAdmission> =
-        std::sync::OnceLock::new();
+    static ADMISSION: std::sync::OnceLock<OwnPidNamespaceAdmission> = std::sync::OnceLock::new();
     ADMISSION.get_or_init(|| {
         let (privileged, privileged_line) = unshare_probe(&OWN_PID_NAMESPACE_PRIVILEGED);
         if privileged == UnshareProbe::Admitted {
@@ -15937,15 +15936,18 @@ fn own_pid_namespace() -> &'static [&'static str] {
 
 #[test]
 fn own_pid_namespace_choice_admits_either_form_and_denies_only_both_denied() {
-    use OwnPidNamespaceChoice::{Denied, Privileged, UserNamespace};
-    use UnshareProbe::{Admitted, Denied as KernelDenied, Other};
-    let choice = |privileged, user_namespace| {
-        match own_pid_namespace_choice(privileged, user_namespace) {
+    use OwnPidNamespaceChoice::Denied;
+    use OwnPidNamespaceChoice::Privileged;
+    use OwnPidNamespaceChoice::UserNamespace;
+    use UnshareProbe::Admitted;
+    use UnshareProbe::Denied as KernelDenied;
+    use UnshareProbe::Other;
+    let choice =
+        |privileged, user_namespace| match own_pid_namespace_choice(privileged, user_namespace) {
             Privileged => "privileged",
             UserNamespace => "user namespace",
             Denied => "denied",
-        }
-    };
+        };
     for (privileged, user_namespace, expected) in [
         (Admitted, Admitted, "privileged"),
         (Admitted, KernelDenied, "privileged"),
@@ -16002,7 +16004,10 @@ fn unshare_denied_recognizes_only_kernel_denial_errnos() {
         "unshare: cannot change root filesystem propagation: Operation not permitted",
         "unshare: unexpected token",
     ] {
-        assert!(!unshare_denied(line), "non-denial misread as denial: {line}");
+        assert!(
+            !unshare_denied(line),
+            "non-denial misread as denial: {line}"
+        );
     }
 }
 
@@ -16490,8 +16495,9 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// ones).
 #[test]
 fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
-    if own_pid_namespace_unavailable("no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base")
-    {
+    if own_pid_namespace_unavailable(
+        "no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base",
+    ) {
         return;
     }
     for (base, call, expected) in [
@@ -16994,7 +17000,8 @@ fn chosen_window_admission_reads_hermits_own_namespace_under_a_misaligned_proc()
 /// fork is the first call past it.
 #[test]
 fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
-    if own_pid_namespace_unavailable("no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task") {
+    if own_pid_namespace_unavailable("no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task")
+    {
         return;
     }
     let pid_max: i32 = fs::read_to_string("/proc/sys/kernel/pid_max")

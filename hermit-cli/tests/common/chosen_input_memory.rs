@@ -84,8 +84,9 @@ fn expected(mode: &str) -> String {
 /// fails this same guest oracle.
 #[test]
 fn chosen_clone_preserves_old_stack_inputs_and_native_output_aliases() {
-    if own_pid_namespace_unavailable("chosen_clone_preserves_old_stack_inputs_and_native_output_aliases")
-    {
+    if own_pid_namespace_unavailable(
+        "chosen_clone_preserves_old_stack_inputs_and_native_output_aliases",
+    ) {
         return;
     }
     for mode in ["input", "outputs"] {
@@ -147,8 +148,9 @@ fn chosen_clone_eperm_fallback_preserves_original_input_and_output_aliases() {
 /// child, not a successful memory-preservation run or a native errno result.
 #[test]
 fn strict_chosen_clone_eperm_refuses_before_original_stack_alias_call() {
-    if own_pid_namespace_unavailable("strict_chosen_clone_eperm_refuses_before_original_stack_alias_call")
-    {
+    if own_pid_namespace_unavailable(
+        "strict_chosen_clone_eperm_refuses_before_original_stack_alias_call",
+    ) {
         return;
     }
     for mode in ["fallback-input", "fallback-outputs"] {
