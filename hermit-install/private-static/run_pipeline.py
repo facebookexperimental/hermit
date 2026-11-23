@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -19,8 +20,10 @@ sys.dont_write_bytecode = True
 
 GIB = 1024 ** 3
 MEMORY_BYTES = 16 * GIB
+# The job's declared disk peak (the recipe's reservation_gib). The admission
+# line and the running stop are the host's, passed in by flag; none is kept here.
 DISK_RESERVATION_BYTES = 24 * GIB
-DISK_FLOOR_BYTES = 537_000_000_000
+SYS_ROOT = Path('/sys')
 CONSOLE_BYTES = 16 * 1024 ** 2
 CPU_SECONDS = WALL_SECONDS = 3600
 OUTER_SECONDS = 3720
@@ -230,21 +233,199 @@ def engine_command(engine, output):
             '--profile', '--no-profile-feedback', '-v']
 
 
+def byte_count(text):
+    """A host-policy byte line: a positive decimal integer, as the policy prints it."""
+    if not re.fullmatch('[0-9]+', text) or int(text) <= 0:
+        raise argparse.ArgumentTypeError(
+            'expected a positive decimal byte count from the host disk policy, got '
+            + repr(text))
+    return int(text)
+
+
 def available_bytes(path):
     status = os.statvfs(path)
     return status.f_bavail * status.f_frsize
 
 
-def projected_disk(available):
-    need(available - DISK_RESERVATION_BYTES >= DISK_FLOOR_BYTES,
-         'projected disk floor refuses: ' + str(available)
-         + '; choose an authorized filesystem with at least 562769803776 available bytes'
-         ' or wait for space to be recovered; do not lower the floor or reservation')
+def minimum_available(paths, available=available_bytes):
+    return min(available(path) for path in paths)
 
 
-def guard_breach(available, console_bytes):
-    if available < DISK_FLOOR_BYTES:
-        return 'disk available ' + str(available) + ' below 537000000000'
+def mount_field(text):
+    """Undo the octal escapes /proc/self/mountinfo uses for space, tab, newline, backslash."""
+    return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), text)
+
+
+def mountinfo_row(table, mount_id, path):
+    """Device, mount point, type, source and superblock options from MOUNT_ID's line."""
+    for line in table.splitlines():
+        fields = line.split(' ')
+        if fields[0] == mount_id:
+            tail = fields.index('-', 6)
+            return dict(device=fields[2], mount_point=mount_field(fields[4]),
+                        fstype=mount_field(fields[tail + 1]),
+                        source=mount_field(fields[tail + 2]),
+                        options=mount_field(fields[tail + 3]))
+    raise RuntimeError('mount ' + mount_id + ' of ' + str(path)
+                       + ' is missing from /proc/self/mountinfo')
+
+
+def mount_of(path):
+    """The mountinfo row of the mount PATH is on, by the open file's own mount ID."""
+    descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    try:
+        fdinfo = Path('/proc/self/fdinfo', str(descriptor)).read_text()
+        ids = [line.split(':', 1)[1].strip() for line in fdinfo.splitlines()
+               if line.startswith('mnt_id:')]
+        need(len(ids) == 1, 'no mount ID for ' + str(path) + ' in /proc/self/fdinfo')
+        # Read the table while the descriptor still pins the mount.
+        table = os.fsdecode(Path('/proc/self/mountinfo').read_bytes())
+    finally:
+        os.close(descriptor)
+    return mountinfo_row(table, ids[0], path)
+
+
+def block_node_number(source):
+    """MAJOR:MINOR of the block device a mount source names; anything else refuses by name."""
+    need(source.startswith('/'), 'mount source ' + repr(source) + ' is not a device path')
+    try:
+        status = os.stat(source)
+    except (OSError, ValueError) as error:
+        raise RuntimeError('cannot stat mount source ' + repr(source) + ': '
+                           + str(error)) from error
+    need(stat.S_ISBLK(status.st_mode), 'mount source ' + repr(source) + ' is not a block device')
+    return '%d:%d' % (os.major(status.st_rdev), os.minor(status.st_rdev))
+
+
+# Filesystem types that keep all their data on the one block device the mount names.
+# The kernel lists a filesystem's whole device set only for these and for btrfs
+# (fs/btrfs/<uuid>/devices); for any other type (bcachefs, f2fs, ZFS, network,
+# userspace and memory filesystems) the guard cannot read where bytes go.
+SINGLE_DEVICE_TYPES = ('ext2', 'ext3', 'ext4', 'xfs')
+# The root bus of a PCI hierarchy in sysfs (/sys/devices/pciDDDD:BB/...).
+PCI_ROOT = re.compile('pci[0-9a-f]{4}:[0-9a-f]{2}')
+
+
+def block_device(sys_root, number, where):
+    node = sys_root / 'dev' / 'block' / number
+    need(node.exists(), 'block device ' + number + ' of the ' + where + ' has no ' + str(node))
+    return node.resolve()
+
+
+def filesystem_devices(mount, sys_root, device_number):
+    """Sysfs directories of every block device a mounted filesystem stores data on."""
+    where = ('filesystem at ' + mount['mount_point'] + ' (type ' + mount['fstype']
+             + ', source ' + repr(mount['source']) + ')')
+    if mount['fstype'] == 'btrfs':
+        # Btrfs reports an unnamed (major 0) device for every mount, so its source
+        # names the device; it is believed only as a member btrfs itself lists.
+        source = block_device(sys_root, device_number(mount['source']), where)
+        for members in sorted((sys_root / 'fs' / 'btrfs').glob('*/devices')):
+            resolved = sorted(member.resolve() for member in members.iterdir())
+            if source in resolved:
+                return resolved
+        raise RuntimeError(where + ': no btrfs filesystem lists its source as a member')
+    need(mount['fstype'] in SINGLE_DEVICE_TYPES,
+         where + ' is not btrfs or a single-device type (' + ', '.join(SINGLE_DEVICE_TYPES)
+         + '), so the devices under it cannot be read; keep H/target on one of those')
+    others = [option for option in mount['options'].split(',')
+              if option.partition('=')[2].startswith('/')]
+    need(not others, where + ' also uses ' + ','.join(others)
+         + '; multi-device filesystems other than btrfs cannot be measured')
+    return [block_device(sys_root, mount['device'], where)]
+
+
+def loop_backing_files(device, sys_root):
+    """Backing files of the loop devices under DEVICE (a sysfs dir).
+
+    A partition stands for its disk, a loop device for its backing file, and an md
+    array for every member. Any other device must be one a PCI device presents,
+    and it is taken at the capacity it reports: this is a trust boundary, not a
+    proof of fixed capacity. SAN disks behind FC, iSCSI-offload or SRP adapters and
+    VM disks pass, and thin provisioning behind them is invisible without
+    privilege, the same blind spot as the host policy's df. Device-mapper (whose
+    thin, snapshot or VDO mapping is not readable without privilege), nbd, the
+    software iSCSI initiator, NVMe over fabrics, zram, brd and ublk refuse by name,
+    and so does local storage that is not under PCI: virtio-mmio disks, NVMe
+    namespaces under native multipath (virtual/nvme-subsystem), storage on ARM
+    board buses, and Hyper-V and Xen disks.
+    """
+    if (device / 'partition').is_file():
+        device = device.parent
+    if (device / 'loop').is_dir():
+        name = device.name
+        try:
+            text = os.fsdecode((device / 'loop' / 'backing_file').read_bytes())
+        except OSError as error:
+            raise RuntimeError('cannot read the backing file of loop device ' + name
+                               + ': ' + str(error)) from error
+        backing = Path(text[:-1] if text.endswith('\n') else text)
+        need(backing.is_absolute() and backing.is_file(),
+             'backing file of loop device ' + name + ' is not a regular file reachable here: '
+             + repr(str(backing)) + '; the filesystem under it cannot be measured')
+        return [backing]
+    if (device / 'md').is_dir():
+        files = []
+        for lower in sorted((device / 'slaves').iterdir()):
+            files.extend(loop_backing_files(lower.resolve(), sys_root))
+        return files
+    try:
+        parts = device.relative_to(sys_root / 'devices').parts
+    except ValueError:
+        parts = ()
+    need(any(PCI_ROOT.fullmatch(part) for part in parts),
+         'block device ' + device.name + ' (' + str(device) + ') is not a disk on the local PCI'
+         ' bus, so its real backing store cannot be measured')
+    return []
+
+
+def storage_chain(path, *, sys_root=SYS_ROOT, mount=mount_of, device_number=block_node_number,
+                  available=available_bytes):
+    """Every filesystem that stores bytes written under PATH, nearest first.
+
+    PATH's own filesystem comes first. A filesystem on a loop device is stored in
+    the loop's backing file, so the filesystem holding that file follows, through
+    partitions, md members and every member of a multi-device btrfs, until no loop
+    device remains. Each filesystem (mountinfo device) is measured once, so the
+    walk ends. A filesystem or device the walk cannot read refuses by name; the
+    walk ends at a device a PCI device presents, which is taken at the capacity
+    it reports (see loop_backing_files for that trust boundary).
+    """
+    chain = []
+    seen = set()
+    pending = [Path(path)]
+    while pending:
+        here = pending.pop(0)
+        row = mount(here)
+        if row['device'] in seen:
+            continue
+        seen.add(row['device'])
+        backing = []
+        for device in filesystem_devices(row, sys_root, device_number):
+            backing.extend(loop_backing_files(device, sys_root))
+        chain.append(dict(path=str(here), device=row['device'], mount_point=row['mount_point'],
+                          fstype=row['fstype'], source=row['source'],
+                          available_bytes=available(here),
+                          backing_files=[str(name) for name in backing]))
+        pending.extend(backing)
+    return chain
+
+
+def projected_disk(chain, admission_line):
+    """Admit only if every filesystem in CHAIN keeps the admission line after the job's peak."""
+    tightest = min(chain, key=lambda filesystem: filesystem['available_bytes'])
+    available = tightest['available_bytes']
+    need(available - DISK_RESERVATION_BYTES >= admission_line,
+         'projected disk admission refuses: ' + tightest['mount_point'] + ' ('
+         + tightest['source'] + ') has ' + str(available) + ' bytes available, which less the '
+         + str(DISK_RESERVATION_BYTES) + '-byte reservation is below the host admission line '
+         + str(admission_line) + '; recover space on that filesystem or wait for it,'
+         ' and do not lower the line or the reservation')
+
+
+def guard_breach(available, console_bytes, stop_line):
+    if available < stop_line:
+        return 'disk available ' + str(available) + ' below the host running stop ' + str(stop_line)
     if console_bytes > CONSOLE_BYTES:
         return 'console exceeds 16 MiB'
     return None
@@ -306,25 +487,28 @@ def terminate(process, grace=TERM_SECONDS):
         return process.wait()
 
 
-def monitor_engine(command, source, environment, output, *, free=available_bytes,
-                   sleep=time.sleep, poll_seconds=POLL_SECONDS, term_seconds=TERM_SECONDS,
-                   disk_path=None):
-    """The original disk/console poll and process-group TERM/KILL policy."""
+def monitor_engine(command, source, environment, output, *, guarded, stop_line,
+                   free=minimum_available, sleep=time.sleep, poll_seconds=POLL_SECONDS,
+                   term_seconds=TERM_SECONDS):
+    """The original disk/console poll and process-group TERM/KILL policy.
+
+    GUARDED is the measurement path of every filesystem in the target's storage
+    chain; FREE returns the least space available among them.
+    """
     console = output / 'console.log'
     started = time.monotonic()
     process = None
     invocation = None
     errors = []
     available = None
-    disk_path = source if disk_path is None else disk_path
     with console.open('xb') as stream:
         try:
             process = subprocess.Popen(command, cwd=source, env=environment,
                                        stdin=subprocess.DEVNULL, stdout=stream,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             while process.poll() is None:
-                available = free(disk_path)
-                breach = guard_breach(available, console.stat().st_size)
+                available = free(guarded)
+                breach = guard_breach(available, console.stat().st_size, stop_line)
                 if breach:
                     errors.append(breach)
                     break
@@ -341,10 +525,10 @@ def monitor_engine(command, source, environment, output, *, free=available_bytes
                     process.wait()
                 except BaseException as error:
                     errors.append('cleanup ' + type(error).__name__ + ': ' + str(error))
-    # Fast completion must not turn the very same floor/cap breach into a pass.
+    # Fast completion must not turn the very same disk/cap breach into a pass.
     try:
-        available = free(disk_path)
-        breach = guard_breach(available, console.stat().st_size)
+        available = free(guarded)
+        breach = guard_breach(available, console.stat().st_size, stop_line)
         if breach and breach not in errors:
             errors.append(breach)
     except Exception as error:
@@ -352,8 +536,8 @@ def monitor_engine(command, source, environment, output, *, free=available_bytes
     return dict(native=native_status(process.returncode if process is not None else None),
                 invocation_failure=invocation,
                 wall_seconds=time.monotonic() - started, guard_breaches=errors,
-                disk_guard_path=str(disk_path), disk_available_after_bytes=available,
-                console_bytes=console.stat().st_size)
+                disk_guard_paths=[str(path) for path in guarded],
+                disk_available_after_bytes=available, console_bytes=console.stat().st_size)
 
 
 def payload(output, expected):
@@ -438,9 +622,10 @@ def execute(args, output):
         save(output / 'dag.json', dag)
         command = engine_command(args.engine, output)
         disk_path = Path(config['paths']['target'])
-        before = available_bytes(disk_path)
-        disk_device = disk_path.stat().st_dev
-        evidence_device = output.stat().st_dev
+        # Resolved once at launch; a later change to the storage under the target
+        # (btrfs device add or replace) is not followed during the run.
+        chain = storage_chain(disk_path)
+        before = min(filesystem['available_bytes'] for filesystem in chain)
         stamp.update(recipe=recipe_identity, binding=binding_identity,
                      config=dict(snapshot=file_identity(output / 'config.json'),
                                  original_files=config_origins),
@@ -451,19 +636,21 @@ def execute(args, output):
                                                         cargo_target_dir=config['paths']['target']),
                      command=command, environment_overrides=overrides,
                      dag=file_identity(output / 'dag.json'), disk_guard_path=str(disk_path),
-                     disk_guard_device=disk_device, evidence_device=evidence_device,
-                     disk_guard_evidence_same_filesystem=disk_device == evidence_device,
-                     disk_available_before_bytes=before,
+                     disk_storage_chain=chain, disk_available_before_bytes=before,
                      limits=dict(cpu_seconds=CPU_SECONDS, wall_seconds=WALL_SECONDS,
                                  outer_seconds=OUTER_SECONDS, cpus=8, pids=512,
                                  memory_bytes=MEMORY_BYTES, swap_bytes=0,
                                  projected_disk_reservation_bytes=DISK_RESERVATION_BYTES,
-                                 disk_floor_bytes=DISK_FLOOR_BYTES, console_bytes=CONSOLE_BYTES,
+                                 disk_admission_line_bytes=args.admission_line_bytes,
+                                 disk_running_stop_bytes=args.running_stop_bytes,
+                                 console_bytes=CONSOLE_BYTES,
                                  poll_seconds=POLL_SECONDS, term_seconds=TERM_SECONDS))
         save(output / 'launch.json', stamp)
-        projected_disk(before)
-        stamp['engine_result'] = monitor_engine(command, source, environment, output,
-                                                disk_path=disk_path)
+        projected_disk(chain, args.admission_line_bytes)
+        stamp['engine_result'] = monitor_engine(
+            command, source, environment, output,
+            guarded=[Path(filesystem['path']) for filesystem in chain],
+            stop_line=args.running_stop_bytes)
         errors.extend(stamp['engine_result']['guard_breaches'])
         for name in ('child.json', 'a6-pids.json'):
             stamp[name] = read_record(output / name)
@@ -575,7 +762,19 @@ def main(argv=None):
     }
     for name, description in descriptions.items():
         parser.add_argument('--' + name, required=True, help=description)
+    # The host disk policy owns both lines; this adapter keeps no copy or default.
+    parser.add_argument('--admission-line-bytes', type=byte_count, required=True,
+                        help='host policy disk.admission_line_bytes (hard floor plus admission'
+                             ' margin): admit only if every filesystem storing H/target keeps'
+                             ' at least this many available bytes after the 24 GiB reservation')
+    parser.add_argument('--running-stop-bytes', type=byte_count, required=True,
+                        help='host policy disk.running_stop_bytes: stop the run when any'
+                             ' filesystem storing H/target has fewer available bytes than this')
     args = parser.parse_args(argv)
+    if not args.running_stop_bytes < args.admission_line_bytes:
+        parser.error('--running-stop-bytes ' + str(args.running_stop_bytes) + ' must be below'
+                     ' --admission-line-bytes ' + str(args.admission_line_bytes)
+                     + '; pass both values unchanged from the host disk policy')
     try:
         need(re.fullmatch('[a-z0-9][a-z0-9-]{0,31}', args.name),
              'invalid --name; choose 1–32 lower-case letters/digits/hyphens starting with a letter/digit')

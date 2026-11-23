@@ -123,11 +123,10 @@ python3 H/hermit-install/private-static/owned/pipeline.py prepare \
   --evidence-root EVIDENCE --name NAME --publish-directory PUBLISH_DIR
 ```
 
-Launch the emitted recipe only with at least 590 GiB free on the `H/target`
-filesystem (the run reserves 24 GiB and stops below its disk floor), and
-return the evidence: published image and descriptor SHA256s,
-`pipeline-result.json`, the filled config and its SHA256, and the H and R
-heads it was filled from.
+Launch the emitted recipe through `run_pipeline.py` as shown below, which
+admits and stops the run by the host disk policy, and return the evidence:
+published image and descriptor SHA256s, `pipeline-result.json`, the filled
+config and its SHA256, and the H and R heads it was filled from.
 
 ## Bounded producer launch
 
@@ -146,8 +145,18 @@ python3 H/hermit-install/private-static/run_pipeline.py \
   --engine-provenance STOCK_STAMP --engine-provenance-sha256 STAMP_SHA \
   --pid-helper PID_HELPER \
   --pid-helper-sha256 3c87bfa780d378b9e8313c904ae6fa91ae3e2e57de12275b340122a41c8cccbb \
-  --tmpdir PRIVATE_TMP --xdg-cache-home PRIVATE_CACHE --output-root EVIDENCE
+  --tmpdir PRIVATE_TMP --xdg-cache-home PRIVATE_CACHE --output-root EVIDENCE \
+  --admission-line-bytes "$(HOST_POLICY get disk.admission_line_bytes)" \
+  --running-stop-bytes "$(HOST_POLICY get disk.running_stop_bytes)"
 ```
+
+`HOST_POLICY` is the host's disk-policy reader; on dev-hermit hosts it is
+`ci-hub/bin/host-policy`. It reads the one policy file and resolves this
+host's values, per-host overrides included, at each launch; the adapter keeps
+no line, copy or default of its own. A failed lookup substitutes an
+empty value. The adapter refuses, by flag name and before it creates any
+evidence, a missing, empty, non-decimal or non-positive value, and a running
+stop that is not below the admission line.
 
 `H` is the canonical final checkout named by the config. `STOCK_DAGRUN` is an
 already built stock binary selected by H's pinned `agent-utils`; passing its
@@ -170,13 +179,45 @@ The one full-DAG step retains separate **3,600 CPU seconds and 3,600 wall
 seconds**, eight reserved CPUs, 16 GiB memory, zero swap and 512 tasks. The
 unchanged helper checks the live scope, reservation, affinity and memory
 events. The outer engine has the original 3,720-second reporting/teardown
-budget. `reservation_gib=24` is a projected **disk** allowance: before launch,
-available bytes minus 25,769,803,776 must be at least 537,000,000,000. During
-execution the same floor and 16 MiB engine-console cap are checked every two
-seconds. The disk observations use the canonical `H/target` filesystem, even
-when evidence is retained elsewhere. A breach sends TERM and then KILL after
-15 seconds. The emitted step keeps its explicit empty job flag and environment
-channels, so stock inner-width rendering preserves the payload arguments.
+budget. `reservation_gib=24` is the job's declared **disk** peak. The disk
+guard measures every filesystem that stores bytes written under the canonical
+`H/target`, even when evidence is retained elsewhere: `H/target`'s own
+filesystem and, when that sits on a loop device, the filesystem holding the
+loop's backing file, through partitions, md members and every member of a
+multi-device btrfs, until no loop device remains. In a worktree slot on a loop
+image this is the slot's filesystem and the host filesystem holding the image.
+Before launch, the least available space among them minus 25,769,803,776 bytes
+must be at least the admission line. During execution the same filesystems and
+the 16 MiB engine-console cap are checked every two seconds, and the run stops
+when the least available space falls below the running stop. The storage is
+resolved once at launch; a later change, such as `btrfs device add`, is not
+followed.
+
+The launch is refused by name when the storage cannot be measured:
+- a filesystem other than btrfs or a single-device type (ext2, ext3, ext4,
+  xfs), such as tmpfs, overlay, a network or FUSE filesystem, bcachefs, f2fs
+  or ZFS;
+- a btrfs whose mount source no btrfs filesystem lists as a member, or whose
+  source cannot be stat'ed;
+- a single-device filesystem whose options name another device, such as an
+  xfs realtime device;
+- a block device that a PCI device does not present: device-mapper (its thin,
+  snapshot or VDO mapping is not readable without privilege), nbd, the software
+  iSCSI initiator, NVMe over fabrics, zram, brd or ublk, and local storage that
+  is not under PCI, such as virtio-mmio disks, NVMe namespaces under native
+  multipath (`virtual/nvme-subsystem`), storage on ARM board buses, and
+  Hyper-V and Xen disks;
+- a loop device whose backing file is not a regular file reachable from the
+  launch.
+
+The trust boundary: a disk that a PCI device presents is taken at the
+capacity it reports. That includes SAN disks behind FC, iSCSI-offload or SRP
+adapters, and VM disks. Thin provisioning behind such a disk is invisible
+without privilege, the same blind spot as the host policy's df-based checks.
+
+A breach sends TERM and then KILL after 15 seconds. The emitted step keeps its
+explicit empty job flag and environment channels, so stock inner-width
+rendering preserves the payload arguments.
 Existing producer 64 MiB stream checks remain in their current owners.
 
 `launch.json` and `receipt.json` record source, adapter, engine/stamp, helper,
@@ -187,7 +228,8 @@ missing. A successful host recipe is not a Ready token, a guest test result or
 a FULL validation receipt; DATA and runtime qualification retain their existing
 producer and consumer checks.
 
-Focused adapter controls use short native host commands, mocked disk observations
+Focused adapter controls use short native host commands, mocked disk observations,
+a fake sysfs tree with an injected mount table (never the host's loop devices)
 and the pinned AU pure Python model (Python 3.10 or newer). They do not invoke
 stock dagrun, its PID helper or the private producer:
 
