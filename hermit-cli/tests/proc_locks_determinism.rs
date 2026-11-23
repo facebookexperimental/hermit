@@ -1817,6 +1817,11 @@ static int stale_private_table_scenario(const char* path) {
 // (`object` from `<jail>/object`), takes a real write lock on another file,
 // and reads /proc/locks through a descriptor it opened on the real procfs
 // before the chroot. Detcore must not take the planted line as the guest's.
+//
+// The test makes a planted "fdinfo" for every descriptor below this limit
+// before the first run, so the jail is the same at the start of both runs of
+// its L2 check; /own must get one of them.
+#define FAKE_PROC_FD_LIMIT 64
 static int fake_proc_scenario(const char* jail) {
   int locks = open("/proc/locks", O_RDONLY);
   if (locks < 0) {
@@ -1840,6 +1845,9 @@ static int fake_proc_scenario(const char* jail) {
   int own = open("/own", O_CREAT | O_RDWR, 0600);
   if (own < 0) {
     die("open /own");
+  }
+  if (own >= FAKE_PROC_FD_LIMIT) {
+    die("/own's descriptor has no planted fdinfo made before the run");
   }
   if ((mkdir("/proc", 0755) != 0 && errno != EEXIST) ||
       (mkdir("/proc/thread-self", 0755) != 0 && errno != EEXIST) ||
@@ -2817,6 +2825,10 @@ fn stale_ledger_entries_admit_no_host_row_on_dbt() {
 /// ptrace). The guest's own lock is hidden too: its `/proc` is not procfs.
 #[test]
 fn a_fake_proc_under_chroot_admits_no_host_row() {
+    /// The descriptors the guest's /own can get: the guest refuses one at or
+    /// above this (`FAKE_PROC_FD_LIMIT` in `LOCK_SCENARIOS_SOURCE`), and this
+    /// test makes a planted fdinfo for each one below it.
+    const FAKE_PROC_FD_LIMIT: u32 = 64;
     let root = tempfile::Builder::new()
         .prefix("proc-locks-fake-proc-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -2847,8 +2859,21 @@ fn a_fake_proc_under_chroot_admits_no_host_row() {
     fs::write(jail.join("object"), object.as_bytes()).expect("write the lock object");
     // The jail's tree exists before the first run, so the guest's calls that
     // make it (mkdir, open with O_CREAT) answer the same in both runs of the
-    // L2 check.
+    // L2 check. That includes the fdinfo the guest plants for /own, made here
+    // for every descriptor /own can get: one the first run created would be a
+    // new file there and an existing one in the second run, and on Linux a new
+    // file's mtime is its creation time.
     fs::create_dir_all(jail.join("proc/thread-self/fdinfo")).expect("create the fake /proc");
+    assert!(
+        LOCK_SCENARIOS_SOURCE.contains(&format!(
+            "#define FAKE_PROC_FD_LIMIT {FAKE_PROC_FD_LIMIT}\n"
+        )),
+        "the guest's FAKE_PROC_FD_LIMIT is not the test's {FAKE_PROC_FD_LIMIT}"
+    );
+    for fd in 0..FAKE_PROC_FD_LIMIT {
+        fs::write(jail.join(format!("proc/thread-self/fdinfo/{fd}")), b"")
+            .expect("create a planted fdinfo");
+    }
     fs::write(jail.join("own"), b"").expect("create the jail's own file");
     let report = root.path().join("fake-proc-verify.json");
     let output = run_guest_on(
