@@ -997,6 +997,13 @@ fn self_sigkill_targets_current_task(
         && target_thread.is_none_or(|target| target == current_thread)
 }
 
+/// The validated timeout of an `rt_sigtimedwait` call: Linux rejects a
+/// negative second or nanosecond count, or a nanosecond count at or
+/// above one second, with EINVAL (`do_sigtimedwait`'s timespec check).
+fn sigtimedwait_timeout_duration(ts: Timespec) -> Result<Duration, Errno> {
+    crate::syscalls::io::ppoll_timeout_duration(ts)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Bind a supported in-guest emulated sleep to its guest dispositions and
     /// mask: SIGALRM's, and those of every signal a scheduler send can reach
@@ -2161,28 +2168,38 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
 
-        let ns_delta = if let Some(timeout) = call.timeout() {
-            let ts: Timespec = guest.memory().read_value(timeout)?;
-            Some(Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64))
-        } else {
-            None
-        };
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
         // While it polls, a signal in the set is taken at the next poll
         // whatever the thread's mask, which a process-directed signal another
         // thread sends must account for
-        // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
-        // the kernel at the first poll.
+        // (`Scheduler::own_process_signal_inputs`). Linux copies the set
+        // before validating the timeout (measured natively: bad set plus
+        // invalid timeout gives EFAULT, not EINVAL), so a set fault is
+        // returned here, ahead of the timeout check below.
         let waited = match call.set() {
             Some(set) => match read_kernel_sigset(guest, set.into()).await {
                 Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
                     return restart_if_first_probe_not_run(Err(error));
                 }
+                Err(error @ Error::Errno(Errno::EFAULT)) => {
+                    return Err(error);
+                }
                 read => read.ok(),
             },
-            None => None,
+            // A NULL set faults the kernel's copy_from_user, like
+            // handle_rt_sigsuspend's NULL-mask case.
+            None => return Err(Errno::EFAULT.into()),
+        };
+        let ns_delta = if let Some(timeout) = call.timeout() {
+            let ts: Timespec = guest.memory().read_value(timeout)?;
+            // Linux returns EINVAL for an invalid timeout
+            // (kernel/signal.c do_sigtimedwait); unchecked casts panicked
+            // Detcore on the Duration addition for e.g. {-1, 1_000_000_000}.
+            Some(sigtimedwait_timeout_duration(ts)?)
+        } else {
+            None
         };
         // After the set's probe, the call's first injection: observing the
         // virtual clock asks the scheduler, which a restart would repeat.
@@ -7151,6 +7168,43 @@ mod tests {
             );
         }
         assert!(matches!(restart(Ok(7)), Ok(7)));
+    }
+
+    /// rt_sigtimedwait rejects an invalid timeout with EINVAL as Linux
+    /// does. The old unchecked conversion turned {-1, 1_000_000_000} into
+    /// a huge Duration and panicked on the Duration addition
+    /// (`from_secs + from_nanos` overflowed); the virtual-clock addition
+    /// saturates and never panics.
+    #[test]
+    fn sigtimedwait_timeout_rejects_invalid_timespecs() {
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: -1,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: 1,
+                tv_nsec: 500,
+            }),
+            Ok(Duration::new(1, 500))
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 999_999_999,
+            }),
+            Ok(Duration::new(i64::MAX as u64, 999_999_999))
+        );
     }
 
     /// A reserved send names the caller's own process by its ids when it names

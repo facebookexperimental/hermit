@@ -4044,3 +4044,108 @@ async fn a_sigalrm_interrupted_pipe_read_shows_eintr_to_detlog_and_the_posthook_
     );
     assert!(!filed_stop(&guest, "HERMIT_"), "{:?}", guest.rpcs());
 }
+
+/// At the handler: `handle_rt_sigtimedwait` checks in Linux's
+/// order (sigsetsize, set copy, timeout) and returns the kernel's errno
+/// instead of panicking on an invalid timeout. Through the fake guest:
+/// (a) a valid set with timeout {-1, 1_000_000_000} is EINVAL (the base
+/// panicked on the `Duration` addition before any probe), (b) a NULL set
+/// is EFAULT, and (c) a faulting set with the same invalid timeout is
+/// EFAULT, proving the set is probed before the timeout is validated.
+/// Each rejected call injects no `rt_sigtimedwait` and files no scheduler
+/// request (no clock observation).
+#[tokio::test]
+async fn rt_sigtimedwait_handler_rejects_invalid_timeout_and_faulting_set_in_linux_order() {
+    use reverie::syscalls::RtSigtimedwait;
+    use reverie::syscalls::Timespec;
+    let set_cell = |mask: u64| Box::leak(Box::new(mask)) as *mut u64 as usize;
+    let timeout_cell = |tv_sec: i64, tv_nsec: i64| {
+        Box::leak(Box::new(Timespec {
+            tv_sec,
+            tv_nsec: tv_nsec as _,
+        })) as *mut Timespec as usize
+    };
+    // A page no access may touch: the set probe's copy faults (EFAULT).
+    // SAFETY: a fresh private anonymous page left PROT_NONE.
+    let bad_set = unsafe {
+        let page = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert_ne!(page, libc::MAP_FAILED);
+        page as usize
+    };
+    let invalid = timeout_cell(-1, 1_000_000_000);
+
+    // (a) Valid set, invalid timeout: EINVAL, never a panic, no wait.
+    let mut guest = turn_guest(true, Some(0));
+    let detcore = tool(&guest);
+    let result = detcore
+        .handle_rt_sigtimedwait(
+            &mut guest,
+            RtSigtimedwait::new()
+                .with_set(Some(AddrMut::from_raw(set_cell(0)).unwrap()))
+                .with_info(None)
+                .with_timeout(Some(Addr::from_raw(invalid).unwrap()))
+                .with_sigsetsize(8),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EINVAL))),
+        "(a): {result:?}"
+    );
+    assert_eq!(
+        guest.injected,
+        [Sysno::rt_sigprocmask],
+        "(a): set probed only"
+    );
+    assert!(guest.rpcs().is_empty(), "(a): no clock observation");
+
+    // (b) NULL set: EFAULT before the (valid) timeout is read.
+    let mut guest = turn_guest(true, Some(0));
+    let detcore = tool(&guest);
+    let result = detcore
+        .handle_rt_sigtimedwait(
+            &mut guest,
+            RtSigtimedwait::new()
+                .with_set(None)
+                .with_info(None)
+                .with_timeout(Some(Addr::from_raw(timeout_cell(1, 0)).unwrap()))
+                .with_sigsetsize(8),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EFAULT))),
+        "(b): {result:?}"
+    );
+    assert!(guest.injected.is_empty(), "(b): no probe of a NULL set");
+    assert!(guest.rpcs().is_empty(), "(b): no clock observation");
+
+    // (c) Faulting set plus invalid timeout: EFAULT wins (set first).
+    let mut guest = turn_guest(true, Some(0));
+    let detcore = tool(&guest);
+    let result = detcore
+        .handle_rt_sigtimedwait(
+            &mut guest,
+            RtSigtimedwait::new()
+                .with_set(Some(AddrMut::from_raw(bad_set).unwrap()))
+                .with_info(None)
+                .with_timeout(Some(Addr::from_raw(invalid).unwrap()))
+                .with_sigsetsize(8),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EFAULT))),
+        "(c): {result:?}"
+    );
+    assert_eq!(
+        guest.injected,
+        [Sysno::rt_sigprocmask],
+        "(c): set probed only"
+    );
+    assert!(guest.rpcs().is_empty(), "(c): no clock observation");
+}
