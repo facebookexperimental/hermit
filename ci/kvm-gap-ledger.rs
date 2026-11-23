@@ -1,4 +1,10 @@
 #!/usr/bin/env -S rust-script --force
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
 //! Run a Hermit test suite as a validation node on a backend that does not pass all of it yet,
 //! held to the suite's known-gap ledger, and hold the ledger to its history.
 //!
@@ -46,6 +52,9 @@
 //! hermit-manifest-plan = { path = "manifest-plan" }
 //! serde_json = "1"
 //! ```
+// LICENSELINT wants the license in its own leading comment, which would hide the embedded manifest
+// that rust-script reads from the first comment after the shebang; the license is the //! lines above.
+// @lint-ignore-every LICENSELINT
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
