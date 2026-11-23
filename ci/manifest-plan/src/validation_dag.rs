@@ -1466,7 +1466,30 @@ fn retire_unconsumed_host_producers(cfg: &mut DagConfig) {
 // each resulting argument before appending it to the original shell payload;
 // preserve literal bytes and the original command's argument placement.
 pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
-pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+pub const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+pub const TEST_NODE_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-test-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
+pub const LEGACY_TEST_NODE_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-test-dependencies.sh && exec bash -c "$1""#;
+
+/// Family-to-image map at the container seam (single source in code;
+/// values mirror ci/hermetic/images/*.json receipts and are
+/// cross-validated by the manifest-plan tests against those files).
+/// Build nodes are never mapped: only test-running e2e buckets switch.
+pub fn family_image_reference(tag: &str) -> Option<&'static str> {
+    match tag {
+        "e2e.manifest_system_utils" => Some(
+            "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+        ),
+        _ => None,
+    }
+}
+
+fn command_guard_for_tag(tag: &str) -> &'static str {
+    if family_image_reference(tag).is_some() {
+        TEST_NODE_COMMAND_GUARD
+    } else {
+        PINNED_ROOT_COMMAND_GUARD
+    }
+}
 
 fn needs_proc_locks_runtime(tag: &str) -> bool {
     matches!(
@@ -1498,6 +1521,9 @@ fn pinned_root_command(step: &Step) -> String {
         env_names.insert("DAGRUN_OUTER_RUN");
     }
     env_names.extend(step.env.keys().map(String::as_str));
+    if family_image_reference(&step.tag()).is_some() {
+        env_names.insert("HERMIT_VALIDATION_IMAGE");
+    }
     // A width channel that the root does not forward leaves the command at its
     // own default however wide the step was admitted.
     env_names.extend(step.jobs_env.as_deref().filter(|name| !name.is_empty()));
@@ -1511,6 +1537,9 @@ fn pinned_root_command(step: &Step) -> String {
         "--cargo-home".into(),
         "ignored/hermetic/split/cargo".into(),
     ];
+    if let Some(reference) = family_image_reference(&step.tag()) {
+        argv.extend(["--digest".into(), reference.into()]);
+    }
     // Proc-locks snapshots include OFD locks from other PID namespaces. Share
     // the native host lease inode, not one file per container or validation.
     if needs_proc_locks_runtime(&step.tag()) {
@@ -1526,7 +1555,7 @@ fn pinned_root_command(step: &Step) -> String {
         "--".into(),
         "bash".into(),
         "-c".into(),
-        PINNED_ROOT_COMMAND_GUARD.into(),
+        command_guard_for_tag(&step.tag()).into(),
         "bash".into(),
         if step.tag() == "test.regular_crates" {
             step.cmd.replace("./ci/run-nextest-counted.sh", "./ci/run-nextest-counted.sh --calibration-launch-proof /run/hermit-nextest-launch.json")
@@ -1574,15 +1603,84 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
             }
         }
     }
-    let legacy = format!("{} bash ", shell_quote(LEGACY_PINNED_ROOT_COMMAND_GUARD));
-    let current = format!("{} bash ", shell_quote(PINNED_ROOT_COMMAND_GUARD));
-    let payload = if let Some(command) = payload.strip_prefix(&legacy) {
-        format!("{current}{command}")
-    } else if payload.starts_with(&current) {
-        payload.to_owned()
-    } else {
-        return Err(format!("{tag} has an unrecognized pinned-root argv guard"));
-    };
+    let digests: Vec<&str> = words
+        .windows(2)
+        .filter(|pair| pair[0] == "--digest")
+        .map(|pair| pair[1])
+        .collect();
+    match (family_image_reference(tag), digests.as_slice()) {
+        (Some(reference), []) => {
+            let position = refreshed.find(" --env ").unwrap_or(refreshed.len());
+            refreshed.insert_str(position, &format!(" --digest {reference}"));
+        }
+        (Some(_), [_]) => {}
+        _ => {}
+    }
+    // Forward the image stamp only on family-mapped buckets: authored
+    // static commands carry no such token, so insert it with the digest.
+    if family_image_reference(tag).is_some() {
+        let stamp_count = words
+            .windows(2)
+            .filter(|pair| pair[0] == "--env" && pair[1] == "HERMIT_VALIDATION_IMAGE")
+            .count();
+        match stamp_count {
+            0 => refreshed.push_str(" --env HERMIT_VALIDATION_IMAGE"),
+            1 => {}
+            _ => {
+                return Err(format!(
+                    "{tag} forwards HERMIT_VALIDATION_IMAGE more than once"
+                ));
+            }
+        }
+    }
+    match (family_image_reference(tag), digests.as_slice()) {
+        (Some(_), []) => {}
+        (Some(reference), [present]) if *present == reference => {}
+        (Some(_), _) => {
+            return Err(format!(
+                "{tag} has an unexpected family image digest option"
+            ));
+        }
+        (None, []) => {}
+        (None, _) => {
+            return Err(format!("{tag} must not set a family image digest"));
+        }
+    }
+    let (current_guard, accepted_guards): (&str, [&str; 4]) =
+        if family_image_reference(tag).is_some() {
+            // Authored static commands still carry the build guard; the
+            // family switch upgrades them to the test-node guard here.
+            (
+                TEST_NODE_COMMAND_GUARD,
+                [
+                    TEST_NODE_COMMAND_GUARD,
+                    LEGACY_TEST_NODE_COMMAND_GUARD,
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                ],
+            )
+        } else {
+            (
+                PINNED_ROOT_COMMAND_GUARD,
+                [
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                ],
+            )
+        };
+    let current = format!("{} bash ", shell_quote(current_guard));
+    let mut upgraded = None;
+    for guard in accepted_guards {
+        let prefix = format!("{} bash ", shell_quote(guard));
+        if let Some(command) = payload.strip_prefix(&prefix) {
+            upgraded = Some(format!("{current}{command}"));
+            break;
+        }
+    }
+    let payload =
+        upgraded.ok_or_else(|| format!("{tag} has an unrecognized pinned-root argv guard"))?;
     Ok(format!("{refreshed} -- bash -c {payload}"))
 }
 
@@ -3575,6 +3673,13 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         }
         step.deps.sort();
         step.deps.dedup();
+        // Family-composed buckets stamp the image they ran in, so
+        // result rows can never credit another image (seat F6). The
+        // wrapper forwards this name because it is in step env.
+        if let Some(reference) = family_image_reference(&step.tag()) {
+            step.env
+                .insert("HERMIT_VALIDATION_IMAGE".into(), reference.into());
+        }
         if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
             step.cmd = pinned_root_command(step);
         } else {
@@ -7496,6 +7601,118 @@ sys.exit(37)
                 );
             }
         }
+    }
+
+    #[test]
+    fn family_image_seam_switches_only_system_utils() {
+        let reference = family_image_reference("e2e.manifest_system_utils")
+            .expect("system-utils is family-mapped");
+        // The code constant must mirror the checked receipt exactly.
+        let receipt: serde_json::Value =
+            serde_json::from_str(include_str!("../../hermetic/images/mini-suite.json"))
+                .expect("suite receipt parses");
+        assert_eq!(receipt["image"]["reference"], reference);
+        assert!(
+            reference.ends_with(
+                "sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c"
+            )
+        );
+        for tag in [
+            "e2e.manifest_language_runtimes",
+            "build.workspace_compile_in_pinned_root",
+            "build.manifest_guests_in_pinned_root",
+        ] {
+            assert_eq!(
+                family_image_reference(tag),
+                None,
+                "{tag} must stay monolith"
+            );
+        }
+        let mut step = owner(Vec::new());
+        step.group = "e2e".to_string();
+        step.job = "manifest_system_utils".to_string();
+        step.cmd = "true".to_string();
+        step.env
+            .insert("HERMIT_VALIDATION_IMAGE".into(), reference.into());
+        let command = pinned_root_command(&step);
+        assert!(
+            command.contains(&format!("--digest {reference}")),
+            "system-utils wrapper must pin the suite digest: {command}"
+        );
+        assert!(
+            command.contains("assert-test-dependencies.sh"),
+            "system-utils wrapper must use the test-node guard: {command}"
+        );
+        assert!(!command.contains("assert-build-dependencies.sh"));
+        // Refresh is idempotent on the generated command and refuses a
+        // wrong family digest by name.
+        assert_eq!(
+            refresh_pinned_root_environment("e2e.manifest_system_utils", &command).unwrap(),
+            command
+        );
+        let wrong = command.replace(
+            reference,
+            "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
+        );
+        assert!(refresh_pinned_root_environment("e2e.manifest_system_utils", &wrong).is_err());
+        // Committed DAG: exactly the system-utils bucket carries it.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let switched: Vec<String> = committed
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains("--digest "))
+            .map(|s| s.tag())
+            .collect();
+        assert_eq!(switched, ["e2e.manifest_system_utils"]);
+        // Exactly one forwarder (seat 8:29): only the switched bucket
+        // forwards HERMIT_VALIDATION_IMAGE into its container, so a
+        // stray outer value can never stamp a monolith container.
+        let forwarders: Vec<String> = committed
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains(" --env HERMIT_VALIDATION_IMAGE"))
+            .map(|s| s.tag())
+            .collect();
+        assert_eq!(forwarders, ["e2e.manifest_system_utils"]);
+        let sysutils = committed
+            .steps
+            .iter()
+            .find(|s| s.tag() == "e2e.manifest_system_utils")
+            .unwrap();
+        assert!(sysutils.cmd.contains("assert-test-dependencies.sh"));
+        assert!(!sysutils.cmd.contains("assert-build-dependencies.sh"));
+        // Payload visibility: the wrapper must forward the stamp name so
+        // the container actually receives HERMIT_VALIDATION_IMAGE (a
+        // dashboard-checkable claim, seat F6).
+        assert!(
+            command.contains(" --env HERMIT_VALIDATION_IMAGE "),
+            "system-utils wrapper must forward HERMIT_VALIDATION_IMAGE: {command}"
+        );
+        assert_eq!(
+            step.env.get("HERMIT_VALIDATION_IMAGE").map(String::as_str),
+            Some(reference)
+        );
+    }
+
+    #[test]
+    fn family_seam_refresh_refuses_unmapped_digest_and_guard() {
+        // An unmapped tag carrying a stray --digest is refused.
+        let mut step = owner(Vec::new());
+        step.cmd = "true".to_string();
+        let authored = pinned_root_command(&step).replace(
+            "run-in-pinned-root.sh ",
+            "run-in-pinned-root.sh --digest localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c ",
+        );
+        let err = refresh_pinned_root_environment(&step.tag(), &authored).unwrap_err();
+        assert!(err.contains("must not set a family image digest"), "{err}");
+        // An unmapped tag carrying the test-node guard is refused (the
+        // payload no longer matches this tag's accepted guard spellings).
+        let authored = pinned_root_command(&step).replace(
+            "assert-build-dependencies.sh",
+            "assert-test-dependencies.sh",
+        );
+        let err = refresh_pinned_root_environment(&step.tag(), &authored).unwrap_err();
+        assert!(err.contains("unrecognized pinned-root argv guard"), "{err}");
     }
 
     #[test]

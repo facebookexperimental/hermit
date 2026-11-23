@@ -19,11 +19,13 @@ const WRAPPER: &str = "./ci/hermetic/run-in-pinned-root.sh";
 #[derive(Debug)]
 struct Probe {
     env: BTreeMap<String, String>,
+    digest: Option<String>,
     consumers: Vec<String>,
 }
 
 fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Probe>, String> {
-    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<String>> = BTreeMap::new();
+    let mut groups: BTreeMap<(BTreeMap<String, String>, Option<String>), Vec<String>> =
+        BTreeMap::new();
     for cfg in std::iter::once(cfg).chain(second) {
         for step in &cfg.steps {
             if step.skip_reason.is_some() {
@@ -51,14 +53,29 @@ fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Pr
                 .position(|arg| arg == "--")
                 .ok_or_else(|| format!("{}: missing pinned-root payload boundary", step.tag()))?;
             let tail = &argv[boundary..];
+            let mapped = hermit_manifest_plan::validation_dag::family_image_reference(&step.tag());
+            let digests: Vec<&str> = argv[1..boundary]
+                .windows(2)
+                .filter(|pair| pair[0] == "--digest")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            let digest_ok = match (mapped, digests.as_slice()) {
+                (None, []) => true,
+                (Some(reference), [present]) => *present == reference,
+                _ => false,
+            };
+            let expected_guard = if mapped.is_some() {
+                hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD
+            } else {
+                hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+            };
             if tail.len() != 6
                 || tail[1] != "bash"
                 || tail[2] != "-c"
                 || tail[4] != "bash"
-                || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                || argv[1..boundary]
-                    .iter()
-                    .any(|arg| arg == "--digest" || arg == "--check-image")
+                || tail[3] != expected_guard
+                || !digest_ok
+                || argv[1..boundary].iter().any(|arg| arg == "--check-image")
             {
                 return Err(format!(
                     "{}: unrecognized canonical pinned-root invocation; cannot bind its image",
@@ -66,23 +83,31 @@ fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Pr
                 ));
             }
             // Preserve every declared outer environment value, including any
-            // future Podman storage setting. Only identical environments share
-            // a probe. All other caller environment is inherited unchanged.
-            groups.entry(step.env.clone()).or_default().push(step.tag());
+            // future Podman storage setting. Only identical environments and
+            // digests share a probe. All other caller environment is inherited.
+            groups
+                .entry((step.env.clone(), mapped.map(str::to_string)))
+                .or_default()
+                .push(step.tag());
         }
     }
     Ok(groups
         .into_iter()
-        .map(|(env, consumers)| Probe { env, consumers })
+        .map(|((env, digest), consumers)| Probe {
+            env,
+            digest,
+            consumers,
+        })
         .collect())
 }
 
 fn probe_command(root: &Path, probe: &Probe) -> Command {
     let mut command = Command::new(root.join(WRAPPER));
-    command
-        .arg("--check-image")
-        .current_dir(root)
-        .envs(&probe.env);
+    command.arg("--check-image");
+    if let Some(digest) = &probe.digest {
+        command.args(["--digest", digest]);
+    }
+    command.current_dir(root).envs(&probe.env);
     command
 }
 
@@ -798,5 +823,63 @@ exit 91
                 .any(|line| line.contains("Cannot start the read-only image probe"))
         );
         assert_eq!(crate::completed_verdict(1), crate::Verdict::Fail);
+    }
+
+    #[test]
+    fn family_suite_probe_is_selected_and_its_absence_refuses() {
+        // F5 regression guard (seat on 814a8104): the suite bucket's
+        // own probe must be selected from the committed DAG, and its
+        // absence alone (default pin present) must refuse admission.
+        let (canonical, _, _) = crate::load_committed_validation_dag(root()).unwrap();
+        let suite_reference = hermit_manifest_plan::validation_dag::family_image_reference(
+            "e2e.manifest_system_utils",
+        )
+        .expect("system-utils is family-mapped");
+        let probes = selected_probes(&canonical, None).unwrap();
+        let suite_probe = probes
+            .iter()
+            .find(|probe| probe.digest.as_deref() == Some(suite_reference))
+            .unwrap_or_else(|| panic!("no probe carries the suite digest: {probes:?}"));
+        assert!(
+            suite_probe
+                .consumers
+                .contains(&"e2e.manifest_system_utils".to_string()),
+            "suite probe consumers: {:?}",
+            suite_probe.consumers
+        );
+        let bucket = canonical
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_system_utils")
+            .unwrap()
+            .clone();
+        let cfg = canonical.with_steps(vec![bucket]);
+        let plan = BoundExecutionPlan::bind(&cfg, None, None).unwrap();
+        admit_with(&plan, "portable", |_| Ok(ExitStatus::from_raw(0)))
+            .unwrap_or_else(|s| panic!("{:?}", s.detail));
+        let refused = admit_with(&plan, "portable", |probe| {
+            if probe.digest.as_deref() == Some(suite_reference) {
+                Ok(ExitStatus::from_raw(1 << 8))
+            } else {
+                Ok(ExitStatus::from_raw(0))
+            }
+        })
+        .expect_err("absent suite image must refuse admission");
+        assert_eq!(refused.nodes_executed, 0);
+        assert_eq!(refused.executed_tests, Some(0));
+        // Wrapper level: only the default pin is available, so the
+        // exact suite digest check exits 1 naming its absence.
+        let f = Fixture::new();
+        let out = f
+            .command()
+            .args(["--check-image", "--digest", suite_reference])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not present locally"),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

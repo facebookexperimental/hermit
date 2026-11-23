@@ -1,0 +1,24 @@
+{
+    "schema_version": 1,
+    "family": "system-utils",
+    "image_name": "hermit-hermetic-mini-suite",
+    "image_reference": "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+    "config_digest": "sha256:70e2ae7c3230e38efafd08e8ef7a679c73ca79840ae71b2e8b0577f281032086",
+    "method": "production-route-v1",
+    "note": "Production-route evidence: RUN 3745 (validate --only portable, 14-node mechanical deps+artifact_deps closure incl. build.e2e_artifact_in_pinned_root) at run_commit through the materialized operational tool, FINAL PASSED with e2e.manifest_system_utils 147/147 in this exact suite digest. pinned_passed and differences_from_pinned are NOT from RUN 3745: they cite the mini step-1 monolith comparison at e5732acc binaries (pinned 147/147, 0 differences on the same 147 cells); RUN 3745 itself proves only the suite side. The five composed images were re-materialized on 2026-11-22 from the local Nix store paths the committed flake.lock names (cache.nixos.org unreachable; not a fresh rebuild) after a host prune deleted the loaded images, and every loaded digest matched its receipt exactly (suite d0b77afa), with the pinned monolith RepoTags unchanged. test_harness_sha256 is the in-root harness that ran the cells (split/target/debug/test-harness of the RUN 3745 checkout, preserved hash-checked in the lane slot); hermit_main_sha is the short main base the run target was rebased onto. This qualification is the approved one-off exception (lead-014 7:13/7:16 PM 2026-11-21): one family (system-utils), one digest (this suite), expiring at the next suite repin; it is no precedent for any other family or digest.",
+    "binaries": {
+        "hermit_sha256": "f52efaafefa62e34d0237c15ba98e853d6733b3da5b035f2d33f9e742e3f490f",
+        "hermit_main_sha": "7177ffaa85d3",
+        "test_harness_sha256": "45f79d79cea98e211213455b05ddb1a3ba4e747dda7e81212796cafd63f68234"
+    },
+    "cells": {
+        "population": 147,
+        "passed": 147,
+        "failed": 0,
+        "pinned_passed": 147,
+        "differences_from_pinned": 0,
+        "results_artifact": "ci/hermetic/images/qualification/system-utils-suite-results.json",
+        "results_sha256": "21040acdbc929a190add99609c611ffd94fe1140a5b85ad7fb62ff32bc7cf2ee"
+    },
+    "run_commit": "7eb2a88dfcc530818539de836fa0b45e12aa2bd3"
+}

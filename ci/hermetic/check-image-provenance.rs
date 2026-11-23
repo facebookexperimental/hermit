@@ -906,11 +906,27 @@ const COMPOSED_NAMES: [&str; 5] = [
     "hermit-hermetic-mini-runner",
     "hermit-hermetic-mini-suite",
 ];
+/// The ONE digest the approved exception (lead-014 2026-11-21) covers.
+/// Enforcement compares against a reference derived from this digest,
+/// and `validate_qualification` asserts the limitation text and the
+/// reference constant against it: a repinned suite has a different
+/// digest, so its qualification is refused by name until repin-grade
+/// receipts replace this exception.
+const EXCEPTION_SUITE_DIGEST: &str =
+    "sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c";
+const EXCEPTION_SUITE_REFERENCE: &str = concat!(
+    "localhost/hermit-hermetic-mini-suite@",
+    "sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c"
+);
 const COMPOSED_EVIDENCE_LIMITATIONS: [&str; 4] = [
     "Builds came from earlier lane definitions and are equal by drvPath and outPath at the receipted definitions; definition_commit names the commit whose tree holds those definitions.",
     "The default-store run is a pre-existing step-1 build in a long-lived store, not a fresh store; the isolated run is the fresh-store control.",
     "No systemd resource bounds were applied and no realized input was forcibly rebuilt; the isolated store substituted only from cache.nixos.org.",
-    "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images.",
+    concat!(
+        "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images, with one approved exception (lead-014 2026-11-21): family system-utils may select only suite digest ",
+        "sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+        " under its production-route qualification receipt; the exception expires at the next suite repin and is no precedent for any other family or digest."
+    ),
 ];
 /// Expected ordered parents per composed image (immediate parent first).
 /// Only the L0 base may have none. This is the completeness source the
@@ -1114,6 +1130,265 @@ fn validate_locked_inputs_against_lock(lock: &Value, locked: &Value) -> Result<(
     Ok(())
 }
 
+fn validate_qualification(repo: &Path, images: &[(String, Value)]) -> Result<(), String> {
+    // Load-bearing qualification directory (seat F2): exactly the
+    // expected receipt files, each strictly validated and bound to
+    // its composed image identity. No skip: deleting or adding a
+    // file fails here.
+    let dir = repo.join(IMAGES_DIR).join("qualification");
+    if !dir.is_dir() {
+        return Err(format!(
+            "{IMAGES_DIR}/qualification is missing; family qualification receipts are required"
+        ));
+    }
+    // Admit the receipt plus the one summary file it declares (seat
+    // defect 1: a correct receipt must be able to pass). The declared
+    // name is read first; traversal out of the directory is refused
+    // when the artifact path is validated below.
+    let path = dir.join("system-utils-suite.json");
+    // The receipt itself obeys the summary's regular-file rule (L3):
+    // evidence may not arrive through a symlink.
+    let receipt_meta = fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot stat {}: {error}", path.display()))?;
+    if !receipt_meta.is_file() || receipt_meta.file_type().is_symlink() {
+        return Err(
+            "qualification system-utils-suite receipt must be a regular file, not a symlink or special file"
+                .into(),
+        );
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let qual = parse_provenance(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    // The artifact path rule runs BEFORE the file-set check, so a
+    // traversal spelling fails with the path rule's own message and
+    // no later check can mask a deleted path rule (seat Low 1).
+    let declared_artifact = field(&qual, "cells", "qualification")
+        .and_then(|cells| string(cells, "results_artifact", "qualification"))
+        .unwrap_or_default();
+    let declared_file = std::path::Path::new(declared_artifact)
+        .strip_prefix("ci/hermetic/images/qualification")
+        .ok()
+        .filter(|rest| {
+            let mut parts = rest.components();
+            matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+        })
+        .and_then(|rest| rest.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name != "system-utils-suite.json")
+        .ok_or_else(|| {
+            "qualification system-utils-suite results_artifact must name one file in ci/hermetic/images/qualification/"
+                .to_string()
+        })
+        .map(Some)?;
+    let mut present = BTreeSet::new();
+    let entries =
+        fs::read_dir(&dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot list qualification: {error}"))?;
+        present.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    let mut expected_files: BTreeSet<String> = ["system-utils-suite.json".to_string()].into();
+    if let Some(file) = &declared_file {
+        expected_files.insert(file.clone());
+    }
+    if present != expected_files {
+        return Err(format!(
+            "qualification files differ from the expected receipts: {present:?}"
+        ));
+    }
+    let ctx = "qualification system-utils-suite";
+    exact_keys(
+        &qual,
+        &[
+            "binaries",
+            "cells",
+            "config_digest",
+            "family",
+            "image_name",
+            "image_reference",
+            "method",
+            "note",
+            "run_commit",
+            "schema_version",
+        ],
+        ctx,
+    )?;
+    if unsigned(&qual, "schema_version", ctx)? != 1 {
+        return Err(format!("{ctx} schema_version must be 1"));
+    }
+    if string(&qual, "family", ctx)? != "system-utils" {
+        return Err(format!(
+            "{ctx} family is not system-utils; the approved exception covers only that family"
+        ));
+    }
+    if string(&qual, "method", ctx)? != "production-route-v1" {
+        return Err(format!(
+            "{ctx} must claim the production route only (method production-route-v1)"
+        ));
+    }
+    if string(&qual, "note", ctx)?.is_empty() {
+        return Err(format!("{ctx} note must state the evidence"));
+    }
+    // Expiry (F3): the exception names exactly one digest. Any other
+    // suite digest is a repin the exception does not cover, whatever
+    // the receipts claim.
+    if !COMPOSED_EVIDENCE_LIMITATIONS[3].contains(EXCEPTION_SUITE_DIGEST) {
+        return Err(format!(
+            "{ctx} internal error: limitation text does not name the exception digest"
+        ));
+    }
+    let exception_reference =
+        format!("localhost/hermit-hermetic-mini-suite@{EXCEPTION_SUITE_DIGEST}");
+    if EXCEPTION_SUITE_REFERENCE != exception_reference {
+        return Err(format!(
+            "{ctx} internal error: exception reference is not derived from the exception digest"
+        ));
+    }
+    if string(&qual, "image_reference", ctx)? != exception_reference {
+        return Err(format!(
+            "{ctx} image_reference is outside the approved exception: it covers only suite digest {EXCEPTION_SUITE_DIGEST}; a repinned suite needs repin-grade receipts"
+        ));
+    }
+    let run_commit = string(&qual, "run_commit", ctx)?;
+    if !is_lower_hex(run_commit, 40) || run_commit.bytes().all(|b| b == b'0') {
+        return Err(format!(
+            "{ctx} run_commit must be a full lowercase non-placeholder hash"
+        ));
+    }
+    let suite = images
+        .iter()
+        .find(|(name, _)| name == "hermit-hermetic-mini-suite")
+        .map(|(_, root)| root)
+        .ok_or_else(|| format!("{ctx} has no suite receipt to bind to"))?;
+    let image = field(suite, "image", ctx)?;
+    for (qkey, ikey) in [
+        ("image_name", "name"),
+        ("image_reference", "reference"),
+        ("config_digest", "config_digest"),
+    ] {
+        if string(&qual, qkey, ctx)? != string(image, ikey, ctx)? {
+            return Err(format!(
+                "{ctx} {qkey} does not equal the suite receipt {ikey}"
+            ));
+        }
+    }
+    let binaries = field(&qual, "binaries", ctx)?;
+    exact_keys(
+        binaries,
+        &["hermit_main_sha", "hermit_sha256", "test_harness_sha256"],
+        ctx,
+    )?;
+    require_flat_sha256(string(binaries, "hermit_sha256", ctx)?, ctx)?;
+    require_flat_sha256(string(binaries, "test_harness_sha256", ctx)?, ctx)?;
+    // hermit_main_sha names the short main base the run target was
+    // rebased onto (the run_commit's main parent line), as a 12-char
+    // lowercase hex prefix; it is an attestation label, while the
+    // two sha256 fields above carry the binding.
+    if !is_lower_hex(string(binaries, "hermit_main_sha", ctx)?, 12) {
+        return Err(format!(
+            "{ctx} binaries.hermit_main_sha must be the 12-char short main base"
+        ));
+    }
+    let cells = field(&qual, "cells", ctx)?;
+    exact_keys(
+        cells,
+        &[
+            "differences_from_pinned",
+            "failed",
+            "passed",
+            "pinned_passed",
+            "population",
+            "results_artifact",
+            "results_sha256",
+        ],
+        ctx,
+    )?;
+    // Bind counts to the bucket's portable cell set derived from the
+    // expected plan, never to numbers typed in the receipt alone.
+    let plan_bytes = fs::read(repo.join("ci/expected-e2e-plan.json"))
+        .map_err(|error| format!("cannot read ci/expected-e2e-plan.json: {error}"))?;
+    let plan: Value = serde_json::from_slice(&plan_bytes)
+        .map_err(|error| format!("ci/expected-e2e-plan.json: {error}"))?;
+    let portable: BTreeSet<(String, String, String)> = array(field(&plan, "cells", ctx)?, ctx)?
+        .iter()
+        .filter(|cell| {
+            cell.get("category").and_then(Value::as_str) == Some("system-utils")
+                && cell.get("lane").and_then(Value::as_str) == Some("portable")
+        })
+        .map(|cell| {
+            Ok((
+                string(cell, "test", ctx)?.to_string(),
+                string(cell, "mode", ctx)?.to_string(),
+                string(cell, "backend", ctx)?.to_string(),
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    let expected_count = portable.len() as u64;
+    let artifact_rel = string(cells, "results_artifact", ctx)?;
+    // Already validated above (before the file-set check): exactly
+    // one plain file directly inside the qualification directory.
+    // The read path is built from that name, never by joining the
+    // receipt string.
+    let artifact_name = declared_file
+        .as_deref()
+        .ok_or_else(|| format!("{ctx} results_artifact must name one file"))?;
+    let artifact_path = dir.join(artifact_name);
+    let artifact_meta = fs::symlink_metadata(&artifact_path)
+        .map_err(|error| format!("cannot stat {artifact_rel}: {error}"))?;
+    if !artifact_meta.is_file() || artifact_meta.file_type().is_symlink() {
+        return Err(format!(
+            "{ctx} results_artifact must be a regular file, not a symlink or special file"
+        ));
+    }
+    let artifact_bytes =
+        fs::read(&artifact_path).map_err(|error| format!("cannot read {artifact_rel}: {error}"))?;
+    if sha256(&artifact_bytes) != string(cells, "results_sha256", ctx)? {
+        return Err(format!("{ctx} results_sha256 does not hash the artifact"));
+    }
+    let summary: Value = serde_json::from_slice(&artifact_bytes)
+        .map_err(|error| format!("{artifact_rel}: {error}"))?;
+    let rows = array(field(&summary, "results", ctx)?, ctx)?;
+    let row_set: BTreeSet<(String, String, String)> = rows
+        .iter()
+        .map(|row| {
+            if string(row, "result", ctx)? != "pass" {
+                return Err(format!("{ctx} results must all pass"));
+            }
+            Ok((
+                string(row, "test", ctx)?.to_string(),
+                string(row, "mode", ctx)?.to_string(),
+                string(row, "backend", ctx)?.to_string(),
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    if row_set != portable
+        || unsigned(cells, "population", ctx)? != expected_count
+        || unsigned(cells, "passed", ctx)? != expected_count
+        || unsigned(cells, "pinned_passed", ctx)? != expected_count
+        || unsigned(cells, "failed", ctx)? != 0
+        || unsigned(cells, "differences_from_pinned", ctx)? != 0
+    {
+        return Err(format!(
+            "{ctx} cells must equal the portable system-utils set ({expected_count})"
+        ));
+    }
+    if string(&summary, "validation_image", ctx)? != string(&qual, "image_reference", ctx)?
+        || string(&summary, "run_commit", ctx)? != run_commit
+        || string(field(&summary, "binaries", ctx)?, "hermit_sha256", ctx)?
+            != string(binaries, "hermit_sha256", ctx)?
+        || string(
+            field(&summary, "binaries", ctx)?,
+            "test_harness_sha256",
+            ctx,
+        )? != string(binaries, "test_harness_sha256", ctx)?
+    {
+        return Err(format!(
+            "{ctx} results summary does not bind image, commit, or binaries"
+        ));
+    }
+    Ok(())
+}
+
 fn verify_composed(repo: &Path) -> Result<(), String> {
     let dir = repo.join(IMAGES_DIR);
     if !dir.is_dir() {
@@ -1126,7 +1401,12 @@ fn verify_composed(repo: &Path) -> Result<(), String> {
         fs::read_dir(&dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("cannot list {IMAGES_DIR}: {error}"))?;
-        present.insert(entry.file_name().to_string_lossy().into_owned());
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Qualification receipts live in their own subdirectory and are
+        // validated by consumers of the family map, not as images.
+        if name != "qualification" {
+            present.insert(name);
+        }
     }
     let expected: BTreeSet<String> = COMPOSED_NAMES
         .iter()
@@ -1380,6 +1660,7 @@ fn verify_composed(repo: &Path) -> Result<(), String> {
             ));
         }
     }
+    validate_qualification(repo, &images)?;
     Ok(())
 }
 
@@ -1500,6 +1781,9 @@ mod tests {
                 .unwrap_err()
                 .contains("does not equal the reconstructed manifest digest")
         );
+        // F3 landed: full composed verification passes at head, with
+        // the qualification receipt bound to the production-route
+        // summary (method production-route-v1 plus hashed results).
         let repo = repo_root().unwrap();
         verify_composed(&repo).unwrap();
     }
@@ -1617,6 +1901,327 @@ mod tests {
     }
 
     #[test]
+    fn qualification_binding_accepts_synthetic_and_refuses_traversal() {
+        // Positive control (seat 1a241930): a fully synthetic valid
+        // qualification (tiny 2-cell plan) passes; the same summary
+        // reached through a .. path fails before any hash comparison.
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let summary = serde_json::json!({
+            "validation_image": "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+            "run_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "binaries": {"hermit_sha256": "c".repeat(64), "test_harness_sha256": "d".repeat(64)},
+            "results": [
+                {"test": "system-utils/a", "mode": "verify", "backend": "ptrace", "result": "pass"},
+                {"test": "system-utils/a", "mode": "verify", "backend": "kvm", "result": "pass"}
+            ]
+        });
+        let summary_bytes = serde_json::to_vec_pretty(&summary).unwrap();
+        let summary_sha = sha256(&summary_bytes);
+        let qual_dir = repo.join(IMAGES_DIR).join("qualification");
+        fs::create_dir_all(&qual_dir).unwrap();
+        fs::create_dir_all(repo.join("ci")).unwrap();
+        fs::write(
+            repo.join("ci/expected-e2e-plan.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"cells": [
+                {"category": "system-utils", "lane": "portable", "test": "system-utils/a", "mode": "verify", "backend": "ptrace"},
+                {"category": "system-utils", "lane": "portable", "test": "system-utils/a", "mode": "verify", "backend": "kvm"},
+                {"category": "system-utils", "lane": "privileged", "test": "system-utils/b", "mode": "verify", "backend": "ptrace"}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            qual_dir.join("system-utils-suite-results.json"),
+            &summary_bytes,
+        )
+        .unwrap();
+        let suite = serde_json::json!({"image": {
+            "name": "hermit-hermetic-mini-suite",
+            "reference": "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+            "config_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }});
+        let qual = serde_json::json!({
+            "schema_version": 1, "family": "system-utils", "method": "production-route-v1",
+            "note": "synthetic positive control",
+            "run_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "image_name": "hermit-hermetic-mini-suite",
+            "image_reference": "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+            "config_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "binaries": {"hermit_main_sha": "e5732acc483d", "hermit_sha256": "c".repeat(64), "test_harness_sha256": "d".repeat(64)},
+            "cells": {"population": 2, "passed": 2, "pinned_passed": 2, "failed": 0,
+                      "differences_from_pinned": 0,
+                      "results_artifact": "ci/hermetic/images/qualification/system-utils-suite-results.json",
+                      "results_sha256": summary_sha}
+        });
+        fs::write(
+            qual_dir.join("system-utils-suite.json"),
+            serde_json::to_vec_pretty(&qual).unwrap(),
+        )
+        .unwrap();
+        let images = vec![("hermit-hermetic-mini-suite".to_string(), suite)];
+        validate_qualification(repo, &images).unwrap();
+        // Traversal spellings fail even though the string has the prefix.
+        for evil in [
+            "ci/hermetic/images/qualification/../qual-summary.json",
+            "ci/hermetic/images/qualification/sub/x.json",
+            "/ci/hermetic/images/qualification/system-utils-suite-results.json",
+        ] {
+            let mut bad = qual.clone();
+            *mutate(&mut bad, "/cells/results_artifact") = Value::String(evil.into());
+            fs::write(
+                qual_dir.join("system-utils-suite.json"),
+                serde_json::to_vec_pretty(&bad).unwrap(),
+            )
+            .unwrap();
+            let err = validate_qualification(repo, &images).unwrap_err();
+            // Pin the path rule itself (seat Low 1): deleting it must
+            // fail this test, so the file-set message is not accepted.
+            assert!(
+                err.contains("results_artifact must name one file"),
+                "{evil}: {err}"
+            );
+        }
+        // A symlinked summary is refused even when its bytes hash right:
+        // evidence must be a regular file inside the directory.
+        fs::write(
+            qual_dir.join("system-utils-suite.json"),
+            serde_json::to_vec_pretty(&qual).unwrap(),
+        )
+        .unwrap();
+        let outside = repo.join("outside-summary.json");
+        fs::write(&outside, &summary_bytes).unwrap();
+        let summary_path = qual_dir.join("system-utils-suite-results.json");
+        fs::remove_file(&summary_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &summary_path).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("must be a regular file"),
+            "symlink summary: {err}"
+        );
+        // A symlink to a file inside the tree is refused too: the
+        // rule is regular-file-only, not target-location-based.
+        let inside_target = repo.join("ci/inside-summary.json");
+        fs::write(&inside_target, &summary_bytes).unwrap();
+        fs::remove_file(&summary_path).unwrap();
+        std::os::unix::fs::symlink(&inside_target, &summary_path).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("must be a regular file"),
+            "inside symlink summary: {err}"
+        );
+        fs::remove_file(&summary_path).unwrap();
+        fs::write(&summary_path, &summary_bytes).unwrap();
+        validate_qualification(repo, &images).unwrap();
+        // F2 (seat on 814a8104): every out-of-scope case refuses by its
+        // own name; no case may pass on another case's message.
+        let write_qual = |value: &Value| {
+            fs::write(
+                qual_dir.join("system-utils-suite.json"),
+                serde_json::to_vec_pretty(value).unwrap(),
+            )
+            .unwrap()
+        };
+        for (pointer, value, needle) in [
+            (
+                "/schema_version",
+                Value::from(2),
+                "schema_version must be 1",
+            ),
+            (
+                "/family",
+                Value::from("language-runtimes"),
+                "family is not system-utils",
+            ),
+            (
+                "/method",
+                Value::from("step1-manual-equivalent-v1"),
+                "must claim the production route only",
+            ),
+            ("/note", Value::from(""), "note must state the evidence"),
+            (
+                "/cells/results_sha256",
+                Value::from("0".repeat(64)),
+                "results_sha256 does not hash the artifact",
+            ),
+            (
+                "/run_commit",
+                Value::from("0000000000000000000000000000000000000000"),
+                "run_commit must be",
+            ),
+        ] {
+            let mut bad = qual.clone();
+            *mutate(&mut bad, pointer) = value;
+            write_qual(&bad);
+            let err = validate_qualification(repo, &images).unwrap_err();
+            assert!(err.contains(needle), "{pointer}: {err}");
+        }
+        // Missing receipt and extra family file fail closed by name.
+        fs::remove_file(qual_dir.join("system-utils-suite.json")).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("cannot stat") || err.contains("cannot read"),
+            "missing receipt: {err}"
+        );
+        write_qual(&qual);
+        fs::write(qual_dir.join("language-runtimes.json"), b"{}").unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(err.contains("files differ"), "extra family file: {err}");
+        fs::remove_file(qual_dir.join("language-runtimes.json")).unwrap();
+        // Wrong digest against the suite receipt refuses by binding name.
+        let mut wrong_digest = qual.clone();
+        *mutate(&mut wrong_digest, "/config_digest") =
+            Value::from(format!("sha256:{}", "9".repeat(64)));
+        write_qual(&wrong_digest);
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("does not equal the suite receipt"),
+            "wrong digest: {err}"
+        );
+        // A failed row and a summary/receipt mismatch refuse by name.
+        write_qual(&qual);
+        let mut bad_summary = summary.clone();
+        *mutate(&mut bad_summary, "/results/0/result") = Value::from("fail");
+        let bad_bytes = serde_json::to_vec_pretty(&bad_summary).unwrap();
+        let mut bad_qual = qual.clone();
+        *mutate(&mut bad_qual, "/cells/results_sha256") = Value::from(sha256(&bad_bytes));
+        write_qual(&bad_qual);
+        fs::write(&summary_path, &bad_bytes).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(err.contains("results must all pass"), "failed row: {err}");
+        let mut mismatch = summary.clone();
+        *mutate(&mut mismatch, "/run_commit") = Value::from("c".repeat(40));
+        let mismatch_bytes = serde_json::to_vec_pretty(&mismatch).unwrap();
+        *mutate(&mut bad_qual, "/cells/results_sha256") = Value::from(sha256(&mismatch_bytes));
+        write_qual(&bad_qual);
+        fs::write(&summary_path, &mismatch_bytes).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("does not bind image, commit, or binaries"),
+            "summary mismatch: {err}"
+        );
+        fs::write(&summary_path, &summary_bytes).unwrap();
+        // V3 (seat on 192a156e): ties, row-set/counts, summary image and
+        // both binary mismatches, and a symlinked receipt each refuse by
+        // their own name; deleting any single comparison turns red.
+        assert!(EXCEPTION_SUITE_REFERENCE.ends_with(&format!("@{EXCEPTION_SUITE_DIGEST}")));
+        assert!(COMPOSED_EVIDENCE_LIMITATIONS[3].contains(EXCEPTION_SUITE_DIGEST));
+        write_qual(&qual);
+        for (label, rows, counts) in [
+            (
+                "row removed",
+                vec![summary["results"][0].clone()],
+                qual.clone(),
+            ),
+            (
+                "row outside plan",
+                {
+                    let mut rows = summary["results"].as_array().unwrap().clone();
+                    rows.push(serde_json::json!({"test": "system-utils/extra", "mode": "verify", "backend": "ptrace", "result": "pass"}));
+                    rows
+                },
+                qual.clone(),
+            ),
+        ] {
+            let mut changed = summary.clone();
+            changed["results"] = Value::Array(rows);
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            let mut changed_qual = counts;
+            *mutate(&mut changed_qual, "/cells/results_sha256") = Value::from(sha256(&bytes));
+            // Keep declared counts at the plan values so only the
+            // row-set comparison can refuse these two cases.
+            write_qual(&changed_qual);
+            fs::write(&summary_path, &bytes).unwrap();
+            let err = validate_qualification(repo, &images).unwrap_err();
+            assert!(
+                err.contains("cells must equal the portable system-utils set"),
+                "{label}: {err}"
+            );
+        }
+        fs::write(&summary_path, &summary_bytes).unwrap();
+        for pointer in [
+            "/cells/population",
+            "/cells/passed",
+            "/cells/pinned_passed",
+            "/cells/failed",
+            "/cells/differences_from_pinned",
+        ] {
+            let mut changed_qual = qual.clone();
+            *mutate(&mut changed_qual, pointer) = Value::from(99);
+            write_qual(&changed_qual);
+            let err = validate_qualification(repo, &images).unwrap_err();
+            assert!(
+                err.contains("cells must equal the portable system-utils set"),
+                "{pointer}: {err}"
+            );
+        }
+        write_qual(&qual);
+        for (pointer, value) in [
+            (
+                "/validation_image",
+                Value::from(
+                    "localhost/hermit-hermetic-mini-suite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+            ("/binaries/hermit_sha256", Value::from("9".repeat(64))),
+            ("/binaries/test_harness_sha256", Value::from("9".repeat(64))),
+        ] {
+            let mut changed = summary.clone();
+            *mutate(&mut changed, pointer) = value;
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            let mut changed_qual = qual.clone();
+            *mutate(&mut changed_qual, "/cells/results_sha256") = Value::from(sha256(&bytes));
+            write_qual(&changed_qual);
+            fs::write(&summary_path, &bytes).unwrap();
+            let err = validate_qualification(repo, &images).unwrap_err();
+            assert!(
+                err.contains("does not bind image, commit, or binaries"),
+                "{pointer}: {err}"
+            );
+        }
+        fs::write(&summary_path, &summary_bytes).unwrap();
+        write_qual(&qual);
+        // Symlinked receipt (L3) refuses as a non-regular file, and the
+        // missing-receipt needle accepts only the stat/read of a
+        // missing regular path (the stat check fires first by name).
+        let receipt_path = qual_dir.join("system-utils-suite.json");
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let outside_receipt = repo.join("outside-receipt.json");
+        fs::write(&outside_receipt, &receipt_bytes).unwrap();
+        fs::remove_file(&receipt_path).unwrap();
+        std::os::unix::fs::symlink(&outside_receipt, &receipt_path).unwrap();
+        let err = validate_qualification(repo, &images).unwrap_err();
+        assert!(
+            err.contains("receipt must be a regular file"),
+            "symlinked receipt: {err}"
+        );
+        fs::remove_file(&receipt_path).unwrap();
+        fs::write(&receipt_path, &receipt_bytes).unwrap();
+        validate_qualification(repo, &images).unwrap();
+        // Simulated repin (F3): suite receipt and qualification name
+        // another digest (the summary still names the exception
+        // reference, but the expiry refusal fires first, so its
+        // needle still discriminates); expiry refuses it by name.
+        let repinned = "localhost/hermit-hermetic-mini-suite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut repin_qual = qual.clone();
+        *mutate(&mut repin_qual, "/image_reference") = Value::from(repinned);
+        write_qual(&repin_qual);
+        let repin_suite = serde_json::json!({"image": {
+            "name": "hermit-hermetic-mini-suite",
+            "reference": repinned,
+            "config_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }});
+        let repin_images = vec![("hermit-hermetic-mini-suite".to_string(), repin_suite)];
+        let err = validate_qualification(repo, &repin_images).unwrap_err();
+        assert!(
+            err.contains("outside the approved exception") && err.contains("repin-grade"),
+            "simulated repin: {err}"
+        );
+        write_qual(&qual);
+        validate_qualification(repo, &images).unwrap();
+    }
+
+    #[test]
     fn accepts_rebased_unrelated_head_with_identical_image_inputs() {
         let root = repo_root().unwrap();
         let fixture = tempfile::tempdir().unwrap();
@@ -1626,8 +2231,14 @@ mod tests {
             fs::copy(root.join(path), destination).unwrap();
         }
         // Composed receipts are fail-closed now: the fixture must carry
-        // groups.nix and every composed receipt, not skip that half.
-        let mut composed_files: Vec<String> = vec!["ci/hermetic/groups.nix".to_string()];
+        // groups.nix, every composed receipt, and the qualification
+        // receipt, not skip those halves.
+        let mut composed_files: Vec<String> = vec![
+            "ci/hermetic/groups.nix".to_string(),
+            "ci/hermetic/images/qualification/system-utils-suite.json".to_string(),
+            "ci/hermetic/images/qualification/system-utils-suite-results.json".to_string(),
+            "ci/expected-e2e-plan.json".to_string(),
+        ];
         for name in COMPOSED_NAMES {
             let short = name.strip_prefix("hermit-hermetic-").unwrap_or(name);
             composed_files.push(format!("{IMAGES_DIR}/{short}.json"));
@@ -1674,6 +2285,9 @@ mod tests {
         // The recorded build-source commit is deliberately absent from this
         // fixture repository. Current input equivalence, not rewritten
         // ancestry, is the live check.
+        // F3 landed: the composed half verifies green at head;
+        // monolith files in the fixture are identical, so the whole
+        // verification passes on input equivalence alone.
         verify(fixture.path()).unwrap();
     }
 

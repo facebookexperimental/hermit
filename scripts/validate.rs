@@ -10177,12 +10177,13 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
     let guarded = guarded_command_source(&tag, &step.cmd)?;
     if guarded != step.cmd {
         const PREFIX: &str = "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo ";
-        let separator = format!(
-            " -- bash -c {} bash ",
-            validate_plan::shell_quote(
-                hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
-            )
-        );
+        let guard = if hermit_manifest_plan::validation_dag::family_image_reference(&tag).is_some()
+        {
+            hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD
+        } else {
+            hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+        };
+        let separator = format!(" -- bash -c {} bash ", validate_plan::shell_quote(guard));
         let (forwarded, payload) = step
             .cmd
             .strip_prefix(PREFIX)
@@ -10193,6 +10194,8 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         let expected_proc_locks_runtime =
             matches!(tag.as_str(), "e2e.manifest_c_programs" | "quick.e2e_verify");
         let mut proc_locks_runtime = false;
+        let expected_family = hermit_manifest_plan::validation_dag::family_image_reference(&tag);
+        let mut family_digest: Option<&str> = None;
         while let Some(option) = words.next() {
             match option {
                 "--env" => {
@@ -10206,6 +10209,12 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
                         return Err(format!("{tag} has an ambiguous pinned-root environment"));
                     }
                 }
+                "--digest" if expected_family.is_some() && family_digest.is_none() => {
+                    let Some(value) = words.next() else {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    };
+                    family_digest = Some(value);
+                }
                 "--proc-locks-runtime" if expected_proc_locks_runtime && !proc_locks_runtime => {
                     proc_locks_runtime = true;
                 }
@@ -10213,6 +10222,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
             }
         }
         if proc_locks_runtime != expected_proc_locks_runtime
+            || family_digest != expected_family
             || payload != validate_plan::shell_quote(&guarded)
             || ["DAGRUN_TEST_COUNTS_PATH", "E2E_RESULT_ROOT", "E2E_RUN_ID"]
                 .iter()
@@ -22212,11 +22222,30 @@ fn guarded_command_source(tag: &str, command: &str) -> Result<String, String> {
             .position(|arg| arg == "--")
             .ok_or_else(|| format!("retry bounds: {tag} has no pinned-root command boundary"))?;
         let tail = &argv[boundary..];
+        // Guard acceptance is tied to the tag, mirroring generation:
+        // family-mapped test nodes use the test-node guard, every
+        // other pinned node the build guard (seat F7/F8).
+        // Switched tags have no pre-digest spelling: accept only the
+        // current guard. Unmapped tags keep the parent behaviour too:
+        // only the current build guard (the legacy spelling stays a
+        // generation-side refresh input, never a validate-side one).
+        let (_current_guard, accepted_guards): (&str, &[&str]) =
+            if hermit_manifest_plan::validation_dag::family_image_reference(tag).is_some() {
+                (
+                    hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD,
+                    &[hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD],
+                )
+            } else {
+                (
+                    hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                    &[hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD],
+                )
+            };
         if tail.len() != 6
             || tail[1] != "bash"
             || tail[2] != "-c"
             || tail[4] != "bash"
-            || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+            || !accepted_guards.contains(&tail[3].as_str())
         {
             return Err(format!(
                 "retry bounds: {tag} has an unrecognized pinned-root invocation"
@@ -38690,6 +38719,43 @@ mod prepared_command_tests {
                 assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
             }
         }
+    }
+
+    #[test]
+    fn unmapped_tag_refuses_the_legacy_guard_spelling() {
+        // Seat Low 2 (0c80e547): re-allowing the legacy guard for an
+        // unmapped tag must fail a test. The legacy spelling is a
+        // generation-side refresh input only.
+        let root = test_source_root();
+        let cfg = validate_plan::validation_config(&root).unwrap();
+        let pinned = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            hermit_manifest_plan::validation_dag::family_image_reference(&pinned.tag()).is_none(),
+            "fixture tag must stay unmapped"
+        );
+        guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let mut argv = shell_words::split(&pinned.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        argv[boundary + 3] =
+            hermit_manifest_plan::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD.into();
+        let legacy_cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let err = guarded_command_source(&pinned.tag(), &legacy_cmd).unwrap_err();
+        assert!(
+            err.contains("unrecognized pinned-root invocation"),
+            "legacy guard must be refused, got: {err}"
+        );
     }
 }
 

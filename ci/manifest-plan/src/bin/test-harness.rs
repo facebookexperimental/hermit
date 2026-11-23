@@ -5083,6 +5083,9 @@ fn report_cpu_profiles(
     use hermit_manifest_plan::cpu_profile_record as record;
     let (image, os_release) =
         record::ci_image(&fs::read_to_string("/etc/os-release").unwrap_or_default());
+    // Family-composed runs stamp the exact image they ran in, so rows
+    // never credit another image (empty on the monolith route).
+    let validation_image = std::env::var("HERMIT_VALIDATION_IMAGE").unwrap_or_default();
     let Some(directory) = results_path.parent() else {
         return;
     };
@@ -5125,6 +5128,7 @@ fn report_cpu_profiles(
         "schema": 1,
         "run_id": run_id,
         "ci_image": image,
+        "validation_image": validation_image,
         "os_release": os_release,
         "cells_by_profile": totals.cells_by_profile,
         "cells_by_reason": totals.cells_by_reason,

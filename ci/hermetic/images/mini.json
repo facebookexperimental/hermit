@@ -93,6 +93,6 @@
         "Builds came from earlier lane definitions and are equal by drvPath and outPath at the receipted definitions; definition_commit names the commit whose tree holds those definitions.",
         "The default-store run is a pre-existing step-1 build in a long-lived store, not a fresh store; the isolated run is the fresh-store control.",
         "No systemd resource bounds were applied and no realized input was forcibly rebuilt; the isolated store substituted only from cache.nixos.org.",
-        "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images."
+        "Build logs were retained only on the build host scratch; this receipt does not authenticate them. Repin-grade systemd dual builds remain required before any consumer selects these images, with one approved exception (lead-014 2026-11-21): family system-utils may select only suite digest sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c under its production-route qualification receipt; the exception expires at the next suite repin and is no precedent for any other family or digest."
     ]
 }

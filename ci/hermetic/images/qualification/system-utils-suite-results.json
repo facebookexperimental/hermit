@@ -1,0 +1,894 @@
+{
+  "validation_image": "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+  "run_commit": "7eb2a88dfcc530818539de836fa0b45e12aa2bd3",
+  "run_id": "validate-muse-imgrebuild-7eb2a88dfcc5-1795422601025841616-4003614-15509b74",
+  "run_number": 3745,
+  "binaries": {
+    "hermit_sha256": "f52efaafefa62e34d0237c15ba98e853d6733b3da5b035f2d33f9e742e3f490f",
+    "test_harness_sha256": "45f79d79cea98e211213455b05ddb1a3ba4e747dda7e81212796cafd63f68234"
+  },
+  "results": [
+    {
+      "test": "system-utils/auxv-loader-dump",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/auxv-loader-dump",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/auxv-loader-dump",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/cat-file-read",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/cat-file-read",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/cat-file-read",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/cat-file-read",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/cat-file-read",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "custom",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-exec-continuity",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-exec-continuity",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/clock-exec-continuity",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/date-nanoseconds",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/date-nanoseconds",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/date-nanoseconds",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/du-tree-summary",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/du-tree-summary",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/du-tree-summary",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/du-tree-summary",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/du-tree-summary",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/errno-path-identity",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/errno-path-identity",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/errno-path-identity",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/errno-path-identity",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/errno-path-identity",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-date",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-date",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-date",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-devrand",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-devrand",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/example-devrand",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/find-tree-metadata",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/find-tree-metadata",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/find-tree-metadata",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/find-tree-metadata",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/find-tree-metadata",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/flock-shared-exclusive",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/flock-shared-exclusive",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/flock-shared-exclusive",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mcookie-random",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mcookie-random",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mcookie-random",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mktemp-name",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mktemp-name",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/mktemp-name",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-enc",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-enc",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-enc",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-genpkey",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-genpkey",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-genpkey",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-passwd",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-passwd",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-passwd",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-rand",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-rand",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-rand",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-x509",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-x509",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/openssl-x509",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/overflow-gid-resolves",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/overflow-gid-resolves",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/overflow-gid-resolves",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/printf-argument-forwarding",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/printf-argument-forwarding",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/printf-argument-forwarding",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/printf-argument-forwarding",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/printf-argument-forwarding",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-random-uuid",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-random-uuid",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-random-uuid",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-uptime",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-uptime",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/proc-uptime",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/procfs-sanitized-paths",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/procfs-sanitized-paths",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ps-proc-table",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ps-proc-table",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ps-proc-table",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/random-device",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/random-device",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/random-device",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/record-getpid",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/record-getpid",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/record-getpid",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/record-getpid",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/record-getpid",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sh-exit-status",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sh-exit-status",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sh-exit-status",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sh-exit-status",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shm-coherency-identity",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shm-coherency-identity",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shm-coherency-identity",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shm-coherency-identity",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shm-coherency-identity",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shuf-permutation",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shuf-permutation",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/shuf-permutation",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sort-random",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sort-random",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/sort-random",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ssh-keygen-ed25519",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ssh-keygen-ed25519",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/ssh-keygen-ed25519",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-surface-identity",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-surface-identity",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-surface-identity",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-surface-identity",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-surface-identity",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-tls-guards",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-tls-guards",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/startup-tls-guards",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-alias-root",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-alias-root",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-alias-root",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-alias-root",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-alias-root",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-script-root",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-script-root",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-script-root",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-script-root",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/stat-script-root",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/true-exit-zero",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/true-exit-zero",
+      "mode": "verify",
+      "backend": "in-guest-trap",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/true-exit-zero",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/true-exit-zero",
+      "mode": "verify",
+      "backend": "liteinst",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/true-exit-zero",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/uuidgen-random",
+      "mode": "replay",
+      "backend": "ptrace",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/uuidgen-random",
+      "mode": "verify",
+      "backend": "kvm",
+      "result": "pass"
+    },
+    {
+      "test": "system-utils/uuidgen-random",
+      "mode": "verify",
+      "backend": "ptrace",
+      "result": "pass"
+    }
+  ]
+}

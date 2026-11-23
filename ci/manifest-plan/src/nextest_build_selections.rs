@@ -563,13 +563,28 @@ pub(super) fn execution_command(step: &dagrun::model::Step) -> Result<String, St
         .iter()
         .position(|arg| arg == "--")
         .ok_or_else(|| format!("{} omits its pinned-root command boundary", step.tag()))?;
+    // Guard acceptance is tied to the tag: family-mapped test nodes use
+    // the test-node guard, every other pinned node the build guard.
+    // Generation already refuses other pairings; keep the reader this
+    // strict so validation is self-contained (seat F7).
+    let (current_guard, legacy_guard) =
+        if crate::validation_dag::family_image_reference(&step.tag()).is_some() {
+            (
+                crate::validation_dag::TEST_NODE_COMMAND_GUARD,
+                crate::validation_dag::LEGACY_TEST_NODE_COMMAND_GUARD,
+            )
+        } else {
+            (
+                crate::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD,
+            )
+        };
     match &args[boundary + 1..] {
         [shell, option, guard, argv0, payload]
             if shell == "bash"
                 && option == "-c"
                 && argv0 == "bash"
-                && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                    || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
+                && (guard == current_guard || guard == legacy_guard) =>
         {
             Ok(payload.clone())
         }

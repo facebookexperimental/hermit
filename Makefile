@@ -230,6 +230,7 @@ LINT_CHECK_TARGETS := \
     lint-check-bisect-probe \
     lint-check-lint-checks-node \
     lint-check-assert-build-dependencies \
+    lint-check-assert-test-dependencies \
     lint-check-image-provenance \
     lint-check-retry-fetch \
     lint-check-apt-install-cached \
@@ -354,6 +355,9 @@ lint-check-lint-checks-node:
 
 lint-check-assert-build-dependencies:
 	./ci/hermetic/assert-build-dependencies.sh --self-test
+
+lint-check-assert-test-dependencies:
+	./ci/hermetic/assert-test-dependencies.sh --self-test
 
 lint-check-image-provenance:
 	./ci/hermetic/check-image-provenance.rs

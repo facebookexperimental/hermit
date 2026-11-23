@@ -69,7 +69,12 @@ receipt's `flake_reattestation` records that its current flake.nix input was
 re-attested by abort-stub evaluation at the same derivation, not rebuilt;
 composed receipts carry their own evidence limitations (local two-store
 method) and must not be selected by any consumer until repin-grade builds
-replace them. The recorded
+replace them, with one approved exception (lead-014, 2026-11-21): family
+system-utils may select only suite digest
+sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c
+under its production-route qualification receipt in
+`images/qualification/`; the exception expires at the next suite repin
+and is no precedent for any other family or digest. The recorded
 build-source commit, tree, and archive are historical evidence: review binds
 those identities and the external bytes and logs to the receipt. Rebases can
 rewrite commit ancestry, so live equivalence is deliberately limited to those
@@ -107,6 +112,9 @@ records, and the superseded 4e1605ec archive bytes. `build-image.sh` remains
 useful for a local one-off build, but one such build is not sufficient
 evidence for another reviewed repin. A future repin must replace the digest
 and provenance together with two new agreeing isolated builds.
+Composed images are provisioned separately with
+`build-composed-images.sh` (or verified already present with `--check`);
+hosts without a mapped image refuse at validate admission.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
