@@ -828,6 +828,20 @@ fn pipe_capacity_failure(
     Some(PipeCapacityFailure { created_fds, error })
 }
 
+/// How many times Detcore injects a new pipe's capacity pin that Reverie
+/// reports did not run (`ERESTARTSYS`) before the run is refused
+/// (`Detcore::pin_pipe_capacity`).
+///
+/// Two, so one retry. The retry of a pin that a signal stopped is exact:
+/// reverie-ptrace holds that signal and delivers it at the guest's resume. On
+/// the retry it shields only realtime signals, and it holds one signal per
+/// thread, so a second report from a signal means that a standard signal
+/// stopped the retry and replaced the held one, which is lost. The pin refuses
+/// there, rather than let the run go on without that signal. The bound also
+/// ends the pin where a seccomp filter the guest inherited returns a restart
+/// every time without running the call.
+const PIPE_PIN_ATTEMPTS: usize = 2;
+
 fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, Errno> {
     if status_flags & OFlag::O_PATH.bits() != 0 {
         return Err(Errno::EBADF);
@@ -17020,6 +17034,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
+    /// Pin the new pipe `fds` to the deterministic capacity by injecting
+    /// `fcntl(F_SETPIPE_SZ)` on its read end, and return the result.
+    ///
+    /// A signal that stops the backend's step of the injected call before its
+    /// `syscall` instruction means that the call did not run: reverie-ptrace
+    /// then reports `ERESTARTSYS` and holds the signal for the guest's resume.
+    /// The pin, which is idempotent on the new, empty pipe, is then injected
+    /// again, but only `PIPE_PIN_ATTEMPTS` times in all; after that the last
+    /// `ERESTARTSYS` is the result. Linux returns neither `ERESTARTSYS` nor
+    /// `EINTR` from `F_SETPIPE_SZ` (`pipe_fcntl` and `pipe_set_size` in
+    /// fs/pipe.c), so every other error, `EINTR` included, is the result at
+    /// once.
+    async fn pin_pipe_capacity<G: Guest<Self>>(
+        guest: &mut G,
+        fds: [RawFd; 2],
+    ) -> Result<i64, Errno> {
+        let pin = syscalls::Fcntl::new()
+            .with_fd(fds[0])
+            .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes()));
+        let mut result = Err(Errno::ERESTARTSYS);
+        for attempt in 1..=PIPE_PIN_ATTEMPTS {
+            result = guest.inject(pin).await;
+            if result != Err(Errno::ERESTARTSYS) {
+                break;
+            }
+            warn!(
+                "[detcore] the capacity pin of new pipe (fds {fds:?}) did not run \
+                 (attempt {attempt} of {PIPE_PIN_ATTEMPTS}): {}",
+                Errno::ERESTARTSYS,
+            );
+        }
+        result
+    }
+
     /// pipe2 system call.
     pub async fn handle_pipe2<G: Guest<Self>>(
         &self,
@@ -17064,13 +17112,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // run, even one that happens to succeed (a pipe created under the quota
                 // already has two pages).
                 let capacity_result = if host_pipe_floor() {
-                    guest
-                        .inject(
-                            syscalls::Fcntl::new()
-                                .with_fd(fds[0])
-                                .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
-                        )
-                        .await
+                    Self::pin_pipe_capacity(guest, fds).await
                 } else {
                     error!(
                         "{}",
@@ -17098,7 +17140,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Defensive, not expected: pinning on a freshly created EMPTY pipe is a
                     // shrink or a no-op. EBUSY needs buffered data and EPERM needs to exceed
                     // `pipe-max-size`; neither can hold here (below a two-page
-                    // `pipe-max-size` the pin is refused before it is tried).
+                    // `pipe-max-size` the pin is refused before it is tried). A pin that
+                    // did not run in `PIPE_PIN_ATTEMPTS` attempts does reach here, with
+                    // `ERESTARTSYS`, as does an `EINTR`, which Linux never returns from
+                    // this call (`Self::pin_pipe_capacity`).
                     for close in failure.close_syscalls() {
                         let _ = guest.inject(close).await;
                     }
@@ -23552,6 +23597,14 @@ mod inject_fstat_scratch {
         /// descriptor received outside the model do where it is gone; any
         /// other answer is not scripted.
         fcntl_ebadf: bool,
+        /// Scripted errors of injected `fcntl(F_SETPIPE_SZ)` calls, in order,
+        /// before any real one; `ERESTARTSYS` is how reverie-ptrace reports
+        /// an injected call that a signal stopped before its `syscall`
+        /// instruction (the signal held for the guest's resume).
+        pipe_pin_errors: std::collections::VecDeque<Errno>,
+        /// The descriptor of every injected `fcntl(F_SETPIPE_SZ)`, a
+        /// scripted failure included.
+        pipe_pin_attempts: Vec<RawFd>,
         /// Whether an injected syscall that nothing here scripts runs in this
         /// process, on the test's own descriptors, as the probes of a
         /// received descriptor (`fcntl`, `fstatfs`, ...) do; otherwise it is
@@ -23635,6 +23688,8 @@ mod inject_fstat_scratch {
                 binder_read_consumed: None,
                 ppoll_ready: None,
                 fcntl_ebadf: false,
+                pipe_pin_errors: Default::default(),
+                pipe_pin_attempts: Vec::new(),
                 unscripted_real: false,
                 counts_memory_reads: false,
                 binder_read_fault: None,
@@ -23891,6 +23946,14 @@ mod inject_fstat_scratch {
                         args.arg5,
                     )
                 });
+            }
+            if let Syscall::Fcntl(call) = Syscall::from_raw(number, args)
+                && matches!(call.cmd(), F_SETPIPE_SZ(_))
+            {
+                self.pipe_pin_attempts.push(call.fd());
+                if let Some(errno) = self.pipe_pin_errors.pop_front() {
+                    return Err(errno);
+                }
             }
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
@@ -27139,6 +27202,104 @@ mod inject_fstat_scratch {
 
         // A null buffer is left alone.
         tool.canonicalize_statfs_buf(&mut guest, None).unwrap();
+    }
+
+    /// A harness guest that sequentializes threads, so that `handle_pipe2`
+    /// pins the new pipe, with `errors` scripted for the pin; and its tool.
+    fn pipe_pin_guest(errors: &[Errno]) -> (Detcore, ScriptedGuest) {
+        assert!(
+            host_pipe_floor(),
+            "this host's pipe-max-size is below two pages, so no pipe is pinned"
+        );
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.sequentialize_threads = true;
+        guest.unscripted_real = true;
+        guest.pipe_pin_errors = errors.iter().copied().collect();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        (tool, guest)
+    }
+
+    /// Runs `handle_pipe2` with `errors` scripted for the pin, and requires
+    /// that it refuses the run, having injected the pin until each scripted
+    /// error was reported. Under this harness the refusal is the
+    /// `UnrecoverableShutdown` RPC that `unrecoverable_shutdown` sends before
+    /// it exits in a build with debug assertions, which unit tests keep on in
+    /// every mode. Returns the descriptors `pipe2` created, and the guest.
+    async fn refused_pipe_pin(errors: &[Errno]) -> ([RawFd; 2], ScriptedGuest) {
+        use futures::FutureExt;
+        let (tool, mut guest) = pipe_pin_guest(errors);
+        let mut fds = [-1i32; 2];
+        let call = syscalls::Pipe2::new()
+            .with_pipefd(AddrMut::from_raw(fds.as_mut_ptr() as usize))
+            .with_flags(OFlag::O_CLOEXEC);
+        let outcome = std::panic::AssertUnwindSafe(tool.handle_pipe2(&mut guest, call))
+            .catch_unwind()
+            .await;
+        let panic = outcome.expect_err("the handler did not refuse the run");
+        let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            message.contains("UnrecoverableShutdown"),
+            "the handler did not refuse the run: {message}"
+        );
+        assert!(
+            guest.pipe_pin_errors.is_empty(),
+            "the pin was not injected until each scripted error was reported"
+        );
+        (fds, guest)
+    }
+
+    /// A signal that stops the injected pin of a new pipe before its
+    /// `syscall` instruction runs makes reverie-ptrace report `ERESTARTSYS`
+    /// and hold the signal for the guest's resume ("Interrupted by a signal
+    /// before the `syscall` executed" in reverie-ptrace's `task.rs`). The pin
+    /// did not run, so it is retried, once: the pipe gets the deterministic
+    /// capacity and both ends are registered. Before, Detcore refused the
+    /// whole run ("cannot pin scheduler-managed pipe to 8192 bytes ...: -512
+    /// ERESTARTSYS"), which a Debian package build under Hermit hit 30 s in.
+    #[tokio::test]
+    async fn a_pipe_pin_a_signal_stopped_before_it_ran_is_retried() {
+        let (tool, mut guest) = pipe_pin_guest(&[Errno::ERESTARTSYS]);
+        let mut fds = [-1i32; 2];
+        let call = syscalls::Pipe2::new()
+            .with_pipefd(AddrMut::from_raw(fds.as_mut_ptr() as usize))
+            .with_flags(OFlag::O_CLOEXEC);
+        assert_eq!(tool.handle_pipe2(&mut guest, call).await.unwrap(), 0);
+        assert_eq!(
+            guest.pipe_pin_attempts, [fds[0]; 2],
+            "the interrupted pin was not retried exactly once"
+        );
+        // SAFETY: F_GETPIPE_SZ only reads the test's own pipe.
+        let capacity = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert_eq!(capacity, deterministic_pipe_capacity_bytes());
+        for fd in fds {
+            assert!(
+                guest.thread.with_detfd(fd, |_| ()).is_ok(),
+                "pipe end {fd} is not registered"
+            );
+            // SAFETY: the test's own descriptor, closed once.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+    }
+
+    /// A pin that a signal stops on every attempt is refused after two
+    /// attempts (`PIPE_PIN_ATTEMPTS`), and both descriptors `pipe2` created
+    /// are closed. A third attempt, which would run and succeed here, would
+    /// come after a held signal may have been lost.
+    #[tokio::test]
+    async fn a_pipe_pin_that_never_runs_is_refused_after_two_attempts() {
+        let (fds, guest) = refused_pipe_pin(&[Errno::ERESTARTSYS; 2]).await;
+        assert_eq!(guest.pipe_pin_attempts, [fds[0]; 2]);
+        assert_eq!(guest.close_attempts, fds);
+    }
+
+    /// Linux never returns `EINTR` from `F_SETPIPE_SZ`, so a pin that reports
+    /// it (a filter or a backend did) is refused without a retry, and both
+    /// descriptors `pipe2` created are closed.
+    #[tokio::test]
+    async fn a_pipe_pin_that_reports_eintr_is_refused_without_a_retry() {
+        let (fds, guest) = refused_pipe_pin(&[Errno::EINTR]).await;
+        assert_eq!(guest.pipe_pin_attempts, [fds[0]]);
+        assert_eq!(guest.close_attempts, fds);
     }
 }
 
