@@ -204,6 +204,38 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         ],
         populations: &[],
     },
+    // The exec-stop-launcher cohort: its producer pair and its consumer.
+    ExtensionNode {
+        tag: "build.hermit_exec_stop_launcher_compile_in_pinned_root",
+        labels: &["full", "portable"],
+        deps: &["pre.reverie_pin", "setup.pinned_root_fetch"],
+        populations: &[],
+    },
+    ExtensionNode {
+        tag: "build.hermit_exec_stop_launcher_in_pinned_root",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.hermit_exec_stop_launcher_compile_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "pre.reverie_pin",
+            "setup.pinned_root_fetch",
+        ],
+        populations: &[],
+    },
+    ExtensionNode {
+        tag: "test.hermit_exec_stop_launcher",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.e2e_artifact_in_pinned_root",
+            "build.hermit_exec_stop_launcher_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "build.workspace_in_pinned_root",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.pinned_root_fetch",
+        ],
+        populations: &[],
+    },
     // ci/verify-submodules.sh's self-test, moved out of pre.submodules (the
     // root of every lane's critical path) into its own tool self-test leaf,
     // with its generated quick/super twin.

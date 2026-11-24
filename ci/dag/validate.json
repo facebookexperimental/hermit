@@ -25405,6 +25405,59 @@
     },
     {
       "group": "test",
+      "job": "hermit_exec_stop_launcher",
+      "desc": "Test Hermit unit and binary targets with exec-stop-launcher and liteinst (-p hermit-run --features exec-stop-launcher,liteinst --lib --bins)",
+      "description": "Runs hermit-run's whole lib and bin test population built with --features exec-stop-launcher,liteinst, the only build that compiles the code behind cfg(all(feature = \"exec-stop-launcher\", feature = \"liteinst\")): the mapped_first_admission module, the exec-stop launcher paths in run.rs and verify_inputs, and the in-guest dispatch they share. Before this node no validation node or Buck target ran that code; lint.clippy and doc.rustdoc only type-check it under --all-features. The executables come from the exec-stop-launcher cohort (build.hermit_exec_stop_launcher_compile_in_pinned_root + build.hermit_exec_stop_launcher_in_pinned_root, target/cohort-exec-stop-launcher), so the feature pair never enters the default workspace union or the production binary. The prerequisites are test.hermit_unit's plus the cohort record. The cohort's compile half builds the in-guest Detcore runtime (libdetcore_liteinst.so) into the same validate deps directory as these test executables with ci/stage-detcore-liteinst.sh (an unqualified runtime left beside the tests, not the qualified one hermit-install's stage-detcore-liteinst installs), where the default workspace build leaves test.hermit_unit's runtime (with its own feature resolution), so the LiteInst and in-guest-trap cases find it when no installation is selected; without it they fail with the runtime unavailable. Filters: the four app::mapped_first_admission::physical_tests::packet_held_tests::mapped_cancel cases are excluded here: they need two declared fixtures (the pinned V11 runtime image and a produced private-static package) that this node does not have. Their owner is the F-B change on bead dh-mzc3l9, which gives them their own serial node, test.hermit_exec_stop_launcher_mapped_cancel; until it lands they run in no node, as before this one; ptrace_completion::tests::real_random_ is skipped as test.hermit_unit skips it, because it needs the PMU and privileged-test.pmu_ptrace_completion_cases runs it. Nothing else is skipped. Run mode: Nextest runs each test in its own process, one test at a time (-j 1), as test.hermit_unit does; test.hermit_unit passed the pinned_cpu and gdb_client isolation tests this population shares in the post-land validation of 2b2e9ecf. The failures bead dh-br4d0f records for them appear only when many tests share one process (cargo test), which this node does not do. Test concurrency is -j 1 for test.hermit_unit's reason: these executables serialize Hermit runs with process-local mutexes. Budgets: the 600-second wall is about 1.5 times test.hermit_unit's largest local wall (389 s over 544 runs) for the same population at the same -j 1; the 1200 CPU-s bound is not yet measured for this selection and must be recalibrated from its first retained runs. Memory keeps test.hermit_unit's 5-GiB baseline and 7-GiB hard cap.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CARGO_TARGET_DIR --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_CENSUS_BASE_COMMIT --env HERMIT_CENSUS_BASE_DIR --env HERMIT_CENSUS_BASE_LISTED_IDS --env HERMIT_CENSUS_DROPPED_FILE --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_E2E_FAIL_FAST --env HERMIT_EPOCH --env HERMIT_NEXTEST_FAIL_FAST --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_NEXTEST_RESULTS_SCHEMA --env HERMIT_NEXTEST_SELECTED_CASES --env HERMIT_PREPARED_NEXTEST_COHORT --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK2 --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_BUILD_MODE --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features exec-stop-launcher,liteinst --lib --bins -j 1 -E '\\''not test(/^app::mapped_first_admission::physical_tests::packet_held_tests::mapped_cancel::mapped_(?:packet_prepared_same_birth|packet_prepared_other_birth_refuses|packet_prepared_poison_refuses_old_lease|genuine_initializer_returns_before_guest)$/)'\\'' -- --skip ptrace_completion::tests::real_random_'",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 5,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.hermit_exec_stop_launcher"
+        }
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.hermit_exec_stop_launcher_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "target/cohort-exec-stop-launcher",
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
+        "HERMIT_PREPARED_NEXTEST_COHORT": "exec-stop-launcher",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"exec-stop-launcher,liteinst\",\"--lib\",\"--bins\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 1200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 5368709120,
+        "hard_mem_max_bytes": 7516192768,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.hermit_exec_stop_launcher"
+    },
+    {
+      "group": "test",
       "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
       "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
@@ -63610,7 +63663,7 @@
       "group": "build",
       "job": "hermit_native_exec_in_pinned_root",
       "desc": "List the native-exec cohort's prepared executables and publish and assert its record",
-      "description": "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode: this record stays cargo-stamped and its consumers resolve the pin instead of the run mode. It deliberately does not run stage-detcore-liteinst: the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.",
+      "description": "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode: this record stays cargo-stamped and its consumers resolve the pin instead of the run mode. It deliberately stages no runtime (neither hermit-install's stage-detcore-liteinst, which installs the qualified one, nor ci/stage-detcore-liteinst.sh, which builds an unqualified one beside the tests): the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.",
       "labels": [
         "full",
         "portable"
@@ -63646,6 +63699,86 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "build.hermit_native_exec_in_pinned_root"
+    },
+    {
+      "group": "build",
+      "job": "hermit_exec_stop_launcher_compile_in_pinned_root",
+      "desc": "Build the exec-stop-launcher cohort's hermit-run targets and CPU wrapper in the validate profile, beside the workspace compile",
+      "description": "The Cargo half of the exec-stop-launcher cohort producer: builds exactly the cohort selection, -p hermit-run --features exec-stop-launcher,liteinst --lib --bins, in the [profile.validate] profile into the cohort target directory (target/cohort-exec-stop-launcher, from the cohort declaration in nextest_binaries), then ci/stage-detcore-liteinst.sh --source . --target-dir \"${CARGO_TARGET_DIR:?}\" --profile validate --offline (offline explicitly, by the 2026-11-22 ruling that fixture staging never reaches the network; setup.pinned_root_fetch has already fetched every locked Cargo input), which builds the in-guest Detcore runtime (the detcore-liteinst cdylib) into the same validate deps directory as the test executables, where Hermit finds it when no installation is selected (the default workspace build leaves the default cohort's runtime in the same place, with its own feature resolution; without it the LiteInst cases of test.hermit_exec_stop_launcher fail with the runtime unavailable), then the dev-profile nextest-cpu-wrapper the prepare half records. Before this node existed no validation node or Buck target ran code behind cfg(all(feature = \"exec-stop-launcher\", feature = \"liteinst\")): lint.clippy and doc.rustdoc only type-check it under --all-features. The feature pair gets its own cohort so it never enters the default workspace union or the production binary. Nothing in it runs a rust-script, so it starts beside build.rust_scripts_in_pinned_root like the workspace compile. ci/stage-detcore-liteinst.sh is not hermit-install's stage-detcore-liteinst, which builds, qualifies and installs the packaged runtime into an installation's rsrcs/: it builds an unqualified runtime in the tests' own profile, takes its path from Cargo's compiler-artifact report, and leaves it in their deps directory, never installed. Budgets, by the step_limits rule from build.hermit_native_exec_compile_in_pinned_root, which this node copies (same package and profile, a smaller feature set) and extends with the runtime build: that node's compile half and wrapper took 2502 + 162 CPU-s cold at 32 jobs, so the CPU bound stays 4200, the next 300-second bucket above 1.5 times their sum; the runtime build is not yet measured, so recalibrate from this node's first retained runs. Wall: that node passed at 479.6 and 518.9 s in the post-land runs of e308b558 and 2b2e9ecf and at 592 s, and was WALL-killed at 606 s (P1 bead dh-59uah3), so this node's wall bound is 960 s, the bucket above 1.5 times the kill wall (909 s), with a step_limits::WALL_CEILING_EXCEPTIONS entry. Its only completion consumer is build.hermit_exec_stop_launcher_in_pinned_root.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CARGO_TARGET_DIR --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_CENSUS_BASE_COMMIT --env HERMIT_CENSUS_BASE_DIR --env HERMIT_CENSUS_BASE_LISTED_IDS --env HERMIT_CENSUS_DROPPED_FILE --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_E2E_FAIL_FAST --env HERMIT_EPOCH --env HERMIT_NEXTEST_FAIL_FAST --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_NEXTEST_SELECTED_CASES --env HERMIT_PREPARED_NEXTEST_COHORT --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK2 --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_BUILD_MODE --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermit-run --features exec-stop-launcher,liteinst --lib --bins && ./ci/run-with-core-build.sh ./ci/stage-detcore-liteinst.sh --source . --target-dir \"${CARGO_TARGET_DIR:?}\" --profile validate --offline && ./ci/run-with-core-build.sh cargo build --locked -p hermit-manifest-plan --bin nextest-cpu-wrapper'",
+      "result_manifests": [],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "target/cohort-exec-stop-launcher",
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_PREPARED_NEXTEST_COHORT": "exec-stop-launcher"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 960,
+      "cpu_timeout": 4200,
+      "priority": 50,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 350.0,
+        "rss_baseline_bytes": 15032385536,
+        "hard_mem_max_bytes": 19327352832,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.hermit_exec_stop_launcher_compile_in_pinned_root"
+    },
+    {
+      "group": "build",
+      "job": "hermit_exec_stop_launcher_in_pinned_root",
+      "desc": "List the exec-stop-launcher cohort's prepared executables and publish and assert its record",
+      "description": "The preparation half of the exec-stop-launcher cohort producer. Once build.hermit_exec_stop_launcher_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort exec-stop-launcher lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/exec-stop-launcher.json under its own lock; the immediately following assert full --cohort exec-stop-launcher verifies the published record, so its consumer (test.hermit_exec_stop_launcher) has the cohort check in its ancestry by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode and the run record names it. Budgets are the native-exec prepare's, not yet measured for this selection.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CARGO_TARGET_DIR --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_CENSUS_BASE_COMMIT --env HERMIT_CENSUS_BASE_DIR --env HERMIT_CENSUS_BASE_LISTED_IDS --env HERMIT_CENSUS_DROPPED_FILE --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_E2E_FAIL_FAST --env HERMIT_EPOCH --env HERMIT_NEXTEST_FAIL_FAST --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_NEXTEST_SELECTED_CASES --env HERMIT_PREPARED_NEXTEST_COHORT --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK2 --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_BUILD_MODE --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full --build-mode cargo --cohort exec-stop-launcher && ./ci/nextest-binaries.rs assert full --cohort exec-stop-launcher'",
+      "result_manifests": [],
+      "deps": [
+        "build.hermit_exec_stop_launcher_compile_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "target/cohort-exec-stop-launcher",
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_PREPARED_NEXTEST_COHORT": "exec-stop-launcher"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 1800,
+      "priority": 50,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 260.0,
+        "rss_baseline_bytes": 15032385536,
+        "hard_mem_max_bytes": 19327352832,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.hermit_exec_stop_launcher_in_pinned_root"
     },
     {
       "group": "quick-super-setup",

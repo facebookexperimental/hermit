@@ -276,7 +276,8 @@ LINT_CHECK_TARGETS := \
     lint-check-run-nextest-counted \
     lint-check-runner-guard \
     lint-check-no-sve \
-    lint-check-detcore-backend-abstraction-test
+    lint-check-detcore-backend-abstraction-test \
+    lint-check-stage-detcore-liteinst
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 
@@ -529,6 +530,9 @@ lint-check-no-sve:
 
 lint-check-detcore-backend-abstraction-test:
 	./scripts/check-detcore-backend-abstraction-test.sh
+
+lint-check-stage-detcore-liteinst:
+	./ci/stage-detcore-liteinst-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its

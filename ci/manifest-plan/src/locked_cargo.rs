@@ -1188,7 +1188,7 @@ mod tests {
     /// workspace, each with how a node reaches it. The invariant test scans
     /// each in full, beside every node command. The list is fixed, not
     /// discovered: a Cargo call in any other program a node runs is not seen.
-    const SCRIPTS: [(&str, &str, &str); 5] = [
+    const SCRIPTS: [(&str, &str, &str); 6] = [
         (
             "ci/run-nextest-counted.sh",
             include_str!("../../run-nextest-counted.sh"),
@@ -1216,6 +1216,12 @@ mod tests {
             "ci/check-musl-detcore.sh",
             include_str!("../../check-musl-detcore.sh"),
             "check.lint_checks runs it through `make lint-checks`",
+        ),
+        (
+            "ci/stage-detcore-liteinst.sh",
+            include_str!("../../stage-detcore-liteinst.sh"),
+            "build.hermit_exec_stop_launcher_compile_in_pinned_root runs it; its `cargo build` \
+             builds the detcore-liteinst runtime beside the cohort's test executables",
         ),
     ];
 

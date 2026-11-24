@@ -42,6 +42,19 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--lib",
             "--bins",
         ]),
+        // hermit-run's lib and bin tests with exec-stop-launcher and
+        // liteinst, prepared in its own cohort
+        // (nextest_binaries::EXEC_STOP_LAUNCHER_COHORT): the only selection
+        // that compiles the code behind cfg(all(feature =
+        // "exec-stop-launcher", feature = "liteinst")).
+        "test.hermit_exec_stop_launcher" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "exec-stop-launcher,liteinst",
+            "--lib",
+            "--bins",
+        ]),
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
         "test.inherited_terminal_read" => Some(&[
             "-p",
@@ -738,10 +751,14 @@ fn preparation_profile<'a>(
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
-    if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
-        if expected.strip_prefix(marker) == Some(rest) {
-            return Ok(Some((profile, cohort)));
+    for cohort in crate::nextest_binaries::REGISTERED_COHORTS {
+        if cohort.is_default() {
+            continue;
+        }
+        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+            if expected.strip_prefix(marker) == Some(rest) {
+                return Ok(Some((profile, cohort)));
+            }
         }
     }
     // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`
@@ -1221,6 +1238,20 @@ mod tests {
         assert_eq!(
             preparation_profile("producer", &cohort_command).unwrap(),
             Some(("full", crate::nextest_binaries::NATIVE_EXEC_COHORT))
+        );
+        // Every registered non-default cohort has the same one form, keyed
+        // by its own slug.
+        let exec_stop_command = format!(
+            "prefix && {}",
+            crate::nextest_binaries::cohort_prepare_command(
+                "full",
+                crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            preparation_profile("producer", &exec_stop_command).unwrap(),
+            Some(("full", crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT))
         );
         for refused in [
             // Without its assert half.

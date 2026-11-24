@@ -68,14 +68,29 @@ pub const DEFAULT_COHORT: PreparedCohort = PreparedCohort { slug: None };
 pub const NATIVE_EXEC_COHORT: PreparedCohort = PreparedCohort {
     slug: Some("native-exec"),
 };
+/// hermit-run's lib and bin tests with exec-stop-launcher and liteinst: the
+/// only build that compiles, and so the only one that can run, the code
+/// behind `cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))`.
+/// Its own cohort for the native-exec cohort's reason: the feature never
+/// enters the default workspace union or the production binary.
+pub const EXEC_STOP_LAUNCHER_COHORT: PreparedCohort = PreparedCohort {
+    slug: Some("exec-stop-launcher"),
+};
+/// Every registered cohort, the default first, in registration order.
+pub const REGISTERED_COHORTS: [PreparedCohort; 3] = [
+    DEFAULT_COHORT,
+    NATIVE_EXEC_COHORT,
+    EXEC_STOP_LAUNCHER_COHORT,
+];
 
 impl PreparedCohort {
     pub fn from_slug(slug: Option<&str>) -> Result<Self, String> {
         match slug {
             None | Some("default") => Ok(DEFAULT_COHORT),
             Some("native-exec") => Ok(NATIVE_EXEC_COHORT),
+            Some("exec-stop-launcher") => Ok(EXEC_STOP_LAUNCHER_COHORT),
             Some(other) => Err(format!(
-                "unknown prepared Nextest cohort {other:?}; known cohorts are the default and \"native-exec\""
+                "unknown prepared Nextest cohort {other:?}; known cohorts are the default, \"native-exec\" and \"exec-stop-launcher\""
             )),
         }
     }
@@ -123,6 +138,7 @@ impl PreparedCohort {
         match self.slug {
             None => None,
             Some("native-exec") => Some("target/cohort-native-exec"),
+            Some("exec-stop-launcher") => Some("target/cohort-exec-stop-launcher"),
             Some(_) => unreachable!("from_slug admits only registered cohorts"),
         }
     }
@@ -137,21 +153,23 @@ impl PreparedCohort {
             Some("native-exec") => Some(
                 "hermit-run/kvm-native-test-support,hermit-run/liteinst,hermit-run/native-exec",
             ),
+            Some("exec-stop-launcher") => Some("hermit-run/exec-stop-launcher,hermit-run/liteinst"),
             Some(_) => unreachable!("from_slug admits only registered cohorts"),
         }
     }
 
     /// The build mode this cohort is pinned to regardless of the run's
-    /// mode, by cohort name only. The native-exec cohort has no Buck
-    /// harvest twins (option (d) substitutes only the default cohort's
-    /// detcore selections), so its binaries are Cargo-built in every run
+    /// mode, by cohort name only. Neither the native-exec nor the
+    /// exec-stop-launcher cohort has Buck harvest twins (option (d)
+    /// substitutes only the default cohort's detcore selections), so its
+    /// binaries are Cargo-built in every run
     /// and its record stays cargo-stamped and per-binary truthful; a buck
     /// run is therefore mixed-mode, which the run record and ledger name
     /// through [`cohort_build_modes`]. The default cohort follows the run.
     pub fn pinned_build_mode(self) -> Option<&'static str> {
         match self.slug {
             None => None,
-            Some("native-exec") => Some("cargo"),
+            Some("native-exec") | Some("exec-stop-launcher") => Some("cargo"),
             Some(_) => unreachable!("from_slug admits only registered cohorts"),
         }
     }
@@ -169,7 +187,7 @@ impl PreparedCohort {
 /// whose native-exec cohort is pinned to cargo is named mixed, never
 /// pure buck.
 pub fn cohort_build_modes(run_mode: &str) -> Vec<(&'static str, String)> {
-    [DEFAULT_COHORT, NATIVE_EXEC_COHORT]
+    REGISTERED_COHORTS
         .into_iter()
         .map(|cohort| {
             (
@@ -187,6 +205,9 @@ pub fn cohort_for_step(tag: &str) -> PreparedCohort {
         "build.hermit_native_exec_compile_in_pinned_root"
         | "build.hermit_native_exec_in_pinned_root"
         | "test.hermit_native_exec" => NATIVE_EXEC_COHORT,
+        "build.hermit_exec_stop_launcher_compile_in_pinned_root"
+        | "build.hermit_exec_stop_launcher_in_pinned_root"
+        | "test.hermit_exec_stop_launcher" => EXEC_STOP_LAUNCHER_COHORT,
         _ => DEFAULT_COHORT,
     }
 }
@@ -6103,6 +6124,31 @@ mod tests {
             prepared_feature_set(&native).unwrap(),
             NATIVE_EXEC_COHORT.expected_feature_set().unwrap()
         );
+        // The exec-stop-launcher cohort keeps its own record, lock and
+        // target, and its constant is its selection's derived feature set.
+        assert_eq!(
+            EXEC_STOP_LAUNCHER_COHORT.record_path(store),
+            store.join("cohorts/exec-stop-launcher.json")
+        );
+        assert_eq!(
+            EXEC_STOP_LAUNCHER_COHORT.lock_path(store),
+            store.join("cohorts/lock.exec-stop-launcher")
+        );
+        assert_eq!(
+            EXEC_STOP_LAUNCHER_COHORT.target_dir(),
+            Some("target/cohort-exec-stop-launcher")
+        );
+        assert_eq!(
+            PreparedCohort::from_slug(Some("exec-stop-launcher")).unwrap(),
+            EXEC_STOP_LAUNCHER_COHORT
+        );
+        let exec_stop =
+            selections(&["-p hermit-run --features exec-stop-launcher,liteinst --lib --bins"]);
+        assert_eq!(
+            prepared_feature_set(&exec_stop).unwrap(),
+            EXEC_STOP_LAUNCHER_COHORT.expected_feature_set().unwrap()
+        );
+        assert_eq!(EXEC_STOP_LAUNCHER_COHORT.pinned_build_mode(), Some("cargo"));
     }
 
     #[test]
@@ -6862,14 +6908,16 @@ esac
             cohort_build_modes("buck"),
             vec![
                 ("default", "buck".to_string()),
-                ("native-exec", "cargo".to_string())
+                ("native-exec", "cargo".to_string()),
+                ("exec-stop-launcher", "cargo".to_string())
             ]
         );
         assert_eq!(
             cohort_build_modes("cargo"),
             vec![
                 ("default", "cargo".to_string()),
-                ("native-exec", "cargo".to_string())
+                ("native-exec", "cargo".to_string()),
+                ("exec-stop-launcher", "cargo".to_string())
             ]
         );
         // End to end through the consumer check: the cargo-stamped
