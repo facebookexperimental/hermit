@@ -61,23 +61,6 @@ where
     }
 }
 
-/// [`inject_with_scratch`] with the buffer only in a transient private
-/// page, never in the guest stack scratch: for a probe made while a
-/// forwarded call is being staged, whose stack scratch the forwarded
-/// call itself may still need (the fdlink respell walk,
-/// `Detcore::guest_fd_link_target`).
-pub(crate) async fn inject_in_transient_page<G, T, const N: usize>(
-    guest: &mut G,
-    initial: [u8; N],
-    call: impl Fn(AddrMut<'_, u8>) -> Syscall,
-) -> Result<(i64, [u8; N]), Errno>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    in_transient_page(guest, &initial, &call).await
-}
-
 /// [`inject_with_scratch`] with the buffer in the guest stack scratch.
 /// `Err(EFAULT)` when the scratch cannot hold it.
 async fn on_stack<G, T, const N: usize>(
