@@ -129,7 +129,9 @@
 #                               cells spent their time (ci/buck-e2e/stages.py), and
 #                               phases.tsv, the epoch time each step of this node began
 #                               and the time and status it exited with (`exit N`), or the
-#                               signal that ended it (`signal TERM`, INT or HUP). Only
+#                               signal that ended it (`signal TERM`, INT or HUP), then
+#                               `daemon stop` and `keeping records` as the signal path
+#                               attempts each. Only
 #                               records this attempt wrote are kept: an earlier attempt's
 #                               are removed from the work directory before any step runs.
 #                               Keeping them is best effort under a time budget (below);
@@ -481,6 +483,10 @@ on_signal() { # $1: the signal. Record it, stop the buck2 daemon, keep what reco
     record_daemon
     if [[ -n $kept ]]; then
         printf '%s\tsignal %s\n' "$(date -u +%s.%N)" "$1" >>"$kept/phases.tsv"
+        # The stop is recorded as it is ATTEMPTED, before `buck2 kill` runs: the order "daemon
+        # stop" before "keeping records" then holds on record even when a loaded host cuts the kill
+        # off at its 1 s bound.
+        printf '%s\tdaemon stop\n' "$(date -u +%s.%N)" >>"$kept/phases.tsv"
     fi
     timeout --foreground -k 0.5 1 "$buck2" kill >/dev/null 2>&1
     kill_daemon_scope
@@ -488,8 +494,12 @@ on_signal() { # $1: the signal. Record it, stop the buck2 daemon, keep what reco
         echo "validate-node: fails: $(<"$daemon_breach")" >&2
     fi
     if [[ -n $kept && -z $exiting ]]; then
+        printf '%s\tkeeping records\n' "$(date -u +%s.%N)" >>"$kept/phases.tsv"
         keep_invocations $((${EPOCHREALTIME/[^0-9]/} + 2000000)) "the 2 s a signalled node keeps for the Buck invocation records"
     fi
+    # A signalled node writes no sidecar: remove the measurement's work directory, with the decoded
+    # event-log copies keep_invocations teed into it, instead of leaving it in $TMPDIR.
+    buck_measure_discard
     trap - "$1"
     kill -s "$1" "$$"
 }

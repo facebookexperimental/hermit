@@ -855,19 +855,17 @@ sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
 """
 # buck2, for what validate-node asks of it: `log show FILE` prints FILE, which here holds the
 # JSON lines themselves (or fails, with FAKE_BUCK2_LOG_SHOW_FAILS, or never ends, with
-# FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, waits
-# until the epoch time FAKE_BUCK2_KILL_UNTIL, when set, and exits FAKE_BUCK2_KILL_RC. With
-# FAKE_BUCK2_ORDER set, `log` and `kill` also append their name to that file, so a test can see
-# which the node asked for first.
+# FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` first sleeps FAKE_BUCK2_KILL_DELAY seconds, when set (a
+# kill slow to start, as on a loaded host), appends a line to FAKE_BUCK2_KILLS, when set, waits
+# until the epoch time FAKE_BUCK2_KILL_UNTIL, when set, and exits FAKE_BUCK2_KILL_RC.
 FAKE_NODE_BUCK2 = """#!/bin/sh
 case $1 in
     log)
-        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo log >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_FAILS:-}" ]; then echo "buck2: cannot read $3" >&2; exit 3; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_HANGS:-}" ]; then exec sleep 600; fi
         exec cat -- "$3" ;;
     kill)
-        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo kill >>"$FAKE_BUCK2_ORDER"; fi
+        if [ -n "${FAKE_BUCK2_KILL_DELAY:-}" ]; then sleep "$FAKE_BUCK2_KILL_DELAY"; fi
         if [ -n "${FAKE_BUCK2_KILLS:-}" ]; then echo kill >>"$FAKE_BUCK2_KILLS"; fi
         if [ -n "${FAKE_BUCK2_KILL_UNTIL:-}" ]; then
             python3 -c 'import sys, time; time.sleep(max(0.0, float(sys.argv[1]) - time.time()))' "$FAKE_BUCK2_KILL_UNTIL"
@@ -1363,40 +1361,117 @@ class ValidateNodeTest(unittest.TestCase):
     def test_a_group_sigterm_is_recorded_as_a_signal_and_the_node_still_dies_of_it(self):
         results = self.root / "e2e-results"
         kills = self.root / "kills"
-        order = self.root / "order"
-        for name, added in (("summaries that work", {}), ("a summary that stalls", {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"})):
+        cases = (("summaries that work", {}), ("a summary that stalls", {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"}),
+                 # A kill slow to start (30 s, far past validate-node's 1 s bound for it and the
+                 # DAG's 5 s reap), as on a loaded host: the node still dies inside 5 s, so the
+                 # kill was cut off at its bound, and bash's own trace shows the node ran it before
+                 # any record keeping.
+                 ("a kill slow to start", {"FAKE_BUCK2_KILL_DELAY": "30"}))
+        observer, trace = self.signal_trace_observer()
+        for number, (name, added) in enumerate(cases):
             with self.subTest(name):
                 kills.unlink(missing_ok=True)
-                order.unlink(missing_ok=True)
-                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills),
-                                                   FAKE_BUCK2_ORDER=str(order), **added)
-                # The daemon stop comes before any record keeping (the stage
-                # summaries ask buck2 to `log show`): the DAG reaps the group
-                # 5 s after its SIGTERM, and record keeping under load once
-                # spent that whole window, leaving the daemon unstopped
-                # (dh-6aaks). This assertion fails on the old order.
-                self.assertEqual(order.read_text().splitlines()[0], "kill",
-                                 "the buck2 daemon was not stopped before keeping records")
+                trace.unlink(missing_ok=True)
+                scratch = self.root / f"tmp-signal-{number}"
+                scratch.mkdir()
+                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills), TMPDIR=str(scratch),
+                                                  BASH_ENV=str(observer), FAKE_SIGNAL_TRACE=str(trace), **added)
                 stderr = (self.root / "node.stderr").read_text()
                 self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
                 # The validation DAG reaps the group 5 s after its SIGTERM.
                 self.assertLess(elapsed, 5, stderr)
+                # The daemon stop comes before any record keeping (the stage summaries ask buck2 to
+                # `log show`): the DAG reaps the group 5 s after its SIGTERM, and record keeping under
+                # load once spent that whole window, leaving the daemon unstopped.
+                self.assert_signal_path_stops_the_daemon_first(trace.read_text(), process.pid)
+                # The node's own rows record the same order, as it attempts each step.
                 phases = self.phases(results)
-                self.assertEqual(phases[-1], "signal TERM")
+                self.assertEqual(phases[-3:], ["signal TERM", "daemon stop", "keeping records"])
                 self.assertFalse([row for row in phases if row.startswith("exit ")], phases)
                 self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
-                if added:
+                if "FAKE_BUCK2_LOG_SHOW_HANGS" in added:
                     self.assertIn("validate-node: the stage summary of the re invocation is incomplete", stderr)
                 else:
                     self.assertEqual((self.kept(results) / "re.stages.txt").read_text(),
                                      stages_test.StagesTest.summary(None, stages_test.two_cells()))
-                self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+                # The trace proved `buck2 kill` ran exactly once. Whether the stand-in got to record
+                # it within the 1 s bound depends on load, so only the slow kill's receipt (which
+                # cannot come before the stand-in's 30 s sleep ends) is pinned.
+                receipt = kills.read_text() if kills.exists() else ""
+                if "FAKE_BUCK2_KILL_DELAY" in added:
+                    self.assertEqual(receipt, "", "the slow kill was not cut off at its bound")
+                else:
+                    self.assertIn(receipt, ("", "kill\n"), "the buck2 daemon was stopped more than once")
+                # A signalled node writes no sidecar, and removes the measurement's work directory
+                # (with its decoded event-log copies) rather than leaving it in $TMPDIR.
+                self.assertEqual(sorted(path.name for path in scratch.glob("buck-measure.*")), [],
+                                 "the signalled node left the measurement's work directory in $TMPDIR")
 
-    def run_as_step(self, results, wall, **added):
+    def signal_trace_observer(self):
+        """A BASH_ENV file that sends the node's xtrace to $FAKE_SIGNAL_TRACE, each line naming
+        the shell's pid and function; return it and the trace's path."""
+        observer = self.root / "trace-signal.sh"
+        observer.write_text('exec 9>>"$FAKE_SIGNAL_TRACE"\nBASH_XTRACEFD=9\n'
+                            "PS4='+signal\t${BASHPID}\t${FUNCNAME[0]:-main}\t'\nset -x\n")
+        return observer, self.root / "signal.trace"
+
+    def assert_signal_path_stops_the_daemon_first(self, trace, pid):
+        """In the node's own shell (PID), on_signal ran `buck2 kill` (bounded at 1 s) and
+        kill_daemon_scope before keep_invocations. Bash writes each trace line before it forks the
+        command, so a stand-in slow to start cannot reorder them."""
+        commands = []
+        for line in trace.splitlines():
+            fields = line.split("\t", 3)
+            if len(fields) == 4 and fields[0].lstrip("+") == "signal" and fields[1:3] == [str(pid), "on_signal"]:
+                commands.append(fields[3].split())
+        kill = ["timeout", "--foreground", "-k", "0.5", "1", str(self.buck2), "kill"]
+        steps = [("buck2 kill", lambda words: words == kill),
+                 ("kill_daemon_scope", lambda words: words == ["kill_daemon_scope"]),
+                 ("keep_invocations", lambda words: words[:1] == ["keep_invocations"])]
+        where = {}
+        for name, matches in steps:
+            found = [index for index, words in enumerate(commands) if matches(words)]
+            self.assertEqual(len(found), 1, f"on_signal ran {name} {len(found)} times: {commands}")
+            where[name] = found[0]
+        self.assertLess(where["buck2 kill"], where["keep_invocations"],
+                        f"on_signal kept records before it stopped the buck2 daemon: {commands}")
+        self.assertLess(where["kill_daemon_scope"], where["keep_invocations"],
+                        f"on_signal kept records before it killed the daemon's scope: {commands}")
+
+    def test_a_node_that_keeps_records_before_stopping_the_daemon_fails_the_order_check(self):
+        # The control: a copy of validate-node whose signal path runs `buck2 kill` and
+        # kill_daemon_scope only after keeping records, with its "daemon stop" row left where it
+        # was. Its rows still read in order, so only the trace check catches it, and it fails on
+        # the order, not on a missing command. The plant finds its lines by content, not
+        # indentation.
+        lines = self.node.read_text().splitlines(keepends=True)
+        start = next(index for index, line in enumerate(lines) if line.startswith("on_signal() {"))
+        end = next(index for index in range(start, len(lines)) if lines[index].rstrip("\n") == "}")
+        body = lines[start:end]
+        stop = [index for index, line in enumerate(body)
+                if line.strip() in ('timeout --foreground -k 0.5 1 "$buck2" kill >/dev/null 2>&1', "kill_daemon_scope")]
+        self.assertEqual(len(stop), 2, "on_signal's daemon stop moved")
+        keep = [index for index, line in enumerate(body) if line.strip().startswith("keep_invocations ")]
+        self.assertEqual(len(keep), 1, "on_signal's record keeping moved")
+        closing = next(index for index in range(keep[0], len(body)) if body[index].strip() == "fi")
+        reordered = ([line for index, line in enumerate(body[:closing + 1]) if index not in stop]
+                     + [body[index] for index in stop] + body[closing + 1:])
+        self.node.write_text("".join(lines[:start] + reordered + lines[end:]))
+        results, kills = self.root / "e2e-results", self.root / "kills"
+        observer, trace = self.signal_trace_observer()
+        process, _elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills), BASH_ENV=str(observer),
+                                           FAKE_SIGNAL_TRACE=str(trace))
+        self.assertEqual(process.returncode, -signal.SIGTERM, (self.root / "node.stderr").read_text())
+        self.assertEqual(self.phases(results)[-3:], ["signal TERM", "daemon stop", "keeping records"])
+        with self.assertRaisesRegex(AssertionError, "kept records before it stopped the buck2 daemon"):
+            self.assert_signal_path_stops_the_daemon_first(trace.read_text(), process.pid)
+
+    def run_as_step(self, results, wall, observe_past_wall=0.0, **added):
         """Run validate-node as the validation DAG runs a step with a WALL-second bound: in its own
         process group, with the start in DAGRUN_STEP_STARTED_MONOTONIC_NS and the bound in
         HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS. Fail if it is still running at the bound, where
-        dagrun would mark it timed out and reap it; return the process and the epoch time when
+        dagrun would mark it timed out and reap it, or OBSERVE_PAST_WALL seconds after it, for a
+        test that is not about the node's exit timing; return the process and the epoch time when
         its exit was observed."""
         started_ns = time.monotonic_ns()
         environment = self.node_environment(str(results), "buck-local", dict(
@@ -1406,7 +1481,7 @@ class ValidateNodeTest(unittest.TestCase):
             process = subprocess.Popen([str(self.node)], stdin=subprocess.DEVNULL, stdout=stderr, stderr=stderr,
                                        env=environment, start_new_session=True)
         try:
-            process.wait(timeout=started_ns / 1e9 + wall - time.monotonic())
+            process.wait(timeout=started_ns / 1e9 + wall + observe_past_wall - time.monotonic())
             # Observe the full node exit, including cleanup, before any caller work. A pause
             # before this capture can still delay the observation; this is not a kernel timestamp.
             observed_exit_at = time.time()
@@ -1425,13 +1500,15 @@ class ValidateNodeTest(unittest.TestCase):
         # The daemon's stop (a stand-in `buck2 kill` that returns 1.5 s before the step's 15 s
         # wall bound) leaves the sidecar write no time: measure_left needs 2 s of the bound. The
         # node then writes no sidecar and removes the measurement's work directory, with the
-        # decoded event-log copy it holds, instead of leaving it in $TMPDIR.
+        # decoded event-log copy it holds, instead of leaving it in $TMPDIR. The test is about that
+        # branch, not the node's exit timing, so it observes the exit up to 30 s past the bound: a
+        # loaded host that slows the last 1.5 s cannot fail it.
         results = self.root / "e2e-results"
         scratch = self.root / "tmp"
         scratch.mkdir()
         kills = self.root / "kills"
         wall = 15
-        process, _ended = self.run_as_step(results, wall, FAKE_BUCK2_KILLS=str(kills),
+        process, _ended = self.run_as_step(results, wall, observe_past_wall=30.0, FAKE_BUCK2_KILLS=str(kills),
                                            FAKE_BUCK2_KILL_UNTIL=str(time.time() + wall - 1.5), TMPDIR=str(scratch))
         stderr = (self.root / "node.stderr").read_text()
         self.assertEqual(process.returncode, 0, stderr)

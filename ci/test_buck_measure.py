@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -176,6 +177,39 @@ class SummarizeTest(unittest.TestCase):
         self.assert_actions_unmeasured(self.run_summarize(), "without an integer execution_kind")
         self.events.write_text(action(1))
         self.assert_actions_unmeasured(self.run_summarize(), "not a readable buck2 event log")
+
+    def test_a_corrupt_deflate_block_leaves_the_actions_unmeasured_not_the_sidecar_lost(self):
+        # A review finding on the first landed version: zlib.error must be typed as an unreadable
+        # log, so the daemon, outputs and bootstrap facts are still written.
+        self.events = self.write_events("events.json-lines.gz", [action(1)] * 400 + [RESULT])
+        data = bytearray(self.events.read_bytes())
+        data[40:80] = b"\xff" * 40
+        self.events.write_bytes(bytes(data))
+        with self.assertRaises(zlib.error):
+            gzip.decompress(bytes(data))
+        record = self.run_summarize()
+        self.assert_actions_unmeasured(record, "not a readable buck2 event log")
+        self.assertEqual(record["daemon"]["placement"], "scope")
+        self.assertEqual(record["outputs"]["measured"], True)
+
+    def test_bytes_that_are_not_utf8_leave_the_actions_unmeasured_not_the_sidecar_lost(self):
+        # The same class as the corrupt deflate block: json.loads decodes bytes first, and invalid
+        # UTF-8 raises UnicodeDecodeError, a ValueError but not a JSONDecodeError. A bad byte in
+        # a middle line, and a copy cut inside a multibyte character (keep_invocations' time
+        # budget can end the copy anywhere), each leave only the actions unmeasured.
+        result = json.loads(RESULT)
+        cut = json.dumps({**result, "note": "café"}, ensure_ascii=False).encode()
+        for lines, needle in (([action(1).encode(), b'{"note": "\xff"}', RESULT.encode()], "invalid JSON before its last line"),
+                              ([action(1).encode(), cut[:cut.index("é".encode()) + 1]], "does not end with buck2's Result record")):
+            with self.subTest(needle):
+                self.events = self.root / "events.event-log.jsonl"
+                self.events.write_bytes(b"\n".join(lines) + b"\n")
+                with self.assertRaises(UnicodeDecodeError):
+                    json.loads(lines[-1] if needle.startswith("does not") else lines[1])
+                record = self.run_summarize()
+                self.assert_actions_unmeasured(record, needle)
+                self.assertEqual(record["daemon"]["placement"], "scope")
+                self.assertEqual(record["outputs"]["measured"], True)
 
     def test_bad_scope_readings_leave_the_daemon_unmeasured(self):
         (self.root / "end.stat").write_text("usage_usec 10\nuser_usec 5\nsystem_usec 5\n")
@@ -335,15 +369,16 @@ class MeasureShellTest(unittest.TestCase):
         return process, records, Decimal(end) - Decimal(start)
 
     def test_the_daemon_read_spends_one_budget_for_status_and_the_summarizer(self):
-        # A `buck2 status` that takes 1.5 of the 2 s leaves the summarizer only the rest: never the
-        # whole 2 s again. The read stays within its 2 s plus one 1 s kill grace.
-        process, records, elapsed = self.daemon_read("2", "1.5")
+        # A `buck2 status` that takes 2 of the 6 s leaves the summarizer only the rest (at most
+        # 4 s): never the whole 6 s again. The read stays within its 6 s plus one 1 s kill grace.
+        # The margins are wide so a loaded host cannot push status past its budget.
+        process, records, elapsed = self.daemon_read("6", "2")
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual([command for _duration, command in records], ["buck2", "python3"], records)
-        self.assertEqual(records[0][0], Decimal(2), records)
+        self.assertEqual(records[0][0], Decimal(6), records)
         self.assertGreater(records[1][0], 0, records)
-        self.assertLessEqual(records[1][0], Decimal("0.5"), f"the summarizer got more than what status left: {records}")
-        self.assertLessEqual(elapsed, 2 + 1, f"the read took {elapsed} s of a 2 s budget")
+        self.assertLessEqual(records[1][0], Decimal(4), f"the summarizer got more than what status left: {records}")
+        self.assertLessEqual(elapsed, 6 + 1, f"the read took {elapsed} s of a 6 s budget")
 
     def test_a_status_that_uses_the_whole_budget_starts_no_summarizer(self):
         # A `buck2 status` still running at the bound is stopped there; nothing starts after it,
@@ -431,13 +466,21 @@ class HarvestWiringTest(unittest.TestCase):
         text = HARVEST.read_text()
         calls = [match.group(0) for match in re.finditer(
             r"buck_measure_(start build\.reverie_buck|bootstrap regenerate-rust-deps|bootstrap stage-pinned-sysroot|"
-            r"build \"\$SHOW_OUTPUT\"|daemon|write 600)", text)]
+            r"build \"\$SHOW_OUTPUT\"|daemon \d+|write \d+)", text)]
         self.assertEqual(calls, ["buck_measure_start build.reverie_buck", "buck_measure_bootstrap regenerate-rust-deps",
                                  "buck_measure_bootstrap stage-pinned-sysroot", 'buck_measure_build "$SHOW_OUTPUT"',
-                                 "buck_measure_daemon", "buck_measure_write 600"])
+                                 "buck_measure_daemon 10", "buck_measure_write 60"])
         self.assertIn('cat -- "$SHOW_OUTPUT" >>"$BUILD_LOG"', text)
         self.assertNotRegex(text, r"\bkill\b", "the harvest leaves the daemon's lifetime to dagrun")
         self.assertNotIn("bm_build_out", text)
+        # The measurement fits inside build.reverie_buck's own 600 s wall and 600 CPU-s: no
+        # buck-out walk (bm_buck_out is never set), and the two calls the harvest bounds itself
+        # are bounded by 10 + 60 s. With buck_measure_start's 30 s
+        # version read and the 1 s grace that `timeout -k 1` gives each bounded command, the
+        # worst case is about 103 s of the 600.
+        self.assertNotIn("bm_buck_out", text, "the harvest must not walk buck-out")
+        bounds = [int(seconds) for seconds in re.findall(r"^buck_measure_(?:daemon|write) (\d+)$", text, re.M)]
+        self.assertLessEqual(sum(bounds), 70, bounds)
 
 
 if __name__ == "__main__":

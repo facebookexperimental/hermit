@@ -135,7 +135,7 @@ class CompareTest(unittest.TestCase):
                                          r"  actions 10, cache hits 4 \(40\.0%\)")
         # 7900 + 0.1 + 0.1 against 7000 + 50 + 0.1: the daemon in the cgroup adds nothing.
         self.assertIn("total: A 7900.2  B 7050.1  B/A 0.892", process.stdout)
-        self.assertIn("2 counted steps in both plans, 6 tests; 0 differences, 0 flaky", process.stdout)
+        self.assertIn("2 counted steps in both plans, 6 tests; 0 differences, 0 retry differences", process.stdout)
         self.assertNotIn("Buck E2E steps", process.stdout)
 
     def test_pass_to_skip_and_skip_to_pass_are_differences(self):
@@ -160,8 +160,42 @@ class CompareTest(unittest.TestCase):
         self.edit_row(self.b, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=1))
         process = self.compare()
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
-        self.assertIn("0 differences, 1 flaky", process.stdout)
-        self.assertIn("test.cli: suite$a: A passed, B passed on attempt 3", process.stdout)
+        self.assertIn("0 differences, 1 retry differences", process.stdout)
+        self.assertIn("test.cli: suite$a: A passed after 1 attempt(s), B after 3", process.stdout)
+
+    def test_the_same_failure_or_skip_after_more_retries_is_not_a_difference(self):
+        # A review finding on the first landed version: the attempt count must not make an
+        # identical outcome a difference.
+        self.write_results(self.a, "test.cli", "101", [row("suite$a", "fail"), row("suite$b"),
+                                                       row("suite$kvm", "skip")])
+        self.edit_row(self.a, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=1))
+        self.write_results(self.b, "test.cli", "201", [row("suite$a", "fail", attempts=3), row("suite$b"),
+                                                       row("suite$kvm", "skip", attempts=2)])
+        self.edit_row(self.b, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=1))
+        process = self.compare()
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertIn("0 differences, 2 retry differences", process.stdout)
+        self.assertIn("test.cli: suite$a: A failed (failed) after 1 attempt(s), B after 3", process.stdout)
+        self.assertIn("test.cli: suite$kvm: A skipped (no /dev/kvm) after 1 attempt(s), B after 2", process.stdout)
+        # A different cause after more retries is still a difference.
+        self.write_results(self.b, "test.cli", "202", [row("suite$a", "fail", attempts=3, cause="cpu_timeout"),
+                                                       row("suite$b"), row("suite$kvm", "skip", attempts=2)])
+        self.edit_row(self.b, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=2))
+        self.assert_difference("test.cli: suite$a: A failed (failed), B failed (cpu_timeout)")
+
+    def test_a_counted_step_that_executed_zero_tests_is_refused(self):
+        # The census never passes a counted node that executed nothing, so zero
+        # tests in either run is no result, never an equal comparison. Zero in B only, in A only
+        # (B's last attempt has its tests again), then in both.
+        self.write_results(self.b, "test.cli", "201", [])
+        self.edit_row(self.b, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=1))
+        self.assert_refused("test.cli.201.results.json: counted step test.cli's last attempt executed zero tests: no result")
+        self.write_results(self.b, "test.cli", "201", self.tests)
+        self.write_results(self.a, "test.cli", "101", [])
+        self.edit_row(self.a, lambda record: next(g for g in record["gates"] if g["name"] == "test.cli").update(retries=1))
+        self.assert_refused("test.cli.101.results.json: counted step test.cli's last attempt executed zero tests: no result")
+        self.write_results(self.b, "test.cli", "201", [])
+        self.assert_refused("executed zero tests: no result")
 
     def test_a_changed_failure_or_a_failure_that_passes_is_a_difference(self):
         self.write_results(self.a, "test.cli", "101", [row("suite$a", "fail")] + self.tests[1:])

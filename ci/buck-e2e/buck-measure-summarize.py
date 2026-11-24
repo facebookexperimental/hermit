@@ -52,6 +52,7 @@ import hashlib
 import json
 import os
 import sys
+import zlib
 from pathlib import Path
 from typing import Iterator
 
@@ -229,13 +230,13 @@ def action_counts(event_logs: list[Path], expected: int | None) -> dict:
                     if last:
                         count_action(json.loads(last), by_kind, log, number - 1)
                     last = line
-            except (OSError, EOFError, gzip.BadGzipFile) as error:
+            except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as error:
                 raise Unmeasured(f"{log}: not a readable buck2 event log: {error}") from error
-            except json.JSONDecodeError as error:
+            except ValueError as error:  # a JSONDecodeError, or a UnicodeDecodeError from bytes not UTF-8
                 raise Unmeasured(f"{log}: invalid JSON before its last line: {error}") from error
             try:
                 final = json.loads(last) if last else None
-            except json.JSONDecodeError:
+            except ValueError:  # as above: also a copy cut inside a multibyte character
                 final = None
             if not isinstance(final, dict) or "Result" not in final:
                 raise Unmeasured(f"{log} does not end with buck2's Result record: the log was cut")

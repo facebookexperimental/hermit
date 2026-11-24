@@ -32,8 +32,14 @@ It prints:
   cells (e2e.manifest_*) are in neither table;
 - every counted test whose final typed outcome differs between the runs, in both directions:
   passed, failed (with the last attempt's cause), diagnostic failure, skipped (with its reason),
-  or absent (no row: not started, ignored or filtered out). A test that passed in both runs but
-  needed retries in one is listed apart as flaky.
+  or absent (no row: not started, ignored or filtered out). A test with the same outcome in both
+  runs but a different number of attempts (a pass that needed retries, or the same failure or
+  skip after more retries) is listed apart as a retry difference; it is not a difference, since
+  retries are routine on loaded hosts.
+
+Limits: actions are counted only for buck2 invocations that keep an event log (the harvest's
+build, the release build and the Buck E2E cell runs; buck-stock's `stage --from-buck` builds keep
+none). buck-hybrid's remote (RE) CPU is in no step's row, so its totals are local CPU only.
 
 Exit status:
 - 0: every counted test has the same outcome in both runs, and every Buck step was measured;
@@ -41,7 +47,8 @@ Exit status:
   only; or a step's recorded selection changed;
 - 2: refused, naming the file: the runs cannot be compared as recorded. That includes a run
   with no counted step; a counted step that did not run, whose last attempt left no start
-  marker, or whose last attempt published no results (killed or refused: no result); a Buck
+  marker, or whose last attempt published no results (killed or refused: no result) or executed
+  zero tests (which the census never passes, so it is no result either); a Buck
   step that ran without a sidecar, with an unmeasured daemon or actions, or more than once (its
   cost is not one build's); a sidecar from a step that holds no buck_daemon unit; and any
   malformed or unreadable input.
@@ -231,6 +238,9 @@ def counted_results(run: Run, tag: str) -> tuple[dict[str, tuple[str, str, int]]
     rows = document["results"]
     need(whole(document["executed_tests"]) and isinstance(rows, list) and len(rows) == document["executed_tests"],
          f"{path}: results does not hold one row per executed test")
+    # The census never lets a counted node that executed nothing pass, so zero is a no-result.
+    need(document["executed_tests"] > 0,
+         f"{path}: counted step {tag}'s last attempt executed zero tests: no result")
     outcomes: dict[str, tuple[str, str, int]] = {}
     for index, row in enumerate(rows):
         where = f"{path}: results[{index}]"
@@ -344,8 +354,10 @@ def compare(run_a: Run, run_b: Run) -> int:
             a, b = outcomes_a.get(test), outcomes_b.get(test)
             if a == b:
                 continue
-            if a is not None and b is not None and a[0] == b[0] == "passed":
-                flaky.append(f"  {tag}: {test}: A {describe(a)}, B {describe(b)}")
+            # The same outcome (kind and cause) with a different number of attempts is a retry
+            # difference, listed apart like a pass that needed retries; it is not a difference.
+            if a is not None and b is not None and a[:2] == b[:2]:
+                flaky.append(f"  {tag}: {test}: A {describe(a)} after {a[2]} attempt(s), B after {b[2]}")
             else:
                 differences.append(f"  {tag}: {test}: A {describe(a)}, B {describe(b)}")
 
@@ -363,10 +375,10 @@ def compare(run_a: Run, run_b: Run) -> int:
         print(f"  total: A {total_a:.1f}  B {total_b:.1f}  B/A {ratio}")
 
     print(f"Test outcomes: {len(shared)} counted steps in both plans, {tests} tests; {len(differences)} differences, "
-          f"{len(flaky)} flaky (passed in both, after retries in one)")
+          f"{len(flaky)} retry differences (the same outcome after a different number of attempts)")
     print("\n".join(differences))
     if flaky:
-        print("Flaky (not a difference):")
+        print("Retry differences (not a difference):")
         print("\n".join(flaky))
     for name, run in (("A", run_a), ("B", run_b)):
         if run.foreign:

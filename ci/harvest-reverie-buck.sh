@@ -52,13 +52,16 @@ else
 fi
 
 # Measure this node's Buck build (ci/buck-e2e/buck-measure.sh): which buck2 ran and how it was
-# chosen, where its daemon ran, the bootstraps' CPU, every action's execution kind, the outputs'
-# sha256 and buck-out's bytes. Record only: a failed measurement costs the sidecar, never the
-# node, and it starts or stops no daemon.
+# chosen, where its daemon ran, the bootstraps' CPU, every action's execution kind and the outputs'
+# sha256. Record only: a failed measurement costs the sidecar, never the node, and it starts or
+# stops no daemon. The measurement fits inside this node's own 600 s wall and 600 CPU-s: it does
+# not walk buck-out (a slow walk on a loaded host could spend the node's budget, so the sidecar
+# records buck-out as not measured by this node), the placement read is capped at 10 s and the
+# sidecar write at 60 s. With buck_measure_start's 30 s version read and the 1 s grace that
+# `timeout -k 1` gives each bounded command, that is at most about 103 s of the 600.
 # shellcheck source-path=SCRIPTDIR source=buck-e2e/buck-measure.sh
 source ci/buck-e2e/buck-measure.sh
 buck_measure_start build.reverie_buck "$BUCK2" "$BUCK2_CHOSEN_BY"
-bm_buck_out=$ROOT_DIR/buck-out
 
 # target| harvested name (the Cargo test-binary stem)
 TARGETS=(
@@ -116,8 +119,8 @@ echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $B
 build_rc=0
 buck_measure_build "$SHOW_OUTPUT" -c hermit.rust_sysroot=pinned-rust-sysroot "${BUCK_TARGETS[@]}" 2>"$BUILD_LOG" || build_rc=$?
 cat -- "$SHOW_OUTPUT" >>"$BUILD_LOG"
-buck_measure_daemon 30
-buck_measure_write 600
+buck_measure_daemon 10
+buck_measure_write 60
 if ((build_rc != 0)); then
   tail -n 30 "$BUILD_LOG" >&2
   echo "harvest-reverie-buck: buck build failed (log retained at $BUILD_LOG)" >&2
