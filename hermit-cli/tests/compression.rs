@@ -8,8 +8,6 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
 
 use std::fs;
 use std::path::Path;
@@ -37,7 +35,7 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
     let artifact_root =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("compression-{}", std::process::id()));
 
-    let (_, output, ()) = skid_overshoot::retry_typed_skid_refusal(
+    let (_, output, ()) = hermit_test::skid_overshoot::retry_typed_skid_refusal(
         "compression",
         SKID_ATTEMPTS,
         || {

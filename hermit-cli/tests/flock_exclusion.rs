@@ -59,8 +59,6 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
-#[path = "common/test_skip.rs"]
-mod test_skip;
 
 use std::fs;
 use std::io::BufRead;
@@ -76,6 +74,8 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+
+use hermit_test::test_skip;
 
 /// `hermit record` writes to shared per-run state; serialize the record/replay
 /// cases the same way `record_replay.rs` does.

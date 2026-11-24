@@ -109,10 +109,10 @@ impl Drop for V3SkipSuppressed {
 /// set the seam variable on the Hermit command, not the test
 /// process, so the command is the first place to look.
 fn command_env(cmd: Option<&Command>, key: &str) -> Option<String> {
-    if let Some(cmd) = cmd {
-        if let Some((_, value)) = cmd.get_envs().find(|(name, _)| *name == key) {
-            return value.and_then(OsStr::to_str).map(str::to_owned);
-        }
+    if let Some(cmd) = cmd
+        && let Some((_, value)) = cmd.get_envs().find(|(name, _)| *name == key)
+    {
+        return value.and_then(OsStr::to_str).map(str::to_owned);
     }
     std::env::var(key).ok()
 }
@@ -157,10 +157,10 @@ pub fn v3_skip_bead(cmd: &Command) -> Option<&'static str> {
             .and_then(|o| o.strip_prefix("--cpu-profile="))
         {
             explicit = Some(profile.to_owned());
-        } else if *option == "--cpu-profile" {
-            if let Some(profile) = options.get(index + 1).and_then(|v| v.to_str()) {
-                explicit = Some(profile.to_owned());
-            }
+        } else if *option == "--cpu-profile"
+            && let Some(profile) = options.get(index + 1).and_then(|v| v.to_str())
+        {
+            explicit = Some(profile.to_owned());
         }
     }
     if explicit.is_none() {

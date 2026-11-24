@@ -70,13 +70,13 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
-#[path = "common/test_skip.rs"]
-mod test_skip;
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+
+use hermit_test::test_skip;
 
 /// Names the directory holding the fixture's distribution files.
 const FIXTURE_ENV: &str = "HERMIT_TEST_V2_ROOTFS";
