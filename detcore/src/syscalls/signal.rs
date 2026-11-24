@@ -178,6 +178,24 @@ fn sigpending_corrected_bytes(kept: KernelSigset, sigsetsize: usize) -> Vec<u8> 
     kept.to_le_bytes()[..sigsetsize.min(KERNEL_SIGSET_SIZE)].to_vec()
 }
 
+/// The set `rt_sigpending` reports: `after_discard`, the kernel-reported
+/// `reported` with each copy Linux discarded at send subtracted, plus every
+/// timer-queued signal it reported. Linux queues a POSIX timer's expiry
+/// (`posix_timer_queue_signal` -> `posixtimer_send_sigqueue`) and
+/// `do_sigpending` reports the queued set without asking whether a dequeue
+/// would deliver the entry,
+/// so a timer entry stays pending even once stale (re-armed far, disarmed
+/// or deleted: `timer_coalesce.c` `stale_*`), and even when its physical
+/// copy stands on one Linux discarded. Only signals the kernel reported
+/// can be restored; a timer entry invents nothing.
+fn sigpending_kept(
+    reported: KernelSigset,
+    after_discard: KernelSigset,
+    timer_queued: KernelSigset,
+) -> KernelSigset {
+    after_discard | (reported & timer_queued)
+}
+
 /// The mask Linux installs when a call names `mask` as the signal mask to sleep
 /// under (`rt_sigsuspend`, `ppoll`, `pselect6`): `set_current_blocked` drops
 /// `SIGKILL` and `SIGSTOP`, which can never be blocked.
@@ -5439,8 +5457,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             let reported = kernel_sigset_from_prefix(&prefix);
             if reported & crate::scheduler::discarded_at_send::STANDARD_SIGNALS != 0 {
                 let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
-                let kept =
+                let after_discard =
                     crate::syscalls::threads::without_discarded(guest, &state, reported, 0).await;
+                // A POSIX timer's queued entry is pending here even when
+                // the discarded record subtracts it for dequeue decisions:
+                // its entry may be stale, or stand on a discarded copy,
+                // and `do_sigpending` reports the queue either way
+                // (`sigpending_kept`). Other pending checks keep the
+                // subtraction unchanged.
+                let timer_queued = match crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::TimerQueued,
+                )
+                .await
+                {
+                    DiscardedSignalAnswer::Bits { thread, process } => thread | process,
+                    _ => unreachable!(),
+                };
+                let kept = sigpending_kept(reported, after_discard, timer_queued);
                 if kept != reported {
                     guest
                         .memory()
@@ -7657,6 +7691,23 @@ mod tests {
         assert_eq!(sigpending_corrected_bytes(0, 4), vec![0u8; 4]);
         assert_eq!(sigpending_corrected_bytes(0, 0), Vec::<u8>::new());
         assert_eq!(sigpending_corrected_bytes(u64::MAX, 9), vec![0xffu8; 8]);
+    }
+
+    #[test]
+    fn sigpending_keeps_timer_queued_signals_but_drops_discarded_standard_ones() {
+        let usr1 = 1_u64 << (libc::SIGUSR1 - 1);
+        let usr2 = 1_u64 << (libc::SIGUSR2 - 1);
+        // Both pending and subtracted as discarded: only the timer-queued
+        // one (USR1, stale_far_handler) stays pending, as Linux reports a
+        // queued POSIX timer entry in do_sigpending even when a dequeue
+        // would skip it as stale.
+        assert_eq!(sigpending_kept(usr1 | usr2, 0, usr1), usr1);
+        // No timer entry: the discarded-at-send subtraction stands.
+        assert_eq!(sigpending_kept(usr1 | usr2, 0, 0), 0);
+        // A timer entry never invents a signal the kernel did not report.
+        assert_eq!(sigpending_kept(usr2, 0, usr1), 0);
+        // A kept copy stays whether or not it is timer-queued.
+        assert_eq!(sigpending_kept(usr1 | usr2, usr2, usr1), usr1 | usr2);
     }
 
     #[test]

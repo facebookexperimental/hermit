@@ -259,6 +259,18 @@ impl DiscardedAtSend {
         self.discarded(queue) & kernel_signal_bit(signal) != 0
     }
 
+    /// The bits of `queue` holding a POSIX timer entry, valid or stale.
+    pub(crate) fn timer_queued(&self, queue: QueueId) -> u64 {
+        (1..32)
+            .filter(|&signal| {
+                self.lists
+                    .entries(queue, signal)
+                    .iter()
+                    .any(|entry| matches!(entry, super::signal_lists::Entry::Timer(_)))
+            })
+            .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
+    }
+
     /// What a sender reads before sending `signal` into `queue`, which held a
     /// copy of it (`present`) as the sender read the kernel's queue.
     pub(crate) fn pre_send(&self, queue: QueueId, signal: i32, present: bool) -> PreSend {
@@ -948,6 +960,13 @@ pub enum DiscardedSignalControl {
         timer: i32,
         now: crate::types::LogicalTime,
     },
+    /// The bits of the calling thread's private queue and of its process's
+    /// shared queue that hold a POSIX timer entry (`signal_lists`), as
+    /// `Bits`. A timer-queued signal is really pending for `rt_sigpending`
+    /// even when its entry is stale or stands on a discarded copy, which
+    /// the `Bits` answer subtracts for dequeue decisions. Last variant:
+    /// this control is serialized, so earlier discriminants must not move.
+    TimerQueued,
 }
 
 /// The answer to a [`DiscardedSignalControl`].
@@ -1571,6 +1590,10 @@ impl Scheduler {
                 let (thread, process) = self.discarded_bits(dtid);
                 DiscardedSignalAnswer::Bits { thread, process }
             }
+            DiscardedSignalControl::TimerQueued => {
+                let (thread, process) = self.timer_queued_bits(dtid);
+                DiscardedSignalAnswer::Bits { thread, process }
+            }
             DiscardedSignalControl::Dequeue { signal, at } => {
                 use super::posix_timer_coalesce::DeliveryAnswer;
                 match self.timer_signal_dequeue(dtid, signal, Some(at)) {
@@ -1878,6 +1901,19 @@ impl Scheduler {
             self.discarded_at_send.discarded(shared) | undeliverable(shared),
         )
     }
+
+    /// The bits of `thread`'s private queue and of its process's shared
+    /// queue that hold a POSIX timer entry, valid or stale (`Entry::Timer`
+    /// in `signal_lists`). Unlike [`Self::discarded_bits`], a stale entry
+    /// counts here: it is undeliverable, not unpending.
+    pub(crate) fn timer_queued_bits(&self, thread: DetTid) -> (u64, u64) {
+        let process = self.thread_tree.process_of(thread).unwrap_or(thread);
+        (
+            self.discarded_at_send.timer_queued(QueueId::Thread(thread)),
+            self.discarded_at_send
+                .timer_queued(QueueId::Process(process)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1897,6 +1933,26 @@ mod tests {
     fn send(record: &mut DiscardedAtSend, queue: QueueId, discarded: bool, present: bool) {
         let pre = record.pre_send(queue, USR1, present);
         record.note_send(queue, USR1, discarded, pre, None);
+    }
+
+    #[test]
+    fn timer_queued_reports_a_timer_entry_in_its_own_queue_only() {
+        let mut record = DiscardedAtSend::default();
+        let entry = crate::scheduler::signal_lists::TimerEntry {
+            process: P,
+            timer: 0,
+            gen_at_send: 1,
+            periodic_at_send: false,
+        };
+        record
+            .lists
+            .append_timer(QueueId::Process(P), USR1, entry, None);
+        let usr1 = kernel_signal_bit(USR1);
+        assert_eq!(record.timer_queued(QueueId::Process(P)), usr1);
+        assert_eq!(record.timer_queued(thread()), 0);
+        // An ordinary pending copy is not timer-queued.
+        send(&mut record, thread(), false, false);
+        assert_eq!(record.timer_queued(thread()), 0);
     }
 
     #[test]
