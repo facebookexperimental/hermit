@@ -36,14 +36,22 @@ def require(ok, message):
 # all, matching Cargo's lto=false), the profiled runtime alias requested at
 # its [cdylib] output, the fbcode x86_64 Linux platform that alias pins, and
 # the exact constraint set of that request, sorted: the runtime target's
-# declared cpu/os compatibility plus the alias's opt build-mode constraint.
+# declared cpu/os compatibility plus the alias's four additional
+# constraints (opt, debug-assertions[on], liteinst-runtime-flags[applied]
+# and ld-as-needed-default-enabled).
 BUCK_RUSTC_FLAGS = ["-Copt-level=3", "-Cdebuginfo=0", "-Cdebug-assertions=yes",
                     "-Coverflow-checks=yes", "-Ccodegen-units=16",
                     "-Cembed-bitcode=no", "-Cpanic=unwind", "-Cstrip=none"]
 BUCK_TARGET = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]"
 BUCK_PLATFORM = "ovr_config//platform/linux:x86_64-fbcode"
-BUCK_CONSTRAINTS = ["ovr_config//build_mode/constraints:opt",
-                    "ovr_config//cpu:x86_64", "ovr_config//os:linux"]
+BUCK_CONSTRAINTS = [
+    "fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[applied]",
+    "fbcode_macros//config/constraints:ld-as-needed-default-enabled",
+    "ovr_config//build_mode/constraints:opt",
+    "ovr_config//cpu:x86_64",
+    "ovr_config//os:linux",
+    "ovr_config//rust:debug-assertions[on]",
+]
 BUCK_ARGV = ["buck2", "build", BUCK_TARGET, "--target-platforms", BUCK_PLATFORM,
              "--show-full-output", "--client-metadata",
              "id=stage-detcore-liteinst"]

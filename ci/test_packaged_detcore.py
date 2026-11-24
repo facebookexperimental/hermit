@@ -41,6 +41,10 @@ import unittest
 # dh-2y5z03 V4.
 EXPORT_REPOSITORY = "facebookexperimental/hermit"
 PROFILE_NAME = "fb-only/liteinst-runtime-profile.bzl"
+# The flags constant's home is the Reverie sibling tree; it is
+# resolved below hermit_root()'s parent (hermetic_infra/ in a
+# checkout, the resources root under Buck).
+REVERIE_CONSTRAINTS_NAME = "reverie/constraints/liteinst-runtime-flags.bzl"
 BUCK_NAME = "BUCK"
 FINALIZER_NAME = "hermit-install/src/bin/stage-detcore-liteinst.rs"
 
@@ -301,7 +305,7 @@ def finalizer_literals(case, root):
 
 def profile_literals(case, root, repository, script_run=None):
     # The profile .bzl: the flag list, the alias platform and its
-    # additional (opt) constraints.
+    # additional constraints.
     profile = export_file_text(root, PROFILE_NAME, repository,
                                "the liteinst-runtime profile comparison",
                                script_run=script_run)
@@ -309,11 +313,27 @@ def profile_literals(case, root, repository, script_run=None):
     case.assertIsNotNone(flags, PROFILE_NAME)
     platform = re.search(r'platform = "([^"]+)"', profile)
     case.assertIsNotNone(platform, PROFILE_NAME)
-    additional = re.search(r"additional_constraints = \[([^\]]*)\]", profile)
+    # The list holds a bracketed value literal
+    # (debug-assertions[on]), so it ends at the platform line that
+    # follows it, not at the first closing bracket.
+    additional = re.search(
+        r"additional_constraints = \[(.*?)\],?\s*\n\s*platform =", profile, re.S)
     case.assertIsNotNone(additional, PROFILE_NAME)
+    additional_text = additional.group(1)
+    additional_values = re.findall(r'"([^"]*)"', additional_text)
+    if "LITEINST_RUNTIME_FLAGS_CONSTRAINT" in additional_text:
+        # The constant's canonical home is the constraints package;
+        # the profile re-exports it without a literal.
+        constraints_bzl = export_file_text(
+            root.parent, REVERIE_CONSTRAINTS_NAME, repository,
+            "the liteinst-runtime profile comparison")
+        match = (re.search(r'LITEINST_RUNTIME_FLAGS_CONSTRAINT = "([^"]+)"', constraints_bzl)
+                 or re.search(r'LITEINST_RUNTIME_FLAGS_CONSTRAINT = "([^"]+)"', profile))
+        case.assertIsNotNone(match, "LITEINST_RUNTIME_FLAGS_CONSTRAINT literal")
+        additional_values.append(match.group(1))
     return {"flags": re.findall(r'"([^"]*)"', flags.group(1)),
             "platform": platform.group(1),
-            "additional": re.findall(r'"([^"]*)"', additional.group(1))}
+            "additional": additional_values}
 
 
 def buck_literals(case, root, repository, script_run=None):
@@ -567,6 +587,17 @@ class ReceiptControls(unittest.TestCase):
             refused(bad)
             bad = copy.deepcopy(good)
             bad["buck_constraints"] = good["buck_constraints"][:-1]
+            refused(bad)
+            # The flags constraint specifically: the other five without
+            # it are not the pinned build either. Neither is the
+            # pre-alias three-constraint set this pin grew from.
+            bad = copy.deepcopy(good)
+            bad["buck_constraints"] = [
+                c for c in good["buck_constraints"] if "liteinst-runtime-flags" not in c]
+            refused(bad)
+            bad = copy.deepcopy(good)
+            bad["buck_constraints"] = ["ovr_config//build_mode/constraints:opt",
+                                       "ovr_config//cpu:x86_64", "ovr_config//os:linux"]
             refused(bad)
             # The executed producer entry binds exactly: program buck2 with
             # arguments == buck_argv[1:], and readelf/objdump entries over
@@ -852,7 +883,11 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text(
                 f"LITEINST_RUNTIME_RUSTC_FLAGS = [{quoted}]\n"
-                'additional_constraints = ["ovr_config//build_mode/constraints:opt"]\n'
+                'additional_constraints = ['
+                '"fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[applied]", '
+                '"fbcode_macros//config/constraints:ld-as-needed-default-enabled", '
+                '"ovr_config//build_mode/constraints:opt", '
+                '"ovr_config//rust:debug-assertions[on]"]\n'
                 f'platform = "{verifier.BUCK_PLATFORM}"\n')
         if buck:
             (root / BUCK_NAME).write_text(

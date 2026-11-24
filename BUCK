@@ -240,11 +240,15 @@ rust_library(
 # liteinst-runtime-profile.bzl), for the staging genrule below. Request
 # :detcore-liteinst-liteinst-runtime[cdylib] explicitly, as with
 # :detcore-liteinst. The open-source build pins the shim liteinst-runtime
-# platform, which applies the profile's exact flags to the whole closure;
-# fbcode pins its x86_64 Linux platform plus opt and does NOT deliver
-# those flags (the profile file's LITEINST_RUNTIME_FLAGS_APPLIED = False;
-# the finalizer refuses to emit a Buck receipt while that holds). No
-# default target references this alias.
+# platform; what its toolchain delivers there is as the landed shim
+# code states and is not measured here -- in fbcode the three
+# select-gated flags reach targets only through the per-target
+# selects. fbcode pins its
+# x86_64 Linux platform plus its four liteinst-runtime constraints,
+# whose closure-wide flag delivery is still unmeasured (the
+# profile file's LITEINST_RUNTIME_FLAGS_APPLIED = False; the finalizer
+# refuses to emit a Buck receipt while that holds). No default target
+# references this alias.
 detcore_liteinst_runtime_alias(
     name = "detcore-liteinst-liteinst-runtime",
     actual = ":detcore-liteinst",

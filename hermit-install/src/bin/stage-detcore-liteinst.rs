@@ -226,14 +226,19 @@ struct BuckArgs {
 /// rather than emitting a receipt its own reader would reject. The target
 /// is the profiled `detcore-liteinst-liteinst-runtime` alias at its
 /// `[cdylib]` output; the constraints, sorted, are the runtime target's
-/// declared cpu/os compatibility plus that alias's opt build-mode
-/// constraint (`fb-only/liteinst-runtime-profile.bzl`).
+/// declared cpu/os compatibility plus that alias's four additional
+/// constraints: the opt build mode, `debug-assertions[on]`,
+/// `liteinst-runtime-flags[applied]` and `ld-as-needed-default-enabled`
+/// (`fb-only/liteinst-runtime-profile.bzl`).
 const BUCK_TARGET: &str = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]";
 const BUCK_PLATFORM: &str = "ovr_config//platform/linux:x86_64-fbcode";
-const BUCK_CONSTRAINTS: [&str; 3] = [
+const BUCK_CONSTRAINTS: [&str; 6] = [
+    "fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[applied]",
+    "fbcode_macros//config/constraints:ld-as-needed-default-enabled",
     "ovr_config//build_mode/constraints:opt",
     "ovr_config//cpu:x86_64",
     "ovr_config//os:linux",
+    "ovr_config//rust:debug-assertions[on]",
 ];
 /// Workspace-relative entries `resolve_buck` requires in the pinned
 /// workspace inventory beyond the CLI-declared sources: the declaring
@@ -505,14 +510,18 @@ fn parse_buck_output(stdout: &str) -> proof::Result<PathBuf> {
 /// A receipt may list `LITEINST_RUNTIME_RUSTC_FLAGS` only when the
 /// supplied profile actually delivers them to the transitive closure.
 /// The profile `.bzl` states this as `LITEINST_RUNTIME_FLAGS_APPLIED`:
-/// the fbcode profile sets it `False` — `fbcode_configured_alias`
-/// transitions platform and constraints only, it has no rustc-flags
-/// parameter, and no fbcode build-mode constraint encodes this flag
-/// list (the Reverie authority also pins exactly the alias's three
-/// constraints, so none can be added here) — while the OSS shim profile,
-/// whose toolchain select applies the list, sets it `True`. Checked at
-/// receipt publication, where the flags would be listed: anything but
-/// an explicit `True` refuses by name and no receipt is emitted.
+/// the fbcode profile sets it `False` — the alias's toolchain
+/// constraints and the closure's per-target selects are expected to
+/// deliver the list, but no fbsource-built ELF has been measured
+/// against it, and the served-closure drift check
+/// (`fb-only/check-liteinst-runtime-closure.py` against
+/// `fb-only/liteinst-runtime-own-closure.txt`) must also pass before
+/// it may become `True`. In fbcode the per-target selects are
+/// the only path for the three select-gated flags; what the
+/// open-source shim's toolchain delivers is as the landed shim
+/// code states and is not measured here. Checked at receipt
+/// publication, where the flags would be listed: anything but an
+/// explicit `True` refuses by name and no receipt is emitted.
 fn require_profile_flags_applied(contents: &str) -> proof::Result<()> {
     require(
         contents
@@ -1432,6 +1441,12 @@ mod tests {
             BUCK_CONSTRAINTS[1],
             "--buck-constraint",
             BUCK_CONSTRAINTS[2],
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[3],
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[4],
+            "--buck-constraint",
+            BUCK_CONSTRAINTS[5],
             "--buck-cwd",
             "fbcode",
             "--workspace-file",
@@ -1529,6 +1544,33 @@ mod tests {
         );
         let mut args = buck_args_fixture();
         args.buck_constraints.reverse();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned runtime constraints")
+        );
+        // The pinned set is exactly six: an extra constraint, a
+        // misspelled flags constraint, and the five without the flags
+        // constraint refuse by the same named check.
+        let mut args = buck_args_fixture();
+        args.buck_constraints
+            .push("ovr_config//os:linux-extra".into());
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned runtime constraints")
+        );
+        let mut args = buck_args_fixture();
+        args.buck_constraints[0] =
+            "fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[aplied]".into();
+        assert!(
+            validate_buck_args(&args)
+                .unwrap_err()
+                .contains("pinned runtime constraints")
+        );
+        let mut args = buck_args_fixture();
+        args.buck_constraints
+            .retain(|constraint| !constraint.contains("liteinst-runtime-flags"));
         assert!(
             validate_buck_args(&args)
                 .unwrap_err()
