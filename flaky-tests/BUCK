@@ -134,10 +134,13 @@ cpp_unittest(
     srcs = [
         "use_configurable_flaky_service.cpp",
     ],
-    # A deliberately flaky fixture: the remote service fails on purpose and the
-    # client crashes on large errors. Keep it out of CI.
+    # A deliberately flaky fixture: the local fake service fails about half
+    # its requests on purpose and the client crashes on large errors. Keep
+    # it out of CI. Loopback only; no external network or credentials.
     labels = [tpx_labels.local_only],
-    network_access = network_access_utils.all(),
+    # In-process client and server in one private namespace; reaches no
+    # host or external network.
+    network_access = network_access_utils.private(),
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only. The
     # open-source Buck build's shim has no curl.
     target_compatible_with = [
