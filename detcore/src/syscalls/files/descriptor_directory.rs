@@ -914,6 +914,33 @@ fn caller_fd_name_is_malformed(link: &Path, own: Option<(i32, i32)>) -> bool {
         .is_none()
 }
 
+/// An absolute walk `current` after following the symbolic link at
+/// its component ending at `link_end`, whose target is `target`: an
+/// absolute target replaces the walk up to the link, a relative one
+/// is named from the link's own directory, and the suffix after the
+/// link follows either (fs/namei.c: a link's target is walked where
+/// the link stands). Kept byte for byte otherwise.
+fn spliced_after_link(current: &[u8], link_end: usize, target: &[u8]) -> Vec<u8> {
+    let suffix = &current[link_end..];
+    let mut next = if target.starts_with(b"/") {
+        target.to_vec()
+    } else {
+        let prefix = &current[..link_end];
+        let parent = match prefix.iter().rposition(|byte| *byte == b'/') {
+            Some(0) | None => &b"/"[..],
+            Some(index) => &prefix[..index],
+        };
+        let mut joined = parent.to_vec();
+        if !joined.ends_with(b"/") {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(target);
+        joined
+    };
+    next.extend_from_slice(suffix);
+    next
+}
+
 /// The respelling of one absolute guest path that leads through a
 /// descriptor link of the caller's own (`/proc/self/fd/N/...`,
 /// `/proc/thread-self/fd/N/...`, `/dev/fd/N/...`, the caller's own
@@ -5544,6 +5571,125 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some((state.detpid?.as_raw(), state.dettid.as_raw()))
     }
 
+    /// The target of the symbolic link at the absolute guest path
+    /// `path`, by one injected `readlinkat` in the guest's context (so
+    /// the executor beneath reads the guest's link, never its own
+    /// files), staged in a transient page rather than the guest stack
+    /// scratch the forwarded call may still need, or `None` where it
+    /// is no link, is absent, or its target does not fit the staged
+    /// probe: the lookup then proceeds as it was spelled,
+    /// fail-closed at the executor as today.
+    async fn guest_fd_link_target<G: Guest<Self>>(guest: &mut G, path: &[u8]) -> Option<Vec<u8>> {
+        // The staged probe must fit a backend's guest-stack scratch
+        // (KVM's is 4096 bytes): a link whose path or target does not
+        // fit is left as spelled, fail-closed at the executor.
+        const PATH_PART: usize = 512;
+        const TARGET_PART: usize = 1024;
+        if path.is_empty() || path.len() >= PATH_PART {
+            return None;
+        }
+        let mut buffer = [0_u8; PATH_PART + TARGET_PART];
+        buffer[..path.len()].copy_from_slice(path);
+        let linked = crate::syscalls::scratch::inject_in_transient_page(guest, buffer, |base| {
+            // SAFETY: the buffer holds a path half and a target half.
+            let target = unsafe { base.add(PATH_PART) };
+            syscalls::Readlinkat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_buf(Some(target.cast::<libc::c_char>()))
+                .with_buf_len(TARGET_PART)
+                .into()
+        })
+        .await;
+        let (length, buffer) = linked.ok()?;
+        let length = usize::try_from(length).ok()?;
+        if length == 0 || length >= TARGET_PART {
+            return None;
+        }
+        Some(buffer[PATH_PART..PATH_PART + length].to_vec())
+    }
+
+    /// [`Self::guest_fd_respelled`] where the descriptor component is
+    /// reached only through a symbolic link on the way (`link/F` with
+    /// `link` a link to `/proc/self/fd/N`, chains of them): the walk is
+    /// replayed in Detcore, one injected `readlinkat` per link, each
+    /// target spliced where its link stands
+    /// ([`spliced_after_link`]) and the spliced spelling decided again
+    /// ([`Self::guest_fd_respelled_absolute`]), at most `MAXSYMLINKS`
+    /// links in all before `ELOOP`, as Linux's walk answers past it
+    /// (fs/namei.c `pick_link`). Only where the executor is beneath
+    /// the injection ([`PlaceholderObject::Placeholder`], KVM): where
+    /// the guest's kernel or the in-guest runtime resolves the path,
+    /// it already walks these links in the guest's own context, and
+    /// no second walk is made. A final component the call does not
+    /// follow is not read as a link, so `O_NOFOLLOW` keeps its native
+    /// `ELOOP`. Spellings under `/proc` or `/dev` are not walked: the
+    /// executor's own objects there are not the guest's links, and a
+    /// descriptor component spelled there is the lexical decision's.
+    async fn guest_fd_respelled_through_links<G: Guest<Self>>(
+        guest: &mut G,
+        absolute: &[u8],
+        own: (i32, i32),
+        follows: bool,
+    ) -> Result<Option<(RawFd, Vec<u8>)>, Errno> {
+        if Self::placeholder_object(guest) != PlaceholderObject::Placeholder {
+            return Ok(None);
+        }
+        let guest_spelled = |path: &[u8]| {
+            !path.starts_with(b"/proc/") && path != b"/proc" && !path.starts_with(b"/dev/")
+        };
+        if !guest_spelled(absolute) {
+            return Ok(None);
+        }
+        let mut current = absolute.to_vec();
+        let mut followed_links = 0;
+        loop {
+            if let Some(respelled) =
+                Self::guest_fd_respelled_absolute(guest, &current, own, follows, followed_links)?
+            {
+                return Ok(Some(respelled));
+            }
+            if !guest_spelled(&current) {
+                return Ok(None);
+            }
+            // The end of each component of the walk, in order.
+            let mut ends = Vec::new();
+            let mut at = 0;
+            while at < current.len() {
+                if current[at] == b'/' {
+                    at += 1;
+                    continue;
+                }
+                let start = at;
+                while at < current.len() && current[at] != b'/' {
+                    at += 1;
+                }
+                if &current[start..at] != b"." {
+                    ends.push(at);
+                }
+            }
+            let mut spliced = false;
+            for (index, end) in ends.iter().enumerate() {
+                if index + 1 == ends.len() && !follows {
+                    break;
+                }
+                let Some(target) = Self::guest_fd_link_target(guest, &current[..*end]).await else {
+                    continue;
+                };
+                followed_links += 1;
+                if followed_links > LINK_LIMIT {
+                    return Err(Errno::ELOOP);
+                }
+                current = spliced_after_link(&current, *end, &target);
+                spliced = true;
+                break;
+            }
+            if !spliced {
+                return Ok(None);
+            }
+        }
+    }
+
     /// `path`, looked up from `dirfd` (`None` for a call that looks it up
     /// from the working directory or the root), respelled where it leads
     /// through a descriptor link of the caller's own to a descriptor that
@@ -5561,6 +5707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// and its native-`ELOOP` cases.
     async fn guest_fd_respelled<G: Guest<Self>>(
         guest: &mut G,
+        sysno: Sysno,
         dirfd: Option<RawFd>,
         path: &[u8],
         follows: bool,
@@ -5586,7 +5733,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => return Ok(None),
             }
         };
-        Self::guest_fd_respelled_absolute(guest, &absolute, own, follows, 0)
+        match Self::guest_fd_respelled_absolute(guest, &absolute, own, follows, 0)? {
+            Some(respelled) => Ok(Some(respelled)),
+            // The link walk's probes are made only for a call that opens
+            // or stats what it names: a forwarded `readlinkat` is
+            // Detcore's own probe of a link as often as the guest's,
+            // and it names a link itself, whose exact descriptor
+            // spelling the lexical decision above already covers.
+            None if matches!(
+                sysno,
+                Sysno::openat
+                    | Sysno::openat2
+                    | Sysno::statx
+                    | crate::arch::FSTATAT
+                    | Sysno::faccessat
+                    | Sysno::faccessat2
+            ) =>
+            {
+                Self::guest_fd_respelled_through_links(guest, &absolute, own, follows).await
+            }
+            None => Ok(None),
+        }
     }
 
     /// [`Self::guest_fd_respelled`] of an absolute spelling the walk has
@@ -5702,7 +5869,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // forms in any case).
             if let Some(dirfd_index) = dirfd_index
                 && let Some((fd, remainder)) =
-                    Self::guest_fd_respelled(guest, dirfd, &path, follows).await?
+                    Self::guest_fd_respelled(guest, sysno, dirfd, &path, follows).await?
             {
                 if remainder.len() >= PATH_LIMIT {
                     return Err(Errno::ENAMETOOLONG);
@@ -7111,6 +7278,37 @@ mod tests {
         assert!(at(38).is_ok_and(|decision| decision.is_some()));
         assert_eq!(at(39), Err(Errno::ELOOP));
         assert_eq!(at(40), Err(Errno::ELOOP));
+    }
+
+    /// A symbolic link's target is walked where the link stands:
+    /// absolute targets replace the walk, relative ones are named
+    /// from the link's directory, and the spliced spelling is what
+    /// the descriptor decision then sees (fdlink cases (b) and (e)).
+    #[test]
+    fn guest_fd_link_targets_splice_into_the_walk() {
+        let own = Some((123, 456));
+        let decide = |path: &[u8]| guest_fd_respell_decision(path, own, true, 1, |_| true);
+        // (b) link -> /proc/self/fd/7, looked up as link/F in /work.
+        let spliced = spliced_after_link(b"/work/link/F", 10, b"/proc/self/fd/7");
+        assert_eq!(spliced, b"/proc/self/fd/7/F".to_vec());
+        assert_eq!(decide(&spliced), Ok(Some((7, b"F".to_vec()))));
+        // (e) link2 -> link (relative), then link -> /proc/self/fd/7.
+        let first = spliced_after_link(b"/work/link2/F", 11, b"link");
+        assert_eq!(first, b"/work/link/F".to_vec());
+        let second = spliced_after_link(&first, 10, b"/proc/self/fd/7");
+        assert_eq!(decide(&second), Ok(Some((7, b"F".to_vec()))));
+        // (c) rel -> . names the same directory: no descriptor, and
+        // the walk goes on from the link's own directory.
+        assert_eq!(
+            spliced_after_link(b"/work/rel/F", 9, b"."),
+            b"/work/./F".to_vec()
+        );
+        assert_eq!(decide(b"/work/./F"), Ok(None));
+        // A target below the root, and a relative target at the root.
+        assert_eq!(
+            spliced_after_link(b"/link/F", 5, b"proc/self/fd/7"),
+            b"/proc/self/fd/7/F".to_vec()
+        );
     }
 
     #[test]
