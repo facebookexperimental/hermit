@@ -199,6 +199,80 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
+    def test_pwd_spelled_nextest_run_registers_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "CARGO_BUILD_JOBS=8 ./ci/run-with-core-build.sh "
+            "$PWD/ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --test zz_probe -j 1",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
+    def test_pwd_spelled_kvm_gap_ledger_run_registers_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "$PWD/ci/kvm-gap-ledger.rs run -- ${CI:+--profile ci} -p hermit-run "
+            "--features third-party-backends,kvm-execution-tests --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
+    def test_other_runner_spelling_fails_the_audit_by_name(self) -> None:
+        for spelling in (
+            "ci/run-nextest-counted.sh",
+            "${PWD}/ci/run-nextest-counted.sh",
+            "/abs/ci/run-nextest-counted.sh",
+            "ci/kvm-gap-ledger.rs",
+            # Whole shell words compare, quotes and suffixes included: a
+            # quoted or suffixed path is an other spelling, refused whole.
+            '"$PWD/ci/run-nextest-counted.sh"',
+            "'./ci/run-nextest-counted.sh'",
+            "$PWD/ci/run-nextest-counted.sh.orig",
+            "$PWD/ci/run-nextest-counted.sh/../../evil",
+        ):
+            with self.subTest(spelling=spelling):
+                result = self._plant_probe_with_dag_command(
+                    f"{spelling} -p hermit-run --test zz_probe -j 1",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("unrecognized spelling", result.stderr)
+                self.assertIn(spelling, result.stderr)
+
+    def test_other_spelling_without_declaration_fails_for_the_spelling(
+        self,
+    ) -> None:
+        # The originally blind case, on an ALREADY REGISTERED binary: a
+        # second step re-runs `registered` through a quoted runner spelling
+        # with no declaration of its own. Without the spelling check the
+        # old audit passed this silently (rc 0: the quoted invocation
+        # executed nothing it could see, and the binary was accounted
+        # through the first step); now the spelling itself refuses it.
+        (self.root / "ci/dag/validate.json").write_text(
+            '{"steps":['
+            '{"group":"test","job":"registered",'
+            '"cmd":"./ci/run-nextest-counted.sh -p hermit-run --test registered",'
+            '"integration_test_binaries":["registered"]},'
+            '{"group":"test","job":"registered_again",'
+            '"cmd":"\\"$PWD/ci/run-nextest-counted.sh\\" -p hermit-run --test registered"}'
+            "]}\n"
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+
+        result = self.audit()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("unrecognized spelling", result.stderr)
+        self.assertIn('"$PWD/ci/run-nextest-counted.sh"', result.stderr)
+
+    def test_echoed_pwd_invocation_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "echo $PWD/ci/run-nextest-counted.sh -p hermit-run --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("integration_test_binaries", result.stderr)
+
     def test_nextest_no_run_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "cargo nextest run -p hermit-run --test zz_probe --no-run",

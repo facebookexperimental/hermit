@@ -4982,7 +4982,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_FLAG_MATRIX_REPORT=$PWD/target/relaxed-flag-matrix/results.tsv $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test relaxed_flag_matrix meaningful_flag_combinations_run_without_crashing -j 1 --no-capture -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"relaxed_flag_matrix"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5133,7 +5133,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test pselect6_simulation -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"pselect6_simulation"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5162,7 +5162,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test record_replay record_replay_matrix -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"record_replay"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5191,7 +5191,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test app_strict_verify java -j 1 --no-capture -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"app_strict_verify"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5278,7 +5278,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"ipc_determinism"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5307,7 +5307,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"random_determinism"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5336,7 +5336,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test integration_matrix -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"integration_matrix"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5365,7 +5365,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes hello_race_chaos_verify -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"hermit_modes"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5394,7 +5394,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes default_ -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"hermit_modes"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5423,7 +5423,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test stress_suite -j 1 -- --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"stress_suite"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5452,7 +5452,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test stress_suite -j 1 -- --ignored --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"stress_suite"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5481,7 +5481,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes chaos_buck_ -j 1 -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"hermit_modes"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {
@@ -5598,7 +5598,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_LEVELDB_BUILD_DIR=$PWD/target/hermit-leveldb-build-super $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test leveldb full_leveldb_suite_is_deterministic_under_strict -j 1 -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"leveldb"########]),
         deps: &[r########"super.build_pinned_leveldb_super_fixture"########],
         env: &[],
         hint: HintSpec {
@@ -5627,7 +5627,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -j 1 -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: None,
+        integration_test_binaries: Some(&[r########"sqlite_veryquick"########]),
         deps: &[r########"super.build_workspace"########],
         env: &[],
         hint: HintSpec {

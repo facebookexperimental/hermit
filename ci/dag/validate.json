@@ -31490,6 +31490,9 @@
           "owner": "super.relaxed_hermit_flag_matrix"
         }
       ],
+      "integration_test_binaries": [
+        "relaxed_flag_matrix"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -31720,6 +31723,9 @@
           "owner": "super.pselect_signal_interruption_diagnostic"
         }
       ],
+      "integration_test_binaries": [
+        "pselect6_simulation"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -31766,6 +31772,9 @@
           "owner": "super.record_replay_matrix_diagnostic"
         }
       ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -31811,6 +31820,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.managed_jvm_strict_verify_diagnostics"
         }
+      ],
+      "integration_test_binaries": [
+        "app_strict_verify"
       ],
       "deps": [
         "pre.reverie_pin",
@@ -31950,6 +31962,9 @@
           "owner": "super.ipc_determinism_diagnostic"
         }
       ],
+      "integration_test_binaries": [
+        "ipc_determinism"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -31995,6 +32010,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.random_source_determinism_diagnostic"
         }
+      ],
+      "integration_test_binaries": [
+        "random_determinism"
       ],
       "deps": [
         "pre.reverie_pin",
@@ -32042,6 +32060,9 @@
           "owner": "super.threaded_integration_matrix_diagnostic"
         }
       ],
+      "integration_test_binaries": [
+        "integration_matrix"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -32087,6 +32108,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.chaos_hello_race_verification_diagnostic"
         }
+      ],
+      "integration_test_binaries": [
+        "hermit_modes"
       ],
       "deps": [
         "pre.reverie_pin",
@@ -32134,6 +32158,9 @@
           "owner": "super.weekly_relaxed_default_mode_cases"
         }
       ],
+      "integration_test_binaries": [
+        "hermit_modes"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -32179,6 +32206,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_portable_chaos_cases"
         }
+      ],
+      "integration_test_binaries": [
+        "stress_suite"
       ],
       "deps": [
         "pre.reverie_pin",
@@ -32226,6 +32256,9 @@
           "owner": "super.weekly_ignored_portable_chaos_cases"
         }
       ],
+      "integration_test_binaries": [
+        "stress_suite"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -32271,6 +32304,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.pmu_buck_chaos_cases"
         }
+      ],
+      "integration_test_binaries": [
+        "hermit_modes"
       ],
       "deps": [
         "pre.reverie_pin",
@@ -32402,6 +32438,9 @@
           "owner": "super.full_leveldb_strict_determinism"
         }
       ],
+      "integration_test_binaries": [
+        "leveldb"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -32447,6 +32486,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.sqlite_veryquick_strict_determinism"
         }
+      ],
+      "integration_test_binaries": [
+        "sqlite_veryquick"
       ],
       "deps": [
         "pre.reverie_pin",

@@ -43,11 +43,30 @@ from dagrun import dag_from_json, DagJsonError  # noqa: E402
 DECLARATIONS = Path("ci/undeclared-test-binaries.tsv")
 DAG_GLOB = "ci/dag/*.json"
 
+# The counted runner and the KVM gap ledger are spelled two ways in the DAG
+# (`./ci/...` and `$PWD/ci/...`); both register.  Any other spelling of either
+# script in a step command refuses the audit by name (see
+# unrecognized_runner_spellings): an unrecognized spelling must never again
+# make a node's executed targets invisible the way $PWD once did.  Spellings
+# compare as whole shell words, quotes and suffixes included, so a quoted or
+# suffixed path is an other spelling, never an audited one.
+_AUDITED_RUNNER_SPELLINGS = frozenset(
+    {
+        "./ci/run-nextest-counted.sh",
+        "$PWD/ci/run-nextest-counted.sh",
+        "./ci/kvm-gap-ledger.rs",
+        "$PWD/ci/kvm-gap-ledger.rs",
+    }
+)
+_RUNNER_TOKEN_RE = re.compile(
+    r"[^\s;&|()<>]*(?:run-nextest-counted\.sh|kvm-gap-ledger\.rs)[^\s;&|()<>]*"
+)
 # Restrict registration to the hermit-cli package.  A similarly named target in
 # hermit-detcore is not evidence that the hermit-cli binary ran.
 _HERMIT_INVOCATION_RE = re.compile(
-    r"(?:cargo (?:test|nextest run)|\./ci/run-nextest-counted\.sh"
-    r"|\./ci/kvm-gap-ledger\.rs run --)"
+    r"(?:cargo (?:test|nextest run)|(?:\./|\$PWD/)ci/run-nextest-counted\.sh"
+    r"(?![^\s;&|()<>\"])|(?:\./|\$PWD/)ci/kvm-gap-ledger\.rs"
+    r"(?![^\s;&|()<>\"]) run --)"
     r"[^\"\n]*?-p hermit-run(?!-)[^\"\n]*"
 )
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")
@@ -130,6 +149,22 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
     return True
 
 
+def unrecognized_runner_spellings(command: str) -> list[str]:
+    """Runner-script spellings in `command` the audit does not recognize.
+
+    Every token naming the counted runner or the KVM gap ledger must use an
+    audited spelling; any other spelling is returned so the audit can refuse
+    it by name instead of silently seeing no invocation there.
+    """
+    return sorted(
+        {
+            token
+            for token in _RUNNER_TOKEN_RE.findall(command)
+            if token not in _AUDITED_RUNNER_SPELLINGS
+        }
+    )
+
+
 def executed_test_targets(command: str) -> set[str]:
     """`--test` targets of hermit-cli invocations this command really executes."""
     found: set[str] = set()
@@ -192,6 +227,18 @@ def registered_targets(root: Path) -> set[str]:
                 f"cannot parse {path.relative_to(root)}: {error}"
             ) from error
         for step in config.steps:
+            # The spelling refusal runs BEFORE the executed-targets read:
+            # _HERMIT_INVOCATION_RE has no left boundary, so
+            # executed_test_targets alone would register /opt/$PWD/ci/...;
+            # keep this order.
+            unrecognized = unrecognized_runner_spellings(step.cmd)
+            if unrecognized:
+                raise ValueError(
+                    f"{path.relative_to(root)} step {step.tag} names a test "
+                    f"runner in unrecognized spelling(s) {unrecognized!r}: "
+                    "only ./ci/... and $PWD/ci/... spellings are audited; "
+                    "respell the command or teach the audit the new spelling"
+                )
             executed = executed_test_targets(step.cmd)
             declared = step.integration_test_binaries
             if declared is None:
