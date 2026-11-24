@@ -468,27 +468,6 @@ class CargoCacheMounts(unittest.TestCase):
             ],
         )
 
-    def test_tmp_is_a_tmpfs_mount(self):
-        # Linkers and the test harness create temporary files in /tmp. The
-        # image provides /tmp as an empty overlay directory; creating files
-        # in it failed with ENOENT in pinned containers during the
-        # post-reboot window of the 2026-11-24 d4a16cb5 post-land, failing
-        # every large link with "Cannot create temporary file in /tmp/".
-        # A tmpfs mountpoint cannot be lost that way. Its pages count
-        # against the node cgroup like the /test tmpfs.
-        result, calls = self.invoke()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        argv = calls[1]
-        self.assertEqual(argv[0], "run")
-        tmpfs = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--tmpfs"]
-        self.assertIn("/tmp:rw,exec,nosuid,nodev,mode=1777", tmpfs)
-        self.assertIn("/test:rw,nosuid,nodev,mode=1777", tmpfs)
-        self.assertEqual(sum(value.startswith("/tmp:") for value in tmpfs), 1)
-        image = argv.index(
-            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-        )
-        self.assertLess(argv.index("/tmp:rw,exec,nosuid,nodev,mode=1777"), image)
-
     def test_payload_takes_no_optional_git_locks(self):
         # A read-only `git status` in one node otherwise creates and deletes
         # .git/index.lock in a Cargo git checkout that another node is copying

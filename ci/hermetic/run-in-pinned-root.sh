@@ -867,18 +867,6 @@ done <<< "$proc_status"
     exit 2
 }
 
-# /tmp is a tmpfs mountpoint, not the image overlay's empty /tmp directory:
-# in the transient post-reboot window of the 2026-11-24 d4a16cb5 post-land,
-# creating files in that overlay /tmp failed with ENOENT in pinned
-# containers and every large link failed with "Cannot create temporary
-# file in /tmp/". A mountpoint cannot be lost that way. Tmpfs pages are
-# charged to this node's cgroup, and with swap.max=0 they cannot be
-# evicted; no size= is set, because the kernel default is half of RAM and a
-# node reaches its own memory cap first. This host's tmpfs default,
-# huge=within_size, gives files of 2 MiB or more a 2 MiB st_blksize to
-# non-Hermit processes in the container; Hermit pins its guests at 4096.
-# exec is explicit: doctests and exec fixtures run files from /tmp, and
-# Podman's documented --tmpfs default includes noexec.
 exec podman run --rm \
     --pull=never \
     --init \
@@ -888,7 +876,6 @@ exec podman run --rm \
     "${device_args[@]}" \
     --network=none \
     --http-proxy=false \
-    --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777 \
     --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/src/target" \
