@@ -44,8 +44,10 @@
 # `--e2e [DRIVER_ARGS...]` instead runs the REAL front door on this checkout's
 # REAL driver, detached the same way: the human route end to end, compiling
 # the driver and running the DAG off the record (default `--quick`, which
-# builds Hermit; `--only portable pre.submodules` runs one cheap node). It is
-# deliberately not part of the default run, which stays cheap.
+# builds Hermit; `--only portable pre.submodules` runs just the portable
+# preflight: the checkout gates, the rust-script and manifest-plan builds and
+# gate.manifest). It is deliberately not part of the default run, which stays
+# cheap.
 #
 # Exit status: 0 every case passed (named skips allowed); 1 a case failed;
 # 2 usage error.

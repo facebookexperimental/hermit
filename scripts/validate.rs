@@ -1880,9 +1880,14 @@ fn usage() -> &'static str {
      \x20                                the GitHub portable shard runner.\n\
      \x20 --hosted-privileged-only      Select the committed 12-node privileged host graph.\n\
      \x20 --requalify-cell TEST MODE BACKEND  Run the committed DAG step owning that exact cell.\n\
-     \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
-     \x20                  declared caps; outside deps are dropped; preflight tags\n\
-     \x20                  reuse validate's canonical preflight nodes.\n\
+     \x20 --only <lane> <group.job>[,...]  Run those node(s) with their own\n\
+     \x20                  declared caps, and every node they depend on (declared\n\
+     \x20                  deps and artifact producers, transitively), plus the\n\
+     \x20                  lane's canonical preflight nodes. The plan is the same\n\
+     \x20                  on and off the record, except that on the record it\n\
+     \x20                  also runs the driver's own self-test where the lane\n\
+     \x20                  has it. A dependency that cannot be selected refuses\n\
+     \x20                  by name before anything runs.\n\
      \x20 --tests <node::case>[,...]     Run only the named test cases (portable\n\
      \x20                  lane; upstream steps those nodes need still run). A case\n\
      \x20                  ID is node tag + '::' + the runner result ID, e.g.\n\
@@ -8127,11 +8132,21 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     {
         expected_tags.insert("selftest.validate_rs".to_string());
     }
+    // dh-kra8l9: --only selects the requested IDs and the preflight WITH their
+    // whole dependency closure, dagrun's own closure over plain and artifact
+    // edges (ignore_selected_deps = false). This replaced an expectation of
+    // exactly those IDs with every outside edge dropped, so the expected
+    // selection is now a superset, compared exactly.
     let mut expected = dagrun::select_steps_by_tags(
         &portable,
         &expected_tags.iter().cloned().collect::<Vec<_>>(),
-        true,
+        false,
     )?;
+    let expected_tags = expected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     // build_plan applies the default early-exit shape before sealing; the
     // reconstructed expectation takes the same step, so the comparison
     // below still catches every other change to the selected graph.
@@ -8142,7 +8157,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         || plan.second.is_some()
     {
         return Err(
-            "only bracket: runtime selection differs from exact committed IDs plus preflight"
+            "only bracket: runtime selection differs from the committed IDs plus preflight with their whole dependency closure"
                 .into(),
         );
     }
@@ -8203,32 +8218,119 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
-    // Off record, build_plan still forces the minimal preflight: the
-    // submodules, the pin gate and the Cargo.lock gate.
-    // The pinned-root command consumes its prepared script producer and locked
-    // input fetch even off record. test.detcore_unit also requires the
-    // prepared-nextest record, so its declared build chain is retained.
-    // Unrelated manifest builds remain outside this focused selection; name
-    // the exact required set explicitly.
-    let expected_off_record = [
-        "pre.submodules".to_string(),
-        PIN_GATE_TAG.to_string(),
-        CARGO_LOCK_GATE_TAG.to_string(),
-        "test.detcore_unit".to_string(),
-        "build.rust_scripts_in_pinned_root".to_string(),
-        "setup.pinned_root_fetch".to_string(),
-        "build.buck_release_artifact".to_string(),
-        "build.e2e_artifact_in_pinned_root".to_string(),
-        "build.liteinst_runtime_in_pinned_root".to_string(),
-        "build.workspace_compile_in_pinned_root".to_string(),
-        "build.workspace_in_pinned_root".to_string(),
-    ]
-    .into_iter()
+    // dh-kra8l9: the off-record flag skips only the ledger row and the
+    // receipt, and decides no part of the plan but the one named exception
+    // (the driver's self-test leaf, on the record only). The off-record plan
+    // is compared byte for byte with the same request on the record, less
+    // that leaf (check_on_record_exception), and its IDs with dagrun's
+    // closure of the request plus the whole preflight. test.detcore_unit
+    // declares its pinned-root build chain and gate.manifest, which brings
+    // gate.manifest's own producers (setup.manifest_plan, build.rust_scripts).
+    // This replaced a fixed 11-ID expectation with a narrower off-record
+    // preflight (the submodules, the pin gate and the Cargo.lock gate) that
+    // left gate.manifest and those producers out: the expectation is now that
+    // superset, compared exactly, and equal to the on-record plan less the
+    // self-test leaf.
+    let on_record_args = parse_argv(&[
+        "--only".into(),
+        "portable".into(),
+        "test.detcore_unit".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: on-record selection failed with exit {code}"))?;
+    let on_record = build_plan(root, &on_record_args, &std::env::temp_dir())?;
+    // The one named exception: on the record the plan also runs the driver's
+    // self-test leaf (dh-2w6af2); nothing else may differ.
+    check_on_record_exception(
+        "portable",
+        &portable,
+        &on_record.cfg,
+        &off_record.cfg,
+        false,
+    )
+    .map_err(|error| {
+        format!(
+            "only bracket: the off-record plan differs from the on-record plan of the same request: {error}"
+        )
+    })?;
+    // test.detcore_unit declares gate.manifest, so its closure holds the gate
+    // and both producers in either mode. pre.cargo_lock's closure holds none
+    // of them: off the record it used to plan only the submodules, the pin
+    // gate and itself. Its plan must be the on-record one, the whole
+    // preflight with its closure.
+    let mut cargo_lock_plans = Vec::new();
+    for off_record in [false, true] {
+        let mut argv = vec![
+            "--only".to_string(),
+            "portable".to_string(),
+            CARGO_LOCK_GATE_TAG.to_string(),
+            "--no-label-pr".to_string(),
+        ];
+        if off_record {
+            argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+        }
+        let args = parse_argv(&argv).map_err(|code| {
+            format!("only bracket: {CARGO_LOCK_GATE_TAG} selection failed with exit {code}")
+        })?;
+        cargo_lock_plans.push(build_plan(root, &args, &std::env::temp_dir())?.cfg);
+    }
+    let cargo_lock_tags =
+        |cfg: &DagConfig| cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let expected_cargo_lock = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ]
+        .map(str::to_string),
+        false,
+    )?;
+    // Off the record the plan is exactly the whole preflight with its
+    // closure; on the record it is that plan plus the driver's self-test
+    // leaf, the one named exception, and nothing else.
+    let exception = check_on_record_exception(
+        "portable",
+        &portable,
+        &cargo_lock_plans[0],
+        &cargo_lock_plans[1],
+        false,
+    );
+    if exception.is_err()
+        || cargo_lock_tags(&cargo_lock_plans[1]) != cargo_lock_tags(&expected_cargo_lock)
+    {
+        return Err(format!(
+            "only bracket: {CARGO_LOCK_GATE_TAG} does not plan the whole preflight on and off the record: expected={:?} on={:?} off={:?} ({})",
+            cargo_lock_tags(&expected_cargo_lock),
+            cargo_lock_tags(&cargo_lock_plans[0]),
+            cargo_lock_tags(&cargo_lock_plans[1]),
+            exception.err().unwrap_or_default()
+        ));
+    }
+    let expected_off_record = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules".to_string(),
+            PIN_GATE_TAG.to_string(),
+            CARGO_LOCK_GATE_TAG.to_string(),
+            RUST_SCRIPT_PRODUCER_TAG.to_string(),
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string(),
+            "gate.manifest".to_string(),
+            "test.detcore_unit".to_string(),
+        ],
+        false,
+    )?
+    .steps
+    .iter()
+    .map(Step::tag)
     .collect::<BTreeSet<_>>();
     let check_off_record_tags = |tags: &BTreeSet<String>| -> Result<(), String> {
         if tags != &expected_off_record {
             return Err(format!(
-                "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight and required pinned-root producers: expected={expected_off_record:?} actual={tags:?}"
+                "only bracket: off-record selection did not select exactly the requested ID and the preflight with their whole dependency closure: expected={expected_off_record:?} actual={tags:?}"
             ));
         }
         Ok(())
@@ -8239,6 +8341,8 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         "setup.pinned_root_fetch",
         "build.workspace_in_pinned_root",
         "build.e2e_artifact_in_pinned_root",
+        "gate.manifest",
+        "setup.manifest_plan",
     ] {
         let mut missing = off_record_tags.clone();
         if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
@@ -8247,10 +8351,18 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    // A node outside the closure is still refused: the first portable node
+    // that test.detcore_unit's closure does not hold.
+    let outside = all_tags
+        .difference(&expected_off_record)
+        .next()
+        .cloned()
+        .ok_or("only bracket: every portable node is in test.detcore_unit's closure")?;
     let mut unrelated = off_record_tags.clone();
-    if !unrelated.insert("setup.manifest_plan".into()) || check_off_record_tags(&unrelated).is_ok()
-    {
-        return Err("only bracket: unrelated manifest producer was not refused".into());
+    if !unrelated.insert(outside.clone()) || check_off_record_tags(&unrelated).is_ok() {
+        return Err(format!(
+            "only bracket: node {outside}, outside the closure, was not refused"
+        ));
     }
 
     let unknown_args = parse_argv(&[
@@ -8319,26 +8431,29 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         &unrelated_args,
         &std::env::temp_dir().join("validate-only-unrelated-plan"),
     )?;
-    if unrelated_plan
-        .cfg
-        .steps
-        .iter()
-        .any(|step| step.job.starts_with("manifest_plan"))
-    {
-        return Err(
-            "only bracket: unrelated test.detcore_unit selection admitted a manifest-plan producer"
-                .into(),
-        );
-    }
+    // dh-kra8l9: this check refused any manifest-plan producer here. The
+    // closure now holds setup.manifest_plan, gate.manifest's declared
+    // producer, so the check is the exact closure equality instead (a
+    // superset; any node outside the closure is still refused).
+    check_off_record_tags(
+        &unrelated_plan
+            .cfg
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>(),
+    )?;
 
     // Reproduce the focused manifest selection that used to reach dagrun with a
-    // dangling pinned-root edge. `--only` intentionally drops unrelated build
-    // dependencies, but both the host and pinned-root manifest commands invoke
-    // target/debug/test-harness. A fresh checkout must therefore retain the
-    // canonical host producer of the test harness and the in-image guest
-    // build without restoring gate.manifest. Since dh-63c2n3 the portable
-    // lane has no host guest build: the public name build.manifest_guests
-    // resolves to its pinned-root twin, and the host copy must not run.
+    // dangling pinned-root edge, and that F3's RUN 3744 ran without
+    // build.e2e_artifact_in_pinned_root (dh-kra8l9). Both the host and
+    // pinned-root manifest commands invoke target/debug/test-harness, and the
+    // e2e nodes read the e2e artifact, so a fresh checkout needs every
+    // producer: the selection is the request plus the preflight (the same on
+    // and off the record) with their whole dependency closure, gate.manifest
+    // included, compared exactly. Since dh-63c2n3 the portable lane has no host guest
+    // build: the public name build.manifest_guests resolves to its pinned-root
+    // twin, and the host copy must not run.
     let manifest_args = parse_argv(&[
         ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
         "--only".into(),
@@ -8366,6 +8481,9 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         "e2e.manifest_applications",
         "e2e.manifest_c_programs",
         "e2e.manifest_system_utils",
+        // RUN 3744's missing producer, and the gate the e2e nodes declare.
+        "build.e2e_artifact_in_pinned_root",
+        "gate.manifest",
     ] {
         if !manifest_tags.contains(required) {
             return Err(format!(
@@ -8378,9 +8496,34 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "only bracket: focused portable manifest selection runs the host guest build build.manifest_guests, which the portable lane no longer has: {manifest_tags:?}"
         ));
     }
-    if manifest_tags.contains("gate.manifest") || manifest_tags.contains("lint.clippy") {
+    // dh-kra8l9: this check refused gate.manifest here, along with
+    // lint.clippy. gate.manifest is a declared dependency of these e2e nodes,
+    // so it is now required (above). Every node outside the closure,
+    // lint.clippy among them, is still refused by the exact equality below.
+    let expected_manifest = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+            "build.manifest_guests_in_pinned_root",
+            "e2e.manifest_applications",
+            "e2e.manifest_c_programs",
+            "e2e.manifest_system_utils",
+        ]
+        .map(str::to_string),
+        false,
+    )?
+    .steps
+    .iter()
+    .map(Step::tag)
+    .collect::<BTreeSet<_>>();
+    if manifest_tags != expected_manifest || manifest_tags.contains("lint.clippy") {
         return Err(format!(
-            "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
+            "only bracket: focused manifest selection is not exactly its dependency closure: expected={expected_manifest:?} actual={manifest_tags:?}"
         ));
     }
     let pinned_manifest_build = manifest_plan
@@ -8443,6 +8586,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "pre.reverie_pin_on_host",
         ),
     ] {
+        let mut record_mode_plans = Vec::new();
         for off_record in [false, true] {
             let mut argv = vec!["--only".into(), lane.into(), target.into()];
             if off_record {
@@ -8451,6 +8595,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             let args = parse_argv(&argv)
                 .map_err(|code| format!("only bracket: {lane} parser exited {code}"))?;
             let hosted = build_plan(root, &args, &std::env::temp_dir())?;
+            record_mode_plans.push(hosted.cfg.clone());
             let tags = hosted
                 .cfg
                 .steps
@@ -8463,10 +8608,60 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 || tags
                     .iter()
                     .any(|tag| tag.ends_with("_in_pinned_root") || tag == "setup.pinned_root_fetch")
-                || (off_record && tags.iter().any(|tag| tag.starts_with("gate.")))
             {
                 return Err(format!(
                     "only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"
+                ));
+            }
+            // dh-kra8l9: off record this refused every gate.* node, under a
+            // narrower off-record preflight. The plan is now the same on and
+            // off the record but for the driver's self-test leaf on the
+            // record (check_on_record_exception, compared byte for byte after
+            // this loop): the request plus the lane's whole preflight with
+            // their dependency closure, in the lane's own graph, compared
+            // exactly (a superset; any node outside the closure is still
+            // refused).
+            let preflight: &[&str] = if lane == "hosted-privileged" {
+                &[
+                    "pre.reverie_pin_on_host",
+                    "build.rust_scripts_on_host",
+                    "setup.manifest_plan_on_host",
+                    "gate.manifest_on_host",
+                ]
+            } else {
+                &[
+                    "pre.submodules",
+                    PIN_GATE_TAG,
+                    CARGO_LOCK_GATE_TAG,
+                    RUST_SCRIPT_PRODUCER_TAG,
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                    "gate.manifest",
+                ]
+            };
+            let lane_graph = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])?;
+            // On the record the request also carries the driver's self-test
+            // leaf when the lane holds it (the one named exception).
+            let self_test_leaf = if off_record {
+                None
+            } else {
+                on_record_self_test_leaf(lane, &lane_graph)
+            };
+            let expected_hosted = dagrun::select_steps_by_tags(
+                &lane_graph,
+                &std::iter::once(target)
+                    .chain(preflight.iter().copied())
+                    .map(str::to_string)
+                    .chain(self_test_leaf)
+                    .collect::<Vec<_>>(),
+                false,
+            )?
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+            if tags != expected_hosted || !tags.iter().any(|tag| tag.starts_with("gate.manifest")) {
+                return Err(format!(
+                    "only bracket: {lane} focused host preparation is not exactly its dependency closure (off_record={off_record}): expected={expected_hosted:?} actual={tags:?}"
                 ));
             }
             // The host guest build waits for the manifest-plan producer that
@@ -8495,6 +8690,19 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+        let lane_graph = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])?;
+        check_on_record_exception(
+            lane,
+            &lane_graph,
+            &record_mode_plans[0],
+            &record_mode_plans[1],
+            false,
+        )
+        .map_err(|error| {
+            format!(
+                "only bracket: {lane} {target} plans differently on and off the record: {error}"
+            )
+        })?;
     }
 
     // The old privileged public name build.manifest_guests resolves to one
@@ -8612,7 +8820,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         return Err("only bracket: selecting IDs changed ci/dag/validate.json".into());
     }
     println!(
-        "  only plan: requested IDs plus committed preflight selected through dagrun; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, outside dependencies drop, selected edges remain, nested scheduler absent, and source/selected-step bytes are guarded both ways"
+        "  only plan: requested IDs plus committed preflight selected through dagrun with their whole dependency closure, the same on and off the record but for the driver's self-test leaf on the record; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, every edge remains, nested scheduler absent, and source/selected-step bytes are guarded both ways"
     );
     Ok(())
 }
@@ -15412,9 +15620,9 @@ mod locked_cargo_tests {
     /// A stale committed Cargo.lock fails the first Cargo call of every
     /// focused plan: `--only LANE NODE` for each node that makes a
     /// lock-resolving Cargo call, in each lane that carries the node, on and
-    /// off the record. Off the record the plan's only preflight is
-    /// pre.submodules, the pin and pre.cargo_lock, so the node's own call runs
-    /// beside the lock gate. Each first call, run as written against a stale
+    /// off the record (one plan since dh-kra8l9; both modes stay checked, so a
+    /// plan that came to differ by record mode would still be covered). Each
+    /// first call, run as written against a stale
     /// lock file in a fixture, must refuse it and leave it byte-identical, and
     /// its mutant without --locked must rewrite it.
     #[test]
@@ -15450,11 +15658,27 @@ mod locked_cargo_tests {
                 }
             }
         }
+        // dh-kra8l9: every focused plan holds its whole dependency closure and
+        // the whole preflight, on and off the record, so lint.clippy waits on
+        // gate.manifest and its locked manifest-plan build, and its own Cargo
+        // call is never the first one (this guard used to pin it as first off
+        // the record). The guard is now that the
+        // plan still contributes first calls, and that lint.clippy's is not
+        // among them, each first call checked against the stale lock below.
+        let lint_plan = "--allow-local-off-the-record-run --only full lint.clippy: ";
         assert!(
-            first.values().flatten().any(|plan| {
-                plan == "--allow-local-off-the-record-run --only full lint.clippy: lint.clippy"
-            }),
-            "off the record, lint.clippy's own Cargo call no longer runs first: {first:?}"
+            first
+                .values()
+                .flatten()
+                .any(|plan| plan.starts_with(lint_plan)),
+            "off the record, --only full lint.clippy contributes no first Cargo call: {first:?}"
+        );
+        assert!(
+            !first
+                .values()
+                .flatten()
+                .any(|plan| plan == &format!("{lint_plan}lint.clippy")),
+            "off the record, lint.clippy's own Cargo call runs before its closure's: {first:?}"
         );
         let scratch = tempfile::tempdir().unwrap();
         locked_cargo::check_stale_lock_twins(&first, scratch.path()).unwrap();
@@ -15607,7 +15831,12 @@ mod case_selection_tests {
     }
 
     #[test]
-    fn case_plan_prunes_the_verdict_gate_but_keeps_producers() {
+    fn case_plan_takes_the_whole_dependency_closure_gate_included() {
+        // dh-kra8l9: a --tests plan is the case node plus the preflight with
+        // their whole dependency closure in the portable lane, compared
+        // exactly. This test used to assert that gate.manifest was pruned by
+        // name; it is a declared dependency of test.cli, so it is now
+        // required, and the expectation is that superset.
         let args = parse_argv(&[
             "--tests".to_string(),
             "test.cli::hermit-run::cli$some_test".to_string(),
@@ -15619,7 +15848,30 @@ mod case_selection_tests {
             plan.cfg.steps.iter().map(|step| step.tag()).collect();
         assert!(tags.contains("test.cli"), "{tags:?}");
         assert!(tags.contains("build.rust_scripts"), "{tags:?}");
-        assert!(!tags.contains("gate.manifest"), "{tags:?}");
+        assert!(tags.contains("gate.manifest"), "{tags:?}");
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()]).unwrap();
+        let expected = dagrun::select_steps_by_tags(
+            &portable,
+            &[
+                "test.cli",
+                "pre.submodules",
+                PIN_GATE_TAG,
+                CARGO_LOCK_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            ]
+            .map(str::to_string),
+            false,
+        )
+        .unwrap()
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags, expected);
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
@@ -15650,22 +15902,81 @@ mod case_selection_tests {
 
     #[test]
     fn case_plan_off_record_portable_case_is_not_refused() {
-        // The off-record preflight drops the producer nodes; a
-        // portable case whose only unplanned committed deps sit
-        // behind the pruned gate.manifest must still plan (it runs
-        // today). The dependency walk prunes the gate.manifest edge
-        // instead of counting the gate's own producers as missing.
+        // dh-kra8l9: a portable case plans off the record exactly as on it;
+        // the off-record flag skips only the ledger row and the receipt. This
+        // used to check only that test.cli planned, under a narrower
+        // off-record preflight whose dependency walk pruned gate.manifest. It
+        // now also requires gate.manifest and its producers, and the same plan
+        // bytes as on the record.
+        let root = test_source_root();
+        let plan_for = |off_record: bool| {
+            let mut argv = vec![
+                "--tests".to_string(),
+                "test.cli::hermit-run::cli$some_test".to_string(),
+                "--no-label-pr".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, "--allow-local-off-the-record-run".to_string());
+            }
+            build_plan(&root, &parse_argv(&argv).unwrap(), &std::env::temp_dir()).unwrap()
+        };
+        let off = plan_for(true);
+        let tags: std::collections::BTreeSet<String> =
+            off.cfg.steps.iter().map(|step| step.tag()).collect();
+        for required in [
+            "test.cli",
+            "gate.manifest",
+            "setup.manifest_plan",
+            "build.rust_scripts",
+        ] {
+            assert!(tags.contains(required), "lacks {required}: {tags:?}");
+        }
+        assert_eq!(
+            dag_to_json(&off.cfg),
+            dag_to_json(&plan_for(false).cfg),
+            "--tests plans differently on and off the record"
+        );
+    }
+
+    #[test]
+    fn case_plan_keeps_a_non_case_node_the_portable_lane_lacks() {
+        // dh-kra8l9 review: --tests held back every tag that the committed
+        // DAG holds and the portable lane does not, not only case nodes, so a
+        // preflight node that lost its portable label was silently left out
+        // of the plan. Plant exactly that: pre.cargo_lock keeps its node but
+        // loses the label. Only case nodes outside the lane are held back
+        // (and refused by name); this non-case node must stay selected, from
+        // the committed DAG, as --only selects it.
+        let root = test_source_root();
+        let (mut committed, path, bytes) = load_committed_validation_dag(&root).unwrap();
+        committed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == CARGO_LOCK_GATE_TAG)
+            .expect("the committed DAG holds pre.cargo_lock")
+            .labels
+            .retain(|label| label != "portable");
+        // No portable node depends on it, so the planted portable lane really
+        // lacks it; otherwise the lane's closure would bring it back.
+        let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()]).unwrap();
+        assert!(
+            !portable
+                .steps
+                .iter()
+                .any(|step| step.tag() == CARGO_LOCK_GATE_TAG),
+            "the planted portable lane still holds {CARGO_LOCK_GATE_TAG}"
+        );
         let args = parse_argv(&[
-            "--allow-local-off-the-record-run".to_string(),
             "--tests".to_string(),
             "test.cli::hermit-run::cli$some_test".to_string(),
         ])
         .unwrap();
-        let root = test_source_root();
-        let plan = build_plan(&root, &args, &std::env::temp_dir()).unwrap();
-        let tags: std::collections::BTreeSet<String> =
-            plan.cfg.steps.iter().map(|step| step.tag()).collect();
+        let plan = build_plan_from(&root, &args, (committed.clone(), path, bytes)).unwrap();
+        let tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+        assert!(tags.contains(CARGO_LOCK_GATE_TAG), "dropped: {tags:?}");
         assert!(tags.contains("test.cli"), "{tags:?}");
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
@@ -15688,12 +15999,54 @@ mod case_selection_tests {
         ));
     }
 
+    /// Every planned step keeps every committed edge, and each of its
+    /// dependencies (plain and artifact) is planned: the plan is the closure
+    /// of what it holds, with nothing dropped. Returns each violation.
+    fn plan_closure_violations(committed: &DagConfig, cfg: &DagConfig) -> Vec<String> {
+        let committed_by_tag: BTreeMap<String, &Step> = committed
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect();
+        let planned: BTreeSet<String> = cfg.steps.iter().map(Step::tag).collect();
+        let mut violations = Vec::new();
+        for step in &cfg.steps {
+            let tag = step.tag();
+            let Some(source) = committed_by_tag.get(&tag) else {
+                violations.push(format!("{tag} is not a committed node"));
+                continue;
+            };
+            let edges = |step: &Step| {
+                step.dependency_tags()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+            if edges(step) != edges(source) {
+                violations.push(format!(
+                    "{tag} lost committed edges: planned {:?}, committed {:?}",
+                    edges(step),
+                    edges(source)
+                ));
+            }
+            for dependency in step.dependency_tags() {
+                if !planned.contains(dependency) {
+                    violations.push(format!("{tag} needs {dependency}, which is not planned"));
+                }
+            }
+        }
+        violations
+    }
+
     #[test]
     fn only_plan_accepts_nodes_from_other_lanes_but_not_unknown_tags() {
         // A rerun of a finished run's failed set names nodes from every
         // lane that run executed. privileged-pmu.preemption is not in the
-        // portable lane subset; the plan must still build (committed-DAG
-        // fallback), while a tag no DAG knows still refuses by name.
+        // portable lane subset; the plan must still build, from the
+        // committed DAG, the complete graph that holds it, while a tag no DAG
+        // knows still refuses by name. dh-kra8l9 strengthened this: each named
+        // node's WHOLE closure (dagrun's transitive_deps over the committed
+        // DAG) is planned with every edge intact, where the dependencies used
+        // to be dropped.
         let root = test_source_root();
         let args = parse_argv(&[
             "--only".to_string(),
@@ -15706,6 +16059,21 @@ mod case_selection_tests {
             plan.cfg.steps.iter().map(|step| step.tag()).collect();
         assert!(tags.contains("test.cli"), "{tags:?}");
         assert!(tags.contains("privileged-pmu.preemption"), "{tags:?}");
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let closure = dagrun::transitive_deps(&committed.steps);
+        for node in ["test.cli", "privileged-pmu.preemption"] {
+            let missing = closure[node]
+                .iter()
+                .filter(|dependency| !tags.contains(*dependency))
+                .collect::<Vec<_>>();
+            assert!(missing.is_empty(), "{node} lacks {missing:?}");
+            assert!(
+                !closure[node].is_empty(),
+                "{node} has no dependency to check"
+            );
+        }
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
 
         let unknown = parse_argv(&[
             "--only".to_string(),
@@ -15718,6 +16086,278 @@ mod case_selection_tests {
             Err(error) => error,
         };
         assert!(error.contains("no.such_node"), "{error}");
+    }
+
+    #[test]
+    fn only_selects_every_node_of_every_lane_with_its_whole_dependency_closure() {
+        // dh-kra8l9: for EVERY node of EVERY lane, `validate --only LANE NODE`
+        // plans exactly the same graph on and off the record but for the
+        // driver's self-test leaf on the record (check_on_record_exception;
+        // otherwise the off-record flag skips only the ledger row and the
+        // receipt), and that plan is exactly the node with its whole closure
+        // over plain and artifact edges plus the closure of the lane's
+        // preflight list, plus, on the record, that leaf with its closure,
+        // every committed edge intact. The oracle is dagrun's own transitive_deps over the
+        // committed DAG. The selection used to drop every edge to an
+        // unselected node, so F3's RUN 3744 ran e2e.manifest_system_utils
+        // without build.e2e_artifact_in_pinned_root and failed after its
+        // setup; off the record it also planned a narrower preflight.
+        let root = test_source_root();
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let closure = dagrun::transitive_deps(&committed.steps);
+        let labels: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .flat_map(|step| step.labels.iter().cloned())
+            .collect();
+        // build_plan parses the 2.7 MB committed DAG on every call; the 1,040
+        // plans below share one parse through build_plan_from.
+        let loaded = load_committed_validation_dag(&root).unwrap();
+        let plan_for = |lane: &str, node: &str, off_record: bool| -> Result<Plan, String> {
+            let mut argv = vec![
+                "--only".to_string(),
+                lane.to_string(),
+                node.to_string(),
+                "--no-label-pr".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+            }
+            let args = parse_argv(&argv).map_err(|code| format!("parser exited {code}"))?;
+            build_plan_from(&root, &args, loaded.clone())
+        };
+        let mut checked = 0usize;
+        let mut expected = 0usize;
+        let mut checked_nodes = BTreeSet::new();
+        // Each problem is filed under its selection's label.
+        let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for lane in &labels {
+            let lane_cfg =
+                dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane)).unwrap();
+            let mut plans = Vec::new();
+            for node in lane_cfg.steps.iter().map(Step::tag) {
+                expected += 1;
+                let label = format!("--only {lane} {node}");
+                let (on, off) = match (plan_for(lane, &node, false), plan_for(lane, &node, true)) {
+                    (Ok(on), Ok(off)) => (on, off),
+                    (on, off) => {
+                        let problems = failures.entry(label).or_default();
+                        for (mode, result) in [("on", on), ("off", off)] {
+                            if let Err(error) = result {
+                                problems.push(format!("refused {mode} the record: {error}"));
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let planned: BTreeSet<String> = on.cfg.steps.iter().map(Step::tag).collect();
+                let problems = failures.entry(label.clone()).or_default();
+                // The one named exception: on the record the plan also runs
+                // the driver's self-test leaf (dh-2w6af2). Nothing else may
+                // differ, in either direction.
+                // Only a request that names the leaf may hold it off the record.
+                let request_holds_leaf =
+                    on_record_self_test_leaf(lane, &lane_cfg).as_deref() == Some(node.as_str());
+                if let Err(error) = check_on_record_exception(
+                    lane,
+                    &lane_cfg,
+                    &on.cfg,
+                    &off.cfg,
+                    request_holds_leaf,
+                ) {
+                    problems.push(format!("plans differently on and off the record: {error}"));
+                }
+                if !planned.contains(&node) {
+                    problems.push("the node itself is not planned".to_string());
+                }
+                for dependency in &closure[&node] {
+                    if !planned.contains(dependency) {
+                        problems.push(format!("lacks {dependency}"));
+                    }
+                }
+                problems.extend(plan_closure_violations(&committed, &on.cfg));
+                checked += 1;
+                checked_nodes.insert(node.clone());
+                plans.push((label, node, planned));
+            }
+            // Exactness: a plan is exactly the node with its own closure plus
+            // the closure of the lane's preflight list, both from the oracle
+            // over the committed DAG, so no node over-selects or misses a
+            // preflight node. This bound used to be the intersection of the
+            // lane's own plans, which a node wrongly added to every plan (by
+            // a mapping, say) would have joined. A wrong entry in the
+            // preflight list itself is outside what this can see. The plans
+            // checked here are the on-record ones, so the bound also holds
+            // the driver's self-test leaf with its closure where the lane
+            // carries it: the one named exception, required, not tolerated.
+            let mut preflight = focused_preflight(lane);
+            preflight.extend(on_record_self_test_leaf(lane, &lane_cfg));
+            let mut preflight_closure: BTreeSet<String> = BTreeSet::new();
+            for tag in &preflight {
+                match closure.get(tag) {
+                    Some(dependencies) => {
+                        preflight_closure.insert(tag.clone());
+                        preflight_closure.extend(dependencies.iter().cloned());
+                    }
+                    None => failures
+                        .entry(format!("--only {lane} (preflight)"))
+                        .or_default()
+                        .push(format!("the committed DAG lacks preflight node {tag}")),
+                }
+            }
+            for (label, node, planned) in plans {
+                let mut exact = preflight_closure.clone();
+                exact.insert(node.clone());
+                exact.extend(closure[&node].iter().cloned());
+                let extra: Vec<&String> = planned.difference(&exact).collect();
+                if !extra.is_empty() {
+                    failures.entry(label.clone()).or_default().push(format!(
+                        "plans node(s) outside its closure and the lane's preflight closure: {extra:?}"
+                    ));
+                }
+                let missing: Vec<&String> = preflight_closure.difference(&planned).collect();
+                if !missing.is_empty() {
+                    failures
+                        .entry(label)
+                        .or_default()
+                        .push(format!("lacks preflight closure node(s): {missing:?}"));
+                }
+            }
+        }
+        failures.retain(|_, problems| !problems.is_empty());
+        let problems: Vec<String> = failures
+            .iter()
+            .flat_map(|(label, problems)| {
+                problems
+                    .iter()
+                    .map(move |problem| format!("{label}: {problem}"))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {expected} selections failed, with {} problem(s); the first 20: {:#?}",
+            failures.len(),
+            problems.len(),
+            problems.iter().take(20).collect::<Vec<_>>()
+        );
+        assert!(checked > 0, "no lane node was checked");
+        assert_eq!(checked, expected);
+        // Every node that declares artifact_deps was checked, so each one's
+        // producers are planned with it.
+        let artifact_consumers: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .filter(|step| !step.artifact_deps.is_empty())
+            .map(Step::tag)
+            .collect();
+        assert!(
+            !artifact_consumers.is_empty(),
+            "no node declares artifact_deps"
+        );
+        let unchecked: Vec<&String> = artifact_consumers.difference(&checked_nodes).collect();
+        assert!(
+            unchecked.is_empty(),
+            "artifact consumer(s) in no lane, never checked: {unchecked:?}"
+        );
+    }
+
+    #[test]
+    fn only_plans_run_3744_with_its_e2e_artifact_producer() {
+        // F3's RUN 3744 selected `--only portable e2e.manifest_system_utils`
+        // and ran a plan without build.e2e_artifact_in_pinned_root, so the
+        // node failed on a missing /src/target/ci/hermit-e2e-artifact.path.
+        for off_record in [false, true] {
+            let mut argv = vec![
+                "--only".to_string(),
+                "portable".to_string(),
+                "e2e.manifest_system_utils".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+            }
+            let root = test_source_root();
+            let plan =
+                build_plan(&root, &parse_argv(&argv).unwrap(), &std::env::temp_dir()).unwrap();
+            let tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+            for producer in [
+                "build.e2e_artifact_in_pinned_root",
+                "build.workspace_compile_in_pinned_root",
+                "build.liteinst_runtime_in_pinned_root",
+                "build.manifest_guests_in_pinned_root",
+                "setup.pinned_root_fetch",
+            ] {
+                assert!(
+                    tags.contains(producer),
+                    "{argv:?} lacks {producer}: {tags:?}"
+                );
+            }
+            let committed = validate_plan::validation_config(&root).unwrap();
+            let violations = plan_closure_violations(&committed, &plan.cfg);
+            assert!(violations.is_empty(), "{argv:?}: {violations:#?}");
+        }
+    }
+
+    #[test]
+    fn a_focused_closure_refuses_a_missing_or_retired_dependency_by_name() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        let template = &committed.steps[0];
+        let step = |tag: &str, deps: &[&str], labels: &[&str]| {
+            let (group, job) = tag.split_once('.').unwrap();
+            let mut step = template.clone();
+            step.group = group.into();
+            step.job = job.into();
+            step.deps = deps.iter().map(|dep| dep.to_string()).collect();
+            step.artifact_deps = Vec::new();
+            step.labels = labels.iter().map(|label| label.to_string()).collect();
+            step
+        };
+        // A dependency the graph does not hold refuses, naming who needs it.
+        let graph = DagConfig {
+            steps: vec![
+                step("test.consumer", &["build.producer"], &["lane"]),
+                step("build.producer", &["build.absent"], &[]),
+            ],
+            ..Default::default()
+        };
+        let tags = BTreeSet::from(["test.consumer".to_string()]);
+        let error = select_focused_closure(&graph, "lane lane", &graph, &tags).unwrap_err();
+        assert!(
+            error.contains("build.producer needs build.absent"),
+            "{error}"
+        );
+        assert!(error.contains("lane lane"), "{error}");
+        // A retired node in the closure (a committed node no label's
+        // selection runs) refuses by name, through refuse_retired_nodes.
+        let mut committed_with_retired = graph.clone();
+        committed_with_retired.steps = vec![
+            step("test.consumer", &["build.producer"], &[]),
+            step("build.producer", &[], &[]),
+            step("test.other", &[], &["lane"]),
+        ];
+        let error = select_focused_closure(
+            &committed_with_retired,
+            "the committed DAG",
+            &committed_with_retired,
+            &tags,
+        )
+        .unwrap_err();
+        assert!(error.contains("retired node(s)"), "{error}");
+        assert!(error.contains("test.consumer"), "{error}");
+        // A complete graph selects the closure, every edge intact.
+        let complete = DagConfig {
+            steps: vec![
+                step("test.consumer", &["build.producer"], &["lane"]),
+                step("build.producer", &[], &[]),
+                step("test.unrelated", &[], &["lane"]),
+            ],
+            ..Default::default()
+        };
+        let selected = select_focused_closure(&complete, "lane lane", &complete, &tags).unwrap();
+        assert_eq!(
+            selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["test.consumer", "build.producer"]
+        );
+        assert_eq!(selected.steps[0].deps, ["build.producer"]);
     }
 
     #[test]
@@ -16439,46 +17079,14 @@ fn select_from_committed_decision(
     }
 }
 
-/// Add only the canonical manifest executable preparation needed by focused
-/// commands. Ordinary build prerequisites remain outside --only; every ID and
-/// dependency retained here is read from the committed source without rewriting.
-fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
+/// A requested guest build resolves to its pinned-root twin. Since dh-63c2n3
+/// the host copy is not in the local lanes at all (only the hosted lanes keep
+/// it), so the public name `build.manifest_guests` selects the twin in its
+/// place; a lane that still has the host copy keeps it and gains the twin
+/// beside it. This maps names only: what a focused selection runs besides
+/// the requested nodes is their dependency closure ([`select_focused_closure`]).
+fn map_focused_guest_builds(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
     let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    // A node that requires the prepared-nextest record consumes
-    // target/ci/nextest-binaries/current.json from disk. That file is written
-    // only by build.workspace_in_pinned_root, reached through
-    // build.e2e_artifact_in_pinned_root. Dropping that declared chain leaves
-    // the node to fail in seconds with a missing-file error, so retain the
-    // full transitive build closure of any such consumer.
-    let consumes_prepared_nextest = cfg
-        .steps
-        .iter()
-        .filter(|step| tags.contains(&step.tag()))
-        .any(|step| step.cmd.contains("HERMIT_PREPARED_NEXTEST_REQUIRED"));
-    if consumes_prepared_nextest {
-        let by_tag: std::collections::BTreeMap<String, &Step> =
-            cfg.steps.iter().map(|step| (step.tag(), step)).collect();
-        let mut stack: Vec<String> = tags.iter().cloned().collect();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        while let Some(tag) = stack.pop() {
-            if !seen.insert(tag.clone()) {
-                continue;
-            }
-            if let Some(step) = by_tag.get(&tag) {
-                for dep in &step.deps {
-                    if dep.starts_with("build.") && available.contains(dep) {
-                        tags.insert(dep.clone());
-                        stack.push(dep.clone());
-                    }
-                }
-            }
-        }
-    }
-    // A requested guest build resolves to its pinned-root twin. Since
-    // dh-63c2n3 the host copy is not in the local lanes at all (only the
-    // hosted lanes keep it), so the public name `build.manifest_guests`
-    // selects the twin in its place; a lane that still has the host copy
-    // keeps it and gains the twin beside it.
     let requested_guest_builds = tags
         .iter()
         .filter(|tag| {
@@ -16497,51 +17105,6 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
             tags.remove(&host);
         }
         tags.insert(twin);
-    }
-    let required_producer = |tag: &str| {
-        let tag = tag.strip_prefix("quick-super-").unwrap_or(tag);
-        let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
-        matches!(
-            tag,
-            "setup.manifest_plan"
-                | "setup.manifest_plan_in_pinned_root"
-                | "build.rust_scripts"
-                | "build.rust_scripts_in_pinned_root"
-                | "setup.pinned_root_fetch"
-                // The strict compatibility corpus reads fixtures this node
-                // writes under the run's own state directory, so a focused
-                // run of e2e.manifest_compat must produce them itself.
-                | "compatprep.fixtures"
-        )
-    };
-    loop {
-        let mut additions = cfg
-            .steps
-            .iter()
-            .filter(|step| tags.contains(&step.tag()))
-            .flat_map(|step| step.deps.iter())
-            .filter(|dependency| required_producer(dependency) && !tags.contains(*dependency))
-            .cloned()
-            .collect::<Vec<_>>();
-        // The host manifest-plan build no longer waits for the rust-script
-        // producer, but every node that waits for it also runs rust-scripts
-        // (gate.manifest, the E2E buckets), so a focused run keeps the two
-        // producers together, as the dependency once did.
-        for tag in tags.iter() {
-            if let Some(prefix) = tag.strip_suffix(validate_plan::MANIFEST_PLAN_PRODUCER_TAG) {
-                let scripts = format!("{prefix}{RUST_SCRIPT_PRODUCER_TAG}");
-                if (prefix.is_empty() || prefix == "quick-super-")
-                    && available.contains(&scripts)
-                    && !tags.contains(&scripts)
-                {
-                    additions.push(scripts);
-                }
-            }
-        }
-        if additions.is_empty() {
-            break;
-        }
-        tags.extend(additions);
     }
 }
 
@@ -16624,6 +17187,14 @@ fn validate_rs_self_test_action(
 
 /// Apply [`validate_rs_self_test_action`] to a focused selection: insert
 /// the node's tag, or print the named NOT-run line for this run form.
+///
+/// This is the ONE exception to the focused plan's rule that the record mode
+/// decides no part of the plan (dh-kra8l9): an on-record `--only` plan in a
+/// lane that carries the node also runs the driver's own self-test leaf, and
+/// an off-record plan skips it (no recursion through the self-test's own
+/// off-record fixture child, and no self-test cost on each local
+/// iteration). Both lines go to stderr, so a plan printed as JSON on stdout
+/// stays free of them.
 fn maybe_add_validate_rs_self_test(
     lane: &str,
     lane_cfg: &DagConfig,
@@ -16637,37 +17208,163 @@ fn maybe_add_validate_rs_self_test(
         ValidateRsSelfTestAction::Add => {
             let tag = tag.expect("Add requires the lane to carry the node");
             if tags.insert(tag.clone()) {
-                println!("Focused validation: {tag} added (always on on-record focused closures)");
+                eprintln!("Focused validation: {tag} added (always on on-record focused closures)");
             }
         }
         ValidateRsSelfTestAction::NotRun(reason) => {
-            println!("selftest.validate_rs NOT run: {reason}");
+            eprintln!("selftest.validate_rs NOT run: {reason}");
         }
     }
 }
 
-/// Select focused tags (with dependency closure) from the lane subset,
-/// falling back to the full committed DAG when the lane subset does not
-/// know a requested tag. A rerun of a finished run's failed set names
-/// nodes from every lane that run executed (portable, privileged,
-/// buck-e2e); refusing such a node because the focused lane subset omits
-/// it makes a one-command rerun impossible. Tags unknown to the
-/// committed DAG itself still refuse, naming them.
-fn select_focused_steps(
+/// The self-test leaf an on-record `--only` plan of `lane` gains through the
+/// one record-mode exception, decided by the driver's own rule
+/// ([`validate_rs_self_test_action`]); `None` when the rule adds nothing.
+fn on_record_self_test_leaf(lane: &str, lane_cfg: &DagConfig) -> Option<String> {
+    let tag = validate_rs_self_test_tag(lane, lane_cfg);
+    let composition_rerun = std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some();
+    match validate_rs_self_test_action(true, false, tag.is_some(), composition_rerun) {
+        ValidateRsSelfTestAction::Add => tag,
+        ValidateRsSelfTestAction::NotRun(_) => None,
+    }
+}
+
+/// Check the one record-mode exception between the plans of one `--only`
+/// request on and off the record. The on-record plan must hold the lane's
+/// self-test leaf whenever the driver's rule adds it, and must equal the
+/// off-record plan byte for byte once that leaf is taken out. The off-record
+/// plan may hold the leaf only when the request itself does
+/// (`request_holds_leaf`: it names the leaf); then the two plans must be equal
+/// outright. Every other difference is refused, in both directions. Returns
+/// the leaf it accounted for.
+fn check_on_record_exception(
+    lane: &str,
     lane_cfg: &DagConfig,
-    committed: &DagConfig,
-    tags: &[String],
-) -> Result<DagConfig, String> {
-    match dagrun::select_steps_by_tags(lane_cfg, tags, true) {
-        Ok(cfg) => Ok(cfg),
-        Err(_) => {
-            let cfg = dagrun::select_steps_by_tags(committed, tags, true)?;
-            // Backstop: the requests were checked before any mapping, and a
-            // live node's dependencies are live, so this never fires today.
-            refuse_retired_nodes(committed, cfg.steps.iter().map(Step::tag))?;
-            Ok(cfg)
+    on: &DagConfig,
+    off: &DagConfig,
+    request_holds_leaf: bool,
+) -> Result<Option<String>, String> {
+    let tags = |cfg: &DagConfig| cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let extra = on_record_self_test_leaf(lane, lane_cfg);
+    let mut on_without = on.clone();
+    if let Some(extra) = &extra {
+        if !tags(on).contains(extra) {
+            return Err(format!(
+                "the on-record plan lacks the driver's self-test leaf {extra}"
+            ));
+        }
+        if tags(off).contains(extra) != request_holds_leaf {
+            let (plan_state, request_state) = if request_holds_leaf {
+                ("lacks", "names")
+            } else {
+                ("holds", "does not name")
+            };
+            return Err(format!(
+                "the off-record plan {plan_state} the driver's self-test leaf {extra}, but the request {request_state} it"
+            ));
+        }
+        if !request_holds_leaf {
+            on_without.steps.retain(|step| step.tag() != *extra);
         }
     }
+    if dag_to_json(&on_without) != dag_to_json(off) {
+        let (on_tags, off_tags) = (tags(&on_without), tags(off));
+        return Err(format!(
+            "the plans differ on and off the record beyond the driver's self-test leaf ({}): only on the record {:?}, only off it {:?} (the step bytes differ if both are empty)",
+            extra.as_deref().unwrap_or("none added in this lane"),
+            on_tags.difference(&off_tags).collect::<Vec<_>>(),
+            off_tags.difference(&on_tags).collect::<Vec<_>>()
+        ));
+    }
+    Ok(extra)
+}
+
+/// The focused selection (`--only`, `--tests`): the requested nodes and every
+/// node they transitively depend on, over plain and artifact edges
+/// (`Step::dependency_tags`, the edges dagrun's own `transitive_deps` walks).
+/// A validate checkout holds no output its plan did not produce, so a focused
+/// run never assumes a dependency's output is already there (dh-kra8l9: a
+/// focused e2e node whose artifact producer was dropped failed two seconds
+/// into its payload, after a fifteen-minute setup).
+///
+/// The closure is computed in ONE graph, `graph`, and nothing is ever filled
+/// in from another: a dependency `graph` does not hold, or a retired node
+/// anywhere in the closure, refuses by name before anything runs. No node is
+/// left out by name, gate.manifest included: the audit gates every node that
+/// declares it, so every focused run that selects such a node runs it.
+fn select_focused_closure(
+    graph: &DagConfig,
+    graph_name: &str,
+    committed: &DagConfig,
+    tags: &BTreeSet<String>,
+) -> Result<DagConfig, String> {
+    let by_tag: BTreeMap<String, &Step> =
+        graph.steps.iter().map(|step| (step.tag(), step)).collect();
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    let mut unsatisfied: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<(String, Option<String>)> =
+        tags.iter().map(|tag| (tag.clone(), None)).collect();
+    while let Some((tag, needed_by)) = stack.pop() {
+        let Some(step) = by_tag.get(&tag) else {
+            match needed_by {
+                None => {
+                    unknown.insert(tag);
+                }
+                Some(parent) => {
+                    unsatisfied.insert(format!("{parent} needs {tag}"));
+                }
+            }
+            continue;
+        };
+        if !closure.insert(tag.clone()) {
+            continue;
+        }
+        for dependency in step.dependency_tags() {
+            stack.push((dependency.to_string(), Some(tag.clone())));
+        }
+    }
+    if !unknown.is_empty() {
+        let mut known = by_tag.keys().cloned().collect::<Vec<_>>();
+        known.sort();
+        return Err(format!(
+            "focused selection names unknown step tag(s) in {graph_name}: {}. Known tags: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", "),
+            known.join(", ")
+        ));
+    }
+    if !unsatisfied.is_empty() {
+        return Err(format!(
+            "focused selection cannot satisfy a dependency in {graph_name}, which does not hold it, so nothing runs: {}",
+            unsatisfied.into_iter().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    refuse_retired_nodes(committed, closure.iter().cloned())?;
+    // This line goes to stderr, so it never mixes into a plan printed as JSON
+    // on stdout (three older name-mapping lines on the --only path still
+    // print to stdout: privileged public names, portable public names and
+    // guest builds).
+    eprintln!(
+        "Focused validation: {} selected tag(s) (the request after name mapping, plus the lane preflight) with their dependency closure in {graph_name}, {} node(s): {}",
+        tags.len(),
+        closure.len(),
+        closure.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    // The selection is dependency-closed, so dagrun's closure mode must return
+    // exactly these nodes with every edge intact. Check it: if dagrun's walk
+    // and this one ever disagree, the plan would differ from the closure just
+    // printed, so refuse loudly instead.
+    let selected =
+        dagrun::select_steps_by_tags(graph, &closure.iter().cloned().collect::<Vec<_>>(), false)?;
+    let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
+    if selected_tags != closure {
+        return Err(format!(
+            "focused selection in {graph_name}: dagrun's closure differs from validate's, so nothing runs: only dagrun's {:?}, only validate's {:?}",
+            selected_tags.difference(&closure).collect::<Vec<_>>(),
+            closure.difference(&selected_tags).collect::<Vec<_>>()
+        ));
+    }
+    Ok(selected)
 }
 
 /// Refuse, by name, any of `tags` that is a retired node: a committed node
@@ -16678,8 +17375,9 @@ fn select_focused_steps(
 /// `gate.manifest`, so it could start before `setup.manifest_plan` builds the
 /// test-harness it runs. `--only` and `--tests` check the names they are
 /// given, before any public-name or guest-build mapping, so a retired name is
-/// neither run through the committed-DAG fallback of
-/// [`select_focused_steps`] nor quietly swapped for another node. A name the
+/// neither selected from the committed DAG nor quietly swapped for another
+/// node; [`select_focused_closure`] also checks every node of the closure it
+/// selects, so no retired node enters a focused plan as a dependency. A name the
 /// committed DAG does not hold is not retired; it is left to the selection's
 /// own unknown-name refusal. The refusal names each live replacement: the
 /// node's pinned-root twin and hosted variant, with the labels each carries.
@@ -16691,11 +17389,15 @@ fn refuse_retired_nodes(
         .steps
         .iter()
         .flat_map(|step| step.labels.iter().cloned())
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // One selection over every label: the union of the labels' dependency
+    // closures is the closure of their union.
     let mut live = BTreeSet::new();
-    for label in &labels {
+    if !labels.is_empty() {
         live.extend(
-            dagrun::select_steps_by_labels(committed, std::slice::from_ref(label))?
+            dagrun::select_steps_by_labels(committed, &labels)?
                 .steps
                 .iter()
                 .map(Step::tag),
@@ -16741,12 +17443,133 @@ fn refuse_retired_nodes(
     ))
 }
 
+/// The preflight a focused selection (`--only LANE`, and `--tests`, which is
+/// the portable lane) adds to its requested nodes: the lane's checkout gates
+/// and its manifest gate with that gate's producers. It is the same on and off
+/// the record: the off-record flag skips only the ledger row and the receipt.
+/// The one record-mode exception, the driver's self-test leaf on the record,
+/// is added beside it by [`add_focused_preflight`].
+fn focused_preflight(lane: &str) -> Vec<String> {
+    let preflight: &[&str] = if lane == "hosted-privileged" {
+        &[
+            "pre.reverie_pin_on_host",
+            "build.rust_scripts_on_host",
+            "setup.manifest_plan_on_host",
+            "gate.manifest_on_host",
+        ]
+    } else {
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ]
+    };
+    preflight
+        .iter()
+        .filter_map(|tag| {
+            // pre.cargo_lock carries no quick/super label yet (admitting a
+            // new quick node also needs the quick dependency-closed source
+            // table), so a focused quick/super selection must not request
+            // a tag its lane graph does not contain.
+            if matches!(lane, "quick" | "super") && *tag == CARGO_LOCK_GATE_TAG {
+                return None;
+            }
+            if matches!(lane, "quick" | "super")
+                && matches!(
+                    *tag,
+                    RUST_SCRIPT_PRODUCER_TAG
+                        | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                        | "gate.manifest"
+                )
+            {
+                Some(format!("quick-super-{tag}"))
+            } else {
+                Some((*tag).to_string())
+            }
+        })
+        .collect()
+}
+
+/// The closure of `tags` ([`select_focused_closure`]) in ONE graph: the lane's
+/// graph when it holds every tag (requested and preflight alike; a lane graph
+/// is itself dependency-closed), else the committed DAG, the complete graph.
+/// For tags the lane holds, both graphs give the same closure, plan bytes and
+/// refusals: dagrun's label selection returns the committed steps unmodified,
+/// closed over the same edges. Only the graph named in the output differs.
+/// Falling back keeps every tag the lane lacks instead of dropping it: a
+/// rerun of a finished run's failed set names nodes from every lane that run
+/// executed, and a preflight node that lost its lane label is still planned.
+/// A lane graph is never spliced with the committed DAG.
+fn select_focused_in_one_graph(
+    committed: &DagConfig,
+    lane_cfg: &DagConfig,
+    lane: &str,
+    tags: &BTreeSet<String>,
+) -> Result<DagConfig, String> {
+    let lane_tags: BTreeSet<String> = lane_cfg.steps.iter().map(Step::tag).collect();
+    if tags.iter().all(|tag| lane_tags.contains(tag)) {
+        select_focused_closure(lane_cfg, &format!("lane {lane}"), committed, tags)
+    } else {
+        select_focused_closure(committed, "the committed DAG", committed, tags)
+    }
+}
+
+/// Add to a focused selection what every focused plan of `lane` adds to its
+/// requested nodes: the lane's [`focused_preflight`], then the ONE record-mode
+/// exception ([`maybe_add_validate_rs_self_test`]: on the record, an `--only`
+/// plan also runs the driver's own self-test leaf), then the public
+/// guest-build name mapping. `--only` and `--tests` both come through here,
+/// so the exception lives in this one place.
+fn add_focused_preflight(
+    lane: &str,
+    lane_cfg: &DagConfig,
+    tags: &mut BTreeSet<String>,
+    on_record: bool,
+    case_selected: bool,
+) {
+    tags.extend(focused_preflight(lane));
+    maybe_add_validate_rs_self_test(lane, lane_cfg, tags, on_record, case_selected);
+    map_focused_guest_builds(lane_cfg, tags);
+}
+
+/// The `--only LANE NODE[,...]` selection: the requested nodes, after their
+/// public-name mappings, plus what [`add_focused_preflight`] adds, each with
+/// its whole dependency closure, in one graph ([`select_focused_in_one_graph`]).
+/// `on_record` decides only the one named exception there; everything else
+/// is the same on and off the record.
+fn only_selection(
+    committed: &DagConfig,
+    lane: &str,
+    nodes: &str,
+    on_record: bool,
+) -> Result<DagConfig, String> {
+    let lane_cfg = dagrun::select_steps_by_labels(committed, &[lane.to_string()])?;
+    let mut tags = requested_step_ids(nodes, "--only")?;
+    refuse_retired_nodes(committed, tags.iter().cloned())?;
+    map_privileged_public_tags(&mut tags, lane);
+    map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
+    add_focused_preflight(lane, &lane_cfg, &mut tags, on_record, false);
+    select_focused_in_one_graph(committed, &lane_cfg, lane, &tags)
+}
+
 /// Runtime plan boundary: every executable path is a selection from the one
 /// committed `ci/dag/validate.json`. The maintenance generator is separate and
 /// never reaches this function.
 fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
-    let (committed, source_path, source_bytes) = load_committed_validation_dag(root)?;
+    build_plan_from(root, args, load_committed_validation_dag(root)?)
+}
 
+/// [`build_plan`] over the committed DAG already loaded by
+/// [`load_committed_validation_dag`] (its config, path and bytes), so a
+/// caller that plans many selections parses the file once.
+fn build_plan_from(
+    root: &Path,
+    args: &Args,
+    (committed, source_path, source_bytes): (DagConfig, PathBuf, Vec<u8>),
+) -> Result<Plan, String> {
     if let Some(Focused::TestCases { cases }) = &args.focused {
         // Like --only on the portable lane (same preflight, same dependency
         // closure), plus a per-node case filter injected as step env below.
@@ -16755,47 +17578,41 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let nodes = cases.keys().cloned().collect::<Vec<_>>().join(",");
         let mut tags = requested_step_ids(&nodes, "--tests")?;
         refuse_retired_nodes(&committed, tags.iter().cloned())?;
-        // No gate.manifest in a case-focused plan: the gate is a verdict
-        // audit (manifest correspondence, footprint freshness), not a
-        // producer of anything the selected cases consume. A --tests run
-        // is a partial, explicitly-selected run; the full profile still
-        // gates every product node on it.
-        let preflight: &[&str] = if args.allow_local_off_the_record_run {
-            &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG]
-        } else {
-            &[
-                "pre.submodules",
-                PIN_GATE_TAG,
-                CARGO_LOCK_GATE_TAG,
-                RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-            ]
-        };
-        tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
-        maybe_add_validate_rs_self_test(
+        add_focused_preflight(
             &lane,
             &lane_cfg,
             &mut tags,
             !args.allow_local_off_the_record_run,
             true,
         );
-        retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let mut cfg =
-            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
-        // A case node whose committed build/setup dependencies the
-        // focused plan does not contain (a privileged-test node, whose
-        // producers sit outside the portable lane subset) would fail
-        // minutes later inside run-in-pinned-root with an error that
-        // reads as the change's failure. Refuse here, naming them.
-        // gate.manifest is deliberately pruned from every case plan
-        // (it audits verdicts; it produces nothing a case consumes),
-        // so it never counts as missing.
-        let planned: BTreeSet<String> = cfg.steps.iter().map(|step| step.tag()).collect();
+        // Only a CASE node the portable lane does not hold (a
+        // privileged-test node) is held back from the selection: the refusal
+        // below names it, with the dependencies the lane lacks (dh-koqvv).
+        // Every other tag is selected exactly as --only selects it, in one
+        // graph, so a preflight node the lane lacks is planned from the
+        // committed DAG, never dropped. A tag no DAG knows still refuses as
+        // unknown.
+        let lane_tags: BTreeSet<String> = lane_cfg.steps.iter().map(Step::tag).collect();
         let committed_by_tag: BTreeMap<String, &Step> = committed
             .steps
             .iter()
             .map(|step| (step.tag(), step))
             .collect();
+        let selected: BTreeSet<String> = tags
+            .iter()
+            .filter(|tag| {
+                !cases.contains_key(*tag)
+                    || lane_tags.contains(*tag)
+                    || !committed_by_tag.contains_key(*tag)
+            })
+            .cloned()
+            .collect();
+        let mut cfg = select_focused_in_one_graph(&committed, &lane_cfg, &lane, &selected)?;
+        // A case node the plan does not hold, or whose committed
+        // dependencies the plan does not contain (a privileged-test node,
+        // whose producers sit outside the portable lane), would otherwise
+        // run without them or not at all. Refuse here, naming them.
+        let planned: BTreeSet<String> = cfg.steps.iter().map(|step| step.tag()).collect();
         for node in cases.keys() {
             let mut missing: BTreeSet<String> = BTreeSet::new();
             let mut stack: Vec<String> = vec![node.clone()];
@@ -16805,29 +17622,28 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                     continue;
                 }
                 if let Some(step) = committed_by_tag.get(&tag) {
-                    for dep in &step.deps {
-                        // Prune the walk at gate.manifest: it is
-                        // deliberately absent from every case plan, so
-                        // neither it nor anything only it needs (its
-                        // producer deps) counts as a case dependency.
-                        if dep == "gate.manifest" {
-                            continue;
-                        }
+                    for dep in step.dependency_tags() {
                         if !planned.contains(dep) {
-                            missing.insert(dep.clone());
+                            missing.insert(dep.to_string());
                         }
-                        stack.push(dep.clone());
+                        stack.push(dep.to_string());
                     }
                 }
             }
+            let profile = args
+                .focused
+                .as_ref()
+                .expect("matched focused mode")
+                .profile();
             if !missing.is_empty() {
                 return Err(format!(
-                    "test selection names cases of {node}, whose dependencies {} are not in profile {}; select the node with --selected or choose a profile that has them",
+                    "test selection names cases of {node}, whose dependencies {} are not in profile {profile}; select the node with --selected or choose a profile that has them",
                     missing.iter().cloned().collect::<Vec<_>>().join(", "),
-                    args.focused
-                        .as_ref()
-                        .expect("matched focused mode")
-                        .profile(),
+                ));
+            }
+            if !planned.contains(node) {
+                return Err(format!(
+                    "test selection names cases of {node}, which profile {profile} does not have; select the node with --selected or choose a profile that has it"
                 ));
             }
         }
@@ -16846,67 +17662,14 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         };
         return finish_selection_for(args, plan, source_path, source_bytes);
     }
+
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
-        let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
-        let mut tags = requested_step_ids(nodes, "--only")?;
-        refuse_retired_nodes(&committed, tags.iter().cloned())?;
-        map_privileged_public_tags(&mut tags, lane);
-        map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
-        let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
-            ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
-            ("hosted-privileged", false) => &[
-                "pre.reverie_pin_on_host",
-                "build.rust_scripts_on_host",
-                "setup.manifest_plan_on_host",
-                "gate.manifest_on_host",
-            ],
-            (_, true) => &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG],
-            (_, false) => &[
-                "pre.submodules",
-                PIN_GATE_TAG,
-                CARGO_LOCK_GATE_TAG,
-                RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-                "gate.manifest",
-            ],
-        };
-        tags.extend(preflight.iter().filter_map(|tag| {
-            // pre.cargo_lock carries no quick/super label yet (admitting a
-            // new quick node also needs the quick dependency-closed source
-            // table), so a focused quick/super selection must not request
-            // a tag its lane graph does not contain.
-            if matches!(lane.as_str(), "quick" | "super") && *tag == CARGO_LOCK_GATE_TAG {
-                return None;
-            }
-            if matches!(lane.as_str(), "quick" | "super")
-                && matches!(
-                    *tag,
-                    RUST_SCRIPT_PRODUCER_TAG
-                        | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-                        | "gate.manifest"
-                )
-            {
-                Some(format!("quick-super-{tag}"))
-            } else {
-                Some((*tag).to_string())
-            }
-        }));
-        // The off-record exemption is load-bearing here, not just
-        // minimalism: the self-test's own submodule fixture child runs an
-        // off-record focused run in a shallow clone, which without the
-        // exemption would schedule the self-test recursively (bounded only
-        // by that child's own timeout). Off-record runs also publish no
-        // evidence, so no land gate is exempt (see the action's doc).
-        maybe_add_validate_rs_self_test(
+        let cfg = only_selection(
+            &committed,
             lane,
-            &lane_cfg,
-            &mut tags,
+            nodes,
             !args.allow_local_off_the_record_run,
-            false,
-        );
-        retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let cfg =
-            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
+        )?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -19849,9 +20612,11 @@ fn exit_fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
-/// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
-/// documented contract deliberately drops build dependencies. It is never a
-/// verdict override and is not inferred for full or other focused profiles.
+/// The `--only` nodes that exited 127 (command not found) in under 5 s, for a
+/// hint. `--only` plans every node's whole dependency closure, so such a node's
+/// producers ran in the same plan: a fast 127 most likely means a missing host
+/// tool or a typo in the node command. It is never a verdict override and is
+/// not inferred for full or other focused profiles.
 fn possible_missing_artifact_nodes<'a>(
     selection_mode: &str,
     outcomes: &'a [StepOutcome],
@@ -35220,16 +35985,16 @@ fn run(
         .as_ref()
         .map(|retained| retained.evidence.clone())
         .unwrap_or(coverage);
-    // `--only` deliberately drops build dependencies, so a fast 127 there is
-    // useful evidence of an absent prerequisite. It is still a red result and
-    // only a possibility: exit 127 can also mean a missing host tool or typo.
+    // `--only` plans every node's whole dependency closure, so a fast 127 there
+    // is not a dropped prerequisite: the node's producers ran in this plan. It
+    // most likely means a missing host tool or a typo, and it stays a red result.
     let missing_artifact = possible_missing_artifact_nodes(plan.selection_mode, &outcomes);
     if !missing_artifact.is_empty() {
         eprintln!(
             "validate: NOTE: {} --only node(s) exited 127 (command not found) in under 5s: {}. \
-             Because --only drops outside dependencies, this MAY mean a required build artifact \
-             is absent; it remains a RED test/configuration failure. Build the named dependencies \
-             and re-run, or inspect the node command for a missing tool or typo.",
+             --only planned each node's whole dependency closure, so its dependencies WERE \
+             planned; this most likely means a missing host tool or a typo in the node command. \
+             It remains a RED test/configuration failure.",
             missing_artifact.len(),
             missing_artifact.join(", ")
         );
@@ -36861,17 +37626,50 @@ mod committed_selection_preservation_tests {
             let plan = build_plan(root, &args, temp.path()).unwrap();
             let mut expected = expected.clone();
             if only {
-                // A focused run keeps the run-owned fixtures the corpus reads
-                // and the bucket's harness and script producers;
-                // --ignore-selected-deps runs exactly what was named.
-                expected.extend([
+                // dh-kra8l9: a focused run is the request plus the lane's
+                // whole preflight (the checkout gates, and the manifest gate
+                // with its two producers) with their whole dependency
+                // closure, compared exactly. The plan is the same on and off
+                // the record. --ignore-selected-deps runs exactly what was
+                // named. The focused expectation used to be the request, the
+                // preflight and a hand-kept list (the run-owned fixtures the
+                // corpus reads, the bucket's harness and script producers).
+                // Each of those must be a declared dependency of the
+                // requested nodes themselves: they are checked against the
+                // request's own closure, without the preflight (which names
+                // two of them), so each check can still fail.
+                let committed = validate_plan::validation_config(root).unwrap();
+                let lane = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+                    .unwrap();
+                let closure_of = |request: &[String]| {
+                    dagrun::select_steps_by_tags(&lane, request, false)
+                        .unwrap()
+                        .steps
+                        .iter()
+                        .map(Step::tag)
+                        .collect::<BTreeSet<_>>()
+                };
+                let mut request = expected.iter().cloned().collect::<Vec<String>>();
+                let request_closure = closure_of(&request);
+                for producer in [
+                    "compatprep.fixtures_on_host",
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                    RUST_SCRIPT_PRODUCER_TAG,
+                ] {
+                    assert!(
+                        request_closure.contains(producer),
+                        "the request's own closure lacks {producer}"
+                    );
+                }
+                request.extend([
                     "pre.submodules".into(),
                     PIN_GATE_TAG.into(),
                     CARGO_LOCK_GATE_TAG.into(),
-                    "compatprep.fixtures_on_host".into(),
-                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
                     RUST_SCRIPT_PRODUCER_TAG.into(),
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
+                    "gate.manifest".into(),
                 ]);
+                expected = closure_of(&request);
             }
             assert_eq!(
                 plan.cfg
@@ -36992,10 +37790,11 @@ mod committed_selection_preservation_tests {
             ),
         ] {
             for off_record in [false, true] {
+                // dh-kra8l9: off the record the plan now holds the target's
+                // whole closure, its manifest gate included, so the failed
+                // gate is exercised off the record too (it used to be
+                // skipped there, the gate being absent).
                 for failed_gate in [pin, gate] {
-                    if off_record && failed_gate == gate {
-                        continue;
-                    }
                     let temp = tempfile::tempdir().unwrap();
                     let sentinel = temp.path().join("target-ran");
                     let mut argv = vec!["--only".into(), lane.into(), target.into()];
