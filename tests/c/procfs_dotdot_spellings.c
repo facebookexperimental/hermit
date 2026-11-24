@@ -24,10 +24,21 @@
  *
  * Usage: procfs_dotdot_spellings DIRECTORY [native] [links | init]
  *
- * native: the run is native. Other processes can change the host's
- *   /proc/locks twice within the three reads of a comparison, so a mismatch
- *   is tried again, up to ATTEMPTS times a millisecond apart, before it is
- *   reported. So is an ELOOP, a known divergence
+ * native: the run is native. Other processes change the host's /proc/locks
+ *   between any two reads, and on a busy host they did so within every
+ *   retry, so natively a read of /proc/locks is compared by this program's
+ *   own rows only: those on the locked file's object, as its own fdinfo lock
+ *   line spells it (the superblock's device and the inode), with their
+ *   leading ordinal, which other rows shift, left out. That object is the
+ *   file's alone only where one device's live inodes have distinct numbers,
+ *   so a native run's DIRECTORY is on tmpfs (on btrfs every subvolume prints
+ *   the same device). A read that host locks change between its 4 KiB
+ *   pieces can still show one of these rows twice or drop it, since each
+ *   read() call starts the kernel's walk of the lock list again at a
+ *   position; that is one more reason a mismatch is still tried again, up
+ *   to ATTEMPTS times a millisecond apart, before it is reported. Under
+ *   Hermit, whose /proc/locks holds only the guest's own
+ *   rows, the whole bytes are compared. So is an ELOOP, a known divergence
  *   (https://github.com/rrnewton/hermit/issues/5045): Linux 7.1.3 keeps the
  *   link count across its RCU-walk retry. So its lookup can report ELOOP for
  *   a path that follows more than 20 links and no more than its limit of 40,
@@ -127,6 +138,85 @@ static int same(const char *bytes, size_t length, const char *reference, size_t 
   return reference != NULL && length == reference_length && memcmp(bytes, reference, length) == 0;
 }
 
+/* Natively, the locked file's object as a lock line spells it (" MM:mm:ino "
+ * with its spaces), from this program's own fdinfo; empty under Hermit. */
+static char own_object[64];
+
+/* The rows of a /proc/locks read `bytes` that name `own_object`, each
+ * without its leading ordinal ("N: "), which rows before it shift; NULL
+ * where there is no object to keep (under Hermit), so the whole bytes are
+ * compared. The caller frees it. */
+static char *own_rows(const char *bytes, size_t length, size_t *out_length) {
+  if (own_object[0] == '\0' || bytes == NULL) {
+    return NULL;
+  }
+  char *out = malloc(length + 1);
+  CHECK(out != NULL);
+  size_t used = 0;
+  const char *line = bytes;
+  const char *end = bytes + length;
+  while (line < end) {
+    const char *newline = memchr(line, '\n', (size_t)(end - line));
+    const char *line_end = newline ? newline : end;
+    size_t line_length = (size_t)(line_end - line);
+    char row[512];
+    if (line_length < sizeof row) {
+      memcpy(row, line, line_length);
+      row[line_length] = '\0';
+      const char *colon = strstr(row, ": ");
+      if (colon != NULL && strstr(row, own_object) != NULL) {
+        size_t kept = strlen(colon + 2);
+        memcpy(out + used, colon + 2, kept);
+        used += kept;
+        out[used++] = '\n';
+      }
+    }
+    line = newline ? newline + 1 : end;
+  }
+  *out_length = used;
+  return out;
+}
+
+/* Whether `bytes` equals `reference`: natively, for /proc/locks, by this
+ * program's own rows (`own_rows`); otherwise byte for byte. */
+static int same_as(const char *plain, const char *bytes, size_t length, const char *reference,
+                   size_t reference_length) {
+  if (strcmp(plain, "/proc/locks") == 0) {
+    size_t own_length = 0, reference_own_length = 0;
+    char *own = own_rows(bytes, length, &own_length);
+    char *reference_own = own_rows(reference, reference_length, &reference_own_length);
+    if (own != NULL && reference_own != NULL) {
+      /* The plain spelling always shows this program's two OFD rows, so an
+       * empty view means the object was not found: never equal. */
+      int equal = reference_own_length > 0 &&
+                  same(own, own_length, reference_own, reference_own_length);
+      free(own);
+      free(reference_own);
+      return equal;
+    }
+    free(own);
+    free(reference_own);
+  }
+  return same(bytes, length, reference, reference_length);
+}
+
+/* Natively, set `own_object` from this program's own fdinfo of `fd`, whose
+ * first lock line names the locked file's object. */
+static void learn_own_object(int fd) {
+  char path[64];
+  snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+  size_t length = 0;
+  char *text = read_all(path, &length);
+  CHECK(text != NULL);
+  const char *line = strstr(text, "lock:\t");
+  CHECK(line != NULL);
+  char class[16], mode[16], access[16], owner[24], object[40];
+  CHECK(sscanf(line, "lock:\t%*d: %15s %15s %15s %23s %39s", class, mode, access, owner,
+               object) == 5);
+  snprintf(own_object, sizeof own_object, " %s ", object);
+  free(text);
+}
+
 /* A millisecond's pause before each attempt after the first. */
 static void pause_before(int attempt) {
   if (attempt > 0) {
@@ -154,7 +244,8 @@ static void show(const char *label, const char *path, const char *plain) {
     } else {
       size_t after_length = 0;
       char *after = read_all(plain, &after_length);
-      equal = same(bytes, length, before, before_length) || same(bytes, length, after, after_length);
+      equal = same_as(plain, bytes, length, before, before_length) ||
+              same_as(plain, bytes, length, after, after_length);
       free(after);
       free(bytes);
     }
@@ -289,6 +380,9 @@ int main(int argc, char **argv) {
   struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
   CHECK(fcntl(first, F_OFD_SETLK, &lock) == 0);
   CHECK(fcntl(second, F_OFD_SETLK, &lock) == 0);
+  if (attempts > 1) {
+    learn_own_object(first);
+  }
   int pid = getpid();
   int tid = (int)syscall(SYS_gettid);
   char plain_fdinfo[64];

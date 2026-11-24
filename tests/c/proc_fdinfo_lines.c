@@ -42,11 +42,13 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +59,9 @@
 #include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <linux/magic.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/timerfd.h>
@@ -649,11 +653,668 @@ static void proc_locks_snapshot(const char* label) {
 }
 
 /*
+ * Natively (--native), the device that files in the guest's directory print
+ * in /proc/locks, as "MM:mm:" in hexadecimal, the form `lock_get_status`
+ * (fs/locks.c) prints `sb->s_dev` in, with the colon before the inode; empty
+ * under Hermit. The directory must be on tmpfs, whose stat device is that
+ * superblock device and whose live inodes have distinct numbers.
+ */
+static char native_device[24];
+
+/* Natively, the guest's directory, whose files are this run's own. */
+static const char* native_directory;
+
+/* The most whole reads a native snapshot takes before it fails, by name,
+ * for want of a read its rule accepts (proc_locks_snapshot_agreed). */
+#define NATIVE_SNAPSHOT_READS 50
+
+/* The most files of the guest's directory a native snapshot tells apart. */
+#define NATIVE_OWN_FILES 64
+
+/* How many consecutive reads must show the same rows of the guest's own
+ * files: part 3 of proc_locks_snapshot_agreed's rule. */
+#define SNAPSHOT_AGREEING_READS 3
+
+/*
+ * The size of the first read() call of successive whole reads of
+ * /proc/locks, in turn; each later call of a read asks for a whole page
+ * (NATIVE_PAGE_PIECE). /proc/locks is a seq_file: a call returns at most a
+ * page, ending on a record, and the next call starts the kernel's walk of the
+ * lock list again, by index, after the last record taken. So a first call of
+ * another size moves every later restart of that read to other records, and
+ * any SNAPSHOT_AGREEING_READS consecutive reads start with three different
+ * sizes. Their restarts typically fall at different records; nothing
+ * guarantees it, which is why the agreement of those reads (part 3 of
+ * proc_locks_snapshot_agreed's rule) is only defence in depth.
+ */
+static const size_t native_piece_sizes[] = {4096, 3072, 2048};
+#define NATIVE_PAGE_PIECE 4096
+
+/*
+ * The guest's exit status: natively (--native), 1 when a check failed, so a
+ * harness that checks only the exit status and the rows still fails on an
+ * unstable snapshot or a failed read; under Hermit always 0, as before, since
+ * those harnesses compare the transcript, failures line included.
+ */
+static int native_exit_status(void) {
+  return native_device[0] != '\0' && failures != 0 ? 1 : 0;
+}
+
+/*
+ * The whole of /proc/locks, read in a first read() call of `piece` bytes and
+ * then calls of a page each (the seq_file returns at most a page per call);
+ * NULL after an error, which is printed. The caller frees it.
+ */
+static char* read_proc_locks_whole(size_t piece, size_t* out_length) {
+  int info = open("/proc/locks", O_RDONLY | O_CLOEXEC);
+  if (info < 0) {
+    printf("open: %s\n", errno_name(errno));
+    return NULL;
+  }
+  size_t capacity = 65536;
+  size_t length = 0;
+  char* text = malloc(capacity);
+  if (text == NULL) {
+    printf("read: %s\n", errno_name(ENOMEM));
+    close(info);
+    return NULL;
+  }
+  for (;;) {
+    if (capacity - length < piece) {
+      char* grown = realloc(text, capacity * 2);
+      if (grown == NULL) {
+        printf("read: %s\n", errno_name(ENOMEM));
+        free(text);
+        close(info);
+        return NULL;
+      }
+      text = grown;
+      capacity *= 2;
+    }
+    ssize_t got = read(info, text + length, piece);
+    if (got < 0) {
+      printf("read: %s\n", errno_name(errno));
+      free(text);
+      close(info);
+      return NULL;
+    }
+    if (got == 0) {
+      break;
+    }
+    length += (size_t)got;
+    piece = NATIVE_PAGE_PIECE;
+  }
+  close(info);
+  *out_length = length;
+  return text;
+}
+
+/*
+ * How many rows of each lock class name the guest's own files, the class as
+ * lock_get_status (fs/locks.c) prints it after a row's ordinal: POSIX,
+ * OFDLCK, FLOCK, LEASE, and any other (BREAKING, DELEG, ACCESS, UNKNOWN). A
+ * blocked request's row ("N: -> ...") is a waiter, not a lock, and is not
+ * counted. Each native snapshot point passes the counts the guest holds there
+ * by construction (part 4 of proc_locks_snapshot_agreed's rule); under Hermit
+ * they are unused.
+ */
+struct lock_class_counts {
+  int posix;
+  int ofd;
+  int flock;
+  int lease;
+  int other;
+};
+
+/* No lock on the guest's own files. */
+static const struct lock_class_counts no_own_locks = {.posix = 0};
+
+static int same_counts(const struct lock_class_counts* a, const struct lock_class_counts* b) {
+  return a->posix == b->posix && a->ofd == b->ofd && a->flock == b->flock &&
+      a->lease == b->lease && a->other == b->other;
+}
+
+static void format_counts(char* text, size_t size, const struct lock_class_counts* counts) {
+  snprintf(text, size, "POSIX %d, OFDLCK %d, FLOCK %d, LEASE %d, other %d", counts->posix,
+           counts->ofd, counts->flock, counts->lease, counts->other);
+}
+
+/* Whether `row`'s next `length` bytes are `word`. */
+static int is_word(const char* row, size_t length, const char* word) {
+  return length == strlen(word) && strncmp(row, word, length) == 0;
+}
+
+/* Counts `row`, the text after a row's ordinal ("N: "), by its class. */
+static void count_lock_class(const char* row, struct lock_class_counts* counts) {
+  while (*row == ' ') {
+    row++;
+  }
+  if (strncmp(row, "->", 2) == 0) {
+    return;
+  }
+  size_t length = strcspn(row, " ");
+  if (is_word(row, length, "POSIX")) {
+    counts->posix++;
+  } else if (is_word(row, length, "OFDLCK")) {
+    counts->ofd++;
+  } else if (is_word(row, length, "FLOCK")) {
+    counts->flock++;
+  } else if (is_word(row, length, "LEASE")) {
+    counts->lease++;
+  } else {
+    counts->other++;
+  }
+}
+
+/*
+ * What one probe of a file found (probe_own_file), with no list involved:
+ * F_OFD_GETLK's answer for a whole-file write lock, which every OFD or POSIX
+ * lock on the file conflicts with, this process's own POSIX locks included
+ * (their owner is the process's descriptor table, the probe's its own
+ * description), and whether a flock is held. It sees which classes are held,
+ * not how many locks of each.
+ */
+struct lock_probe {
+  int error; /* the errno of a probe that failed, else 0 */
+  short type; /* F_UNLCK when no OFD or POSIX lock is held */
+  pid_t pid; /* the conflicting lock's l_pid: -1 for an OFD lock */
+  long long start;
+  long long len;
+  int flock_held; /* flock(LOCK_EX | LOCK_NB) failed with EWOULDBLOCK */
+};
+
+static int same_probe(const struct lock_probe* a, const struct lock_probe* b) {
+  return a->error == b->error && a->type == b->type && a->pid == b->pid && a->start == b->start &&
+      a->len == b->len && a->flock_held == b->flock_held;
+}
+
+/*
+ * Natively, the locks on the file a probe description `fd` (native_probe_fd)
+ * opens, probed without changing what is locked: F_OFD_GETLK takes no lock,
+ * and a flock(LOCK_EX | LOCK_NB) that succeeds, which shows that no flock is
+ * held, is let go at once, before the caller reads /proc/locks. Only under
+ * --native: under Hermit the guest's calls stay as they were.
+ */
+static struct lock_probe probe_own_file(int fd) {
+  struct lock_probe probe;
+  memset(&probe, 0, sizeof(probe));
+  if (fd < 0) {
+    probe.error = -fd;
+    return probe;
+  }
+  struct flock query = {
+      .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0, .l_pid = 0};
+  if (fcntl(fd, F_OFD_GETLK, &query) != 0) {
+    probe.error = errno;
+    return probe;
+  }
+  probe.type = query.l_type;
+  probe.pid = query.l_pid;
+  probe.start = (long long)query.l_start;
+  probe.len = (long long)query.l_len;
+  if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+    if (flock(fd, LOCK_UN) != 0) {
+      probe.error = errno;
+    }
+  } else if (errno == EWOULDBLOCK) {
+    probe.flock_held = 1;
+  } else {
+    probe.error = errno;
+  }
+  return probe;
+}
+
+/*
+ * Natively, one probe description per file of the guest's directory, by
+ * inode, opened read-only on first sight and never closed: closing any
+ * descriptor of a file drops every POSIX lock this process holds on it
+ * (locks_remove_posix, from filp_close), so a probe description closed after
+ * each probe could change what is locked. No native snapshot case takes a
+ * lease, which a read-only open could break.
+ */
+static struct {
+  unsigned long ino;
+  int fd;
+} native_probes[NATIVE_OWN_FILES];
+static int native_probe_count;
+
+/* The probe description of the file `name` in `directory`, of inode `ino`,
+ * opened on first sight; -errno when there is none. */
+static int native_probe_fd(int directory, const char* name, unsigned long ino) {
+  for (int i = 0; i < native_probe_count; i++) {
+    if (native_probes[i].ino == ino) {
+      return native_probes[i].fd;
+    }
+  }
+  if (native_probe_count == NATIVE_OWN_FILES) {
+    return -EMFILE;
+  }
+  int fd = openat(directory, name, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -errno;
+  }
+  struct stat status;
+  if (fstat(fd, &status) != 0) {
+    /* Kept open all the same: see native_probes. */
+    return -errno;
+  }
+  native_probes[native_probe_count].ino = (unsigned long)status.st_ino;
+  native_probes[native_probe_count].fd = fd;
+  native_probe_count++;
+  /* Where another file took the name between the listing and the open, its
+   * description is kept under its own inode, and `ino` has no probe yet. */
+  return (unsigned long)status.st_ino == ino ? fd : -ESTALE;
+}
+
+/*
+ * The objects of the files in the guest's directory as /proc/locks spells
+ * them, each as " MM:mm:INODE " with its spaces, into `objects`, and each
+ * one's probe description (native_probe_fd) into `probe_fds`; returns how
+ * many, or -errno when the directory cannot be listed. These are this run's
+ * own files: nothing else uses the directory.
+ */
+static int native_own_files(char objects[][48], int* probe_fds) {
+  int count = 0;
+  DIR* listing = opendir(native_directory);
+  if (listing == NULL) {
+    return -errno;
+  }
+  struct dirent* entry;
+  while ((entry = readdir(listing)) != NULL && count < NATIVE_OWN_FILES) {
+    struct stat status;
+    if (fstatat(dirfd(listing), entry->d_name, &status, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(status.st_mode)) {
+      snprintf(objects[count], 48, " %s%lu ", native_device, (unsigned long)status.st_ino);
+      probe_fds[count] =
+          native_probe_fd(dirfd(listing), entry->d_name, (unsigned long)status.st_ino);
+      count++;
+    }
+  }
+  closedir(listing);
+  return count;
+}
+
+/*
+ * The rows of a /proc/locks read naming one of the `count` files `objects`
+ * spells (native_own_files), each without its leading ordinal ("N: "), which
+ * other rows shift, and the count of each file's rows by lock class in
+ * `per_file`. The caller frees it.
+ */
+static char* own_lock_rows(
+    const char* text,
+    size_t length,
+    const char (*objects)[48],
+    int count,
+    struct lock_class_counts* per_file,
+    size_t* out_length) {
+  char* out = malloc(length + 1);
+  if (out == NULL) {
+    abort();
+  }
+  for (int i = 0; i < count; i++) {
+    per_file[i] = no_own_locks;
+  }
+  size_t used = 0;
+  const char* line = text;
+  const char* end = text + length;
+  while (line < end) {
+    const char* newline = memchr(line, '\n', (size_t)(end - line));
+    const char* line_end = newline ? newline : end;
+    size_t line_length = (size_t)(line_end - line);
+    char row[512];
+    if (line_length < sizeof(row)) {
+      memcpy(row, line, line_length);
+      row[line_length] = '\0';
+      const char* colon = strstr(row, ": ");
+      int own = -1;
+      for (int i = 0; colon != NULL && i < count && own < 0; i++) {
+        if (strstr(colon, objects[i]) != NULL) {
+          own = i;
+        }
+      }
+      if (own >= 0) {
+        count_lock_class(colon + 2, &per_file[own]);
+        size_t kept = strlen(colon + 2);
+        memcpy(out + used, colon + 2, kept);
+        used += kept;
+        out[used++] = '\n';
+      }
+    }
+    line = newline ? newline + 1 : end;
+  }
+  *out_length = used;
+  return out;
+}
+
+/* The parts of proc_locks_snapshot_agreed's rule, as bits. */
+#define SNAPSHOT_PART_PROBES 1 /* part 1: the probes agree before and after */
+#define SNAPSHOT_PART_CLASSES 2 /* part 2: the rows name the probed classes */
+#define SNAPSHOT_PART_AGREE 4 /* part 3: consecutive reads agree */
+#define SNAPSHOT_PART_COUNTS 8 /* part 4: each class's count is the expected one */
+#define SNAPSHOT_ALL_PARTS 15
+
+/*
+ * The judge of one native snapshot's successive reads (snapshot_acceptor_take),
+ * with the parts of the rule in force (`parts`: all four, except where the
+ * self-test leaves one out) and the counts the guest holds (`expected`).
+ */
+struct snapshot_acceptor {
+  int parts;
+  struct lock_class_counts expected;
+  /* Consecutive reads, ending with the last, that passed parts 1, 2 and 4
+   * and show the same rows. */
+  int streak;
+  /* The same, leaving part 4 out. */
+  int steady;
+  /* The last read's rows of the guest's own files (own_lock_rows). */
+  char* rows;
+  size_t rows_length;
+  /* The parts the last read failed, its counts, and why, for standard error. */
+  int failed;
+  struct lock_class_counts seen;
+  char reason[1024];
+  /* How many reads each part rejected. */
+  int rejected[4];
+};
+
+static void snapshot_acceptor_init(
+    struct snapshot_acceptor* acceptor,
+    int parts,
+    struct lock_class_counts expected) {
+  memset(acceptor, 0, sizeof(*acceptor));
+  acceptor->parts = parts;
+  acceptor->expected = expected;
+}
+
+static void snapshot_acceptor_free(struct snapshot_acceptor* acceptor) {
+  free(acceptor->rows);
+  acceptor->rows = NULL;
+}
+
+__attribute__((format(printf, 2, 3))) static void
+add_reason(struct snapshot_acceptor* acceptor, const char* format, ...) {
+  size_t used = strlen(acceptor->reason);
+  va_list arguments;
+  va_start(arguments, format);
+  vsnprintf(acceptor->reason + used, sizeof(acceptor->reason) - used, format, arguments);
+  va_end(arguments);
+}
+
+/* Why the rows `rows` of one file do not name the classes `probe` found
+ * held (part 2), or NULL when they do. */
+static const char* probe_class_mismatch(
+    const struct lock_probe* probe,
+    const struct lock_class_counts* rows) {
+  if (probe->type == F_UNLCK) {
+    if (rows->ofd != 0 || rows->posix != 0) {
+      return "no OFD or POSIX lock is held, but there are OFDLCK or POSIX rows";
+    }
+  } else if (probe->pid == -1) {
+    if (rows->ofd == 0) {
+      return "an OFD lock is held, but there is no OFDLCK row";
+    }
+  } else if (rows->posix == 0) {
+    return "a POSIX lock is held, but there is no POSIX row";
+  }
+  if (probe->flock_held && rows->flock == 0) {
+    return "a flock is held, but there is no FLOCK row";
+  }
+  if (!probe->flock_held && rows->flock != 0) {
+    return "no flock is held, but there are FLOCK rows";
+  }
+  return NULL;
+}
+
+/*
+ * Judges one whole read of /proc/locks, `text`, by the parts of
+ * proc_locks_snapshot_agreed's rule in force: the rows naming the `count`
+ * files `objects` spells, each file's probes from just before the read
+ * (`before`) and just after it (`after`), and the reads before it. Returns 1
+ * when the read is accepted; records the parts it failed, and why, in
+ * `acceptor`. It does no I/O, so that the self-test feeds it planted reads.
+ */
+static int snapshot_acceptor_take(
+    struct snapshot_acceptor* acceptor,
+    const char* text,
+    size_t length,
+    const char (*objects)[48],
+    int count,
+    const struct lock_probe* before,
+    const struct lock_probe* after) {
+  struct lock_class_counts per_file[NATIVE_OWN_FILES];
+  size_t rows_length = 0;
+  char* rows = own_lock_rows(text, length, objects, count, per_file, &rows_length);
+  int parts = acceptor->parts;
+  int failed = 0;
+  struct lock_class_counts seen = no_own_locks;
+  acceptor->reason[0] = '\0';
+  for (int i = 0; i < count; i++) {
+    seen.posix += per_file[i].posix;
+    seen.ofd += per_file[i].ofd;
+    seen.flock += per_file[i].flock;
+    seen.lease += per_file[i].lease;
+    seen.other += per_file[i].other;
+    /* The object without its spaces. */
+    int width = (int)strlen(objects[i]) - 2;
+    const char* name = objects[i] + 1;
+    if (parts & SNAPSHOT_PART_PROBES) {
+      if (before[i].error != 0 || after[i].error != 0) {
+        failed |= SNAPSHOT_PART_PROBES;
+        add_reason(acceptor, " part 1 (%.*s: a probe failed, errno %d)", width, name,
+                   before[i].error != 0 ? before[i].error : after[i].error);
+      } else if (!same_probe(&before[i], &after[i])) {
+        failed |= SNAPSHOT_PART_PROBES;
+        add_reason(acceptor, " part 1 (%.*s: the probes before and after the read differ)",
+                   width, name);
+      }
+    }
+    if (parts & SNAPSHOT_PART_CLASSES) {
+      const struct lock_probe* probes[2] = {&before[i], &after[i]};
+      for (int j = 0; j < 2; j++) {
+        const char* mismatch =
+            probes[j]->error == 0 ? probe_class_mismatch(probes[j], &per_file[i]) : NULL;
+        if (mismatch != NULL) {
+          failed |= SNAPSHOT_PART_CLASSES;
+          add_reason(acceptor, " part 2 (%.*s: %s)", width, name, mismatch);
+          break;
+        }
+      }
+    }
+  }
+  if ((parts & SNAPSHOT_PART_COUNTS) && !same_counts(&seen, &acceptor->expected)) {
+    char seen_text[128];
+    char expected_text[128];
+    format_counts(seen_text, sizeof(seen_text), &seen);
+    format_counts(expected_text, sizeof(expected_text), &acceptor->expected);
+    failed |= SNAPSHOT_PART_COUNTS;
+    add_reason(acceptor, " part 4 (%s, where %s is expected)", seen_text, expected_text);
+  }
+  int same = acceptor->rows != NULL && rows_length == acceptor->rows_length &&
+      memcmp(rows, acceptor->rows, rows_length) == 0;
+  if ((failed & (SNAPSHOT_PART_PROBES | SNAPSHOT_PART_CLASSES)) != 0) {
+    acceptor->steady = 0;
+  } else {
+    acceptor->steady = acceptor->steady > 0 && same ? acceptor->steady + 1 : 1;
+  }
+  if (failed != 0) {
+    acceptor->streak = 0;
+  } else if (acceptor->streak > 0 && same) {
+    acceptor->streak++;
+  } else {
+    if (acceptor->streak > 0 && (parts & SNAPSHOT_PART_AGREE)) {
+      failed |= SNAPSHOT_PART_AGREE;
+      add_reason(acceptor, " part 3 (this run's rows differ from the previous read's)");
+    }
+    acceptor->streak = 1;
+  }
+  for (int part = 0; part < 4; part++) {
+    if (failed & (1 << part)) {
+      acceptor->rejected[part]++;
+    }
+  }
+  free(acceptor->rows);
+  acceptor->rows = rows;
+  acceptor->rows_length = rows_length;
+  acceptor->failed = failed;
+  acceptor->seen = seen;
+  int needed = (parts & SNAPSHOT_PART_AGREE) ? SNAPSHOT_AGREEING_READS : 1;
+  return (failed & ~SNAPSHOT_PART_AGREE) == 0 && acceptor->streak >= needed;
+}
+
+/*
+ * Whether reads that went unaccepted failed only on the count: the last
+ * SNAPSHOT_AGREEING_READS passed parts 1 and 2 and showed the same rows, and
+ * the last of them failed part 4. That is Linux's count differing from the
+ * expected one, not an unstable list.
+ */
+static int snapshot_count_differs(const struct snapshot_acceptor* acceptor) {
+  return acceptor->steady >= SNAPSHOT_AGREEING_READS &&
+      (acceptor->failed & SNAPSHOT_PART_COUNTS) != 0;
+}
+
+/*
+ * A native snapshot: whole reads of /proc/locks until one is accepted, and
+ * then that read, whole. One read of /proc/locks is not one snapshot: it is a
+ * seq_file, each of whose read() calls returns at most a page ending on a
+ * record and starts the kernel's walk of the lock list again by index, so
+ * host locks that come and go between two calls drop the record just after
+ * that restart or repeat the one just before it (the hazard Detcore's own
+ * capture handles; see "Why repeats appear" in detcore/src/procfs/locks.rs).
+ * Under heavy host churn two reads can tear alike, so their agreement alone
+ * is not enough. A read is accepted when all four parts of this rule hold
+ * for its rows naming the guest's own files (on tmpfs a file's object is its
+ * own), as snapshot_acceptor_take judges them:
+ *
+ * 1. The kernel's own answer, with no list involved (probe_own_file on each
+ *    own file's probe description), is the same just before the read and
+ *    just after it, so the guest's locks did not change during the read.
+ * 2. The rows name the classes the probes found: a row of each class a probe
+ *    found held, and no OFDLCK, POSIX or FLOCK row of a class it found free
+ *    (F_OFD_GETLK names one conflicting lock, so where it finds an OFD lock
+ *    a POSIX lock is unknown, and the reverse; leases are not probed). A
+ *    dropped row of a held class fails here. The probes see presence, not
+ *    multiplicity.
+ * 3. The read and the SNAPSHOT_AGREEING_READS - 1 reads before it show the
+ *    same rows, each read's first read() call of another size
+ *    (native_piece_sizes). Kept as defence in depth: parts 1, 2 and 4 already
+ *    reject every tear that changes the snapshot cases' answers; this part
+ *    rejects one that keeps every class's count but changes what a row says,
+ *    as a drop of one row and a repeat of another of the same class.
+ * 4. Each class's count of the rows is the count the guest holds at this
+ *    point by construction (`expected`): a repeat shows one too many, a drop
+ *    one too few.
+ *
+ * A tear only drops or repeats rows of locks that exist, and what the rule
+ * still accepts is named: a drop of one of two byte-identical rows
+ * (joined_twin_locks) and a repeat of the other, which prints the true
+ * answer once the ordinals are left out; and a Linux whose count differs
+ * from the expected one, hidden by a tear that repeats alike in three reads,
+ * which can never hide a Hermit defect. Other processes' rows, which a
+ * harness never compares, are printed as read. Each rejected read, with the
+ * parts it failed and why, and the accepted read's retake count go to
+ * standard error. After NATIVE_SNAPSHOT_READS reads with none accepted the
+ * snapshot fails, printed with its label as "rows agree; count differs from
+ * expected" where only the count kept it from acceptance
+ * (snapshot_count_differs) and as "unstable" otherwise, then the last read's
+ * rows of the guest's files; the guest then exits 1 (native_exit_status), so
+ * it never passes, whatever rows a harness expects.
+ */
+static void proc_locks_snapshot_agreed(const char* label, struct lock_class_counts expected) {
+  printf("--- %s ---\n", label);
+  static char objects[NATIVE_OWN_FILES][48];
+  static int probe_fds[NATIVE_OWN_FILES];
+  static struct lock_probe before[NATIVE_OWN_FILES];
+  static struct lock_probe after[NATIVE_OWN_FILES];
+  struct snapshot_acceptor acceptor;
+  snapshot_acceptor_init(&acceptor, SNAPSHOT_ALL_PARTS, expected);
+  size_t sizes = sizeof(native_piece_sizes) / sizeof(native_piece_sizes[0]);
+  for (int reads = 1; reads <= NATIVE_SNAPSHOT_READS; reads++) {
+    int count = native_own_files(objects, probe_fds);
+    if (count < 0) {
+      printf("opendir: %s\n", errno_name(-count));
+      snapshot_acceptor_free(&acceptor);
+      failures++;
+      return;
+    }
+    for (int i = 0; i < count; i++) {
+      before[i] = probe_own_file(probe_fds[i]);
+    }
+    size_t length = 0;
+    char* text = read_proc_locks_whole(native_piece_sizes[(size_t)(reads - 1) % sizes], &length);
+    for (int i = 0; i < count; i++) {
+      after[i] = probe_own_file(probe_fds[i]);
+    }
+    if (text == NULL) {
+      snapshot_acceptor_free(&acceptor);
+      failures++;
+      return;
+    }
+    int accepted = snapshot_acceptor_take(
+        &acceptor, text, length, (const char(*)[48])objects, count, before, after);
+    if (acceptor.failed != 0) {
+      fprintf(stderr, "/proc/locks snapshot \"%s\": read %d rejected:%s\n", label, reads,
+              acceptor.reason);
+    }
+    if (accepted) {
+      fwrite(text, 1, length, stdout);
+      fprintf(stderr,
+              "/proc/locks snapshot \"%s\": accepted at read %d, %d retakes (reads rejected by "
+              "part 1: %d, part 2: %d, part 3: %d, part 4: %d)\n",
+              label, reads, reads - SNAPSHOT_AGREEING_READS, acceptor.rejected[0],
+              acceptor.rejected[1], acceptor.rejected[2], acceptor.rejected[3]);
+      free(text);
+      snapshot_acceptor_free(&acceptor);
+      return;
+    }
+    free(text);
+  }
+  if (snapshot_count_differs(&acceptor)) {
+    char seen_text[128];
+    char expected_text[128];
+    format_counts(seen_text, sizeof(seen_text), &acceptor.seen);
+    format_counts(expected_text, sizeof(expected_text), &acceptor.expected);
+    printf("rows agree; count differs from expected: \"%s\": the last %d of %d reads of "
+           "/proc/locks showed the same rows of this run's files, with %s, where %s is "
+           "expected\n",
+           label, acceptor.steady, NATIVE_SNAPSHOT_READS, seen_text, expected_text);
+  } else {
+    printf("unstable: \"%s\": %d reads of /proc/locks, and none was accepted (reads rejected by "
+           "part 1: %d, part 2: %d, part 3: %d, part 4: %d)\n",
+           label, NATIVE_SNAPSHOT_READS, acceptor.rejected[0], acceptor.rejected[1],
+           acceptor.rejected[2], acceptor.rejected[3]);
+  }
+  /* The last read's rows of this run's files, without their ordinals, so
+   * that a harness never counts them as a snapshot's rows. */
+  for (size_t at = 0; at < acceptor.rows_length;) {
+    const char* row = acceptor.rows + at;
+    size_t row_length = strcspn(row, "\n");
+    printf("the last read's row: %.*s\n", (int)row_length, row);
+    at += row_length + 1;
+  }
+  fprintf(stderr,
+          "/proc/locks snapshot \"%s\": none accepted in %d reads (reads rejected by part 1: %d, "
+          "part 2: %d, part 3: %d, part 4: %d)\n",
+          label, NATIVE_SNAPSHOT_READS, acceptor.rejected[0], acceptor.rejected[1],
+          acceptor.rejected[2], acceptor.rejected[3]);
+  snapshot_acceptor_free(&acceptor);
+  failures++;
+}
+
+/*
  * As proc_locks_snapshot, with the whole of /proc/locks however long it is:
  * natively it lists every lock on the host, more than the fixed buffer above
- * holds, and a harness finds this guest's rows among them by inode.
+ * holds, and a harness finds this guest's rows among them by object (device
+ * and inode). `expected` is how many locks of each class the guest holds on
+ * its own files at this point, by construction. Natively (--native) the
+ * snapshot is proc_locks_snapshot_agreed's, whose part 4 checks `expected`;
+ * under Hermit, whose /proc/locks holds the guest's rows alone, it is one
+ * read, and `expected` is unused.
  */
-static void proc_locks_snapshot_whole(const char* label) {
+static void proc_locks_snapshot_whole(const char* label, struct lock_class_counts expected) {
+  if (native_device[0] != '\0') {
+    proc_locks_snapshot_agreed(label, expected);
+    return;
+  }
   printf("--- %s ---\n", label);
   int info = open("/proc/locks", O_RDONLY | O_CLOEXEC);
   if (info < 0) {
@@ -1010,7 +1671,7 @@ static void received_from_parent(const char* directory) {
  * description, and with it an OFD lock or a flock, until the receipt hands
  * it to the parent; a POSIX lock is the child's, which its close of the
  * descriptor or its exit releases. The file stays, so that a native run's
- * harness can find its rows by inode among the host's.
+ * harness can find its rows among the host's by object (device and inode).
  */
 static void in_flight_scenario(const char* directory, const char* kind, int sender_exits) {
   int pair[2];
@@ -1046,6 +1707,10 @@ static void in_flight_scenario(const char* directory, const char* kind, int send
     failures++;
     return;
   }
+  /* What the file holds while the description does: its OFD lock or its
+   * flock; a POSIX lock is the sender's, gone with its close or its exit. */
+  const struct lock_class_counts held = {
+      .ofd = strcmp(kind, "ofd") == 0, .flock = strcmp(kind, "flock") == 0};
   if (sender_exits) {
     siginfo_t exited;
     memset(&exited, 0, sizeof(exited));
@@ -1053,19 +1718,19 @@ static void in_flight_scenario(const char* directory, const char* kind, int send
     printf("the sender's %s lock, send and exit: %s\n", kind,
            waited == 0 && exited.si_code == CLD_EXITED && exited.si_status == 0 ? "ok"
                                                                                 : "failed");
-    proc_locks_snapshot_whole("in flight after the sender exited");
+    proc_locks_snapshot_whole("in flight after the sender exited", held);
   } else {
     char byte = 0;
     ssize_t got = read(closed[0], &byte, 1);
     printf("the sender's %s lock, send and close: %s\n", kind,
            got == 1 && byte == 'y' ? "ok" : "failed");
-    proc_locks_snapshot_whole("in flight after the sender closed its descriptor");
+    proc_locks_snapshot_whole("in flight after the sender closed its descriptor", held);
   }
   int received[1] = {-1};
   printf("recvmsg: %d descriptors\n", receive_descriptors(pair[0], received, 1));
-  proc_locks_snapshot_whole("received");
+  proc_locks_snapshot_whole("received", held);
   check("close of the received descriptor", close(received[0]));
-  proc_locks_snapshot_whole("closed");
+  proc_locks_snapshot_whole("closed", no_own_locks);
   int status = 0;
   if ((!sender_exits && write(pair[0], "x", 1) != 1) || waitpid(child, &status, 0) != child ||
       !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -1120,7 +1785,8 @@ static void in_flight_scenario(const char* directory, const char* kind, int send
  * open's conflicting lock is granted, and the parent closes its sending end
  * and looks a last time.
  *
- * The file stays, so that a native run's harness can find its rows by inode.
+ * The file stays, so that a native run's harness can find its rows by
+ * object (device and inode).
  */
 static void receiver_gone_scenario(const char* directory, const char* how) {
   int exec_terminated = strcmp(how, "exec-terminated") == 0;
@@ -1210,13 +1876,15 @@ static void receiver_gone_scenario(const char* directory, const char* how) {
   if (!parent_keeps) {
     close(pair[0]);
   }
+  /* The OFD lock of the description the queued message holds. */
+  const struct lock_class_counts queued = {.ofd = 1};
   int locked = lock_file(directory, "receiver-gone");
   struct flock whole = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
   check("F_OFD_SETLK", fcntl(locked, F_OFD_SETLK, &whole));
   int carried[1] = {locked};
   printf("sendmsg to the child's socket: %d\n", send_descriptors(pair[1], carried, 1));
   check("close of the parent's descriptor", close(locked));
-  proc_locks_snapshot_whole("in flight to the child's socket");
+  proc_locks_snapshot_whole("in flight to the child's socket", queued);
   if (write(exec_terminated ? release[1] : go[1], "g", 1) != 1) {
     failures++;
   }
@@ -1258,7 +1926,7 @@ static void receiver_gone_scenario(const char* directory, const char* how) {
   snprintf(path, sizeof(path), "%s/receiver-gone", directory);
   struct flock unlock = {.l_type = F_UNLCK, .l_whence = SEEK_SET};
   if (parent_keeps) {
-    proc_locks_snapshot_whole("after the child's death");
+    proc_locks_snapshot_whole("after the child's death", queued);
     int fresh = open(path, O_RDWR | O_CLOEXEC);
     int refused = fcntl(fresh, F_OFD_SETLK, &whole);
     check("a fresh open's conflicting F_OFD_SETLK", refused);
@@ -1266,20 +1934,20 @@ static void receiver_gone_scenario(const char* directory, const char* how) {
       fcntl(fresh, F_OFD_SETLK, &unlock);
     }
     close(fresh);
-    proc_locks_snapshot_whole("after a fresh open's attempt");
+    proc_locks_snapshot_whole("after a fresh open's attempt", queued);
     check("close of the parent's receiving end", close(pair[0]));
-    proc_locks_snapshot_whole("after the parent's receiving end closed");
+    proc_locks_snapshot_whole("after the parent's receiving end closed", no_own_locks);
     fresh = open(path, O_RDWR | O_CLOEXEC);
     check("a second fresh open's conflicting F_OFD_SETLK", fcntl(fresh, F_OFD_SETLK, &whole));
     check("its unlock", fcntl(fresh, F_OFD_SETLK, &unlock));
     close(fresh);
   } else {
-    proc_locks_snapshot_whole("after the child's socket went");
+    proc_locks_snapshot_whole("after the child's socket went", no_own_locks);
     int fresh = open(path, O_RDWR | O_CLOEXEC);
     check("a fresh open's conflicting F_OFD_SETLK", fcntl(fresh, F_OFD_SETLK, &whole));
     check("its unlock", fcntl(fresh, F_OFD_SETLK, &unlock));
     close(fresh);
-    proc_locks_snapshot_whole("after a fresh open's lock and unlock");
+    proc_locks_snapshot_whole("after a fresh open's lock and unlock", no_own_locks);
   }
   if (strcmp(how, "exec") == 0 &&
       (write(release[1], "x", 1) != 1 || waitpid(child, &status, 0) != child ||
@@ -1287,7 +1955,7 @@ static void receiver_gone_scenario(const char* directory, const char* how) {
     failures++;
   }
   close(pair[1]);
-  proc_locks_snapshot_whole("at the end");
+  proc_locks_snapshot_whole("at the end", no_own_locks);
   close(go[0]);
   close(go[1]);
   close(ready[0]);
@@ -1311,11 +1979,10 @@ static int busy_socket = -1;
 static char busy_path[512];
 
 /*
- * Whether /proc/locks lists a whole-file OFD write lock. Under Hermit it lists
- * only the guest's own rows, so this is the in-flight lock; natively another
- * process's identical lock may be listed too, which only makes the answer yes.
+ * Whether one read of /proc/locks, in read() calls of at most `piece` bytes,
+ * lists a whole-file OFD write lock (lists_whole_file_write_lock).
  */
-static int lists_whole_file_write_lock(void) {
+static int read_lists_whole_file_write_lock(size_t piece) {
   int info = open("/proc/locks", O_RDONLY | O_CLOEXEC);
   if (info < 0) {
     return 0;
@@ -1323,7 +1990,8 @@ static int lists_whole_file_write_lock(void) {
   static char text[1 << 20];
   size_t length = 0;
   for (;;) {
-    ssize_t got = read(info, text + length, sizeof(text) - 1 - length);
+    size_t room = sizeof(text) - 1 - length;
+    ssize_t got = read(info, text + length, room < piece ? room : piece);
     if (got <= 0) {
       break;
     }
@@ -1344,6 +2012,24 @@ static int lists_whole_file_write_lock(void) {
              strcmp(line + line_length - 6, " 0 EOF") == 0;
   }
   return listed;
+}
+
+/*
+ * Whether /proc/locks lists a whole-file OFD write lock. Under Hermit it lists
+ * only the guest's own rows, so this is the in-flight lock, read once as
+ * before. Natively another process's identical lock may be listed too, which
+ * only makes the answer yes; and each read() call starts the kernel's walk of
+ * the list again, so host locks that come and go can make one read drop the
+ * row (as for proc_locks_snapshot_agreed). So natively a read that misses it
+ * is followed by one in calls of another size, and only two misses in a row
+ * count as "listed no lock".
+ */
+static int lists_whole_file_write_lock(void) {
+  if (native_device[0] == '\0') {
+    return read_lists_whole_file_write_lock(SIZE_MAX);
+  }
+  return read_lists_whole_file_write_lock(native_piece_sizes[0]) ||
+         read_lists_whole_file_write_lock(native_piece_sizes[1]);
 }
 
 /*
@@ -1436,7 +2122,9 @@ static void receiver_dies_busy_scenario(const char* directory, const char* how) 
   int carried[1] = {locked};
   printf("sendmsg to the child's socket: %d\n", send_descriptors(pair[1], carried, 1));
   check("close of the parent's descriptor", close(locked));
-  proc_locks_snapshot_whole("in flight to the child's socket");
+  /* The OFD lock of the description the queued message holds. */
+  const struct lock_class_counts queued = {.ofd = 1};
+  proc_locks_snapshot_whole("in flight to the child's socket", queued);
   if (write(go[1], "g", 1) != 1) {
     failures++;
   }
@@ -1454,13 +2142,13 @@ static void receiver_dies_busy_scenario(const char* directory, const char* how) 
   printf("the busy sibling ran: %s\n", busy_record->rounds >= 3 ? "yes" : "no");
   printf("its calls through the child's descriptors that failed: %d\n", busy_record->failed_calls);
   printf("its reads of /proc/locks that listed no lock: %d\n", busy_record->missing_rows);
-  proc_locks_snapshot_whole("after the child's death");
+  proc_locks_snapshot_whole("after the child's death", no_own_locks);
   int fresh = open(busy_path, O_RDWR | O_CLOEXEC);
   check("a fresh open's conflicting F_OFD_SETLK", fcntl(fresh, F_OFD_SETLK, &whole));
   struct flock unlock = {.l_type = F_UNLCK, .l_whence = SEEK_SET};
   check("its unlock", fcntl(fresh, F_OFD_SETLK, &unlock));
   close(fresh);
-  proc_locks_snapshot_whole("after a fresh open's lock and unlock");
+  proc_locks_snapshot_whole("after a fresh open's lock and unlock", no_own_locks);
   close(pair[1]);
   close(go[0]);
   close(go[1]);
@@ -1478,9 +2166,11 @@ static void receiver_dies_busy_scenario(const char* directory, const char* how) 
  * from the unlock on. The report goes to standard output, that file.
  */
 static void stdio_alias_in_flight(void) {
+  /* The one description's one OFD lock. */
+  const struct lock_class_counts one_lock = {.ofd = 1};
   struct flock shared = {.l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
   check("F_OFD_SETLK through standard input", fcntl(0, F_OFD_SETLK, &shared));
-  proc_locks_snapshot_whole("one lock through standard input");
+  proc_locks_snapshot_whole("one lock through standard input", one_lock);
   int pair[2];
   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
     printf("socketpair: %s\n", errno_name(errno));
@@ -1490,15 +2180,15 @@ static void stdio_alias_in_flight(void) {
   int carried[1] = {0};
   printf("sendmsg of standard input: %d\n", send_descriptors(pair[0], carried, 1));
   check("close of standard input", close(0));
-  proc_locks_snapshot_whole("standard input in flight");
+  proc_locks_snapshot_whole("standard input in flight", one_lock);
   struct flock unlock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
   check("F_OFD_SETLK unlock through standard output", fcntl(1, F_OFD_SETLK, &unlock));
-  proc_locks_snapshot_whole("after the unlock through standard output");
+  proc_locks_snapshot_whole("after the unlock through standard output", no_own_locks);
   int received[1] = {-1};
   printf("recvmsg: %d descriptors\n", receive_descriptors(pair[1], received, 1));
-  proc_locks_snapshot_whole("received");
+  proc_locks_snapshot_whole("received", no_own_locks);
   check("close of the received descriptor", close(received[0]));
-  proc_locks_snapshot_whole("closed");
+  proc_locks_snapshot_whole("closed", no_own_locks);
   close(pair[0]);
   close(pair[1]);
 }
@@ -1510,7 +2200,7 @@ static void stdio_alias_in_flight(void) {
  * own. Linux lists each lock object: two rows while the child holds the
  * second, one after the child closes it, none after the parent closes the
  * first. The file stays, so that a native run's harness can find its rows by
- * inode.
+ * object (device and inode).
  */
 static void joined_twin_locks(const char* directory) {
   int pair[2];
@@ -1546,7 +2236,10 @@ static void joined_twin_locks(const char* directory) {
   struct flock shared = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
   check("F_OFD_SETLK through the first open", fcntl(first, F_OFD_SETLK, &shared));
   check("F_OFD_SETLK through the second open", fcntl(second, F_OFD_SETLK, &shared));
-  proc_locks_snapshot_whole("two opens' identical OFD locks");
+  /* Each open's lock object, then the first's alone, then none. */
+  const struct lock_class_counts both = {.ofd = 2};
+  const struct lock_class_counts first_only = {.ofd = 1};
+  proc_locks_snapshot_whole("two opens' identical OFD locks", both);
   int carried[1] = {second};
   printf("sendmsg of the second open to the child: %d\n", send_descriptors(pair[0], carried, 1));
   char answer = 0;
@@ -1555,20 +2248,20 @@ static void joined_twin_locks(const char* directory) {
   }
   printf("child's receipt: %s\n", answer == 'y' ? "ok" : "failed");
   check("close of the parent's second open", close(second));
-  proc_locks_snapshot_whole("the child holding the second open");
+  proc_locks_snapshot_whole("the child holding the second open", both);
   answer = 0;
   if (write(done[1], "x", 1) != 1 || read(pair[0], &answer, 1) != 1) {
     failures++;
   }
   printf("child's close of the second open: %s\n", answer == 'y' ? "ok" : "failed");
-  proc_locks_snapshot_whole("after the child closed the second open");
+  proc_locks_snapshot_whole("after the child closed the second open", first_only);
   int status = 0;
   if (write(done[1], "x", 1) != 1 || waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
       WEXITSTATUS(status) != 0) {
     failures++;
   }
   check("close of the first open", close(first));
-  proc_locks_snapshot_whole("after the first open's close");
+  proc_locks_snapshot_whole("after the first open's close", no_own_locks);
   close(pair[0]);
   close(pair[1]);
   close(done[0]);
@@ -1701,9 +2394,241 @@ static void standard_stream_kinds(const char* directory) {
 }
 
 /*
+ * The self-test's planted reads of /proc/locks for snapshot_acceptor_take.
+ * The guest's file is 00:2a:100; each text first lists rows that only look
+ * like it (another device, and an inode it prefixes), which are never its
+ * own. The multi-class truth holds two OFD locks on different ranges and a
+ * POSIX lock with a blocked request, which is not counted.
+ */
+static const char planted_objects[1][48] = {" 00:2a:100 "};
+#define PLANTED_FOREIGN \
+  "1: POSIX  ADVISORY  WRITE 77 00:2b:100 0 EOF\n" \
+  "2: FLOCK  ADVISORY  WRITE 78 00:2a:1000 0 EOF\n"
+#define PLANTED_OFD_READ "3: OFDLCK ADVISORY  READ  -1 00:2a:100 0 9\n"
+#define PLANTED_OFD_WRITE "4: OFDLCK ADVISORY  WRITE -1 00:2a:100 20 29\n"
+#define PLANTED_POSIX \
+  "5: POSIX  ADVISORY  WRITE 4242 00:2a:100 40 49\n" \
+  "5: -> POSIX  ADVISORY  WRITE 4300 00:2a:100 40 49\n"
+#define PLANTED_TWIN "OFDLCK ADVISORY  READ  -1 00:2a:100 0 EOF\n"
+
+/* One planted read: its text and its own file's probes around it. */
+struct planted_read {
+  const char* text;
+  struct lock_probe before;
+  struct lock_probe after;
+};
+
+/*
+ * Feeds `reads` to one snapshot's acceptor with `parts` in force and
+ * `expected`; returns the read (from 1) it accepted, 0 for none. Each read's
+ * failed parts go to `failed`, and whether it ended as
+ * snapshot_count_differs to `count_differs`.
+ */
+static int planted_acceptance(
+    const struct planted_read* reads,
+    int count,
+    struct lock_class_counts expected,
+    int parts,
+    int* failed,
+    int* count_differs) {
+  struct snapshot_acceptor acceptor;
+  snapshot_acceptor_init(&acceptor, parts, expected);
+  int accepted_at = 0;
+  for (int i = 0; i < count && accepted_at == 0; i++) {
+    if (snapshot_acceptor_take(
+            &acceptor,
+            reads[i].text,
+            strlen(reads[i].text),
+            planted_objects,
+            1,
+            &reads[i].before,
+            &reads[i].after)) {
+      accepted_at = i + 1;
+    }
+    failed[i] = acceptor.failed;
+  }
+  *count_differs = snapshot_count_differs(&acceptor);
+  snapshot_acceptor_free(&acceptor);
+  return accepted_at;
+}
+
+static int self_test_checks;
+static int self_test_wrong;
+
+static void self_test_expect(int ok, const char* name, const char* what) {
+  self_test_checks++;
+  if (!ok) {
+    printf("self-test: %s: %s\n", name, what);
+    self_test_wrong++;
+  }
+}
+
+/*
+ * A planted torn read that only `part` decides: with every part in force it
+ * is never accepted before read `accepted_with_all` (0: not at all) and read
+ * `at` fails `part` alone; with only `part` left out, the torn read is
+ * accepted, at read `accepted_without`.
+ */
+static void planted_torn_case(
+    const char* name,
+    const struct planted_read* reads,
+    int count,
+    struct lock_class_counts expected,
+    int part,
+    int at,
+    int accepted_with_all,
+    int accepted_without) {
+  int failed[8] = {0};
+  int differs = 0;
+  int accepted = planted_acceptance(reads, count, expected, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(
+      accepted == accepted_with_all, name, "with every part, accepted at another read");
+  self_test_expect(failed[at - 1] == part, name, "with every part, not rejected by its part alone");
+  accepted =
+      planted_acceptance(reads, count, expected, SNAPSHOT_ALL_PARTS & ~part, failed, &differs);
+  self_test_expect(accepted == accepted_without, name, "without its part, not accepted");
+}
+
+/*
+ * proc_locks_snapshot_agreed's rule, through the acceptance function itself
+ * (snapshot_acceptor_take), on planted reads: clean reads are accepted; each
+ * part rejects a torn read that only it decides, which is accepted when only
+ * that part is left out; the observed drop fails parts 2 and 4 each; the twin
+ * residual is accepted with the true answer; and an exhausted snapshot whose
+ * reads agree but whose count differs is told from an unstable one.
+ */
+static void snapshot_rule_self_test(void) {
+  const struct lock_probe free_file = {.type = F_UNLCK};
+  const struct lock_probe ofd = {.type = F_RDLCK, .pid = -1, .start = 0, .len = 10};
+  const struct lock_probe ofd_range_changed = {.type = F_RDLCK, .pid = -1, .start = 0, .len = 0};
+  const struct lock_probe posix = {.type = F_WRLCK, .pid = 4242, .start = 40, .len = 10};
+  const struct lock_probe twin = {.type = F_RDLCK, .pid = -1, .start = 0, .len = 0};
+  const struct lock_probe flocked = {.type = F_UNLCK, .flock_held = 1};
+  const struct lock_class_counts mixed = {.ofd = 2, .posix = 1};
+  const struct lock_class_counts one_ofd = {.ofd = 1};
+  const char* clean = PLANTED_FOREIGN PLANTED_OFD_READ PLANTED_OFD_WRITE PLANTED_POSIX;
+  int failed[8] = {0};
+  int differs = 0;
+
+  /* Clean reads: the multi-class truth, a flock, and no lock at all. */
+  const struct planted_read clean_reads[] = {
+      {clean, ofd, ofd}, {clean, ofd, ofd}, {clean, ofd, ofd}};
+  int accepted = planted_acceptance(clean_reads, 3, mixed, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(accepted == 3, "three clean reads", "not accepted at the third");
+  self_test_expect(failed[0] == 0 && failed[1] == 0 && failed[2] == 0, "three clean reads",
+                   "a part failed");
+  const char* flock_text = PLANTED_FOREIGN "3: FLOCK  ADVISORY  WRITE 4250 00:2a:100 0 EOF\n";
+  const struct planted_read flock_reads[] = {
+      {flock_text, flocked, flocked},
+      {flock_text, flocked, flocked},
+      {flock_text, flocked, flocked}};
+  const struct lock_class_counts one_flock = {.flock = 1};
+  accepted = planted_acceptance(flock_reads, 3, one_flock, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(accepted == 3, "a flock", "not accepted at the third read");
+  const struct planted_read free_reads[] = {
+      {PLANTED_FOREIGN, free_file, free_file},
+      {PLANTED_FOREIGN, free_file, free_file},
+      {PLANTED_FOREIGN, free_file, free_file}};
+  accepted = planted_acceptance(free_reads, 3, no_own_locks, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(accepted == 3, "no lock", "not accepted at the third read");
+
+  /* Part 1: the probes around the third read differ (the lock they report
+   * changed during it), though its rows are the true answer. */
+  const struct planted_read changed[] = {
+      {clean, ofd, ofd}, {clean, ofd, ofd}, {clean, ofd, ofd_range_changed}};
+  planted_torn_case("part 1, a lock that changed during the read", changed, 3, mixed,
+                    SNAPSHOT_PART_PROBES, 3, 0, 3);
+  planted_acceptance(changed, 3, mixed, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(!differs, "part 1, a lock that changed during the read",
+                   "taken for a count that differs");
+
+  /* Part 2: an OFD lock and a POSIX lock are held, the expected count names
+   * the OFD lock alone (as where Linux differs from it), and every read drops
+   * the POSIX row, which only the probe that finds the POSIX lock catches. */
+  const char* dropped_posix = PLANTED_FOREIGN PLANTED_OFD_READ;
+  const struct planted_read posix_dropped[] = {
+      {dropped_posix, posix, posix}, {dropped_posix, posix, posix}, {dropped_posix, posix, posix}};
+  planted_torn_case("part 2, a dropped POSIX row", posix_dropped, 3, one_ofd,
+                    SNAPSHOT_PART_CLASSES, 1, 0, 3);
+
+  /* Part 3: the first read drops the OFD read lock's row at one restart and
+   * repeats the OFD write lock's at another, which keeps every class and
+   * count; only the clean reads after it disagree with it. */
+  const char* moved =
+      PLANTED_FOREIGN PLANTED_OFD_WRITE PLANTED_OFD_WRITE PLANTED_POSIX;
+  const struct planted_read moved_reads[] = {
+      {moved, ofd, ofd}, {clean, ofd, ofd}, {clean, ofd, ofd}, {clean, ofd, ofd}};
+  planted_torn_case("part 3, a drop and a repeat of one class", moved_reads, 4, mixed,
+                    SNAPSHOT_PART_AGREE, 2, 4, 1);
+
+  /* Part 4: two OFD rows and a POSIX row torn into one OFD row and two POSIX
+   * rows, alike in every read: the classes are the same, and the probes,
+   * which see presence, agree. */
+  const char* swapped =
+      PLANTED_FOREIGN PLANTED_OFD_READ PLANTED_POSIX PLANTED_POSIX;
+  const struct planted_read swapped_reads[] = {
+      {swapped, ofd, ofd}, {swapped, ofd, ofd}, {swapped, ofd, ofd}};
+  planted_torn_case("part 4, one class's row for another's", swapped_reads, 3, mixed,
+                    SNAPSHOT_PART_COUNTS, 1, 0, 3);
+  planted_acceptance(swapped_reads, 3, mixed, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(differs, "part 4, one class's row for another's",
+                   "not told as a count that differs");
+
+  /* Part 4: one lock's row repeated, as the base showed for standard input. */
+  const char* repeated = PLANTED_FOREIGN PLANTED_OFD_READ PLANTED_OFD_READ;
+  const struct planted_read repeated_reads[] = {
+      {repeated, ofd, ofd}, {repeated, ofd, ofd}, {repeated, ofd, ofd}};
+  planted_torn_case("part 4, a repeated row", repeated_reads, 3, one_ofd, SNAPSHOT_PART_COUNTS,
+                    1, 0, 3);
+
+  /* The observed failure, one lock's row dropped in every read: parts 2 and
+   * 4 each reject it. */
+  const struct planted_read dropped[] = {
+      {PLANTED_FOREIGN, ofd, ofd}, {PLANTED_FOREIGN, ofd, ofd}, {PLANTED_FOREIGN, ofd, ofd}};
+  const char* drop = "a dropped row";
+  accepted = planted_acceptance(dropped, 3, one_ofd, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(accepted == 0, drop, "accepted with every part");
+  self_test_expect(failed[0] == (SNAPSHOT_PART_CLASSES | SNAPSHOT_PART_COUNTS), drop,
+                   "not rejected by parts 2 and 4");
+  accepted = planted_acceptance(dropped, 3, one_ofd, SNAPSHOT_ALL_PARTS & ~SNAPSHOT_PART_CLASSES,
+                                failed, &differs);
+  self_test_expect(accepted == 0, drop, "accepted without part 2");
+  accepted = planted_acceptance(dropped, 3, one_ofd, SNAPSHOT_ALL_PARTS & ~SNAPSHOT_PART_COUNTS,
+                                failed, &differs);
+  self_test_expect(accepted == 0, drop, "accepted without part 4");
+  accepted = planted_acceptance(
+      dropped, 3, one_ofd,
+      SNAPSHOT_ALL_PARTS & ~(SNAPSHOT_PART_CLASSES | SNAPSHOT_PART_COUNTS), failed, &differs);
+  self_test_expect(accepted == 3, drop, "not accepted without parts 2 and 4");
+
+  /* The named residual: one of two byte-identical twin rows dropped and the
+   * other repeated reads as the true answer once ordinals are left out. */
+  const char* twins = PLANTED_FOREIGN "3: " PLANTED_TWIN "4: " PLANTED_TWIN;
+  const char* torn_twins = PLANTED_FOREIGN "3: " PLANTED_TWIN "3: " PLANTED_TWIN;
+  const struct lock_class_counts two_ofd = {.ofd = 2};
+  const struct planted_read twin_reads[] = {
+      {torn_twins, twin, twin}, {twins, twin, twin}, {torn_twins, twin, twin}};
+  accepted = planted_acceptance(twin_reads, 3, two_ofd, SNAPSHOT_ALL_PARTS, failed, &differs);
+  self_test_expect(accepted == 3, "the twin residual", "not accepted");
+  struct lock_class_counts per_file[1];
+  size_t twins_length = 0;
+  size_t torn_length = 0;
+  char* twins_rows =
+      own_lock_rows(twins, strlen(twins), planted_objects, 1, per_file, &twins_length);
+  char* torn_rows =
+      own_lock_rows(torn_twins, strlen(torn_twins), planted_objects, 1, per_file, &torn_length);
+  self_test_expect(twins_length == torn_length && memcmp(twins_rows, torn_rows, twins_length) == 0,
+                   "the twin residual", "its rows are not the true answer's");
+  free(twins_rows);
+  free(torn_rows);
+}
+
+/*
  * Feeds the line normalizer well-formed and malformed timerfd, eventfd and
  * lock lines: each malformed one must count as a failure, and each
- * well-formed one must not. Prints "self-test ok" when they do.
+ * well-formed one must not. Then checks proc_locks_snapshot_agreed's rule on
+ * planted reads (snapshot_rule_self_test). Prints the number of checks and
+ * "self-test ok" when they all hold.
  */
 static int self_test(void) {
   const char* good[] = {
@@ -1729,29 +2654,25 @@ static int self_test(void) {
       "lock:\t1: OFDLCK ADVISORY  READ -1 00:7 0 9",
       "lock:\t1: OFDLCK ADVISORY  READ -1 0:18:7 0 9",
   };
-  int wrong = 0;
   for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
     char line[128];
     snprintf(line, sizeof(line), "%s", good[i]);
     int before = failures;
     print_line(0, line);
-    if (failures != before) {
-      printf("self-test: accepted line refused: %s\n", good[i]);
-      wrong++;
-    }
+    self_test_expect(failures == before, good[i], "accepted line refused");
   }
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     char line[128];
     snprintf(line, sizeof(line), "%s", bad[i]);
     int before = failures;
     print_line(0, line);
-    if (failures == before) {
-      printf("self-test: malformed line accepted: %s\n", bad[i]);
-      wrong++;
-    }
+    self_test_expect(failures != before, bad[i], "malformed line accepted");
   }
-  printf(wrong == 0 ? "self-test ok\n" : "self-test failed\n");
-  return wrong == 0 ? 0 : 1;
+  snapshot_rule_self_test();
+  printf("self-test: %d checks, %d wrong\n", self_test_checks, self_test_wrong);
+  int ok = self_test_wrong == 0 && self_test_checks > 0;
+  printf(ok ? "self-test ok\n" : "self-test failed\n");
+  return ok ? 0 : 1;
 }
 
 /*
@@ -1824,7 +2745,7 @@ static void standard_streams(void) {
 
 /*
  * Usage: proc_fdinfo_lines --self-test, or proc_fdinfo_lines [DIRECTORY
- * [--skip-flock] [--skip-lease] [--skip-posix] [--proc-locks | --twin-ofd-locks |
+ * [--native] [--skip-flock] [--skip-lease] [--skip-posix] [--proc-locks | --twin-ofd-locks |
  * --inherited-stdin-lock[=record] | --shared-stdio-locks |
  * --shared-stdio-fork-unlock | --shared-stdio-close-exec | --shared-stdio-close-both |
  * --received-from-parent | --stdin-and-stdout-locks |
@@ -1835,7 +2756,10 @@ static void standard_streams(void) {
  * --in-flight-receiver-dies-busy=kills-itself|exit-group |
  * --stdio-alias-in-flight | --joined-twin-locks |
  * --received-lock-exec | --standard-stream-kinds]]. The lock files go in
- * DIRECTORY (default /tmp). A backend that refuses flock(2) or F_SETLEASE by
+ * DIRECTORY (default /tmp). --native says the run is native: DIRECTORY must
+ * be on tmpfs, and each whole /proc/locks snapshot is retaken until a read
+ * of the rows naming DIRECTORY's files passes proc_locks_snapshot_agreed's
+ * rule. A backend that refuses flock(2) or F_SETLEASE by
  * stopping the run (KVM refuses flock) is run with the matching option;
  * --skip-posix takes no record lock (F_SETLK), whose /proc/locks rows and
  * fdinfo lines Hermit refuses on KVM, whose provider holds a record lock as
@@ -1886,8 +2810,11 @@ int main(int argc, char** argv) {
   int skip_posix = 0;
   const char* mode = NULL;
   int inherited = 0;
+  int native = 0;
   for (int i = 2; i < argc; i++) {
-    if (strcmp(argv[i], "--skip-flock") == 0) {
+    if (strcmp(argv[i], "--native") == 0) {
+      native = 1;
+    } else if (strcmp(argv[i], "--skip-flock") == 0) {
       skip_flock = 1;
     } else if (strcmp(argv[i], "--skip-lease") == 0) {
       skip_lease = 1;
@@ -1934,6 +2861,22 @@ int main(int argc, char** argv) {
       fprintf(stderr, "unknown option %s\n", argv[i]);
       return 2;
     }
+  }
+  if (native) {
+    struct stat directory_status;
+    struct statfs filesystem;
+    if (stat(directory, &directory_status) != 0 || statfs(directory, &filesystem) != 0) {
+      fprintf(stderr, "--native: stat %s: %s\n", directory, errno_name(errno));
+      return 2;
+    }
+    if (filesystem.f_type != TMPFS_MAGIC) {
+      fprintf(stderr, "--native: %s is not on tmpfs (magic %#lx)\n", directory,
+              (unsigned long)filesystem.f_type);
+      return 2;
+    }
+    snprintf(native_device, sizeof(native_device), "%02x:%02x:", major(directory_status.st_dev),
+             minor(directory_status.st_dev));
+    native_directory = directory;
   }
   if (mode != NULL) {
     if (strcmp(mode, "--proc-locks") == 0) {
@@ -2003,7 +2946,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     printf("failures=%d\n", failures);
-    return 0;
+    return native_exit_status();
   }
   pipes();
   memfds();
@@ -2015,5 +2958,5 @@ int main(int argc, char** argv) {
   lookups();
   standard_streams();
   printf("failures=%d\n", failures);
-  return 0;
+  return native_exit_status();
 }

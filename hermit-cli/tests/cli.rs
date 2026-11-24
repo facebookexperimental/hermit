@@ -78620,6 +78620,87 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
     }
 }
 
+/// A directory for a native run whose `/proc/locks` rows a test finds by
+/// object (`proc_locks_object`): a new directory on the tmpfs at `/dev/shm`.
+///
+/// A `/proc/locks` row names its file by the superblock's device and the
+/// inode. Elsewhere that pair need not be the test's file alone: every
+/// subvolume of one btrfs filesystem prints the same device (`sb->s_dev`)
+/// while each numbers its inodes from its own counter, so on a host whose
+/// checkouts are subvolumes of one btrfs (as on the devservers that run these
+/// tests) other processes' locks on files in other subvolumes print the very
+/// same object. One tmpfs is one superblock with an anonymous device of its
+/// own, and it never gives two live files one inode number (`shmem_get_inode`
+/// takes the number from the superblock's own counter, or from
+/// `get_next_ino`), so there the object names the test's file and nothing
+/// else. A host without a tmpfs at `/dev/shm` fails here, by name, rather
+/// than compare rows that could be another process's.
+fn native_lock_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir_in("/dev/shm")
+        .expect("make the native run's directory on the tmpfs at /dev/shm");
+    let name = std::ffi::CString::new(directory.path().to_str().unwrap()).unwrap();
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `name` is NUL-terminated and `filesystem` is written before it
+    // is read.
+    assert_eq!(
+        unsafe { libc::statfs(name.as_ptr(), filesystem.as_mut_ptr()) },
+        0,
+        "statfs {}",
+        directory.path().display()
+    );
+    // SAFETY: statfs returned 0, so it filled `filesystem`.
+    let magic = unsafe { filesystem.assume_init() }.f_type;
+    assert_eq!(
+        magic,
+        libc::TMPFS_MAGIC,
+        "{} is not on tmpfs (filesystem magic {magic:#x}), so its /proc/locks object \
+         need not be the test's file alone",
+        directory.path().display()
+    );
+    directory
+}
+
+/// The object a `/proc/locks` row spells for the file at `path`, as
+/// `lock_get_status` (fs/locks.c) prints it: the superblock's device
+/// (`sb->s_dev`) as `MAJOR:MINOR` in hexadecimal, and the inode. The device
+/// is the third field of the mountinfo row of the file's mount, which prints
+/// the same `sb->s_dev`, found by the mount ID the file's fdinfo names; on
+/// btrfs, `stat`'s device is a subvolume's anonymous one, not this. The
+/// object is the file's alone only on a filesystem that numbers its live
+/// inodes uniquely under one device, such as the tmpfs
+/// `native_lock_directory` uses.
+fn proc_locks_object(path: &Path) -> String {
+    let file = fs::File::open(path).expect("open the native run's locked file");
+    let fdinfo = fs::read_to_string(format!(
+        "/proc/self/fdinfo/{}",
+        std::os::fd::AsRawFd::as_raw_fd(&file)
+    ))
+    .expect("read the locked file's fdinfo");
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .expect("the fdinfo names a mount")
+        .trim()
+        .to_owned();
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+    let device = mountinfo
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(' ');
+            (fields.next()? == mount_id)
+                .then(|| fields.nth(1))
+                .flatten()
+        })
+        .expect("mountinfo has the file's mount");
+    let (major, minor) = device.split_once(':').expect("a MAJOR:MINOR device");
+    let inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().expect("stat the file"));
+    format!(
+        "{:02x}:{:02x}:{inode}",
+        major.parse::<u32>().expect("a decimal major"),
+        minor.parse::<u32>().expect("a decimal minor"),
+    )
+}
+
 static PROC_FDINFO_LINES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 /// `tests/c/proc_fdinfo_lines.c`, built once per test process.
@@ -79548,15 +79629,22 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     // descriptor; the parent looks while the description is in flight, after
     // its receipt, and after its close. Each section's rows as their lock
     // classes, in order. Natively /proc/locks lists the host's locks too, so
-    // the native run's rows are the locked file's, by inode; under Hermit
-    // every row is the guest's own. Linux's in-flight reference holds an OFD
-    // lock and a flock until the receipt; a POSIX lock is the sender's, and
-    // goes with its close or its exit. ptrace shows Linux's rows, and so does
-    // KVM for the OFD lock and for the flock, which Detcore's flock model
-    // decides and follows through the flight (the kvm lane's slice SP2); it
-    // refuses the first snapshot that would show the record lock its provider
-    // holds as an OFD lock through the flight.
-    let lock_classes = |text: &str, inode: Option<u64>| {
+    // the native run's rows are those naming the locked file's object (device
+    // and inode, on the tmpfs `native_lock_directory` makes), and the guest,
+    // given `--native`, accepts a snapshot only by its four-part rule (the
+    // kernel's lock probes agree before and after the read, the rows name
+    // the probed classes, three consecutive reads agree, and each class's
+    // count is the one the guest holds), since a read that host locks change
+    // between its pieces can repeat or drop a row; under Hermit every row is
+    // the guest's own, read once and compared whole. A pid cannot pick
+    // the rows: an OFD lock's row prints -1. Linux's in-flight reference
+    // holds an OFD lock and a flock until the receipt; a POSIX lock is the
+    // sender's, and goes with its close or its exit. ptrace shows Linux's
+    // rows, and so does KVM for the OFD lock and for the flock, which
+    // Detcore's flock model decides and follows through the flight (the kvm
+    // lane's slice SP2); it refuses the first snapshot that would show the
+    // record lock its provider holds as an OFD lock through the flight.
+    let lock_classes = |text: &str, object: Option<&str>| {
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
         for line in text.lines() {
             if let Some(label) = line
@@ -79571,11 +79659,7 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 first.ends_with(':') && first[..first.len() - 1].parse::<u64>().is_ok()
             }) && fields.len() >= 8
                 && fields[1] != "->";
-            let ours = inode.is_none_or(|inode| {
-                fields.get(5).is_some_and(|object| {
-                    object.rsplit(':').next() == Some(inode.to_string().as_str())
-                })
-            });
+            let ours = object.is_none_or(|object| fields.get(5) == Some(&object));
             if let Some((_, rows)) = sections.last_mut()
                 && is_row
                 && ours
@@ -79608,21 +79692,19 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         ] {
             let case = format!("the sender {variant}, {kind}");
             let mode = format!("--in-flight-sender-{variant}={kind}");
-            let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let native_directory = native_lock_directory();
             let native = Command::new(proc_fdinfo_lines_guest())
                 .arg(native_directory.path())
                 .arg(&mode)
+                .arg("--native")
                 .output()
                 .expect("run the fdinfo-lines guest natively");
             assert!(
                 native.status.success(),
                 "{test}: native, {case}: {native:?}"
             );
-            let inode = std::os::unix::fs::MetadataExt::ino(
-                &fs::metadata(native_directory.path().join("in-flight"))
-                    .expect("the native run's locked file"),
-            );
-            let native_rows = lock_classes(&stdout(&native), Some(inode));
+            let object = proc_locks_object(&native_directory.path().join("in-flight"));
+            let native_rows = lock_classes(&stdout(&native), Some(object.as_str()));
             assert_eq!(
                 native_rows,
                 linux,
@@ -79781,10 +79863,11 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 && transcript.ends_with("failures=0\n")
         };
         let mode = format!("--in-flight-receiver-gone={how}");
-        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native_directory = native_lock_directory();
         let native = Command::new(proc_fdinfo_lines_guest())
             .arg(native_directory.path())
             .arg(&mode)
+            .arg("--native")
             .output()
             .expect("run the fdinfo-lines guest natively");
         assert!(
@@ -79796,12 +79879,9 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             shows_every_line(&native),
             "{test}: native, {case}\n{native}"
         );
-        let inode = std::os::unix::fs::MetadataExt::ino(
-            &fs::metadata(native_directory.path().join("receiver-gone"))
-                .expect("the native run's locked file"),
-        );
+        let object = proc_locks_object(&native_directory.path().join("receiver-gone"));
         assert_eq!(
-            &lock_classes(&native, Some(inode)),
+            &lock_classes(&native, Some(object.as_str())),
             expected,
             "{test}: native, {case}\n{native}"
         );
@@ -79894,10 +79974,11 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     for how in ["kills-itself", "exit-group"] {
         let case = format!("the busy receiver ends itself by {how}");
         let mode = format!("--in-flight-receiver-dies-busy={how}");
-        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native_directory = native_lock_directory();
         let native = Command::new(proc_fdinfo_lines_guest())
             .arg(native_directory.path())
             .arg(&mode)
+            .arg("--native")
             .output()
             .expect("run the fdinfo-lines guest natively");
         assert!(
@@ -79911,12 +79992,9 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 && native.ends_with("failures=0\n"),
             "{test}: native, {case}\n{native}"
         );
-        let inode = std::os::unix::fs::MetadataExt::ino(
-            &fs::metadata(native_directory.path().join("receiver-dies-busy"))
-                .expect("the native run's locked file"),
-        );
+        let object = proc_locks_object(&native_directory.path().join("receiver-dies-busy"));
         assert_eq!(
-            lock_classes(&native, Some(inode)),
+            lock_classes(&native, Some(object.as_str())),
             busy,
             "{test}: native, {case}\n{native}"
         );
@@ -79955,12 +80033,13 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     // identity, then an unlock through standard output, the receipt and the
     // received descriptor's close. One description, one lock: Linux lists it
     // until the unlock, and no more.
-    let alias_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let alias_directory = native_lock_directory();
     let alias_path = alias_directory.path().join("in-flight-standard-streams");
     let alias = read_write(&alias_path);
     let native = Command::new(proc_fdinfo_lines_guest())
         .arg(alias_directory.path())
         .arg("--stdio-alias-in-flight")
+        .arg("--native")
         .stdin(Stdio::from(
             alias.try_clone().expect("share the standard streams' file"),
         ))
@@ -79972,9 +80051,7 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         "{test}: native, standard input in flight: {native:?}"
     );
     let native = fs::read_to_string(&alias_path).expect("read the native run's report");
-    let inode = std::os::unix::fs::MetadataExt::ino(
-        &fs::metadata(&alias_path).expect("the native run's standard streams' file"),
-    );
+    let object = proc_locks_object(&alias_path);
     let in_flight_alias = sections(
         &[
             "one lock through standard input",
@@ -79986,7 +80063,7 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         &[&["OFDLCK"], &["OFDLCK"], &[], &[], &[]],
     );
     assert_eq!(
-        lock_classes(&native, Some(inode)),
+        lock_classes(&native, Some(object.as_str())),
         in_flight_alias,
         "{test}: native, standard input in flight\n{native}"
     );
@@ -80035,10 +80112,11 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             &[],
         ],
     );
-    let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native_directory = native_lock_directory();
     let native = Command::new(proc_fdinfo_lines_guest())
         .arg(native_directory.path())
         .arg("--joined-twin-locks")
+        .arg("--native")
         .output()
         .expect("run the fdinfo-lines guest natively");
     assert!(
@@ -80046,12 +80124,9 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         "{test}: native, joined twins: {native:?}"
     );
     let native = stdout(&native);
-    let inode = std::os::unix::fs::MetadataExt::ino(
-        &fs::metadata(native_directory.path().join("joined-twins"))
-            .expect("the native run's locked file"),
-    );
+    let object = proc_locks_object(&native_directory.path().join("joined-twins"));
     assert_eq!(
-        lock_classes(&native, Some(inode)),
+        lock_classes(&native, Some(object.as_str())),
         twins,
         "{test}: native, joined twins\n{native}"
     );
@@ -80205,7 +80280,9 @@ fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
 /// https://github.com/rrnewton/hermit/issues/5045: Linux 7.1.3 keeps the link
 /// count across its RCU-walk retry.
 fn procfs_dotdot_spellings_native(modes: &[&str]) -> String {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // The guest compares its reads of /proc/locks by the rows naming its
+    // locked file's object, which only a tmpfs makes the file's alone.
+    let directory = native_lock_directory();
     let output = Command::new(procfs_dotdot_spellings_guest())
         .arg(directory.path())
         .arg("native")
