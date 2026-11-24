@@ -156,8 +156,11 @@ cpp_unittest(
     ],
 )
 
+# The original host-side harness, restored unchanged under a native
+# name until its retirement is approved after the wired proof: the
+# same buck_sh_test this package shipped as flaky_server_test.
 buck_sh_test(
-    name = "flaky_server_test",
+    name = "flaky_server_native_test",
     args = [
         "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
         "1",
@@ -168,6 +171,44 @@ buck_sh_test(
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "external_flaky_service/flaky_server_test.sh",
+)
+
+# The original server script, staged for the in-guest driver below.
+buck_export_file(
+    name = "external_flaky_service/flaky_server.sh",
+    visibility = ["//hermetic_infra/hermit/flaky-tests:"],
+)
+
+buck_export_file(
+    name = "flaky_server_guest.sh",
+    visibility = ["//hermetic_infra/hermit/flaky-tests:"],
+)
+
+# flaky_server.sh answers each request with a bash RANDOM bit; the old
+# host-side test made one draw its exit code over a host port. This
+# target instead runs the unmodified server as a multi-process guest
+# (flaky_server_guest.sh starts it, makes the requests in order, and
+# cleans up exactly what it started) under Hermit strict verify, and
+# passes only on bitwise parity plus the protocol property: exactly
+# the requested replies, each 0 or 1, in request order. No
+# network_access is declared, because a target that never reaches
+# the network (the guest loopback only, --network=local) is not
+# labelled as though it did. The host-side flaky_server_test.sh
+# stays until the wired proof lands and its retirement is approved.
+# Keep local_only until a passing HEAD run in
+# fbcode//mode/dev-nosan; then check the first continuous
+# coverage-mode run.
+hermit_host_test(
+    name = "flaky_server_test",
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "$(location :flaky_server_guest.sh)",
+        "$(location :external_flaky_service/flaky_server.sh)",
+        "8",
+        "18080",
+    ],
+    labels = [tpx_labels.local_only],
+    test = "run_flaky_server_hermit.sh",
 )
 
 # This package's Cargo manifest, for the tree check.backend_abstraction runs
