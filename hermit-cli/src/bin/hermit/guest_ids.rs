@@ -31,9 +31,12 @@
 //! took. With none, or without the capability, it warns and the guest gets
 //! host IDs.
 //!
-//! Chosen IDs also require the host to validate a legacy clone's original
-//! exit signal before the conversion to clone3 can replace it. Admission
-//! probes that behavior; a kernel version string does not establish it.
+//! Chosen IDs also require the legacy-clone probe to reach the host
+//! kernel's exit-signal handling with valid pointers, so that a SIGCHLD
+//! child and a signal-65 call distinguish validating kernels (EINVAL)
+//! from kernels that silently accept the signal (child created, with
+//! Detcore's clone3 conversion supplying the validation). Admission
+//! probes that behaviour; a kernel version string does not establish it.
 
 use std::collections::BTreeSet;
 
@@ -352,9 +355,10 @@ fn resolve_with(
         }
         _ => {}
     }
-    // The conversion in Detcore preserves early signal validation only on
-    // hosts that demonstrate it. Refuse/fall back before drawing the cursor,
-    // reserving windows or probing a chosen PID; Namespace returned above.
+    // The probe must reach the kernel's exit-signal handling before the
+    // run relies on Detcore's conversion for signal validation. Refuse or
+    // fall back before drawing the cursor, reserving windows or probing a
+    // chosen PID when it cannot; Namespace returned above.
     if let Err(cause) = host.legacy_clone_signal_validation() {
         if required.is_none() && !strict {
             return Ok((
@@ -476,59 +480,86 @@ fn host_ids_warning(cause: &str) -> String {
     )
 }
 
-/// Admission needs both observations: an invalid signal's EINVAL alone
-/// could instead come from an unrelated validation or policy failure.
+/// What one legacy-clone probe call did: the child it created was reaped
+/// here, or the kernel refused the call with this errno before any task
+/// could be woken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyCloneProbe {
+    Created,
+    Failed(i32),
+}
+
+/// Admission needs both observations. The SIGCHLD probe must create and
+/// reap a child, which proves the probe's pointers reach the kernel's
+/// exit-signal handling instead of failing earlier on an unrelated bad
+/// pointer. The signal-65 probe then shows which host behaviour Detcore
+/// must preserve: a kernel that validates the signal refuses it with
+/// EINVAL, and a kernel without legacy validation creates the child and
+/// silently accepts the signal (Detcore's conversion to clone3 then
+/// supplies the validation, as `clone3` validates on every host). Any
+/// other pair is unproven: the valid signal did not create a child, or
+/// the invalid one failed for an unrelated reason.
 fn check_legacy_clone_signal_validation(
-    mut probe: impl FnMut(i32) -> Result<i32, String>,
+    mut probe: impl FnMut(i32) -> Result<LegacyCloneProbe, String>,
 ) -> Result<(), String> {
     let valid = probe(libc::SIGCHLD);
     let invalid = probe(65);
-    if valid == Ok(libc::EFAULT) && invalid == Ok(libc::EINVAL) {
+    if valid == Ok(LegacyCloneProbe::Created)
+        && matches!(
+            invalid,
+            Ok(LegacyCloneProbe::Created) | Ok(LegacyCloneProbe::Failed(libc::EINVAL))
+        )
+    {
         return Ok(());
     }
-    let describe = |result: Result<i32, String>| match result {
-        Ok(libc::EFAULT) => format!("EFAULT ({})", libc::EFAULT),
-        Ok(libc::EINVAL) => format!("EINVAL ({})", libc::EINVAL),
-        Ok(errno) => format!(
+    let describe = |result: Result<LegacyCloneProbe, String>| match result {
+        Ok(LegacyCloneProbe::Created) => "created a child".to_owned(),
+        Ok(LegacyCloneProbe::Failed(libc::EFAULT)) => format!("EFAULT ({})", libc::EFAULT),
+        Ok(LegacyCloneProbe::Failed(libc::EINVAL)) => format!("EINVAL ({})", libc::EINVAL),
+        Ok(LegacyCloneProbe::Failed(errno)) => format!(
             "errno {errno} ({})",
             std::io::Error::from_raw_os_error(errno)
         ),
         Err(cause) => format!("probe failed: {cause}"),
     };
     Err(format!(
-        "legacy clone exit-signal validation is unsupported or unproven: SIGCHLD probe returned \
-         {}, signal 65 probe returned {}; expected EFAULT ({}) then EINVAL ({})",
+        "legacy clone exit-signal validation is unsupported or unproven: SIGCHLD probe \
+         returned {}, signal 65 probe returned {}; expected SIGCHLD to create a child, then \
+         EINVAL ({}) or a created child for signal 65",
         describe(valid),
         describe(invalid),
-        libc::EFAULT,
         libc::EINVAL,
     ))
 }
 
-/// Use CLONE_PIDFD with an output address outside the Linux user address
-/// range, so copy_process fails before kernel_clone can wake a new task.
-/// Unlike a null pointer, usize::MAX does not rely on the zero page being
-/// unmapped. No CLONE_PARENT means neither init restrictions nor reparenting
-/// can confuse the probe.
+/// Probe one legacy `clone` exit signal with a valid pidfd output
+/// pointer, so the call reaches the kernel's exit-signal handling on
+/// every host instead of failing on the pointer first. The child exits
+/// at once and is reaped here; its pidfd is closed. No CLONE_PARENT
+/// means neither init restrictions nor reparenting can confuse the probe.
+/// This allocates and releases one host PID per created probe child; it
+/// allocates no guest-chosen ID.
 ///
-/// Linux v6.16 copy_process writes the pidfd at kernel/fork.c:2210:
-/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?id=038d61fd642278bab63ee8ef722c50d10ab01e8f#n2210>.
-/// Failure releases the pidfd/PID at line 2430 and returns an error, before
-/// kernel_clone could wake the task at line 2630. Its kernel_clone lacks
-/// original-signal validation, so both probes reach EFAULT. Linux v7.1.3
-/// kernel_clone checks the signal first, yielding EINVAL for 65:
+/// Linux v7.1.3 `kernel_clone` validates the signal before
+/// `copy_process`, yielding EINVAL for 65:
 /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?id=199c9959d3a9b53f346c221757fc7ac507fbac50#n2702>.
-/// This may allocate/release an internal host PID before EFAULT; it allocates
-/// no guest-chosen ID. Unexpected success is reaped and never admits Chosen.
-fn probe_legacy_clone_errno(signal: i32) -> Result<i32, String> {
-    // SAFETY: a fork-like clone without CLONE_VM. The invalid output pointer
-    // should prevent creation; a defensive child path only calls _exit.
+/// Earlier kernels have no legacy exit-signal validation (the check was
+/// clone3-only), so signal 65 creates a child there exactly as SIGCHLD
+/// does; the pair still distinguishes the two host behaviours, and
+/// Detcore's conversion to the validating `clone3` form supplies the
+/// signal validation the older kernel lacks.
+fn probe_legacy_clone_errno(signal: i32) -> Result<LegacyCloneProbe, String> {
+    let mut pidfd: libc::c_int = -1;
+    // SAFETY: a fork-like clone without CLONE_VM. The pidfd output pointer
+    // is valid storage in this frame, so the call reaches the kernel's
+    // exit-signal handling instead of failing on the pointer first. The
+    // child path only calls _exit, which is async-signal-safe.
     let child = unsafe {
         libc::syscall(
             libc::SYS_clone,
             (libc::CLONE_PIDFD | signal) as libc::c_ulong,
             0usize,
-            usize::MAX,
+            std::ptr::from_mut(&mut pidfd) as usize,
             0usize,
             0usize,
         )
@@ -539,22 +570,35 @@ fn probe_legacy_clone_errno(signal: i32) -> Result<i32, String> {
     if child < 0 {
         return std::io::Error::last_os_error()
             .raw_os_error()
+            .map(LegacyCloneProbe::Failed)
             .ok_or_else(|| "legacy clone failed without an OS error number".to_owned());
     }
     let mut status = 0;
-    // SAFETY: wait only for this unexpected child, including a clone child
-    // whose exit signal was not SIGCHLD. Its only userspace action is _exit.
+    // SAFETY: wait only for this probe child, including a clone child whose
+    // exit signal was not SIGCHLD. Its only userspace action is _exit. A
+    // child already reaped automatically (ECHILD, as when SIGCHLD is
+    // ignored) still proves creation.
+    let mut reap_failure = None;
     while unsafe { libc::waitpid(child as libc::pid_t, &mut status, libc::__WALL) } < 0 {
         let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            break;
+        }
         if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(format!(
-                "legacy clone unexpectedly created child {child}; could not reap it: {error}"
+            reap_failure = Some(format!(
+                "legacy clone created child {child}; could not reap it: {error}"
             ));
+            break;
         }
     }
-    Err(format!(
-        "legacy clone unexpectedly created child {child}; reaped with wait status {status}"
-    ))
+    if pidfd >= 0 {
+        // SAFETY: the pidfd the kernel opened for this probe in this process.
+        unsafe { libc::close(pidfd) };
+    }
+    match reap_failure {
+        Some(cause) => Err(cause),
+        None => Ok(LegacyCloneProbe::Created),
+    }
 }
 
 /// The ID the kernel gives a new task next: that of a child made with a
@@ -838,55 +882,63 @@ mod tests {
 
     #[test]
     fn legacy_clone_validation_requires_the_exact_probe_pair() {
-        let mut signals = Vec::new();
-        assert!(
-            check_legacy_clone_signal_validation(|signal| {
-                signals.push(signal);
-                Ok(if signal == libc::SIGCHLD {
-                    libc::EFAULT
-                } else {
-                    libc::EINVAL
+        use LegacyCloneProbe::Created;
+        use LegacyCloneProbe::Failed;
+        // A validating kernel (EINVAL for 65) and a silently accepting
+        // one (child created for 65) both admit Chosen: the SIGCHLD child
+        // proves the probe reached the exit-signal handling.
+        for invalid in [Failed(libc::EINVAL), Created] {
+            let mut signals = Vec::new();
+            assert!(
+                check_legacy_clone_signal_validation(|signal| {
+                    signals.push(signal);
+                    Ok(if signal == libc::SIGCHLD {
+                        Created
+                    } else {
+                        invalid
+                    })
                 })
-            })
-            .is_ok()
-        );
-        assert_eq!(signals, [libc::SIGCHLD, 65]);
+                .is_ok(),
+                "signal 65 outcome {invalid:?} must admit"
+            );
+            assert_eq!(signals, [libc::SIGCHLD, 65]);
+        }
 
-        // The older source's pair, unrelated EINVAL, and failed probes
-        // cannot establish early original-signal validation.
+        // A valid signal that creates no child, an invalid one refused
+        // for an unrelated reason, and failed probes prove nothing.
         for (pair, expected) in [
             (
-                [Ok(libc::EFAULT), Ok(libc::EFAULT)],
+                [Ok(Failed(libc::EFAULT)), Ok(Failed(libc::EFAULT))],
                 ["EFAULT (14)", "EFAULT (14)"],
             ),
             (
-                [Ok(libc::EINVAL), Ok(libc::EINVAL)],
+                [Ok(Failed(libc::EINVAL)), Ok(Failed(libc::EINVAL))],
                 ["EINVAL (22)", "EINVAL (22)"],
             ),
             (
-                [Ok(libc::EPERM), Ok(libc::EINVAL)],
+                [Ok(Created), Ok(Failed(libc::EPERM))],
                 [
+                    "created a child",
                     "errno 1 (Operation not permitted (os error 1))",
-                    "EINVAL (22)",
                 ],
             ),
             (
-                [Ok(libc::EFAULT), Ok(libc::ENOSYS)],
+                [Ok(Created), Ok(Failed(libc::ENOSYS))],
                 [
-                    "EFAULT (14)",
+                    "created a child",
                     "errno 38 (Function not implemented (os error 38))",
                 ],
             ),
             (
                 [
-                    Err("unexpected child was reaped".to_owned()),
-                    Ok(libc::EINVAL),
+                    Err("child could not be reaped".to_owned()),
+                    Ok(Failed(libc::EINVAL)),
                 ],
-                ["probe failed: unexpected child was reaped", "EINVAL (22)"],
+                ["probe failed: child could not be reaped", "EINVAL (22)"],
             ),
             (
-                [Ok(libc::EFAULT), Err("probe failed".to_owned())],
-                ["EFAULT (14)", "probe failed: probe failed"],
+                [Ok(Created), Err("probe failed".to_owned())],
+                ["created a child", "probe failed: probe failed"],
             ),
         ] {
             let mut results = pair.into_iter();
@@ -905,6 +957,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The real probe reaches the kernel's exit-signal check with valid
+    /// pointers on this host: SIGCHLD creates a reaped child, and signal
+    /// 65 is either refused with EINVAL (validating kernel) or creates a
+    /// child (silently accepting kernel). With the former bad pidfd
+    /// pointer both calls failed with EFAULT and proved neither.
+    #[test]
+    fn the_legacy_clone_probe_reaches_exit_signal_handling() {
+        assert_eq!(
+            probe_legacy_clone_errno(libc::SIGCHLD),
+            Ok(LegacyCloneProbe::Created)
+        );
+        let invalid = probe_legacy_clone_errno(65);
+        assert!(
+            matches!(
+                invalid,
+                Ok(LegacyCloneProbe::Created) | Ok(LegacyCloneProbe::Failed(libc::EINVAL))
+            ),
+            "signal 65 probe on this host: {invalid:?}"
+        );
+        assert!(check_legacy_clone_signal_validation(probe_legacy_clone_errno).is_ok());
     }
 
     /// A pid_max under two windows (Linux allows down to 301) leaves no whole
