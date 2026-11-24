@@ -874,6 +874,118 @@ fn selector_links(link: &Path) -> usize {
     }
 }
 
+/// Whether `link` (a normalized descriptor-link spelling, as
+/// [`descriptor_link_prefix`] spells it) names the caller's own
+/// descriptor directory with a final component that is no descriptor
+/// name procfs knows: the shapes for the caller's own process and
+/// thread (`self`, `thread-self`, `/dev/fd`, the caller's own numbers),
+/// whose descriptor component is not a plain decimal without leading
+/// zeros ([`crate::syscalls::namespace::decimal_fd`], procfs's
+/// `name_to_int`). Linux answers such a name `ENOENT` at the link
+/// (`proc_lookupfd_common`, fs/proc/fd.c; measured natively for
+/// non-decimal, signed, leading-zero and overflowing spellings), never
+/// a lookup in another descriptor universe.
+// Wired into the injection seam by the next commit in this stack;
+// exercised here only by the `guest_fd_components` unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
+fn caller_fd_name_is_malformed(link: &Path, own: Option<(i32, i32)>) -> bool {
+    let names: Vec<&str> = link
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let own_pid = own.map(|(pid, _)| pid.to_string());
+    let own_tid = own.map(|(_, tid)| tid.to_string());
+    let caller_shape = match names.as_slice() {
+        ["dev", "fd", _] => true,
+        ["proc", "self", "fd", _] | ["proc", "thread-self", "fd", _] => true,
+        ["proc", subject, "fd", _] => own_pid.as_deref() == Some(*subject),
+        ["proc", subject, "task", thread, "fd", _] => {
+            (*subject == "self" || own_pid.as_deref() == Some(*subject))
+                && own_tid.as_deref() == Some(*thread)
+        }
+        _ => false,
+    };
+    caller_shape
+        && crate::syscalls::namespace::decimal_fd(std::ffi::OsStr::new(
+            names.last().copied().unwrap_or_default(),
+        ))
+        .is_none()
+}
+
+/// The respelling of one absolute guest path that leads through a
+/// descriptor link of the caller's own (`/proc/self/fd/N/...`,
+/// `/proc/thread-self/fd/N/...`, `/dev/fd/N/...`, the caller's own
+/// numbered spellings), decided from the guest's descriptor model
+/// alone (dh-23x5y5, Option A): `Ok(Some((fd, remainder)))` where the
+/// lookup is the call `openat(fd, remainder)` (or its `*at` analogue)
+/// instead, `Ok(None)` where the path leads through no such link of
+/// the caller's (another process's link, a lexical `proc/self/fd`
+/// below a regular directory, the descriptor directory itself, or
+/// the link itself, which the caller's exact-link handling names),
+/// and `Err` where Linux's walk of the guest spelling fails before
+/// any file below the descriptor: `ENOENT` for a descriptor the
+/// model does not hold (closed) or a malformed descriptor name, and
+/// `ELOOP` once the links the walk follows pass `MAXSYMLINKS` (each
+/// descriptor link, the selector links before it
+/// ([`selector_links`]), and `followed_links` the caller already
+/// followed to reach this spelling, as a symbolic link's target).
+/// A held descriptor that is no directory respells alike: the kernel
+/// below the respelled descriptor answers `ENOTDIR` for a name below
+/// it, as it does below the link (measured natively). The remainder
+/// is kept byte for byte. Guest spellings this does not respell never
+/// reach a host resolver from here; where a later walk splices a
+/// symbolic link whose target leads through a descriptor link, the
+/// caller feeds the spliced spelling back through this decision, so
+/// descriptor components are recognized in any position of the
+/// resolved walk, not only leading (fs/namei.c `pick_link`).
+/// M4c (guest-procfs resolution, S3) must compose with this
+/// respelling, not replace it: it consumes the `(fd, remainder)`
+/// form produced here and must not reintroduce untranslated guest
+/// `/proc/self/fd/N` spellings into any host resolver.
+// Wired into the injection seam by the next commit in this stack;
+// exercised here only by the `guest_fd_components` unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
+fn guest_fd_respell_decision(
+    path: &[u8],
+    own: Option<(i32, i32)>,
+    follows: bool,
+    followed_links: usize,
+    is_open: impl Fn(RawFd) -> bool,
+) -> Result<Option<(RawFd, Vec<u8>)>, Errno> {
+    let Some((link, end)) = descriptor_link_prefix(path) else {
+        return Ok(None);
+    };
+    let Some(descriptor) = crate::syscalls::namespace::own_descriptor_link(&link, own) else {
+        return if caller_fd_name_is_malformed(&link, own) {
+            Err(Errno::ENOENT)
+        } else {
+            Ok(None)
+        };
+    };
+    if followed_links + selector_links(&link) + 1 > LINK_LIMIT {
+        return Err(Errno::ELOOP);
+    }
+    if !is_open(descriptor.fd) {
+        return Err(Errno::ENOENT);
+    }
+    let raw_rest = &path[end..];
+    let rest = &raw_rest[raw_rest.iter().take_while(|byte| **byte == b'/').count()..];
+    if rest.is_empty() {
+        // The link itself, or a final `/` (or `/.`) after it, which
+        // Linux follows to the descriptor's own directory.
+        let _ = follows;
+        return Ok(if raw_rest.is_empty() {
+            None
+        } else {
+            Some((descriptor.fd, b".".to_vec()))
+        });
+    }
+    Ok(Some((descriptor.fd, rest.to_vec())))
+}
+
 /// procfs's largest pathname, `PATH_MAX`, with its NUL.
 const PATH_LIMIT: usize = libc::PATH_MAX as usize;
 
@@ -6779,6 +6891,99 @@ mod tests {
         assert_eq!(root("self/status"), "/proc/self/status");
         assert_eq!(root(".."), "/proc/..");
         assert_eq!(root("."), "/proc/.");
+    }
+
+    /// fdlink (dh-23x5y5): a guest descriptor component
+    /// (`/proc/self/fd/N/...`, `/proc/thread-self/fd/N/...`) is respelled
+    /// to `(fd N, remainder)` by the guest fd model alone. `open` in the
+    /// closures below is the model's table: a number it holds, directory
+    /// or not (a non-directory descriptor respells too; the kernel
+    /// below the respelled `openat(fd, rest)` answers `ENOTDIR`, as it
+    /// does below the link natively); a number it does not hold is
+    /// closed, which Linux answers `ENOENT` at the link
+    /// (`proc_lookupfd_common`, fs/proc/fd.c; measured natively for
+    /// closed, malformed, leading-zero and overflowing numbers).
+    #[test]
+    fn guest_fd_components_respell_to_their_descriptor_and_remainder() {
+        let own = Some((123, 456));
+        let decide = |path: &str, follows: bool, open: &[i32]| {
+            guest_fd_respell_decision(path.as_bytes(), own, follows, 0, |fd| open.contains(&fd))
+        };
+        let some = |fd: i32, rest: &str| Ok(Some((fd, rest.as_bytes().to_vec())));
+        // Leading spellings, every caller spelling of its own links.
+        assert_eq!(decide("/proc/self/fd/7/F", true, &[7]), some(7, "F"));
+        assert_eq!(decide("/proc/thread-self/fd/7/F", true, &[7]), some(7, "F"));
+        assert_eq!(decide("/dev/fd/7/F", true, &[7]), some(7, "F"));
+        assert_eq!(decide("/proc/123/fd/7/F", true, &[7]), some(7, "F"));
+        assert_eq!(
+            decide("/proc/123/task/456/fd/7/a/b", true, &[7]),
+            some(7, "a/b")
+        );
+        // The remainder is kept byte for byte, `..` included: the
+        // kernel below the descriptor resolves it, as it does below
+        // the link.
+        assert_eq!(
+            decide("/proc/self/fd/7/a/../c", true, &[7]),
+            some(7, "a/../c")
+        );
+        // A final `/` follows the link to the directory itself.
+        assert_eq!(decide("/proc/self/fd/7/", true, &[7]), some(7, "."));
+        // Another process's link is not the caller's to respell.
+        assert_eq!(decide("/proc/999/fd/7/F", true, &[7]), Ok(None));
+        // A lexical `proc/self/fd` below a regular directory names
+        // regular directories, not a link: only a spelling the walk
+        // reaches at the root, or spliced in by a symbolic link's
+        // target (which the caller feeds back through this decision),
+        // is a descriptor component.
+        assert_eq!(decide("/tmp/x/proc/self/fd/7/F", true, &[7]), Ok(None));
+        assert_eq!(decide("proc/self/fd/7/F", true, &[7]), Ok(None));
+        assert_eq!(decide("/proc/self/status", true, &[7]), Ok(None));
+        assert_eq!(decide("/proc/self/fd", true, &[7]), Ok(None));
+        // The link itself is never respelled: unfollowed, the caller's
+        // own `ELOOP`/`readlink` handling names it; followed, the
+        // existing exact-link handling reopens the descriptor.
+        assert_eq!(decide("/proc/self/fd/7", false, &[7]), Ok(None));
+        assert_eq!(decide("/proc/self/fd/7", true, &[7]), Ok(None));
+    }
+
+    #[test]
+    fn guest_fd_components_fail_closed_with_linuxs_errno() {
+        let own = Some((123, 456));
+        let decide = |path: &str, open: &[i32]| {
+            guest_fd_respell_decision(path.as_bytes(), own, true, 0, |fd| open.contains(&fd))
+        };
+        // Closed descriptor: `ENOENT` at the link, with or without a
+        // remainder (measured natively).
+        assert_eq!(decide("/proc/self/fd/99/F", &[7]), Err(Errno::ENOENT));
+        assert_eq!(
+            decide("/proc/thread-self/fd/99/F", &[7]),
+            Err(Errno::ENOENT)
+        );
+        // Numbers procfs never names: not decimal, signed, leading
+        // zeros, or past `i32` (measured natively: all `ENOENT`).
+        for bad in ["abc", "-1", "07", "99999999999999999999", "7x"] {
+            let path = format!("/proc/self/fd/{bad}/F");
+            assert_eq!(decide(&path, &[7]), Err(Errno::ENOENT), "{path}");
+        }
+        // A non-directory descriptor respells: the respelled lookup
+        // below it answers `ENOTDIR` natively, in the kernel.
+        assert_eq!(
+            decide("/proc/self/fd/8/F", &[8]),
+            Ok(Some((8, b"F".to_vec())))
+        );
+    }
+
+    #[test]
+    fn guest_fd_components_count_toward_the_link_limit() {
+        let own = Some((123, 456));
+        // `/proc/self/fd/N` follows two links on Linux's walk: the
+        // `self` selector and the descriptor link itself.
+        let at = |extra: usize| {
+            guest_fd_respell_decision(b"/proc/self/fd/7/F", own, true, extra, |_| true)
+        };
+        assert!(at(38).is_ok_and(|decision| decision.is_some()));
+        assert_eq!(at(39), Err(Errno::ELOOP));
+        assert_eq!(at(40), Err(Errno::ELOOP));
     }
 
     #[test]
