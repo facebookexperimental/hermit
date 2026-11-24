@@ -2542,7 +2542,32 @@ impl ManifestInputs {
     }
 }
 
+/// The per-category environment override for a bucket image, for routes
+/// whose image cannot live in the shared manifest (the fbsource Buck
+/// route supplies mini-crypto only to its system-utils ptrace seam).
+/// Unset or empty means manifest behaviour, byte for byte.
+fn bucket_image_env_name(category: &str) -> String {
+    format!(
+        "HERMIT_E2E_BUCKET_IMAGE_{}",
+        category
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
+}
+
 fn bucket_image(set: &ManifestSet, category: &str) -> Option<String> {
+    if let Ok(override_image) = std::env::var(bucket_image_env_name(category)) {
+        if !override_image.trim().is_empty() {
+            return Some(override_image);
+        }
+    }
     set.documents
         .iter()
         .find(|document| document.bucket == category)
@@ -13058,6 +13083,18 @@ fn execute_observed_until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bucket_image_env_name_uppercases_and_underscores() {
+        assert_eq!(
+            bucket_image_env_name("system-utils"),
+            "HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"
+        );
+        assert_eq!(
+            bucket_image_env_name("bin-c"),
+            "HERMIT_E2E_BUCKET_IMAGE_BIN_C"
+        );
+    }
+
     /// The session is the field after the process group, whatever bytes the
     /// command name holds.
     #[test]

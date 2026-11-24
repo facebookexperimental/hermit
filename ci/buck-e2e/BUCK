@@ -152,6 +152,18 @@ buck_genrule(
     cmd = "mkdir -p $OUT && echo 'This bundle ships no v2 rootfs (ci/buck-e2e/cell.sh).' > $OUT/NO-V2-ROOTFS",
 )
 
+# mini-crypto/: only a NO-MINI-CRYPTO marker until a published mini-crypto
+# oci-dir is wired in as the bundle inputs' "mini_crypto" (the dual-built
+# archives have no Buck-visible home yet). A cell whose target env asks for
+# the guest image (HERMIT_E2E_GUEST_IMAGE, defs.bzl guest_image_categories)
+# fails by record on a marker-only bundle - never a silent bare-host run;
+# cells that do not ask run exactly as today.
+buck_genrule(
+    name = "empty-mini-crypto",
+    out = "mini-crypto",
+    cmd = "mkdir -p $OUT && echo 'This bundle ships no mini-crypto image (ci/buck-e2e/cell.sh).' > $OUT/NO-MINI-CRYPTO",
+)
+
 # hermit/install/ for LiteInst cells: the rsrcs/ of hermit-cli's staged
 # installation layout (the LiteInst runtimes, the Detcore receipt and the
 # preload revision; unqualified until the finalizer genrule passes -- see
@@ -205,6 +217,7 @@ hermit_e2e_bundle(
     harness_bin = _INPUTS["harness_bin"],
     hermit = _INPUTS["hermit"],
     install = _INPUTS["install"],
+    mini_crypto = _INPUTS.get("mini_crypto", ":empty-mini-crypto"),
     recorder = "bundle-record",
     run_state = _INPUTS["run_state"],
     source_sha = _INPUTS["source_sha"],

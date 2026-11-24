@@ -246,7 +246,9 @@ def _bundle_impl(ctx):
     retries a loader-rejected verify or chaos cell (KVM or ptrace) inside (issue 5476);
     a bundle without one gets a directory holding only NO-V2-ROOTFS (:empty-v2-rootfs),
     which declares that retry unavailable. cell.sh fails a cell whose v2-rootfs/ has
-    neither an oci-layout nor that marker."""
+    neither an oci-layout nor that marker. mini-crypto/ follows the same pattern for
+    the system-utils mini-image seam: an oci-dir, or only NO-MINI-CRYPTO
+    (:empty-mini-crypto) where no published image is wired in yet."""
     hermit = ctx.attrs.hermit[DefaultInfo].default_outputs[0]
     record = ctx.actions.declare_output("BUNDLE_RECORD.json")
     ctx.actions.run(
@@ -263,13 +265,14 @@ def _bundle_impl(ctx):
     )
     entries = {
         "BUNDLE_RECORD.json": record,
+        "SOURCE_SHA": ctx.attrs.source_sha,
         "bin": ctx.attrs.harness_bin,
         "build": ctx.attrs.fixtures,
         "hermit/hermit": hermit,
         "hermit/install": ctx.attrs.install,
+        "mini-crypto": ctx.attrs.mini_crypto,
         "run-state": ctx.attrs.run_state,
         "src": ctx.attrs.src,
-        "SOURCE_SHA": ctx.attrs.source_sha,
         "v2-rootfs": ctx.attrs.v2_rootfs,
     }
     return [DefaultInfo(default_output = ctx.actions.copied_dir("bundle", entries))]
@@ -281,6 +284,7 @@ hermit_e2e_bundle = rule(
         "harness_bin": attrs.source(allow_directory = True),
         "hermit": attrs.dep(),
         "install": attrs.source(allow_directory = True),
+        "mini_crypto": attrs.source(allow_directory = True),
         "recorder": attrs.source(),
         "run_state": attrs.source(allow_directory = True),
         "source_sha": attrs.source(),
@@ -289,7 +293,7 @@ hermit_e2e_bundle = rule(
     },
 )
 
-def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = [], require_host_caps = False, require_host_caps_for = []):
+def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = [], require_host_caps = False, require_host_caps_for = [], guest_image_categories = []):
     """One hermit_e2e_cell_test per plan cell, plus test suites all / re / local.
 
     `labels` are added to every cell's test, e.g. a consumer's CI scheduling labels.
@@ -310,6 +314,16 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     custom cells run with --strict, that keep a timeslice on ptrace, e9patch or kvm).
     requires_host_capabilities never names that counter, so on a host whose counter is
     inexact a flagged cell fails too.
+
+    `guest_image_categories`, a list of manifest categories, marks those
+    categories' non-privileged ptrace cells for the bundle's guest image
+    for the category (today: mini-crypto for system-utils): their container
+    is empty, their env carries HERMIT_E2E_GUEST_IMAGE, and cell.sh points
+    the harness's bucket-image override at the bundle copy - or records a
+    failed test when the bundle ships no such image, never a bare-host run.
+    Privileged-lane cells keep pinned-root routing (the fbsource consumer
+    also excludes them by name). Categories not listed keep byte-identical
+    routing. Separate keyword, same reason as require_host_caps_for.
     """
     if require_host_caps not in [True, False]:
         fail("require_host_caps must be True or False; pass a list of host capabilities as require_host_caps_for")
@@ -350,6 +364,14 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     # its own harness process, which otherwise samples its own start time. validate-node sets
     # it from the checked-out commit's committer time.
     epoch = read_root_config("hermit_e2e", "epoch", "")
+    # -c hermit_e2e.mini_crypto_system_utils=true is the fbsource seam opt-in:
+    # it asks for system-utils ptrace cells in the bundle's mini-crypto image
+    # without any consumer passing guest_image_categories explicitly.
+    mini_crypto_value = read_root_config("hermit_e2e", "mini_crypto_system_utils", "false")
+    if mini_crypto_value not in ["true", "false"]:
+        fail("-c hermit_e2e.mini_crypto_system_utils must be true or false, got " + mini_crypto_value)
+    if not guest_image_categories and mini_crypto_value == "true":
+        guest_image_categories = ["system-utils"]
     if plan["schema"] != 1:
         fail("expected-e2e-plan.json schema must be 1")
     by_route = {"local": [], "re": []}
@@ -385,6 +407,15 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
         if where == "re" and "cpuid-faulting" in (cell.get("requires_host_capabilities") or []):
             re_properties = {"cpuid_faulting": "true"}
         container, container_reason = _container(cell, where)
+        guest_image = cell["category"] in guest_image_categories and cell["backend"] == "ptrace" and cell.get("lane") != "privileged"
+        if guest_image:
+            if where != "local":
+                fail("guest_image_categories routes only local cells for now: {} is {}".format(cell_id(cell), where))
+            container = ""
+            container_reason = "runs inside the bundle's guest image for its category (guest_image_categories), not the pinned-root container"
+            # The route reason names the same choice: these cells no longer
+            # run in the pinned root, so the pinned-root route reason would lie.
+            reason = "runs inside the bundle's guest image for its category, not on a host or RE worker"
         name = cell_slug(cell)
         env = {
             "HERMIT_E2E_CONTAINER": container,
@@ -392,6 +423,10 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             "HERMIT_E2E_ROUTE": where,
             "HERMIT_E2E_ROUTE_REASON": reason,
         }
+        if guest_image:
+            if cell["category"] != "system-utils":
+                fail("guest_image_categories has no image wired for category {} (only system-utils -> mini-crypto)".format(cell["category"]))
+            env["HERMIT_E2E_GUEST_IMAGE"] = "mini-crypto"
         if where == "local" and _requires_host_caps_here(cell, require_host_caps, require_host_caps_for):
             env["HERMIT_E2E_REQUIRE_HOST_CAPS"] = "1"
         if nonce:

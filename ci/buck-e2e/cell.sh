@@ -185,6 +185,13 @@ fi
 # for a cell on this host, a per-host cache keyed by the file's identity (inode, size,
 # mtime, ctime); ci/manifest-plan/src/bundle_record.rs. A prebuilt bundle without a
 # record runs as before. Both are unset first, so a caller's values never leak in.
+# The whole bucket-image override family is cleared the same way (the harness
+# reads one such name per category): only the bundle_env assignment below,
+# from the target's guest-image decision and the bundle's own image, may set one.
+bucket_image_unsets=()
+for bucket_image_name in "${!HERMIT_E2E_BUCKET_IMAGE_@}"; do
+    bucket_image_unsets+=(-u "$bucket_image_name")
+done
 bundle_env=()
 [[ -f $B/BUNDLE_RECORD.json ]] && bundle_env+=(HERMIT_E2E_BUNDLE_RECORD="$B/BUNDLE_RECORD.json")
 # The bundle's v2 rootfs, when it carries one: an oci-dir the harness retries
@@ -205,6 +212,32 @@ elif [[ ! -f $B/v2-rootfs/NO-V2-ROOTFS ]]; then
     emit_fatal "the bundle's v2-rootfs/ holds no oci-layout (issue 5476's v2 rootfs) and no NO-V2-ROOTFS (a bundle that ships none, ci/buck-e2e/BUCK :empty-v2-rootfs), so a loader-rejected cell would lose its v2 retry without a word"
 fi
 [[ -n $v2_rootfs ]] && bundle_env+=(HERMIT_E2E_V2_OCI_DIR="$v2_rootfs")
+# The mini-crypto seam: the TARGET decides (HERMIT_E2E_GUEST_IMAGE, set by
+# defs.bzl for guest-image cells), the bundle supplies. A cell that needs
+# the mini-crypto image gets the harness's per-category bucket-image
+# override pointed at the bundle copy — or the cell fails by name if the
+# bundle declares it ships none; it never silently runs on the bare host.
+# From the bundle alone, like v2-rootfs: a caller's bucket-image override
+# never leaks in (the whole family is unset first below).
+mini_crypto_image=''
+if [[ -f $B/mini-crypto/oci-layout && -e $B/mini-crypto/NO-MINI-CRYPTO ]]; then
+    emit_fatal "the bundle's mini-crypto/ holds both an oci-layout and NO-MINI-CRYPTO, so whether it ships a mini-crypto image is ambiguous"
+elif [[ -f $B/mini-crypto/oci-layout ]]; then
+    mini_crypto_image=$B/mini-crypto
+elif [[ ! -f $B/mini-crypto/NO-MINI-CRYPTO ]]; then
+    emit_fatal "the bundle's mini-crypto/ holds no oci-layout and no NO-MINI-CRYPTO (a bundle that ships none, ci/buck-e2e/BUCK :empty-mini-crypto), so a system-utils cell would lose its image without a word"
+fi
+guest_image=${HERMIT_E2E_GUEST_IMAGE:-}
+case $guest_image in
+"") ;;
+mini-crypto)
+    [[ -n $mini_crypto_image ]] || emit_fatal "this cell needs the mini-crypto guest image (HERMIT_E2E_GUEST_IMAGE=mini-crypto) but the bundle declares it ships none (NO-MINI-CRYPTO)"
+    [[ $TEST == system-utils/* && $BACKEND == ptrace ]] ||
+        emit_fatal "the mini-crypto guest image is requested for $TEST at $BACKEND, which is not a system-utils ptrace cell"
+    bundle_env+=(HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS="oci-dir:$mini_crypto_image")
+    ;;
+*) emit_fatal "unknown HERMIT_E2E_GUEST_IMAGE '$guest_image' (expected mini-crypto or empty)" ;;
+esac
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
@@ -302,7 +335,7 @@ case $container in
     # as each Cargo category node runs it, plans a candidate beside it. Without it the
     # cell's own one-cell plan holds no comparison and it ran auto (x86-64-v3).
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR "${bucket_image_unsets[@]}" \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
@@ -472,6 +505,7 @@ exec "$@"'
     inner_bundle_env=()
     [[ -f $B/BUNDLE_RECORD.json ]] && inner_bundle_env+=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
     [[ -n $v2_rootfs ]] && inner_bundle_env+=(HERMIT_E2E_V2_OCI_DIR=/src/bundle/v2-rootfs)
+    [[ $guest_image == mini-crypto ]] && inner_bundle_env+=(HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS=oci-dir:/src/bundle/mini-crypto)
     # The PASS baseline goes into the scratch tree, the container's /src.
     inner_refusal_args=()
     if [[ -n $refusal_baseline ]]; then
@@ -480,7 +514,7 @@ exec "$@"'
         inner_refusal_args=(--record-host-image-interpreter-refusals /src/refusal-baseline)
     fi
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT -u HERMIT_E2E_V2_OCI_DIR "${bucket_image_unsets[@]}" \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
