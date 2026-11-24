@@ -133,6 +133,7 @@ class CargoCacheMounts(unittest.TestCase):
         caller_affinity=None,
         project=None,
         bundle_lower=None,
+        hermit_bundle=None,
         extra_env=None,
         extra_forwarded=None,
         prefix=None,
@@ -158,6 +159,8 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
         if bundle_lower is not None:
             forwarded += ["--bundle-lower", str(bundle_lower)]
+        if hermit_bundle is not None:
+            forwarded += ["--hermit-bundle", str(hermit_bundle)]
         if extra_env:
             env.update(extra_env)
         if extra_forwarded:
@@ -837,6 +840,124 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn(
             "HERMIT_CENSUS_BASE_LISTED_IDS=/census-base/cli.listed-ids", argv)
         self.assertIn("HERMIT_CENSUS_DROPPED_FILE=/census-base/dropped.txt", argv)
+
+
+    def hermit_bundle_fixture(self, kind="binary-only", tamper=False, install=False, binary=None):
+        import hashlib as _hl
+        hermit = binary if binary is not None else b"#!/bin/sh\n[ \"$1\" = --version ] && echo 'hermit fixture 0.0'\n"
+        binary_hash = _hl.sha256(hermit).hexdigest()
+        identity = _hl.sha256(f"{kind}\n{binary_hash}\nnone\nnone\n".encode()).hexdigest()
+        bundle = self.root / identity
+        bundle.mkdir(parents=True)
+        (bundle / "kind").write_text(kind)
+        hermit_path = bundle / "hermit"
+        hermit_path.write_bytes(hermit + (b"# tampered\n" if tamper else b""))
+        hermit_path.chmod(0o755)
+        (bundle / "hermit.sha256").write_text(binary_hash)
+        if install:
+            (bundle / "install").mkdir()
+        return bundle
+
+    def test_hermit_bundle_is_mounted_verified_and_named(self):
+        bundle = self.hermit_bundle_fixture()
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertIn(
+            f"type=bind,source={bundle},destination=/hermit-bundle,ro=true", argv
+        )
+        self.assertIn("HERMIT_BIN=/hermit-bundle/hermit", argv)
+        self.assertFalse(any(arg.startswith("HERMIT_INSTALL_DIR=") for arg in argv))
+        self.assertIn("hermit bundle verified:", result.stderr)
+
+    def fake_elf_tools(self, missing=None):
+        # Fake readelf/ldd, first on PATH through the test tools dir, so a
+        # planted ELF reaches the wrapper's ABI preflight deterministically.
+        readelf = self.root / "tools/readelf"
+        readelf.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "if '-d' in sys.argv:\n"
+            "    print('0x0000000000000001 (NEEDED)             Shared library: [libfixture.so.1]')\n"
+            "else:\n"
+            "    print('  Name: GLIBC_2.34  Flags: none  Version: 2')\n"
+        )
+        readelf.chmod(0o755)
+        ldd = self.root / "tools/ldd"
+        body = (
+            "print('libmissing-fixture.so.1 => not found')\n"
+            if missing
+            else "print('libfixture.so.1 => /lib/libfixture.so.1 (0x00007f0000000000)')\n"
+        )
+        ldd.write_text(f"#!{sys.executable}\n{body}")
+        ldd.chmod(0o755)
+
+    def test_a_tampered_hermit_bundle_is_refused_before_launch(self):
+        bundle = self.hermit_bundle_fixture(tamper=True)
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("failed artifact verification", result.stderr)
+        self.assertIn("published Hermit hash mismatch", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_a_complete_bundle_without_install_is_refused_before_launch(self):
+        bundle = self.hermit_bundle_fixture(kind="complete")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("failed artifact verification", result.stderr)
+        self.assertIn("resource bundle has no rsrcs directory", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_bundle_elf_with_an_unresolved_library_is_refused_by_name(self):
+        self.fake_elf_tools(missing="libmissing-fixture.so.1")
+        bundle = self.hermit_bundle_fixture(binary=b"\x7fELF planted fixture\n")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("DT_NEEDED: libfixture.so.1", result.stderr)
+        self.assertIn("libmissing-fixture.so.1 => not found", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_bundle_binary_whose_version_fails_is_refused_before_launch(self):
+        self.fake_elf_tools()
+        bundle = self.hermit_bundle_fixture(binary=b"\x7fELF planted fixture\n")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--version exited nonzero", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_empty_hermit_bundle_value_is_refused_by_name(self):
+        result, calls = self.invoke(hermit_bundle="")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--hermit-bundle was given an empty value", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_check_image_refuses_hermit_bundle(self):
+        env = repository_neutral_env()
+        env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
+        env["PINNED_ROOT_CAPTURE"] = str(self.capture)
+        result = subprocess.run(
+            [
+                "bash", str(WRAPPER),
+                "--check-image",
+                "--digest", "fixture@sha256:" + "0" * 64,
+                "--hermit-bundle", str(self.hermit_bundle_fixture()),
+            ],
+            cwd=self.root, env=env,
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--check-image accepts only optional --digest", result.stderr)
+
+    def test_forwarded_hermit_install_dir_is_refused_with_a_bundle(self):
+        bundle = self.hermit_bundle_fixture()
+        result, calls = self.invoke(
+            hermit_bundle=bundle,
+            extra_env={"HERMIT_INSTALL_DIR": "/host/install"},
+            extra_forwarded=["--env", "HERMIT_INSTALL_DIR"],
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("HERMIT_INSTALL_DIR is bundle-owned", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
 
     def test_bundle_lower_is_a_read_only_bind_that_adds_no_link(self):
         # ci/buck-e2e/cell.sh shares one staged bundle across concurrent cells as

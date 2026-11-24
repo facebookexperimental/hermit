@@ -68,7 +68,7 @@ set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
-src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; bundle_lower=""
+src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; bundle_lower=""; hermit_bundle=""; hermit_bundle_given=false
 project_src=""; project_out=""; project_descriptor=""; project_mode="ro=true"
 proc_locks_runtime=false
 check_image=false
@@ -77,7 +77,7 @@ pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
-            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--bundle-lower DIR] [--env NAME]... -- CMD...' \
+            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--bundle-lower DIR] [--hermit-bundle DIR] [--env NAME]... -- CMD...' \
                 '--bundle-lower DIR mounts DIR read-only at /bundle-lower, as the lower layer of an overlay the command mounts itself.' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
                 '--project-src/--project-out/--project-descriptor admit one distinct /project workspace and target; the original core stays at /src. --project-src-rw is separate from --src-rw.' \
@@ -97,6 +97,7 @@ while [[ $# -gt 0 ]]; do
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --nextest-calibration) nextest_calibration=true; shift ;;
         --bundle-lower) bundle_lower=$2; shift 2 ;;
+        --hermit-bundle) [[ "$hermit_bundle_given" == false ]] || { echo "duplicate --hermit-bundle" >&2; exit 2; }; hermit_bundle=$2; hermit_bundle_given=true; shift 2 ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -173,7 +174,7 @@ check_pinned_image() {
 }
 
 if "$check_image"; then
-    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$hermit_bundle_given" == false && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
@@ -208,6 +209,64 @@ if [[ -n "$bundle_lower" ]]; then
         exit 2
     }
     bundle_mount=(--mount "type=bind,source=$bundle_lower,destination=/bundle-lower,ro=true")
+fi
+
+if [[ "$hermit_bundle_given" == true && -z "$hermit_bundle" ]]; then
+    echo "run-in-pinned-root: --hermit-bundle was given an empty value; pass a bundle directory or omit it" >&2
+    exit 2
+fi
+hermit_bundle_mount=()
+hermit_bundle_env=()
+if [[ -n "$hermit_bundle" ]]; then
+    # A host-built Hermit bundle (owner 7502): the same published-artifact
+    # format the in-root build produces, verified by the one existing
+    # verifier, then mounted read-only so a run inside the image needs no
+    # Rust toolchain of its own. The ldd and --version preflight is a HOST
+    # check only: it refuses, by name, libraries this host cannot resolve
+    # and a binary that cannot execute here. The container resolves against
+    # the pinned image's own libraries, so a host pass does not by itself
+    # prove the in-image ABI; the printed DT_NEEDED/GLIBC line is the
+    # audit record for that comparison.
+    hermit_bundle=$(realpath -m -- "$hermit_bundle")
+    [[ -d "$hermit_bundle" ]] || {
+        echo "run-in-pinned-root: --hermit-bundle $hermit_bundle is not a directory" >&2
+        exit 2
+    }
+    [[ "$hermit_bundle" != *,* ]] || {
+        echo "run-in-pinned-root: --hermit-bundle path cannot contain a comma: $hermit_bundle" >&2
+        exit 2
+    }
+    wrapper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    verified_bundle=$("$wrapper_dir/../verify-hermit-e2e-artifact.sh" "$hermit_bundle") || {
+        echo "run-in-pinned-root: --hermit-bundle $hermit_bundle failed artifact verification" >&2
+        exit 2
+    }
+    hermit_binary=$verified_bundle/hermit
+    magic=$(od -An -t x1 -N4 "$hermit_binary" | tr -d ' \n')
+    if [[ $magic == 7f454c46 ]]; then
+        needed=$(readelf -d "$hermit_binary" | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p' | paste -sd, -)
+        glibc_versions=$(readelf -V --wide "$hermit_binary" | sed -n 's/.*Name: \(GLIBC_[^ ]*\) *Flags:.*/\1/p' | sort -u | paste -sd, -)
+        echo "run-in-pinned-root: hermit bundle binary DT_NEEDED: $needed; GLIBC symbol versions: $glibc_versions" >&2
+        ldd_out=$(timeout -k 2 30 ldd "$hermit_binary" 2>&1) || {
+            echo "run-in-pinned-root: hermit bundle preflight failed: ldd cannot run $hermit_binary: $ldd_out" >&2
+            exit 2
+        }
+        if grep -q "not found" <<<"$ldd_out"; then
+            echo "run-in-pinned-root: hermit bundle preflight failed: $hermit_binary has unresolved libraries on this host:" >&2
+            grep "not found" <<<"$ldd_out" >&2
+            exit 2
+        fi
+    fi
+    version_out=$(timeout -k 2 30 "$hermit_binary" --version 2>&1) || {
+        echo "run-in-pinned-root: hermit bundle preflight failed: $hermit_binary --version exited nonzero: $version_out" >&2
+        exit 2
+    }
+    echo "run-in-pinned-root: hermit bundle verified: $verified_bundle ($version_out)" >&2
+    hermit_bundle_mount=(--mount "type=bind,source=$verified_bundle,destination=/hermit-bundle,ro=true")
+    hermit_bundle_env=(-e HERMIT_BIN=/hermit-bundle/hermit)
+    if [[ -d $verified_bundle/install ]]; then
+        hermit_bundle_env+=(-e HERMIT_INSTALL_DIR=/hermit-bundle/install)
+    fi
 fi
 
 # A second workspace is one paired source/output, never an arbitrary mount.
@@ -614,6 +673,10 @@ for name in "${pass_env[@]}"; do
         echo "run-in-pinned-root: HERMIT_RUNNING_KERNEL_UAPI_ASM is wrapper-owned; do not forward it" >&2
         exit 2
     fi
+    if [[ $name == HERMIT_INSTALL_DIR && -n "$hermit_bundle" ]]; then
+        echo "run-in-pinned-root: HERMIT_INSTALL_DIR is bundle-owned when --hermit-bundle is set; do not forward it" >&2
+        exit 2
+    fi
     [[ -v $name ]] || continue
     case "$name" in
         E2E_RESULT_ROOT)
@@ -888,8 +951,10 @@ exec podman run --rm \
     "${git_mounts[@]}" \
     "${extra_mounts[@]}" \
     "${bundle_mount[@]}" \
+    "${hermit_bundle_mount[@]}" \
     "${calibration_mount[@]}" \
     "${env_args[@]}" \
+    "${hermit_bundle_env[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
     -e "CARGO_TARGET_DIR=$effective_target_in" \
