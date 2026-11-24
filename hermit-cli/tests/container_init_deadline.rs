@@ -615,6 +615,20 @@ fn virtual_clock_exhaustion_under_a_scheduler_turn_cost_ends_the_run() {
     let status = status.unwrap_or_else(|| {
         panic!("the run did not end within {TEARDOWN_BUDGET:?}; stderr:\n{stderr}")
     });
+    // On a host whose refusal Hermit classifies and caches as a
+    // host fact in the shared dh-38lkn5 class (the same classifier
+    // the other v3 cases use), Hermit ends this launch at admission
+    // with the refusal exit (122) before the clock-exhaustion path
+    // this case is about can be reached. Count that refusal as a
+    // skip, as the other v3 cases do; every other exit still fails
+    // the equality below.
+    hermit_test::abort_on_host_fact_v3_refusal_for(
+        "container_init_deadline",
+        Some(Path::new("/bin/sh")),
+        true,
+        status.code(),
+        &stderr,
+    );
     assert_eq!(
         status.code(),
         Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
