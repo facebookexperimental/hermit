@@ -18,7 +18,16 @@ and cgroup policy stay on the host. Each wrapped build or test node runs in a
 privileged podman container pinned by digest, with `/dev/kvm` passed through
 when present, no runtime network, and source at `/src`. The wrapper defaults
 that source bind to read-only; validation nodes explicitly make it writable.
-Output and target volumes are separate and writable. `--cgroups=disabled` keeps
+Output and target volumes are separate and writable. The running kernel's
+generated uapi `asm` headers
+(`/lib/modules/$(uname -r)/build/arch/x86/include/generated/uapi/asm`) are
+bound read-only at that same path, because Detcore's syscall-table test checks
+its tables against the kernel the tests run on and the image carries no kernel
+headers; on a host without them nothing is bound and that test fails by name.
+The wrapper names that directory in `HERMIT_RUNNING_KERNEL_UAPI_ASM` in every
+container, bound or not, and where it is set the test reads only that header,
+never one the image might carry.
+`--cgroups=disabled` keeps
 the container and its monitor inside the caller's resource group, so the outer
 node accounts for and terminates their descendants. The wrapper does not add
 an independent container resource policy. `--init` makes Podman's own init

@@ -135,6 +135,7 @@ class CargoCacheMounts(unittest.TestCase):
         bundle_lower=None,
         extra_env=None,
         extra_forwarded=None,
+        prefix=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -163,6 +164,7 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded += extra_forwarded
         result = subprocess.run(
             [
+                *(prefix or []),
                 "bash",
                 str(WRAPPER),
                 "--src",
@@ -892,6 +894,194 @@ class CargoCacheMounts(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
                 self.assertFalse(any(call[0] == "run" for call in calls), calls)
+
+    def kernel_header_mounts(self, release=None, prefix=None, fake_uname=True):
+        """Run the wrapper, under a fake `uname -r` printing RELEASE when one
+        is given, and return its result and every --mount under /lib/modules.
+        Whatever is bound, the container is told where the running kernel's
+        headers belong (HERMIT_RUNNING_KERNEL_UAPI_ASM), exactly once, so the
+        syscall-table test reads only there. With PREFIX and fake_uname off,
+        the release instead comes from the prefix itself (setarch)."""
+        if release is not None and fake_uname:
+            uname = self.root / "tools/uname"
+            uname.write_text(f"#!/bin/sh\nprintf '%s\\n' '{release}'\n")
+            uname.chmod(0o755)
+        result, calls = self.invoke(prefix=prefix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertEqual(argv[0], "run")
+        guest = f"/lib/modules/{release or os.uname().release}/build/arch/x86/include/generated/uapi/asm"
+        named = [
+            argv[i + 1]
+            for i, arg in enumerate(argv[:-1])
+            if arg == "-e" and argv[i + 1].startswith("HERMIT_RUNNING_KERNEL_UAPI_ASM=")
+        ]
+        self.assertEqual(named, [f"HERMIT_RUNNING_KERNEL_UAPI_ASM={guest}"])
+        mounts = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--mount"]
+        headers = [m for m in mounts if "/lib/modules/" in m]
+        # A bound run says so in one stderr line (the node's log, outside
+        # any test output capture); an unbound run never claims a bind.
+        said = [
+            line for line in result.stderr.splitlines() if "bound host syscall header:" in line
+        ]
+        if headers:
+            source = dict(field.split("=", 1) for field in headers[0].split(","))["source"]
+            self.assertEqual(
+                said,
+                [
+                    "run-in-pinned-root: bound host syscall header: "
+                    f"{guest}/unistd_64.h (ro, from {source})"
+                ],
+            )
+        else:
+            self.assertEqual(said, [])
+        return result, headers
+
+    def test_the_running_kernel_header_directory_name_is_wrapper_owned(self):
+        result, calls = self.invoke(
+            extra_env={"HERMIT_RUNNING_KERNEL_UAPI_ASM": "/elsewhere"},
+            extra_forwarded=["--env", "HERMIT_RUNNING_KERNEL_UAPI_ASM"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HERMIT_RUNNING_KERNEL_UAPI_ASM is wrapper-owned", result.stderr)
+        self.assertFalse(any(call[0] == "run" for call in calls), calls)
+
+    def test_running_kernel_uapi_headers_are_bound_read_only_where_the_host_has_them(self):
+        # Detcore's syscall-table test reads the running kernel's
+        # unistd_64.h from this directory first. The container shares the
+        # host's kernel, so the same release names the same path inside.
+        release = os.uname().release
+        guest = f"/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm"
+        result, headers = self.kernel_header_mounts()
+        if os.path.isdir(guest):
+            self.assertEqual(
+                headers,
+                [f"type=bind,source={os.path.realpath(guest)},destination={guest},ro=true"],
+            )
+        else:
+            self.assertEqual(headers, [])
+            self.assertIn(f"uapi headers are absent at {guest}", result.stderr)
+
+    def test_a_host_without_uapi_headers_binds_none_and_says_so(self):
+        release = "0.0.0-hermit-fixture-without-headers"
+        result, headers = self.kernel_header_mounts(release)
+        self.assertEqual(headers, [])
+        self.assertIn(
+            "uapi headers are absent at "
+            f"/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm;",
+            result.stderr,
+        )
+
+    def test_uapi_headers_podman_cannot_name_exactly_are_not_bound(self):
+        result, headers = self.kernel_header_mounts("0.0.0-hermit,fixture")
+        self.assertEqual(headers, [])
+        self.assertIn("cannot name /lib/modules/0.0.0-hermit,fixture/", result.stderr)
+
+    def _other_release_prefix(self, fixture):
+        """(release, prefix) running the wrapper so its `uname -r` reports a
+        release that is not this host's, in a private mount namespace whose
+        /lib/modules is a tmpfs holding only FIXTURE's trees: kernels/<R'>
+        for R' and decoy/ for the running release. setarch --uname-2.6
+        changes the uname(2) release too, so this holds even if the wrapper
+        ever stops shelling out to uname(1). Skips (never counts) where the
+        capability is refused."""
+        for argv, capability in (
+            (["unshare", "-rm", "/bin/true"], "unprivileged user+mount namespaces (unshare -rm)"),
+            (["setarch", "x86_64", "--uname-2.6", "/bin/true"], "setarch x86_64 --uname-2.6 personality"),
+        ):
+            probe = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if probe.returncode != 0:
+                self.skipTest(f"{capability} refused here: {probe.stderr.strip()}")
+        other = subprocess.run(
+            ["setarch", "x86_64", "--uname-2.6", "uname", "-r"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        running = os.uname().release
+        self.assertNotEqual(other, running)
+        setup = (
+            'mount -t tmpfs tmpfs /lib/modules || exit 125; '
+            'mkdir -p "/lib/modules/$1" "/lib/modules/$3" || exit 125; '
+            'ln -s "$2/kernels/$1" "/lib/modules/$1/build" || exit 125; '
+            'ln -s "$2/decoy" "/lib/modules/$3/build" || exit 125; '
+            'shift 3; exec "$@"'
+        )
+        return other, [
+            "setarch", "x86_64", "--uname-2.6",
+            "unshare", "-rm", "/bin/sh", "-c", setup, "sh",
+            other, str(fixture), running,
+        ]
+
+    def _header_fixture(self, base, release, with_header=True):
+        # The wrapper realpath()s the source, so compare against the
+        # resolved fixture path (a symlinked temp dir would differ).
+        base = Path(os.path.realpath(base))
+        asm = base / "kernels" / release / "arch/x86/include/generated/uapi/asm"
+        asm.mkdir(parents=True)
+        if with_header:
+            (asm / "unistd_64.h").write_text("#define __NR_read 0\n")
+        decoy = base / "decoy/arch/x86/include/generated/uapi/asm"
+        decoy.mkdir(parents=True)
+        (decoy / "unistd_64.h").write_text("#define __NR_decoy 9999\n")
+        return base
+
+    def test_another_kernels_headers_are_bound_at_its_own_release(self):
+        # The bound branch with a release that is not the running one: the
+        # only /lib/modules trees in the namespace are R' (real) and the
+        # running release's decoy, so a wrapper that used the running
+        # release anywhere would bind the decoy and fail by name here.
+        running = os.uname().release
+        probe_root = self.root / "probe-fixture"
+        other, _ = self._other_release_prefix(probe_root)
+        fixture = self._header_fixture(self.root / "fixture", other)
+        other, prefix = self._other_release_prefix(fixture)
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        guest = f"/lib/modules/{other}/build/arch/x86/include/generated/uapi/asm"
+        self.assertEqual(
+            headers,
+            [
+                "type=bind,"
+                f"source={fixture}/kernels/{other}/arch/x86/include/generated/uapi/asm,"
+                f"destination={guest},ro=true"
+            ],
+        )
+        argv = self.capture.read_text()
+        self.assertNotIn(running, argv)
+        self.assertNotIn("decoy", argv)
+        self.assertNotIn(running, result.stderr)
+        self.assertNotIn("decoy", result.stderr)
+
+    def test_another_kernel_without_headers_binds_none_and_says_so(self):
+        fixture = self._header_fixture(self.root / "fixture", "unused", with_header=False)
+        # with_header=False still makes kernels/unused; R' stays absent.
+        other, prefix = self._other_release_prefix(fixture)
+        # No kernels/<R'> tree exists under the fixture, only the decoy.
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        self.assertEqual(headers, [])
+        self.assertIn(
+            "run-in-pinned-root: the running kernel's uapi headers are absent at "
+            f"/lib/modules/{other}/build/arch/x86/include/generated/uapi/asm;",
+            result.stderr,
+        )
+
+    def test_a_comma_in_the_host_header_path_is_not_bound(self):
+        # The existing comma case puts the comma in the release; this one
+        # puts it in the resolved HOST path (the mount source).
+        other, _ = self._other_release_prefix(self.root / "probe-fixture")
+        fixture = self._header_fixture(self.root / "src,x", other)
+        other, prefix = self._other_release_prefix(fixture)
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        self.assertEqual(headers, [])
+        self.assertIn(
+            f"cannot name /lib/modules/{other}/build/arch/x86/include/generated/uapi/asm "
+            f"(host path {fixture}/kernels/{other}/arch/x86/include/generated/uapi/asm)",
+            result.stderr,
+        )
 
     def test_relative_run_state_refuses_before_container_launch(self):
         result, calls = self.invoke(run_state="relative-state")

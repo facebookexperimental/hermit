@@ -7473,13 +7473,16 @@ mod tests {
         );
     }
 
+    // The test supplies the cache snapshot rather than reading the host's: a
+    // host may have no /etc/ld.so.cache (the validation's pinned root has
+    // none), and the mount plan under test does not depend on the bytes.
+    // A snapshot with bytes always gets a staged /etc, so the case runs on
+    // every host.
     #[test]
     fn user_mounts_shadow_frozen_etc_files_by_cover() {
-        let (mut mounts, mut guard) = identity_hardening_mounts(None)
+        let snapshot = LdSoCacheSnapshot::from_bytes(b"a cache this test owns".to_vec());
+        let (mut mounts, mut guard) = identity_hardening_mounts(Some(&snapshot))
             .expect("identity hardening mounts should be constructible");
-        if guard._etc_stage.is_none() {
-            return;
-        }
         let mounted_at = |mounts: &[PlannedMount], target: &Path| {
             mounts
                 .iter()

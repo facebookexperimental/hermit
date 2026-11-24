@@ -9,6 +9,9 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+#[path = "common/loader_cache.rs"]
+mod loader_cache;
+
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
@@ -2020,7 +2023,9 @@ fn proc_self_mountinfo_shows_a_user_bind_over_private_tmp_at_its_target() {
 /// a host entry created mid-run must not appear. Hermit itself runs inside
 /// a private mount namespace whose /etc is a sandbox copy, so the rename
 /// the trigger performs is over the very dentries Hermit's setup froze
-/// from, without touching the host's real /etc.
+/// from, without touching the host's real /etc. The sandbox's loader cache
+/// is one the test builds with ldconfig (common/loader_cache.rs), not a
+/// copy of the host's, which a host may not have.
 #[test]
 fn guest_etc_survives_a_host_rename_of_ld_so_cache() {
     let _guard = hermit_run_lock();
@@ -2032,8 +2037,8 @@ fn guest_etc_survives_a_host_rename_of_ld_so_cache() {
         .expect("create rename sandbox");
     let etc = sandbox.path().join("etc");
     fs::create_dir(&etc).unwrap();
-    let v1 = fs::read("/etc/ld.so.cache").expect("host loader cache");
-    fs::write(etc.join("ld.so.cache"), &v1).unwrap();
+    let v1 = loader_cache::build(&etc.join("ld.so.cache"))
+        .unwrap_or_else(|reason| panic!("cannot build the sandbox's loader cache: {reason}"));
     fs::copy("/etc/group", etc.join("group")).unwrap();
     fs::copy("/etc/hosts", etc.join("hosts")).unwrap();
     let mut v2 = v1.clone();

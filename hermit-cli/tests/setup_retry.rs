@@ -20,7 +20,11 @@
 //!
 //! The fixture runs hermit inside an outer user+mount namespace whose `/etc`
 //! and `/var/run` (as the host resolves it) are test-owned directories, so
-//! the test renames over them without touching the host's. The race probe
+//! the test renames over them without touching the host's. The fixture builds
+//! what they hold itself: its `/etc/ld.so.cache` with `ldconfig`
+//! (`common/loader_cache.rs`), never a copy of the host's, and, on a host with
+//! no `/var/run` (the validation's pinned root has none), a test-owned `/var`
+//! holding its run directory. The race probe
 //! `setup_mounts_made` (docs/RACE_PROBES.md) holds the container's init after
 //! setup made its mounts and before it records the mount table. The renames
 //! occur at that after-mounts hold, once per affected path per held setup
@@ -30,6 +34,9 @@
 //! case needs CPUID faulting or an exact branch counter and none is gated on
 //! either. A host where the fixture cannot be built fails each case, naming
 //! why.
+
+#[path = "common/loader_cache.rs"]
+mod loader_cache;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -75,10 +82,18 @@ struct Fixture {
     directory: tempfile::TempDir,
     etc: PathBuf,
     run: PathBuf,
-    /// The host's `/var/run`, resolved: the fixture's run directory is bound
-    /// over it, so the guest's `/var/run/nscd` is the fixture's.
+    /// The test-owned directory bound over [`Fixture::cover_target`]: the run
+    /// directory itself, or a `var` directory holding it.
+    cover: PathBuf,
+    /// The host's `/var/run`, resolved, or, on a host with no `/var/run`, its
+    /// `/var`.
+    cover_target: PathBuf,
+    /// Where the fixture's run directory appears in the outer namespace, so
+    /// that the guest's `/var/run/nscd` is the fixture's: the host's
+    /// `/var/run`, resolved, or `/var/run` itself.
     var_run: PathBuf,
-    /// The bytes Hermit freezes at `/etc/ld.so.cache`.
+    /// The loader cache the fixture built, which Hermit freezes at
+    /// `/etc/ld.so.cache`.
     cache: Vec<u8>,
     hermit: PathBuf,
 }
@@ -94,33 +109,53 @@ fn fixture_with(hermit: &Path) -> Fixture {
     build_fixture(hermit).unwrap_or_else(|reason| panic!("{UNBUILDABLE_FIXTURE}: {reason}"))
 }
 
-/// The fixture, or why it cannot be built: no outer namespace, no host cache,
-/// no `/var/run`, or a nested `hermit` that does not run on this host.
+/// The fixture, or why it cannot be built: no outer namespace, no loader
+/// cache built (`loader_cache::build` names why), neither a `/var/run` nor a
+/// `/var` to hold one, or a nested `hermit` that does not run on this host.
 fn build_fixture(hermit: &Path) -> Result<Fixture, String> {
     let probe = run(Command::new("unshare").args(["-rm", "true"]));
     if !probe.status.success() {
         return Err(format!("unshare -rm unavailable: {probe:?}"));
     }
-    let cache = std::fs::read("/etc/ld.so.cache").unwrap_or_default();
-    if cache.is_empty() {
-        return Err("the host has no /etc/ld.so.cache".to_owned());
-    }
-    let var_run = std::fs::canonicalize("/var/run")
-        .map_err(|error| format!("the host's /var/run does not resolve: {error}"))?;
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let etc = directory.path().join("etc");
     std::fs::create_dir(&etc).unwrap();
-    std::fs::write(etc.join("ld.so.cache"), &cache).unwrap();
+    let cache = loader_cache::build(&etc.join("ld.so.cache"))?;
     // A group file Hermit freezes, the host's or, where it has none, one of
     // its own, so that a rename over `/etc/group` always meets a frozen file.
     let group = std::fs::read("/etc/group").unwrap_or_else(|_| b"root:x:0:\n".to_vec());
     std::fs::write(etc.join("group"), group).unwrap();
-    let run_dir = directory.path().join("run");
+    // The run directory covers the host's `/var/run`, resolved. A host with
+    // no `/var/run` gets one in the outer namespace instead: a test-owned
+    // `var` directory holding the run directory covers its `/var`.
+    let (run_dir, cover, cover_target, var_run) = match std::fs::canonicalize("/var/run") {
+        Ok(var_run) => {
+            let run_dir = directory.path().join("run");
+            (run_dir.clone(), run_dir, var_run.clone(), var_run)
+        }
+        Err(_) if Path::new("/var").is_dir() => {
+            let var = directory.path().join("var");
+            let run_dir = var.join("run");
+            (
+                run_dir,
+                var,
+                PathBuf::from("/var"),
+                PathBuf::from("/var/run"),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "the host's /var/run does not resolve ({error}), and it has no /var to hold one"
+            ));
+        }
+    };
     std::fs::create_dir_all(run_dir.join("nscd")).unwrap();
     let fixture = Fixture {
         directory,
         etc,
         run: run_dir,
+        cover,
+        cover_target,
         var_run,
         cache,
         hermit: hermit.to_path_buf(),
@@ -164,8 +199,8 @@ impl Fixture {
         let script = format!(
             "mount --bind {} /etc && mount --bind {} {} && exec {} run --strict --no-virtualize-cpuid --cpu-profile=x86-64-v2 --max-timeslice=disabled {} {} -- /bin/sh -c '{guest}'",
             self.etc.display(),
-            self.run.display(),
-            self.var_run.display(),
+            self.cover.display(),
+            self.cover_target.display(),
             self.hermit.display(),
             detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             extra_args,

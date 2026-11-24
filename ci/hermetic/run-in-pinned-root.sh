@@ -7,8 +7,9 @@
 # boundary without creating a second resource or cgroup layer. Each invocation
 # is one privileged podman container pinned BY DIGEST, with /dev/kvm passed
 # through, no runtime network, source at /src (read-only by default, explicitly
-# writable for validation nodes), and separate writable output and target
-# volumes.
+# writable for validation nodes), separate writable output and target
+# volumes, and the running kernel's generated uapi asm headers read-only at
+# their host path.
 #
 # WHY BY DIGEST AND NOT BY TAG. A tag is mutable; a digest is the artifact that
 # actually ran. The digest belongs in the receipt next to the flake.lock: the
@@ -567,11 +568,52 @@ elif [[ -d $host_pinned_cpu_dir ]] &&
         "type=bind,source=$host_pinned_cpu_dir,destination=$guest_pinned_cpu_dir"
     )
 fi
+
+# The running kernel's syscall numbers, read-only, at the path where the host
+# keeps them. Detcore's every_host_kernel_syscall_number_is_accounted_for
+# checks that its tables name every syscall number the kernel under test
+# wires, and only that kernel's own headers say which numbers those are. The
+# image has no kernel headers (no /lib/modules, no /usr/include/asm), and a
+# copy kept in the image or the tree would stop matching the kernel the tests
+# run on. A container runs on the host's kernel, so `uname -r` inside it
+# reports this same release and the test reads this directory's unistd_64.h
+# first. Where the host has no such directory (or Podman's comma-framed
+# --mount cannot name it exactly), nothing is bound and that test fails by
+# name, listing the paths it tried.
+#
+# HERMIT_RUNNING_KERNEL_UAPI_ASM names this directory in every container,
+# bound or not, and is wrapper-owned (a forwarded --env of it is refused
+# below). Where it is set the test reads only this directory's header, so a
+# header the image might carry can never stand in for the running kernel's.
+kernel_release=$(uname -r)
+guest_uapi_asm=/lib/modules/$kernel_release/build/arch/x86/include/generated/uapi/asm
+env_args+=(-e "HERMIT_RUNNING_KERNEL_UAPI_ASM=$guest_uapi_asm")
+host_uapi_asm=
+if [[ -d $guest_uapi_asm ]]; then
+    host_uapi_asm=$(realpath -e -- "$guest_uapi_asm")
+fi
+if [[ $host_uapi_asm$guest_uapi_asm == *[,$'\t\r\n']* ]]; then
+    echo "run-in-pinned-root: not binding the running kernel's uapi headers: Podman's comma-framed --mount cannot name $guest_uapi_asm (host path ${host_uapi_asm:-absent}) exactly; the host syscall-table test will fail by name" >&2
+elif [[ -z $host_uapi_asm ]]; then
+    echo "run-in-pinned-root: the running kernel's uapi headers are absent at $guest_uapi_asm; the host syscall-table test will fail by name" >&2
+else
+    # One line on every bound run, in the node's own log: a node that passes
+    # shows which header the syscall-table test compared against.
+    echo "run-in-pinned-root: bound host syscall header: $guest_uapi_asm/unistd_64.h (ro, from $host_uapi_asm)" >&2
+    extra_mounts+=(
+        --mount
+        "type=bind,source=$host_uapi_asm,destination=$guest_uapi_asm,ro=true"
+    )
+fi
 for name in "${pass_env[@]}"; do
     [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
         echo "run-in-pinned-root: invalid environment name '$name'." >&2
         exit 2
     }
+    if [[ $name == HERMIT_RUNNING_KERNEL_UAPI_ASM ]]; then
+        echo "run-in-pinned-root: HERMIT_RUNNING_KERNEL_UAPI_ASM is wrapper-owned; do not forward it" >&2
+        exit 2
+    fi
     [[ -v $name ]] || continue
     case "$name" in
         E2E_RESULT_ROOT)

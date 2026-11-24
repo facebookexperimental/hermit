@@ -14,6 +14,9 @@
 
 #![allow(dead_code)]
 
+#[path = "loader_cache.rs"]
+mod loader_cache;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -678,7 +681,9 @@ pub struct HostCacheRename {
 /// the test's own copy (`unshare -rm`, as `procfs_determinism.rs`'s
 /// `guest_etc_survives_a_host_rename_of_ld_so_cache`), so the rename below
 /// replaces the very file Hermit froze `/etc/ld.so.cache` from, never the
-/// host's. While run 1's guest waits on the FIFO (after run 1's setup, and
+/// host's. That file is a loader cache the test builds with ldconfig
+/// (`loader_cache.rs`), not a copy of the host's, which a host may not have.
+/// While run 1's guest waits on the FIFO (after run 1's setup, and
 /// before the guest first opens the path), the test renames a replacement
 /// over that file, as ldconfig does. Run 2 gets its line with nothing
 /// renamed. A pair rerun (which nothing here should name) gets its lines too,
@@ -691,8 +696,8 @@ pub fn verify_across_a_host_cache_rename(hermit: &Path, name: &str) -> HostCache
     let _ = std::fs::remove_dir_all(&root);
     let etc = root.join("etc");
     std::fs::create_dir_all(&etc).expect("create the test's /etc");
-    let frozen = std::fs::read("/etc/ld.so.cache").expect("read the host's loader cache");
-    std::fs::write(etc.join("ld.so.cache"), &frozen).expect("write the test's cache");
+    let frozen = loader_cache::build(&etc.join("ld.so.cache"))
+        .unwrap_or_else(|reason| panic!("cannot build the test's loader cache: {reason}"));
     for file in ["group", "hosts"] {
         std::fs::copy(Path::new("/etc").join(file), etc.join(file))
             .unwrap_or_else(|error| panic!("copy /etc/{file}: {error}"));

@@ -7253,6 +7253,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        // A kernel release with no headers, so the wrapper's one line about
+        // the running kernel's syscall header is the same on every host.
+        write_executable(
+            &root.join("tools/uname"),
+            b"#!/bin/sh\necho 0.0.0-wrapper-fixture\n",
+        );
         write_executable(
             &root.join("tools/podman"),
             br##"#!/usr/bin/env python3
@@ -7364,7 +7370,19 @@ sys.exit(37)
             String::from_utf8_lossy(&output.stderr),
         );
         assert_eq!(output.stdout, b"literal-payload-status-37\n");
-        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let expected_stderr: &[u8] = if wrapped {
+            b"run-in-pinned-root: the running kernel's uapi headers are absent at \
+/lib/modules/0.0.0-wrapper-fixture/build/arch/x86/include/generated/uapi/asm; \
+the host syscall-table test will fail by name\n"
+        } else {
+            b""
+        };
+        assert_eq!(
+            output.stderr,
+            expected_stderr,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         if wrapped {
             let calls = fs::read_to_string(root.join("podman.jsonl")).unwrap();
             let calls = calls

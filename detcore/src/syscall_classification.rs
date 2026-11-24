@@ -3359,38 +3359,17 @@ mod tests {
     /// The numbers come from the running kernel's own headers, preferring
     /// its build tree (`/lib/modules/$(uname -r)/build/.../unistd_64.h`)
     /// and falling back to the installed `/usr/include/asm/unistd_64.h`.
-    /// If neither exists, the test fails rather than passing on no
-    /// evidence, unless the operator explicitly opts out with
-    /// `HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS=1` (a hermetic sandbox with
-    /// no kernel headers says so, instead of silently weakening the check
-    /// for every other host).
+    /// If none exists, the test fails by name rather than passing on no
+    /// evidence. The validation's pinned root has no kernel headers of its
+    /// own, so `ci/hermetic/run-in-pinned-root.sh` binds the running
+    /// kernel's generated uapi `asm` directory read-only at the same path
+    /// and names it in `HERMIT_RUNNING_KERNEL_UAPI_ASM`; with that set, the
+    /// header in the directory derived from `uname -r` is the only one read,
+    /// and a value naming any other directory is refused
+    /// (`host_syscall_table::candidates`).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn every_host_kernel_syscall_number_is_accounted_for() {
-        use std::collections::BTreeMap;
-
-        fn parse_nr_defines(text: &str, numbers: &mut BTreeMap<i32, String>) {
-            for line in text.lines() {
-                let Some(rest) = line.trim().strip_prefix("#define __NR_") else {
-                    continue;
-                };
-                let mut fields = rest.split_whitespace();
-                let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
-                    continue;
-                };
-                // Only plain decimal definitions name a wired number;
-                // aliases (`__NR_x __NR_y`) and offset expressions belong
-                // to another ABI's arithmetic. `__NR_syscalls` is the
-                // table's size, not a syscall.
-                if name == "syscalls" {
-                    continue;
-                }
-                if let Ok(nr) = value.parse::<i32>() {
-                    numbers.entry(nr).or_insert_with(|| name.to_owned());
-                }
-            }
-        }
-
         let release = std::process::Command::new("uname")
             .arg("-r")
             .output()
@@ -3398,36 +3377,21 @@ mod tests {
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
             .unwrap_or_default();
-        let candidates = [
-            format!("/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm/unistd_64.h"),
-            format!("/lib/modules/{release}/build/include/uapi/asm-generic/unistd.h"),
-            "/usr/include/asm/unistd_64.h".to_owned(),
-            "/usr/include/x86_64-linux-gnu/asm/unistd_64.h".to_owned(),
-        ];
-        let mut host: BTreeMap<i32, String> = BTreeMap::new();
-        let mut source = None;
-        for candidate in &candidates {
-            if release.is_empty() && candidate.contains("/lib/modules/") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(candidate) {
-                parse_nr_defines(&text, &mut host);
-                if !host.is_empty() {
-                    source = Some(candidate.clone());
-                    break;
-                }
-            }
-        }
-        let Some(source) = source else {
-            assert_eq!(
-                std::env::var("HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS").as_deref(),
-                Ok("1"),
+        let pinned_root_uapi_asm = std::env::var_os(host_syscall_table::PINNED_ROOT_UAPI_ASM_VAR);
+        let candidates = host_syscall_table::candidates(&release, pinned_root_uapi_asm.as_deref())
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+        let Some((source, mut host)) =
+            host_syscall_table::read_first(std::path::Path::new("/"), &candidates)
+        else {
+            panic!(
                 "no host syscall table found in {candidates:?}: cannot prove \
-                 KNOWN_BEYOND_PINNED_TABLE complete on this host. Install the \
-                 kernel headers, or set HERMIT_SKIP_HOST_SYSCALL_COMPLETENESS=1 \
-                 to opt out explicitly."
+                 KNOWN_BEYOND_PINNED_TABLE complete for the running kernel \
+                 (release {release:?}; {}={pinned_root_uapi_asm:?}). Install \
+                 that kernel's headers; in the pinned root, \
+                 ci/hermetic/run-in-pinned-root.sh binds their directory \
+                 read-only when the host has it.",
+                host_syscall_table::PINNED_ROOT_UAPI_ASM_VAR
             );
-            return;
         };
         // The common (non-x32) numbers only: the x32 ABI shares the header
         // range above __X32_SYSCALL_BIT and is not a table Detcore dispatches.
@@ -3454,5 +3418,13 @@ mod tests {
              the syscalls pin and classify them).",
             gaps.join(", ")
         );
+        println!(
+            "{source} (kernel release {release}) wires {} syscall numbers; \
+             every one is in the pinned table or the manifests",
+            host.len()
+        );
     }
+
+    #[cfg(target_arch = "x86_64")]
+    mod host_syscall_table;
 }
