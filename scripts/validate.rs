@@ -8114,6 +8114,19 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .into_iter()
         .map(str::to_string),
     );
+    // The selftest.validate_rs inclusion build_plan applies to every
+    // on-record focused closure, decided by exactly the driver's own
+    // pure action function (this bracket is an on-record run in the
+    // portable lane, which carries the node).
+    if validate_rs_self_test_action(
+        true,
+        false,
+        true,
+        std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some(),
+    ) == ValidateRsSelfTestAction::Add
+    {
+        expected_tags.insert("selftest.validate_rs".to_string());
+    }
     let mut expected = dagrun::select_steps_by_tags(
         &portable,
         &expected_tags.iter().cloned().collect::<Vec<_>>(),
@@ -16550,6 +16563,89 @@ fn keep_ancestor_baseline(
     })
 }
 
+/// The lane's `selftest.validate_rs` tag, when the lane graph carries one.
+fn validate_rs_self_test_tag(lane: &str, lane_cfg: &DagConfig) -> Option<String> {
+    let tag = if matches!(lane, "quick" | "super") {
+        "quick-super-selftest.validate_rs"
+    } else {
+        "selftest.validate_rs"
+    };
+    lane_cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == tag)
+        .then(|| tag.to_string())
+}
+
+/// What a focused closure does with `selftest.validate_rs`. Pure so every
+/// combination is unit-testable without a repository or a plan.
+#[derive(Debug, PartialEq, Eq)]
+enum ValidateRsSelfTestAction {
+    /// Insert the node's tag into the focused selection.
+    Add,
+    /// Do not insert it; print this named reason instead of passing
+    /// silently.
+    NotRun(&'static str),
+}
+
+/// The one rule for the validation driver's own self-test in focused
+/// closures: every on-record focused closure in a lane that carries the
+/// node includes it, because it is a leaf no dependency closure reaches,
+/// and a targeted land gate that changes the driver must not skip the
+/// driver's own brackets. The exclusions are the run forms that publish
+/// no evidence or repeat a base run's work: case-selected (`--tests`)
+/// runs, off-record local runs, and ci-hub composition reruns (the base
+/// run at the same commit already ran the node; a flaky rerun failure
+/// would refuse an otherwise-green composition). Lanes without the node
+/// (privileged, hosted-privileged) name the hole instead of passing
+/// silently.
+fn validate_rs_self_test_action(
+    on_record: bool,
+    case_selected: bool,
+    lane_has_node: bool,
+    composition_rerun: bool,
+) -> ValidateRsSelfTestAction {
+    if case_selected {
+        return ValidateRsSelfTestAction::NotRun("case-selected mode");
+    }
+    if composition_rerun {
+        return ValidateRsSelfTestAction::NotRun(
+            "ci-hub composition rerun (the base run at this commit already ran it)",
+        );
+    }
+    if !on_record {
+        return ValidateRsSelfTestAction::NotRun("off-record local run");
+    }
+    if !lane_has_node {
+        return ValidateRsSelfTestAction::NotRun("lane carries no such node");
+    }
+    ValidateRsSelfTestAction::Add
+}
+
+/// Apply [`validate_rs_self_test_action`] to a focused selection: insert
+/// the node's tag, or print the named NOT-run line for this run form.
+fn maybe_add_validate_rs_self_test(
+    lane: &str,
+    lane_cfg: &DagConfig,
+    tags: &mut BTreeSet<String>,
+    on_record: bool,
+    case_selected: bool,
+) {
+    let tag = validate_rs_self_test_tag(lane, lane_cfg);
+    let composition_rerun = std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some();
+    match validate_rs_self_test_action(on_record, case_selected, tag.is_some(), composition_rerun) {
+        ValidateRsSelfTestAction::Add => {
+            let tag = tag.expect("Add requires the lane to carry the node");
+            if tags.insert(tag.clone()) {
+                println!("Focused validation: {tag} added (always on on-record focused closures)");
+            }
+        }
+        ValidateRsSelfTestAction::NotRun(reason) => {
+            println!("selftest.validate_rs NOT run: {reason}");
+        }
+    }
+}
+
 /// Select focused tags (with dependency closure) from the lane subset,
 /// falling back to the full committed DAG when the lane subset does not
 /// know a requested tag. A rerun of a finished run's failed set names
@@ -16676,6 +16772,13 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             ]
         };
         tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
+        maybe_add_validate_rs_self_test(
+            &lane,
+            &lane_cfg,
+            &mut tags,
+            !args.allow_local_off_the_record_run,
+            true,
+        );
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
         let mut cfg =
             select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
@@ -16788,6 +16891,19 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 Some((*tag).to_string())
             }
         }));
+        // The off-record exemption is load-bearing here, not just
+        // minimalism: the self-test's own submodule fixture child runs an
+        // off-record focused run in a shallow clone, which without the
+        // exemption would schedule the self-test recursively (bounded only
+        // by that child's own timeout). Off-record runs also publish no
+        // evidence, so no land gate is exempt (see the action's doc).
+        maybe_add_validate_rs_self_test(
+            lane,
+            &lane_cfg,
+            &mut tags,
+            !args.allow_local_off_the_record_run,
+            false,
+        );
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
         let cfg =
             select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
@@ -38817,6 +38933,47 @@ mod prepared_command_tests {
             err.contains("unrecognized pinned-root invocation"),
             "legacy guard must be refused, got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rs_self_test_action_covers_every_combination() {
+        // Add is exactly: on-record, not case-selected, the lane carries
+        // the node, and not a composition rerun. Every other combination
+        // is a named NotRun, with case-selected taking precedence over
+        // composition, which takes precedence over off-record, which
+        // takes precedence over a lane without the node.
+        for on_record in [false, true] {
+            for case_selected in [false, true] {
+                for lane_has_node in [false, true] {
+                    for composition_rerun in [false, true] {
+                        let action = validate_rs_self_test_action(
+                            on_record,
+                            case_selected,
+                            lane_has_node,
+                            composition_rerun,
+                        );
+                        let expected = if case_selected {
+                            ValidateRsSelfTestAction::NotRun("case-selected mode")
+                        } else if composition_rerun {
+                            ValidateRsSelfTestAction::NotRun(
+                                "ci-hub composition rerun (the base run at this commit already ran it)",
+                            )
+                        } else if !on_record {
+                            ValidateRsSelfTestAction::NotRun("off-record local run")
+                        } else if !lane_has_node {
+                            ValidateRsSelfTestAction::NotRun("lane carries no such node")
+                        } else {
+                            ValidateRsSelfTestAction::Add
+                        };
+                        assert_eq!(
+                            action, expected,
+                            "on_record={on_record} case_selected={case_selected} \
+                             lane_has_node={lane_has_node} composition_rerun={composition_rerun}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
