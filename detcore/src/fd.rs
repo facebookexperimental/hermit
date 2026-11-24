@@ -944,6 +944,17 @@ struct OpenFileDescription {
     /// name is below it (ENOTDIR), whatever its recorded `path` spells.
     #[serde(default)]
     procfs_link_itself: bool,
+    /// For an open whose `/proc` spelling has a `self` or `thread-self`
+    /// selector, the pid and tid (as `/proc` spells them) of the task that
+    /// selector named: the opener's where its own path spelled the selector,
+    /// else the one recorded on the directory descriptor the path was
+    /// relative to. Linux resolves the selector at that open and pins the
+    /// directory to its task, so a name looked up below it later, by a
+    /// fork's child or a receiver, is that task's
+    /// (`Detcore::procfs_selector_opener`). Shared by descriptor aliases and
+    /// a fork's copies.
+    #[serde(default)]
+    procfs_selector_opener: Option<(i32, i32)>,
     /// This open file is a `/proc` directory Detcore serves itself, `/proc`
     /// or a task's descriptor directory, `/proc/<pid>/fd`
     /// (`procfs::fd_directory::PlaceholderDirectory`): which directory, its
@@ -1779,6 +1790,7 @@ impl DetFd {
                 pidfd_target: None,
                 procfs_reached: None,
                 procfs_link_itself: false,
+                procfs_selector_opener: None,
                 placeholder: None,
                 recordreplay_task_directory: false,
                 inherited_external_read: None,
@@ -2120,6 +2132,18 @@ impl DetFd {
     /// Whether this open file is a `/proc` selector link itself.
     pub(crate) fn procfs_link_itself(&self) -> bool {
         self.with_description(|d| d.procfs_link_itself)
+    }
+
+    /// Record the task a `self` or `thread-self` selector in this open
+    /// file's spelling named (`OpenFileDescription::procfs_selector_opener`).
+    pub(crate) fn set_procfs_selector_opener(&self, ids: (i32, i32)) {
+        self.with_description(|d| d.procfs_selector_opener = Some(ids))
+    }
+
+    /// The task a `self` or `thread-self` selector in this open file's
+    /// spelling named, if it had one and Detcore knew the task's numbers.
+    pub(crate) fn procfs_selector_opener(&self) -> Option<(i32, i32)> {
+        self.with_description(|d| d.procfs_selector_opener)
     }
 
     /// The placeholder directory this open file is, if it is one
@@ -2939,6 +2963,13 @@ impl DetFd {
 
     pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::target_fd))
+    }
+
+    /// For an `fdinfo`, the task whose descriptor table it shows, as its open
+    /// bound it (`procfs::FdinfoTable`), kept with the open file description
+    /// through a fork or a transfer.
+    pub(crate) fn procfs_fdinfo_table(&self) -> Option<crate::procfs::FdinfoTable> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::fdinfo_table))
     }
 
     /// Move the cursor shared by every alias of a procfs open file as the

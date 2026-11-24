@@ -338,6 +338,35 @@ pub(crate) fn held_locks_in_fdinfo(contents: &[u8]) -> Vec<HeldLock> {
         .collect()
 }
 
+/// `locks` as a refusal names them: each lock's class, mode, access and
+/// range, without its object (`MAJOR:MINOR:INODE`), which holds the host's
+/// device and inode numbers.
+fn without_identity(locks: &[HeldLock]) -> String {
+    let locks = locks
+        .iter()
+        .map(|lock| {
+            format!(
+                "{} {} {} {}-{}",
+                lock.class, lock.mode, lock.access, lock.start, lock.end
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", locks.join(", "))
+}
+
+/// Every `lock:` line of a descriptor's `/proc/<pid>/fdinfo/<fd>` text, of
+/// any class, in the kernel's order, split as a `/proc/locks` row (fdinfo
+/// spells each as `locks_show` does, without waiters: `show_fd_locks` in
+/// fs/locks.c); `None` when any `lock:` line is not one, which a caller
+/// refuses. A file with no `lock:` line has none.
+pub(crate) fn fdinfo_lock_rows(contents: &[u8]) -> Option<Vec<LockRowFacts>> {
+    let text = std::str::from_utf8(contents).ok()?;
+    text.lines()
+        .filter_map(|line| line.strip_prefix("lock:\t"))
+        .map(|row| lock_rows(row.as_bytes())?.pop())
+        .collect()
+}
+
 /// Which of `rows` the guest owns (see the module comment). `held` is every
 /// lock a guest description some guest table references holds; each distinct
 /// lock admits at most one row, so a lock listed by two descriptions the
@@ -544,6 +573,20 @@ pub(crate) struct LockLedger {
     /// row each ([`LockLedger::rendered_rows`]). Kept while some table
     /// references the identity, and across an exec that keeps it.
     alias_groups: BTreeMap<OpenFileId, OpenFileId>,
+    /// The lease each open file description holds by the guest's own
+    /// `F_SETLEASE` through a descriptor of it, as the access a `lock:` line
+    /// spells (`READ` or `WRITE`), from the call's kind and its recorded
+    /// result ([`LockLedger::note_lease`]); a description with no entry holds
+    /// none the guest took. Linux ties a lease to the open file description
+    /// as it ties an OFD lock or a flock (`lease_init` sets `flc_owner` to
+    /// the `struct file`, fs/locks.c), and fdinfo lists it only for that
+    /// description (`__show_fd_locks`). A fdinfo whose lease lines differ
+    /// from this record (a lease the guest did not take, inherited or a host
+    /// holder's; one the kernel removed after a break, on its own clock) is
+    /// refused by name ([`LockLedger::fdinfo_owners`]). Kept with the
+    /// description's locks: forgotten with its last reference, shared by its
+    /// alias group and kept across an exec that keeps it.
+    leases: BTreeMap<OpenFileId, GuestLease>,
     /// The files, as a lock line spells its object (`MAJOR:MINOR:INODE`), on
     /// which a guest's record-lock request (`F_SETLK`, `F_SETLKW`) succeeded
     /// while the backend held the lock it took as an OFD lock of the open
@@ -862,6 +905,19 @@ struct KeptDescription {
     takers: BTreeMap<HeldLock, DetPid>,
     second_identity: bool,
     alias_group: Option<OpenFileId>,
+    lease: Option<GuestLease>,
+}
+
+/// The lease the guest's own `F_SETLEASE` left an open file description
+/// holding ([`LockLedger::note_lease`]): its access, as a `lock:` line spells
+/// it (`READ` or `WRITE`), and the process that took it, which Linux records
+/// as the lease's owner when it creates the lease (`lease_init` sets
+/// `flc_pid` to `current->tgid`) and keeps when a later call through the same
+/// description changes its type in place (`lease_modify`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuestLease {
+    access: String,
+    taker: DetPid,
 }
 
 /// A change to the copies in flight over `SCM_RIGHTS`
@@ -954,6 +1010,7 @@ impl LockLedger {
         self.takers.remove(&open_file);
         self.second_identities.remove(&open_file);
         self.alias_groups.remove(&open_file);
+        self.leases.remove(&open_file);
     }
 
     fn set_references(&mut self, open_file: OpenFileId, table: Table, slots: u32) {
@@ -1231,6 +1288,7 @@ impl LockLedger {
             return;
         };
         let takers = self.takers.get(&open_file).cloned();
+        let lease = self.leases.get(&open_file).cloned();
         let others = self
             .alias_groups
             .iter()
@@ -1252,7 +1310,60 @@ impl LockLedger {
                     self.takers.remove(&member);
                 }
             }
+            match &lease {
+                Some(lease) => {
+                    self.leases.insert(member, lease.clone());
+                }
+                None => {
+                    self.leases.remove(&member);
+                }
+            }
         }
+    }
+
+    /// The guest's own `F_SETLEASE` through a descriptor of `open_file` in
+    /// `process`'s table, which `slots` of its slots name, succeeded: the
+    /// description now holds a lease of `lease`'s access (`READ` for
+    /// `F_RDLCK`, `WRITE` for `F_WRLCK`), or none (`F_UNLCK`). The call's
+    /// kind and its recorded result decide it, so a replay records the same
+    /// lease without reading the host; no fdinfo is read, so the recording
+    /// is unchanged. The description's other locks are left as they were,
+    /// and a description whose locks the ledger never read holds no OFD lock
+    /// or flock it knows of (an empty record), so that what else the ledger
+    /// keeps of a description (its references, an exec's survivors, its alias
+    /// group) keeps the lease too. Linux changes an existing lease of the
+    /// same description in place (`lease_modify`), keeping its owner, so
+    /// there is at most one, and its taker is the process whose call created
+    /// it: `process` for a new lease, the earlier taker for a type change.
+    /// After an unlock, the next lease is new, and its taker is its caller.
+    pub(crate) fn note_lease(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        lease: Option<String>,
+        slots: u32,
+    ) {
+        let table = self.table_of(process);
+        self.set_references(open_file, table, slots);
+        if !self.references.contains_key(&open_file) {
+            return;
+        }
+        self.locks
+            .entry(open_file)
+            .or_insert_with(|| Ok(Vec::new()));
+        match lease {
+            Some(access) => {
+                let taker = self
+                    .leases
+                    .get(&open_file)
+                    .map_or(process, |held| held.taker);
+                self.leases.insert(open_file, GuestLease { access, taker });
+            }
+            None => {
+                self.leases.remove(&open_file);
+            }
+        }
+        self.reconcile_aliases(open_file);
     }
 
     /// As [`Self::note_locks`], after a call of `process`'s that can take a
@@ -1509,6 +1620,7 @@ impl LockLedger {
                             takers: self.takers.get(open_file).cloned().unwrap_or_default(),
                             second_identity: self.second_identities.contains(open_file),
                             alias_group: self.alias_groups.get(open_file).copied(),
+                            lease: self.leases.get(open_file).cloned(),
                         },
                     );
                 }
@@ -1586,6 +1698,12 @@ impl LockLedger {
                     }
                     if !before.takers.is_empty() && !self.takers.contains_key(open_file) {
                         self.takers.insert(*open_file, before.takers.clone());
+                    }
+                    // The description's lease, which the exec does not change.
+                    if let Some(lease) = &before.lease
+                        && !self.leases.contains_key(open_file)
+                    {
+                        self.leases.insert(*open_file, lease.clone());
                     }
                 }
             }
@@ -1862,6 +1980,350 @@ impl LockLedger {
             .filter(|(open_file, _)| self.counts(open_file, None))
             .find_map(|(_, locks)| locks.as_ref().err())
             .map(String::as_str)
+    }
+
+    /// Why the ledger's record of `open_file`, whose fdinfo `lock:` lines
+    /// name inode number `inode` (as a lock line spells it), may be stale,
+    /// so that it cannot vouch for those lines; `None` where it may vouch.
+    /// Read only.
+    fn description_record_stale(&self, open_file: OpenFileId, inode: &str) -> Option<String> {
+        if let Some(reason) = &self.refused {
+            return Some(reason.clone());
+        }
+        if self.aliased_everything || self.aliased_inodes.contains(inode) {
+            return Some(
+                "a lock or unlock went through a descriptor of this file that Detcore may \
+                        know under another identity, so its record of this open file \
+                        description's locks may be stale"
+                    .to_owned(),
+            );
+        }
+        let opaque = self.references.get(&open_file).is_some_and(|references| {
+            references.keys().any(|table| {
+                self.owners.get(table).is_some_and(|owners| {
+                    owners.iter().any(|process| self.opaque.contains(process))
+                })
+            })
+        });
+        opaque.then(|| {
+            "a process whose descriptor table Detcore cannot follow references \
+                        this open file description, so its record of the description's locks \
+                        may be stale"
+                .to_owned()
+        })
+    }
+
+    /// [`Self::description_record_stale`] where no inode number names the
+    /// file: any inode marked aliased may be its own.
+    fn description_record_stale_for_any_file(&self, open_file: OpenFileId) -> Option<String> {
+        let inode = self
+            .aliased_inodes
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        self.description_record_stale(open_file, inode)
+    }
+
+    /// The OFD and flock locks Detcore last read `open_file` holding, for the
+    /// `lock:` lines of a fdinfo the kernel printed of a descriptor of it,
+    /// whose lines name inode number `inode` (as a lock line spells it); or
+    /// why the ledger cannot vouch for that fdinfo's OFD and flock lines: its
+    /// record of the description may be stale
+    /// ([`Self::description_record_stale`]), or it has none. Read only.
+    fn description_locks(
+        &self,
+        open_file: OpenFileId,
+        inode: &str,
+    ) -> Result<Vec<HeldLock>, String> {
+        if let Some(reason) = self.description_record_stale(open_file, inode) {
+            return Err(reason);
+        }
+        match self.locks.get(&open_file) {
+            None => Err(
+                "Detcore never read the locks of this open file description (one \
+                         inherited or received holding them, with no lock call through it \
+                         since)"
+                    .to_owned(),
+            ),
+            Some(Err(reason)) => Err(reason.clone()),
+            Some(Ok(locks)) => Ok(locks
+                .iter()
+                .filter(|lock| lock.belongs_to_a_description())
+                .cloned()
+                .collect()),
+        }
+    }
+
+    /// The owner each of `rows`, the `lock:` lines of a fdinfo the kernel
+    /// printed of a descriptor of `open_file` (`fdinfo_lock_rows`), shows,
+    /// as Linux would print it to the guest (`lock_get_status` in fs/locks.c,
+    /// whose `locks_translate_pid` gives -1 for an OFD lock and 0 for a taker
+    /// the reader's PID namespace cannot see); or why Detcore cannot serve
+    /// those lines. `listed` says whether the container's `/proc` lists a
+    /// guest process; `guest_process` names the listed guest process a
+    /// kernel owner number is, in the guest's numbering, if any. `file_inode`
+    /// is the inode number the fdinfo's own `ino:` line names, for a fdinfo
+    /// whose lines name no file.
+    ///
+    /// The kernel lists exactly the locks held through this description
+    /// (`__show_fd_locks` keeps a lock whose `flc_file` is it), and of those
+    /// only the ones the shown table or the description owns (it skips a lock
+    /// whose `flc_owner` is neither the shown task's `files_struct` nor the
+    /// file): every OFD lock, flock and lease, whose owner is the file, and
+    /// the POSIX locks the shown table took, whose owner is that table. The
+    /// lines come in an order the guest's own calls decide, so they keep it.
+    /// Each OFD and flock
+    /// line must be, field for field, a lock this ledger last read the
+    /// description holding, and every such lock must be listed (multisets
+    /// equal): a difference means a change Detcore did not see (another
+    /// holder of a description it shares with the host, or an identity the
+    /// ledger cannot follow), whose timing it cannot vouch for, and the read
+    /// is refused by name rather than shown or hidden. A lease is the
+    /// description's too (`lease_init` sets `flc_owner` to the `struct
+    /// file`), and the ledger keeps the one the guest's own `F_SETLEASE`
+    /// took ([`Self::note_lease`]): the description's active lease line, or
+    /// its absence, must be that lease, else the read is refused by name (a
+    /// lease the guest did not take, inherited or a host holder's; one the
+    /// kernel removed after a break on its own clock; one a host holder of
+    /// the description changed). This holds for a fdinfo with no lock line
+    /// at all, which the caller asks about too, and so does the comparison of
+    /// OFD and flock locks, against an empty set: the ledger's record of a
+    /// description it read must not be stale or unknown, and must hold none.
+    /// A fdinfo another table shows is never asked about: the caller refuses
+    /// it by name, whatever it lists. A lease taken through a descriptor the
+    /// guest received, which
+    /// Detcore may model as a second identity of the sender's description, is
+    /// kept for that identity alone, and no inode is marked aliased for it: a
+    /// residual, where the lock path marks one
+    /// (`Detcore::refresh_description_locks`), since reading the fdinfo for
+    /// its inode would change what a recording holds. The sender's identity
+    /// then refuses its fdinfo while the lease is listed ("did not take
+    /// through it"), and once a break on the host's clock removes the lease,
+    /// a read through it that holds no other lock shows no lock line. An OFD
+    /// line's owner is -1; a
+    /// flock's is its taker, from the flock model where it decides the file,
+    /// else the kernel's number; a POSIX lock's and an active lease's are the
+    /// kernel's number. A kernel number is shown as the guest process it
+    /// names, or 0 where it names none (a taker outside the guest, or gone).
+    /// A lease being broken (`BREAKING`) ends at a moment the host's clock
+    /// decides (`lease_break_time`), and is refused by name, as is any other
+    /// lease state (the breaker's own `BREAKER` entry is not on the leased
+    /// description, so it never appears in its fdinfo) and every class Detcore
+    /// does not serve (`DELEG`, `ACCESS`, `UNKNOWN`). Read only.
+    pub(crate) fn fdinfo_owners(
+        &self,
+        open_file: OpenFileId,
+        rows: &[LockRowFacts],
+        listed: &dyn Fn(DetPid) -> bool,
+        guest_process: &dyn Fn(i64) -> Option<DetPid>,
+        file_inode: Option<&str>,
+    ) -> Result<Vec<i64>, String> {
+        if rows.iter().any(|row| row.waiter) {
+            return Err(
+                "a fdinfo lock line names a waiter, which Linux never lists there".to_owned(),
+            );
+        }
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.lock.class == "LEASE" && row.lock.mode != "ACTIVE")
+        {
+            return Err(format!(
+                "a lease in state {}, whose break ends at a moment the host's clock decides \
+                 (lease_break_time)",
+                row.lock.mode
+            ));
+        }
+        let kernel_owner =
+            |owner: i64| guest_process(owner).map_or(0, |process| i64::from(process.as_raw()));
+        self.vouch_for_lease(open_file, rows, listed, &kernel_owner)?;
+        let described = rows
+            .iter()
+            .map(|row| &row.lock)
+            .filter(|lock| lock.belongs_to_a_description())
+            .collect::<Vec<_>>();
+        if let Some(first) = described.first() {
+            let inode = first.object.rsplit(':').next().unwrap_or_default();
+            let mut held = self.description_locks(open_file, inode)?;
+            let mut shown = described.iter().copied().cloned().collect::<Vec<_>>();
+            held.sort_unstable();
+            shown.sort_unstable();
+            if held != shown {
+                return Err(format!(
+                    "the kernel lists the OFD and flock locks {} held through this open file \
+                     description, where Detcore last read it holding {}: a change Detcore did \
+                     not see, whose timing it cannot vouch for",
+                    without_identity(&shown),
+                    without_identity(&held),
+                ));
+            }
+            if let Some(reason) = self.record_lock_held_as_ofd(described.iter().copied()) {
+                return Err(reason);
+            }
+        } else if self.locks.contains_key(&open_file) {
+            // No OFD or flock line at all, the last one gone too (no lock
+            // line, or only POSIX lines and a lease): the ledger, which read
+            // this description, must vouch for the empty set as for any
+            // other. Its record must not be stale, for the file the fdinfo's
+            // own `ino:` line names (`file_inode`; with none, for any file
+            // whose record may be), nor unknown, and every lock it last read
+            // the description holding must be gone as well, else an unlock
+            // Detcore did not see (another holder's, on the host's clock)
+            // would read as clean. A description the ledger never read has
+            // no record to compare: the guest took no OFD or flock lock
+            // through it that Detcore saw.
+            let stale = match file_inode {
+                Some(inode) => self.description_record_stale(open_file, inode),
+                None => self.description_record_stale_for_any_file(open_file),
+            };
+            if let Some(reason) = stale {
+                return Err(reason);
+            }
+            let held = self.description_locks(open_file, file_inode.unwrap_or_default())?;
+            if !held.is_empty() {
+                return Err(format!(
+                    "the kernel lists no OFD or flock lock held through this open file \
+                     description, where Detcore last read it holding {}: a change Detcore did \
+                     not see, whose timing it cannot vouch for",
+                    without_identity(&held),
+                ));
+            }
+        }
+        rows.iter()
+            .map(
+                |row| match (row.lock.class.as_str(), row.lock.mode.as_str()) {
+                    ("OFDLCK", _) => Ok(-1),
+                    ("FLOCK", _) => self.fdinfo_flock_owner(open_file, row, listed, &kernel_owner),
+                    ("POSIX", _) | ("LEASE", "ACTIVE") => Ok(kernel_owner(row.owner)),
+                    ("LEASE", mode) => Err(format!(
+                        "a lease in state {mode}, whose break ends at a moment the host's clock \
+                     decides (lease_break_time)"
+                    )),
+                    (class, _) => Err(format!("a {class} lock line, which Detcore does not serve")),
+                },
+            )
+            .collect()
+    }
+
+    /// Whether the active lease lines among `rows`, a fdinfo's `lock:` lines
+    /// of a descriptor of `open_file` (none at all included), are exactly the
+    /// lease the guest's own `F_SETLEASE` left the description holding
+    /// ([`Self::leases`]): none where it holds none, else one line of its
+    /// access whose owner is its taker. Linux keeps at most one lease per
+    /// description, and prints its owner (`flc_pid`), which a host holder's
+    /// unlock and new lease of the same access would change. The owner a
+    /// line shows (`kernel_owner`, the guest process its number names, or 0)
+    /// must be the taker, which the container's `/proc` must still list
+    /// (`listed`): a taker that is gone, whose number the kernel may or may
+    /// not still print, cannot be vouched for. A difference, or a record that
+    /// may be stale ([`Self::description_record_stale`]), is refused by name.
+    /// Read only.
+    fn vouch_for_lease(
+        &self,
+        open_file: OpenFileId,
+        rows: &[LockRowFacts],
+        listed: &dyn Fn(DetPid) -> bool,
+        kernel_owner: &dyn Fn(i64) -> i64,
+    ) -> Result<(), String> {
+        let shown = rows
+            .iter()
+            .filter(|row| row.lock.class == "LEASE")
+            .collect::<Vec<_>>();
+        let held = self.leases.get(&open_file);
+        if shown.is_empty() && held.is_none() {
+            return Ok(());
+        }
+        if let Some(first) = shown.first() {
+            let inode = first.lock.object.rsplit(':').next().unwrap_or_default();
+            if let Some(reason) = self.description_record_stale(open_file, inode) {
+                return Err(reason);
+            }
+        }
+        if let ([row], Some(lease)) = (shown.as_slice(), held)
+            && row.lock.access == lease.access
+        {
+            if !listed(lease.taker) {
+                return Err(
+                    "the guest process that took this open file description's lease is gone, \
+                     so Detcore cannot vouch for the owner the kernel prints for it"
+                        .to_owned(),
+                );
+            }
+            if kernel_owner(row.owner) != i64::from(lease.taker.as_raw()) {
+                return Err(
+                    "the kernel lists this open file description's lease with another owner \
+                     than the guest process that took it (a host holder unlocked it and took \
+                     a new one): a change Detcore did not see, whose timing it cannot vouch for"
+                        .to_owned(),
+                );
+            }
+            return Ok(());
+        }
+        let held = held.map(|lease| &lease.access);
+        match (shown.as_slice(), held) {
+            (_, None) => Err(
+                "the kernel lists a lease held through this open file description that the \
+                 guest did not take through it (inherited, or a host holder's): a lease \
+                 Detcore did not see taken, whose timing it cannot vouch for"
+                    .to_owned(),
+            ),
+            ([], Some(access)) => Err(format!(
+                "the guest's {access} lease on this open file description is gone from its \
+                 fdinfo, which the kernel removes after a lease break at a moment its own \
+                 clock decides (lease_break_time), or a host holder removed: a change Detcore \
+                 did not see"
+            )),
+            (shown, Some(access)) => Err(format!(
+                "the kernel lists the leases {} held through this open file description, where \
+                 the guest's own F_SETLEASE left it holding one {access} lease: a change \
+                 Detcore did not see, whose timing it cannot vouch for",
+                without_identity(&shown.iter().map(|row| row.lock.clone()).collect::<Vec<_>>()),
+            )),
+        }
+    }
+
+    /// [`Self::fdinfo_owners`] for a flock line: the flock model's taker
+    /// where the model decides the file and holds the lock through
+    /// `open_file` (as a rendered fdinfo shows it, `Self::flock_held_by`),
+    /// whose mode must be the line's; otherwise, the file the kernel's, the
+    /// kernel's number (`kernel_owner`). A file that left the model is
+    /// refused by name.
+    fn fdinfo_flock_owner(
+        &self,
+        open_file: OpenFileId,
+        row: &LockRowFacts,
+        listed: &dyn Fn(DetPid) -> bool,
+        kernel_owner: &dyn Fn(i64) -> i64,
+    ) -> Result<i64, String> {
+        let inode = self
+            .flock_inode_of
+            .get(&open_file)
+            .and_then(|key| self.flock_inodes.get(key));
+        if let Some(reason) = inode.and_then(|inode| inode.refused.as_ref()) {
+            // Named without the lock's object, which holds the host's device
+            // and inode numbers.
+            return Err(format!(
+                "the flock locks of this descriptor's file left Detcore's flock model: {reason}"
+            ));
+        }
+        let Some((mode, taker)) = self.flock_held_by(open_file) else {
+            return Ok(kernel_owner(row.owner));
+        };
+        let access = match mode {
+            FlockMode::Exclusive => "WRITE",
+            FlockMode::Shared => "READ",
+        };
+        if row.lock.access != access {
+            return Err(format!(
+                "the kernel lists a {} flock held through this open file description, where \
+                 Detcore's flock model holds a {access} one",
+                row.lock.access
+            ));
+        }
+        Ok(if listed(taker) {
+            i64::from(taker.as_raw())
+        } else {
+            0
+        })
     }
 }
 
@@ -5836,5 +6298,474 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             with_appended_rows(b"x".to_vec(), vec![true], vec!["y".to_owned()]),
             (b"x\ny\n".to_vec(), vec![true, true])
         );
+    }
+
+    // The lock lines of a fdinfo the kernel printed (`LockLedger::fdinfo_owners`).
+
+    /// `lines`, each a `lock:` line's text after its number, as the rows of
+    /// a fdinfo the kernel printed.
+    fn fdinfo_rows(lines: &[&str]) -> Vec<LockRowFacts> {
+        let text = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("lock:\t{}: {line}\n", index + 1))
+            .collect::<String>();
+        fdinfo_lock_rows(text.as_bytes()).expect("every line is a lock row")
+    }
+
+    /// Kernel owner number 3 names guest process 3; no other number names a
+    /// guest process.
+    fn guest_three(owner: i64) -> Option<DetPid> {
+        (owner == 3).then(|| DetPid::from_raw(3))
+    }
+
+    /// The container's `/proc` lists guest process 3 alone.
+    fn listed_three(process: DetPid) -> bool {
+        process.as_raw() == 3
+    }
+
+    /// Every `lock:` line, of every class, in order, with its owner: the
+    /// POSIX line too, which `held_locks_in_fdinfo` leaves out; a `lock:`
+    /// line that is not a lock row refuses the whole file.
+    #[test]
+    fn fdinfo_rows_are_every_lock_line_or_none() {
+        assert_eq!(fdinfo_lock_rows(b"pos:\t0\nflags:\t02\n"), Some(Vec::new()));
+        let rows = fdinfo_lock_rows(FDINFO).expect("FDINFO's lock lines are lock rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.lock.class.as_str(), row.owner))
+                .collect::<Vec<_>>(),
+            [
+                ("OFDLCK", -1),
+                ("POSIX", 3),
+                ("FLOCK", 4242),
+                ("OFDLCK", -1)
+            ]
+        );
+        assert_eq!(fdinfo_lock_rows(b"lock:\t1: not a lock\n"), None);
+        assert_eq!(fdinfo_lock_rows(b"lock:\t\n"), None);
+    }
+
+    /// A flock Detcore's flock model decides shows the model's taker, or 0
+    /// once the container's `/proc` no longer lists it, whatever number the
+    /// kernel's mirror of it printed (77 names no guest process here); a mode
+    /// other than the model's is refused by name.
+    #[test]
+    fn a_modelled_flock_shows_its_takers_number() {
+        let process = DetPid::from_raw(3);
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.flock(process, process, flock_request(description(0), SH, true)),
+            granted()
+        );
+        let shared = fdinfo_rows(&["FLOCK  ADVISORY  READ 77 00:2a:1001 0 EOF"]);
+        ledger.note_locks(process, description(0), vec![shared[0].lock.clone()], 1);
+        assert_eq!(
+            ledger.fdinfo_owners(description(0), &shared, &listed_three, &guest_three, None),
+            Ok(vec![3]),
+            "the model's taker, listed"
+        );
+        assert_eq!(
+            ledger.fdinfo_owners(description(0), &shared, &|_| false, &guest_three, None),
+            Ok(vec![0]),
+            "the model's taker, no longer listed"
+        );
+        let exclusive = fdinfo_rows(&["FLOCK  ADVISORY  WRITE 3 00:2a:1001 0 EOF"]);
+        ledger.note_locks(process, description(0), vec![exclusive[0].lock.clone()], 1);
+        let refusal = ledger
+            .fdinfo_owners(
+                description(0),
+                &exclusive,
+                &listed_three,
+                &guest_three,
+                None,
+            )
+            .expect_err("a mode other than the model's is refused");
+        assert!(
+            refusal.contains("flock model holds a READ one"),
+            "{refusal}"
+        );
+    }
+
+    /// When the last OFD or flock line is gone from a description's fdinfo,
+    /// the locks the ledger last read it holding must be gone too: a
+    /// description it read holding an OFD lock or a flock, whose fdinfo now
+    /// lists none (another holder unlocked it on the host's clock), is refused
+    /// by name, not served as clean, whether the fdinfo has no lock line at
+    /// all or only a POSIX lock's, which the ledger does not follow.
+    #[test]
+    fn a_description_lock_gone_from_its_fdinfo_is_refused_not_served_clean() {
+        let process = DetPid::from_raw(3);
+        let posix_only = fdinfo_rows(&["POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9"]);
+        for held in [
+            "OFDLCK ADVISORY  WRITE -1 00:2a:1001 0 EOF",
+            "FLOCK  ADVISORY  WRITE 3 00:2a:1001 0 EOF",
+        ] {
+            let mut ledger = LockLedger::default();
+            let rows = fdinfo_rows(&[held]);
+            ledger.note_locks(process, description(0), vec![rows[0].lock.clone()], 1);
+            assert!(
+                ledger
+                    .fdinfo_owners(description(0), &rows, &listed_three, &guest_three, None)
+                    .is_ok(),
+                "{held}: the held lock, listed"
+            );
+            for (shown, what) in [(&[][..], "no lock line"), (&posix_only[..], "a POSIX line")] {
+                let refusal = ledger
+                    .fdinfo_owners(
+                        description(0),
+                        shown,
+                        &listed_three,
+                        &guest_three,
+                        Some("1001"),
+                    )
+                    .expect_err("a held lock gone from the fdinfo is refused");
+                let class = held.split_whitespace().next().expect("a class");
+                assert!(
+                    refusal.contains("lists no OFD or flock lock") && refusal.contains(class),
+                    "{held}, {what}: {refusal}"
+                );
+            }
+        }
+    }
+
+    /// An empty set of OFD and flock lines is vouched for as any other: a
+    /// description the ledger read holding nothing, or never read (no lock
+    /// Detcore saw taken through it), shows its fdinfo as it is, a POSIX
+    /// line's owner translated; but where its record of the description may
+    /// be stale (the run's refusal, the file's inode aliased, or, with no
+    /// inode to tell, any inode aliased) or is unknown, the read is refused by
+    /// that reason, as a fdinfo listing a lock would be.
+    #[test]
+    fn an_empty_set_of_description_locks_is_vouched_for_as_any_other() {
+        let process = DetPid::from_raw(3);
+        let posix_only = fdinfo_rows(&["POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9"]);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), Vec::new(), 1);
+        for open_file in [description(0), description(1)] {
+            assert_eq!(
+                ledger.fdinfo_owners(open_file, &[], &listed_three, &guest_three, Some("1001")),
+                Ok(Vec::new()),
+                "{open_file:?}: no lock line"
+            );
+            assert_eq!(
+                ledger.fdinfo_owners(open_file, &posix_only, &listed_three, &guest_three, None),
+                Ok(vec![3]),
+                "{open_file:?}: a POSIX line"
+            );
+        }
+
+        let mut aliased = LockLedger::default();
+        aliased.note_locks(process, description(0), Vec::new(), 1);
+        aliased.alias_inode(Some("1001".to_owned()));
+        for file_inode in [Some("1001"), None] {
+            let refusal = aliased
+                .fdinfo_owners(description(0), &[], &listed_three, &guest_three, file_inode)
+                .expect_err("an aliased file's empty set is refused");
+            assert!(
+                refusal.contains("may know under another identity"),
+                "{file_inode:?}: {refusal}"
+            );
+        }
+        assert_eq!(
+            aliased.fdinfo_owners(
+                description(0),
+                &[],
+                &listed_three,
+                &guest_three,
+                Some("2002")
+            ),
+            Ok(Vec::new()),
+            "another file's aliasing says nothing of this one"
+        );
+        assert_eq!(
+            aliased.fdinfo_owners(
+                description(1),
+                &[],
+                &listed_three,
+                &guest_three,
+                Some("1001")
+            ),
+            Ok(Vec::new()),
+            "a description never read has no record to be stale"
+        );
+
+        let mut refused = LockLedger::default();
+        refused.note_locks(process, description(0), Vec::new(), 1);
+        refused.refuse("after flock on fd 4, its fdinfo could not be read (ENOMEM)".to_owned());
+        let refusal = refused
+            .fdinfo_owners(
+                description(0),
+                &[],
+                &listed_three,
+                &guest_three,
+                Some("1001"),
+            )
+            .expect_err("the run's refusal stands for an empty set");
+        assert!(refusal.contains("(ENOMEM)"), "{refusal}");
+
+        let mut unknown = LockLedger::default();
+        unknown.note_unknown(
+            process,
+            description(0),
+            "after F_OFD_SETLK on fd 3, its fdinfo could not be read (EMFILE)".to_owned(),
+            1,
+        );
+        for shown in [&[][..], &posix_only[..]] {
+            let refusal = unknown
+                .fdinfo_owners(
+                    description(0),
+                    shown,
+                    &listed_three,
+                    &guest_three,
+                    Some("1001"),
+                )
+                .expect_err("an unknown record cannot vouch for an empty set");
+            assert!(refusal.contains("(EMFILE)"), "{refusal}");
+        }
+    }
+
+    /// POSIX locks, which the ledger does not follow, and the active lease
+    /// the guest took, show the guest process the kernel's number names, or
+    /// 0 where it names none (a host process's 4242); a lease being broken, a
+    /// class Detcore does not serve and a waiter, which fdinfo never lists,
+    /// are refused by name.
+    #[test]
+    fn record_locks_and_leases_show_the_kernels_number_translated() {
+        let mut ledger = LockLedger::default();
+        let posix = fdinfo_rows(&[
+            "POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9",
+            "POSIX  ADVISORY  READ 4242 00:2a:1001 20 29",
+        ]);
+        assert_eq!(
+            ledger.fdinfo_owners(description(0), &posix, &listed_three, &guest_three, None),
+            Ok(vec![3, 0])
+        );
+        ledger.note_lease(
+            DetPid::from_raw(3),
+            description(0),
+            Some("READ".to_owned()),
+            1,
+        );
+        let rows = fdinfo_rows(&[
+            "POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9",
+            "POSIX  ADVISORY  READ 4242 00:2a:1001 20 29",
+            "LEASE  ACTIVE    READ 3 00:2a:1001 0 EOF",
+        ]);
+        assert_eq!(
+            ledger.fdinfo_owners(description(0), &rows, &listed_three, &guest_three, None),
+            Ok(vec![3, 0, 3])
+        );
+        for (line, reason) in [
+            (
+                "LEASE  BREAKING  READ 3 00:2a:1001 0 EOF",
+                "a lease in state BREAKING",
+            ),
+            (
+                "LEASE  BREAKER   READ 3 00:2a:1001 0 EOF",
+                "a lease in state BREAKER",
+            ),
+            (
+                "DELEG  ACTIVE    READ 3 00:2a:1001 0 EOF",
+                "DELEG lock line",
+            ),
+            ("ACCESS ADVISORY  READ 3 00:2a:1001 0 9", "ACCESS lock line"),
+            (
+                "-> POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9",
+                "names a waiter",
+            ),
+        ] {
+            let refusal = LockLedger::default()
+                .fdinfo_owners(
+                    description(0),
+                    &fdinfo_rows(&[line]),
+                    &listed_three,
+                    &guest_three,
+                    None,
+                )
+                .expect_err("refused by name");
+            assert!(refusal.contains(reason), "{line}: {refusal}");
+        }
+    }
+
+    /// A description's active lease line is served only as the lease the
+    /// guest's own `F_SETLEASE` left it holding (`LockLedger::note_lease`):
+    /// one the guest did not take (inherited, a host holder's), one of
+    /// another access (a host holder of the description changed it), and the
+    /// guest's lease gone from the fdinfo (the kernel removed it after a
+    /// break, on its own clock), with other lock lines or none, are refused
+    /// by name; after the guest's own `F_UNLCK`, no lease line is right.
+    /// Version 479474115 served every one of these on the kernel's word.
+    #[test]
+    fn a_lease_is_served_only_as_the_guests_own_f_setlease_left_it() {
+        let process = DetPid::from_raw(3);
+        let read = fdinfo_rows(&["LEASE  ACTIVE    READ 3 00:2a:1001 0 EOF"]);
+        let write = fdinfo_rows(&["LEASE  ACTIVE    WRITE 3 00:2a:1001 0 EOF"]);
+        let posix = fdinfo_rows(&["POSIX  ADVISORY  WRITE 3 00:2a:1001 0 9"]);
+        let owners = |ledger: &LockLedger, rows: &[LockRowFacts]| {
+            ledger.fdinfo_owners(description(0), rows, &listed_three, &guest_three, None)
+        };
+        let refused = |ledger: &LockLedger, rows: &[LockRowFacts], reason: &str| {
+            let refusal = owners(ledger, rows).expect_err("refused by name");
+            assert!(refusal.contains(reason), "{refusal}");
+            assert!(!refusal.contains("00:2a"), "no host identity: {refusal}");
+        };
+
+        // Inherited, or a host holder's: the guest never took a lease.
+        let mut ledger = LockLedger::default();
+        refused(&ledger, &read, "that the guest did not take through it");
+
+        // The guest's own READ lease is served with its taker.
+        ledger.note_lease(process, description(0), Some("READ".to_owned()), 1);
+        assert_eq!(owners(&ledger, &read), Ok(vec![3]));
+
+        // A host holder changed it to a WRITE lease between the guest's turns.
+        refused(&ledger, &write, "where the guest's own F_SETLEASE left it");
+
+        // A host holder unlocked it and took a new READ lease of its own: the
+        // same access, but the kernel prints the host's number (4242, which
+        // names no guest process).
+        let host_read = fdinfo_rows(&["LEASE  ACTIVE    READ 4242 00:2a:1001 0 EOF"]);
+        refused(
+            &ledger,
+            &host_read,
+            "with another owner than the guest process",
+        );
+
+        // The taker is gone from the container's /proc: unprovable.
+        let refusal = ledger
+            .fdinfo_owners(description(0), &read, &|_| false, &guest_three, None)
+            .expect_err("a gone taker is not vouched for");
+        assert!(refusal.contains("is gone"), "{refusal}");
+
+        // The kernel removed it after a break, on its own clock: gone, with
+        // other lines beside it or with no lock line at all.
+        refused(&ledger, &posix, "is gone from its fdinfo");
+        refused(&ledger, &[], "is gone from its fdinfo");
+
+        // The guest's own F_UNLCK: no lease is right, and one is refused.
+        ledger.note_lease(process, description(0), None, 1);
+        assert_eq!(owners(&ledger, &[]), Ok(Vec::new()));
+        refused(&ledger, &read, "that the guest did not take through it");
+
+        // A record that may be stale vouches for no lease line.
+        ledger.note_lease(process, description(0), Some("READ".to_owned()), 1);
+        ledger.alias_inode(Some("1001".to_owned()));
+        refused(&ledger, &read, "may be stale");
+    }
+
+    /// A lease belongs to its open file description: taken through one of
+    /// the description's descriptors (two slots, as after a `dup`), it is
+    /// served through another, in the taker's table and in a forked child's,
+    /// which references the same description. Its owner is the process whose
+    /// call created it: a type change through the description keeps it
+    /// (`lease_modify`), while a new lease after an unlock is its caller's,
+    /// so the child's new lease shows the child, and a line still naming the
+    /// parent is refused. The description's last reference forgets it.
+    #[test]
+    fn a_lease_belongs_to_its_description_through_every_table() {
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(4);
+        let row = |access: &str, owner: i32| {
+            fdinfo_rows(&[&format!(
+                "LEASE  ACTIVE    {access} {owner} 00:2a:1001 0 EOF"
+            )])
+        };
+        let listed = |process: DetPid| matches!(process.as_raw(), 3 | 4);
+        let guest = |owner: i64| matches!(owner, 3 | 4).then(|| DetPid::from_raw(owner as i32));
+        let owners = |ledger: &LockLedger, rows: &[LockRowFacts]| {
+            ledger.fdinfo_owners(description(0), rows, &listed, &guest, None)
+        };
+        let mut ledger = LockLedger::default();
+        ledger.note_lease(parent, description(0), Some("READ".to_owned()), 2);
+        assert_eq!(
+            owners(&ledger, &row("READ", 3)),
+            Ok(vec![3]),
+            "the taker's table"
+        );
+        ledger.fork(parent, child, false);
+        assert_eq!(
+            owners(&ledger, &row("READ", 3)),
+            Ok(vec![3]),
+            "the forked child's"
+        );
+        // The child changes its type in place: the parent still owns it.
+        ledger.note_lease(child, description(0), Some("WRITE".to_owned()), 2);
+        assert_eq!(
+            owners(&ledger, &row("WRITE", 3)),
+            Ok(vec![3]),
+            "a type change keeps its owner"
+        );
+        assert!(owners(&ledger, &row("WRITE", 4)).is_err());
+        ledger.note_lease(child, description(0), None, 2);
+        assert_eq!(
+            owners(&ledger, &[]),
+            Ok(Vec::new()),
+            "the child released it"
+        );
+        ledger.note_lease(child, description(0), Some("READ".to_owned()), 2);
+        assert_eq!(
+            owners(&ledger, &row("READ", 4)),
+            Ok(vec![4]),
+            "the child's new lease is the child's"
+        );
+        assert!(
+            owners(&ledger, &row("READ", 3)).is_err(),
+            "a line naming the parent is not the child's new lease"
+        );
+        ledger.release(parent, description(0), 0);
+        ledger.release(child, description(0), 0);
+        assert!(
+            owners(&ledger, &row("READ", 4)).is_err(),
+            "forgotten with the description"
+        );
+    }
+
+    /// A refusal names the locks it compared without their objects, which
+    /// hold the host's device and inode numbers.
+    #[test]
+    fn a_multiset_refusal_names_no_host_identity() {
+        let process = DetPid::from_raw(3);
+        let ofd = fdinfo_rows(&["OFDLCK ADVISORY  READ -1 00:18:7 0 0"]);
+        let other = fdinfo_rows(&["OFDLCK ADVISORY  WRITE -1 00:18:7 0 0"]);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), vec![ofd[0].lock.clone()], 1);
+        let refusal = ledger
+            .fdinfo_owners(description(0), &other, &listed_three, &guest_three, None)
+            .expect_err("a change Detcore did not see");
+        assert!(refusal.contains("OFDLCK ADVISORY WRITE 0-0"), "{refusal}");
+        assert!(refusal.contains("OFDLCK ADVISORY READ 0-0"), "{refusal}");
+        assert!(!refusal.contains("00:18"), "{refusal}");
+    }
+
+    /// Where the ledger's record of the description may be stale, its OFD
+    /// and flock lines are refused by name rather than vouched for: after a
+    /// lock call through another identity of the file's inode, and while a
+    /// table the ledger cannot follow references the description.
+    #[test]
+    fn a_record_that_may_be_stale_refuses_the_descriptions_lines() {
+        let process = DetPid::from_raw(3);
+        let ofd = fdinfo_rows(&["OFDLCK ADVISORY  READ -1 00:18:7 0 0"]);
+        let ledger = || {
+            let mut ledger = LockLedger::default();
+            ledger.note_locks(process, description(0), vec![ofd[0].lock.clone()], 1);
+            ledger
+        };
+        assert_eq!(
+            ledger().fdinfo_owners(description(0), &ofd, &listed_three, &guest_three, None),
+            Ok(vec![-1])
+        );
+        let mut aliased = ledger();
+        aliased.alias_inode(Some("7".to_owned()));
+        let refusal = aliased
+            .fdinfo_owners(description(0), &ofd, &listed_three, &guest_three, None)
+            .expect_err("an aliased inode is refused");
+        assert!(refusal.contains("another identity"), "{refusal}");
+        let mut opaque = ledger();
+        opaque.mark_opaque(process);
+        let refusal = opaque
+            .fdinfo_owners(description(0), &ofd, &listed_three, &guest_three, None)
+            .expect_err("an opaque table is refused");
+        assert!(refusal.contains("cannot follow"), "{refusal}");
     }
 }

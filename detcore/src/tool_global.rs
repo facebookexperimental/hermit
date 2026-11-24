@@ -6179,6 +6179,46 @@ impl GlobalState {
                     })),
                 })
             }
+            GlobalRequest::FdinfoLockOwners(open_file, rows, file_inode) => {
+                // A taker is shown while the container's `/proc` lists it (a
+                // live process, or a zombie not yet reaped). A kernel owner
+                // number names the guest process `/proc` lists under it, in
+                // the guest's numbering, as for a kernel `/proc/locks`
+                // snapshot (`GuestLockRows`). A table a process that exited
+                // used references nothing, as for every lock query
+                // (`LockLedger::prune`).
+                let sched = self.lock_rpc_scheduler(false).await;
+                let listed = sched.procfs_listing(None).processes;
+                let is_listed = |process: DetPid| listed.binary_search(&process.as_raw()).is_ok();
+                let guest_process = |owner: i64| {
+                    let owner = i32::try_from(owner).ok().filter(|owner| *owner > 0)?;
+                    sched
+                        .procfs_ids(false, &[owner])
+                        .first()
+                        .copied()
+                        .flatten()
+                        .filter(|guest| listed.binary_search(guest).is_ok())
+                        .map(DetPid::from_raw)
+                };
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::FdinfoLockOwners(ledger.fdinfo_owners(
+                    open_file,
+                    &rows,
+                    &is_listed,
+                    &guest_process,
+                    file_inode.as_deref(),
+                ))
+            }
+            GlobalRequest::DescriptionLease(open_file, lease, slots) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .note_lease(process, open_file, lease, slots);
+                R::DescriptionLease(())
+            }
             GlobalRequest::LedgerLockRows => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let listed = sched.procfs_listing(None).processes;
@@ -8755,8 +8795,15 @@ pub enum SignalScope {
 /// under this revision (60 on its own base, renumbered to 61 at its
 /// rebase onto main's 60). 62 adds `ReportAdmittedRestartCode`, an admitted
 /// restart code's entry in the unsupported-use summary, sent from a backend
-/// hook with no access to the guest; it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 62;
+/// hook with no access to the guest. 63 adds the `FdinfoLockOwners` pair, the
+/// owners a fdinfo the kernel printed shows on its `lock:` lines, and the
+/// `DescriptionLease` pair, the lease a guest's `F_SETLEASE` left a
+/// description holding. 64 is the same change with the procfs open file
+/// model an exec carries in digest: `ProcfsFile`'s fdinfo fields, which
+/// `PrepareExec` and `MarkPastFirstExecve` encode by position, and the shared
+/// open-file model; a runtime built at 63 did not digest them, so the two
+/// refuse each other. 64 is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 64;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9811,6 +9858,21 @@ pub enum GlobalRequest {
     /// environment strings (`ProcessAuxvTable::current_exec_strings`).
     /// Appended last.
     ProcessExecStrings(DetPid),
+    /// The owner each `lock:` line of a fdinfo the kernel printed of a
+    /// descriptor of this open file description shows, for these lines, in
+    /// the kernel's order, and the inode number the fdinfo's `ino:` line
+    /// names, for lines that name no file
+    /// (`procfs::locks::LockLedger::fdinfo_owners`). Appended last.
+    FdinfoLockOwners(
+        OpenFileId,
+        Vec<crate::procfs::locks::LockRowFacts>,
+        Option<String>,
+    ),
+    /// The guest's own `F_SETLEASE` through a descriptor of this open file
+    /// description succeeded: the lease it now holds (the access a `lock:`
+    /// line spells), or none, and how many slots of the caller's table name
+    /// it (`procfs::locks::LockLedger::note_lease`). Appended last.
+    DescriptionLease(OpenFileId, Option<String>, u32),
 }
 
 /// What a guest thread publishes of its CPU accounting with a request
@@ -10259,6 +10321,12 @@ pub enum GlobalResponse {
     /// number names and its image's number and recorded strings, if any.
     /// Appended last.
     ProcessExecStrings(DetPid, Option<(u64, Box<ExecStrings>)>),
+    /// One owner per lock line asked about, in order, or why the lines
+    /// cannot be served (`procfs::locks::LockLedger::fdinfo_owners`).
+    /// Appended last.
+    FdinfoLockOwners(Result<Vec<i64>, String>),
+    /// The ledger noted the description's lease. Appended last.
+    DescriptionLease(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -14650,6 +14718,56 @@ pub(crate) async fn note_second_identity_locks<G, T>(
     .await
     .1;
     assert_eq!(response, GlobalResponse::SecondIdentityLocks(()));
+}
+
+/// The owner each of `rows`, the `lock:` lines of a fdinfo the kernel printed
+/// of a descriptor of `open_file`, in the kernel's order, shows to the guest,
+/// or why Detcore cannot serve those lines
+/// (`procfs::locks::LockLedger::fdinfo_owners`).
+pub(crate) async fn fdinfo_lock_owners<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    rows: Vec<crate::procfs::locks::LockRowFacts>,
+    file_inode: Option<String>,
+) -> Result<Vec<i64>, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::FdinfoLockOwners(open_file, rows, file_inode),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::FdinfoLockOwners(owners) => owners,
+        _ => unreachable!(),
+    }
+}
+
+/// Tell the lock ledger the lease the guest's own `F_SETLEASE` left
+/// `open_file` holding, or none, with the slots of the caller's table that
+/// name it (`procfs::locks::LockLedger::note_lease`).
+pub(crate) async fn note_description_lease<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    lease: Option<String>,
+    slots: u32,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::DescriptionLease(open_file, lease, slots),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::DescriptionLease(()) => {}
+        _ => unreachable!(),
+    }
 }
 
 /// The owner each of `locks`, held through `open_file`, shows on a lock line

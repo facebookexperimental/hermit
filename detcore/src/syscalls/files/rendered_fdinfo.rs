@@ -696,7 +696,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// system's device: through a proven mountinfo-to-metadata rewrite
     /// (`Config::mountinfo_device_rewrites`), then the run's device pool where
     /// metadata is virtualized, as `mountinfo` and `stat` number it.
-    async fn lock_line_device<G: Guest<Self>>(guest: &mut G, raw_device: u64) -> u64 {
+    pub(super) async fn lock_line_device<G: Guest<Self>>(guest: &mut G, raw_device: u64) -> u64 {
         let device = guest
             .config()
             .mountinfo_device_rewrites

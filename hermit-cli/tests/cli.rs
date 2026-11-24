@@ -79043,9 +79043,22 @@ fn run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences() {
 }
 
 /// The fdinfo-lines guest at L2 on ptrace, whose fdinfo the kernel prints
-/// and Detcore sanitizes as before package K slice K8-h (unchanged by it):
-/// every host identity it shows agrees with `statx` and `fstat`, and every
-/// step runs.
+/// and Detcore sanitizes: every host identity it shows agrees with `statx`
+/// and `fstat`, every step runs, and its `lock:` lines are native Linux's,
+/// line for line and in order: a record lock, then an OFD lock beside it, a
+/// flock through a second open, a lease, and the OFD lock left after the
+/// record lock's unlock. Each line has its owner (this process, or -1 for the
+/// OFD lock) and its object's inode checked by the guest against `getpid` and
+/// `fstat`. Before, Detcore refused every fdinfo read that listed a lock, by
+/// name, which stopped this run at the first one.
+///
+/// The transcript's other lines are not compared with Linux's here. On ptrace
+/// they differ before any lock is taken, in two named ways this test does not
+/// bless: the `flags:` line shows the flags of Detcore's descriptor model (so
+/// `00` for a pipe or a socket where Linux prints the file's flags, and the
+/// guest's own check "flags agree with F_GETFL and F_GETFD" answers no), and
+/// a timerfd shows the kernel's timer, which Detcore's virtual timerfd never
+/// arms.
 #[test]
 fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
     // The guest's own line checks refuse every malformed line before they
@@ -79058,12 +79071,564 @@ fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
         self_test.status.success() && stdout(&self_test).ends_with("self-test ok\n"),
         "self-test: {self_test:?}"
     );
+    let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(proc_fdinfo_lines_guest())
+        .arg(native_directory.path())
+        .output()
+        .expect("run proc-fdinfo-lines natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = stdout(&native);
+    assert!(native.ends_with("failures=0\n"), "native:\n{native}");
+    // Linux lists these lines on every file system the guest's directory can
+    // be on, so the comparison cannot pass with none.
+    for line in [
+        "lock:\t1: POSIX  ADVISORY  WRITE SELF DEV:INO 0 9\n",
+        "lock:\t2: OFDLCK ADVISORY  READ -1 DEV:INO 100 EOF\n",
+        "lock:\t1: FLOCK  ADVISORY  READ SELF DEV:INO 0 EOF\n",
+        "lock:\t1: OFDLCK ADVISORY  READ -1 DEV:INO 100 EOF\n",
+    ] {
+        assert!(native.contains(line), "native lacks {line:?}:\n{native}");
+    }
+    // The lease is required too, so that the guest's own F_SETLEASE, its
+    // publication to the ledger (`Detcore::note_description_lease`) and the
+    // vouching of the lease line run on every host this test passes on. A
+    // host whose file system or sysctl refuses leases (fs.leases-enable=0)
+    // fails here by name rather than passing without them.
+    let lease = "lock:\t1: LEASE  ACTIVE    READ SELF DEV:INO 0 EOF\n";
+    assert!(
+        native.contains(lease),
+        "native lacks the lease line {lease:?}: this test needs a host and a \
+         file system for CARGO_TARGET_TMPDIR that grant F_SETLEASE \
+         (fs.leases-enable=1):\n{native}"
+    );
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let ptrace = proc_fdinfo_lines_at_l2(
         "ptrace",
         &[directory.path().to_str().expect("directory path is UTF-8")],
     );
     assert!(ptrace.ends_with("failures=0\n"), "ptrace:\n{ptrace}");
+    // Each section's label with its lock lines, in order.
+    let lock_sections = |transcript: &str| {
+        let mut label = "";
+        transcript
+            .lines()
+            .filter_map(|line| {
+                if line.starts_with("== ") {
+                    label = line;
+                    None
+                } else {
+                    line.starts_with("lock:\t")
+                        .then(|| format!("{label}\n{line}"))
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        lock_sections(&ptrace),
+        lock_sections(&native),
+        "ptrace's fdinfo lock lines are Linux's\nptrace:\n{ptrace}\nnative:\n{native}"
+    );
+}
+
+static PROC_FDINFO_OTHER_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// A fdinfo whose descriptor table is another task's, while the reader's own
+/// descriptor 7 is another file, and the reader's own through a directory
+/// descriptor or a descriptor link (`tests/c/proc_fdinfo_other_process.c`).
+/// Natively each prints Linux's answer: the other table's `ino:` (b's) and
+/// its lock with its process's pid, or the reader's own lock; and, where the
+/// other process made itself non-dumpable, the kernel's EACCES at the open.
+///
+/// On ptrace Detcore serves a fdinfo's lock lines only where the open bound
+/// it to the reader's own descriptor table. Every other fdinfo is read as
+/// before the lock ledger, through the reader's descriptor of the same
+/// number:
+/// - where the kernel's bytes reach the sanitizer, another task's lock lines
+///   are refused by name ("lock lines are not served", exit 122), never
+///   answered from the reader's own descriptor: another process's fdinfo, one
+///   reached through a parent's `/proc/self` directory descriptor (which Linux
+///   pinned to the parent at its open), through a descriptor link to it
+///   (`/proc/self/fd/N/fdinfo/7`), or through links a lexical reading skips
+///   (`/proc/<own pid>/cwd/L/../../fdinfo/7`), one a parent opened before a
+///   fork, the process's `/proc/self/fdinfo/7` read by a thread made
+///   without `CLONE_FILES`, which shows the leader's table, and another
+///   process's moved with `dup2` over the reader's own bound fdinfo
+///   descriptor before the read (the binding moves with the open file);
+/// - where the reader's descriptor of that number is a file Detcore renders
+///   or a placeholder for a /proc directory, its rendering replaces the file,
+///   the other task's lock lines included, at exit 0; where the reader has no
+///   such descriptor, the read fails with EBADF, which the guest prints. Those
+///   four cases are pinned
+///   here to that answer, which is base's and not Linux's
+///   (https://github.com/facebookexperimental/hermit/issues/544): this change
+///   neither causes nor fixes it, and the change that does replaces them.
+///
+/// Where the kernel itself refuses the open (a non-dumpable target), its
+/// EACCES reaches the guest as natively. The reader's own fdinfo opened
+/// through its own `/proc/self` directory, as `self/fdinfo/7` or
+/// `./self/fdinfo/7` relative to `/proc`, as `../self/fdinfo/7` relative to
+/// its parent's `/proc/self`, or as `/proc/self/fd/D/self/fdinfo/7` where D
+/// holds `/proc`, is the reader's, bound at that open, and served byte for
+/// byte as natively.
+///
+/// The guest's five lock-free other-task cases (unlocked,
+/// inherited-directory-unlocked, inherited-directory-unlocked-rendered,
+/// symlink-named-self, descriptor-link-directory) are not run here: there the
+/// reader's descriptor answers with the wrong identity and no lock line to
+/// refuse, the same issue.
+#[test]
+fn another_process_fdinfo_lock_lines_are_refused_on_ptrace() {
+    let guest = futex_c_guest(
+        &PROC_FDINFO_OTHER_PROCESS_GUEST,
+        "proc_fdinfo_other_process",
+    )
+    .to_str()
+    .expect("guest path should be UTF-8");
+    /// What ptrace answers: the read refused by this name (exit 122, nothing
+    /// of the file shown), the native transcript itself, or base's answer
+    /// for issue 544, which is not Linux's: this exact transcript and exit.
+    #[derive(Clone, Copy, Debug)]
+    enum Ptrace {
+        Refused(&'static str),
+        AsNative,
+        Issue544 { shown: &'static str, exit: i32 },
+    }
+    use Ptrace::*;
+    const LOCK_LINES: &str = "procfs sanitize refused fdinfo: lock lines are not served";
+    let child_posix = "child's fd 7: ino=INO\nchild's fd 7: POSIX WRITE owner=CHILD inode=INO\n";
+    let inherited_posix =
+        "inherited fdinfo: ino=INO\ninherited fdinfo: POSIX WRITE owner=PARENT inode=INO\n";
+    // Issue 544's answers: the reader's rendering (OTHER-INODE, no lock
+    // line), and the read's EBADF where the reader has no fd 7, which the
+    // guest prints.
+    let child_rendering = "child's fd 7: ino=OTHER-INODE\n";
+    let cases: [(&str, &str, Ptrace); 19] = [
+        ("posix", child_posix, Refused(LOCK_LINES)),
+        (
+            "flock",
+            "child's fd 7: ino=INO\nchild's fd 7: FLOCK READ owner=CHILD inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // The kernel's own refusal of the open, as natively.
+        ("non-dumpable", "child's fd 7: open EACCES\n", AsNative),
+        // The parent's own fd 7 is a file Hermit renders, a placeholder it
+        // holds for a /proc directory, or none: as before the lock ledger,
+        // the first two answer with the parent's rendering and the third's
+        // read fails with EBADF (issue 544).
+        (
+            "rendered-collision",
+            child_posix,
+            Issue544 {
+                shown: child_rendering,
+                exit: 0,
+            },
+        ),
+        (
+            "placeholder-collision",
+            child_posix,
+            Issue544 {
+                shown: child_rendering,
+                exit: 0,
+            },
+        ),
+        (
+            "no-reader-descriptor",
+            child_posix,
+            Issue544 {
+                shown: "child's fd 7: read EBADF\n",
+                exit: 0,
+            },
+        ),
+        ("inherited-posix", inherited_posix, Refused(LOCK_LINES)),
+        (
+            "inherited-flock",
+            "inherited fdinfo: ino=INO\ninherited fdinfo: FLOCK READ owner=PARENT inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // Through the parent's /proc/self directory descriptor, the child's
+        // fd 7 a file of its own or one Hermit renders (issue 544 for the
+        // latter, as above).
+        ("inherited-directory", inherited_posix, Refused(LOCK_LINES)),
+        (
+            "inherited-directory-rendered",
+            inherited_posix,
+            Issue544 {
+                shown: "inherited fdinfo: ino=OTHER-INODE\n",
+                exit: 0,
+            },
+        ),
+        (
+            "private-thread",
+            "thread's /proc/self/fdinfo/7: ino=INO\n\
+             thread's /proc/self/fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // Through a descriptor link to the parent's /proc/self, inherited by
+        // a child whose own fd 7 holds a lock of its own: the parent's
+        // table, so its lock lines are refused, never the child's served.
+        (
+            "descriptor-link-parent-self",
+            "child's /proc/self/fd/N/fdinfo/7: ino=INO\n\
+             child's /proc/self/fd/N/fdinfo/7: POSIX WRITE owner=PARENT inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // The parent's, by the child's own number through links a lexical
+        // reading skips (cwd and an ordinary symbolic link to the parent's
+        // thread directory): bound to no table, so its lock lines are
+        // refused, never the child's own served.
+        (
+            "number-through-link",
+            "child's /proc/<child>/cwd/L/../../fdinfo/7: ino=INO\n\
+             child's /proc/<child>/cwd/L/../../fdinfo/7: POSIX WRITE owner=PARENT inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // The parent's fdinfo moved with dup2 over the child's own, bound
+        // descriptor before the read: the descriptor carries the parent's
+        // open file and its binding, so its lock lines are refused, never
+        // served as the child's.
+        (
+            "dup-over-own",
+            "child's dup2-replaced fdinfo: ino=INO\n\
+             child's dup2-replaced fdinfo: POSIX WRITE owner=PARENT inode=INO\n",
+            Refused(LOCK_LINES),
+        ),
+        // The reader's own, through a directory descriptor: served.
+        (
+            "own-directory",
+            "own /proc/self directory's fdinfo/7: ino=INO\n\
+             own /proc/self directory's fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            AsNative,
+        ),
+        (
+            "proc-directory-self",
+            "/proc directory's self/fdinfo/7: ino=INO\n\
+             /proc directory's self/fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            AsNative,
+        ),
+        (
+            "proc-directory-dot-self",
+            "/proc directory's ./self/fdinfo/7: ino=INO\n\
+             /proc directory's ./self/fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            AsNative,
+        ),
+        // A child's own, as ../self/fdinfo/7 relative to its parent's
+        // /proc/self: that `self` is the child's, resolved at this open.
+        (
+            "parent-directory-dotdot-self",
+            "child's ../self/fdinfo/7: ino=INO\n\
+             child's ../self/fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            AsNative,
+        ),
+        // The reader's own, as /proc/self/fd/D/self/fdinfo/7 where D holds
+        // /proc: Detcore resolves the link as Linux does, so the open binds
+        // the reader's table, and serves it with its lock.
+        (
+            "descriptor-link-proc-self",
+            "/proc/self/fd/D/self/fdinfo/7: ino=INO\n\
+             /proc/self/fd/D/self/fdinfo/7: POSIX WRITE owner=SELF inode=INO\n",
+            AsNative,
+        ),
+    ];
+    for (case, linux, ptrace) in cases {
+        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native = Command::new(guest)
+            .arg(native_directory.path())
+            .arg(case)
+            .output()
+            .expect("run proc-fdinfo-other-process natively");
+        assert!(native.status.success(), "{case} natively: {native:?}");
+        assert_eq!(stdout(&native), linux, "{case} natively");
+
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+        let args = [
+            "--backend",
+            "ptrace",
+            "run",
+            "--strict",
+            "--proc=standard",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest,
+            directory_arg,
+            case,
+        ];
+        let run = hermit(&args);
+        let shown = stdout(&run);
+        match ptrace {
+            Refused(reason) => {
+                // EXIT-CLASS: hermit (the fdinfo sanitizer's policy refusal)
+                assert_eq!(run.status.code(), Some(122), "{case}: {}", stderr(&run));
+                assert!(
+                    stderr(&run).contains(reason),
+                    "{case}: refused by {reason:?}: {}",
+                    stderr(&run)
+                );
+                assert_eq!(shown, "", "{case}: nothing of the file is shown");
+            }
+            AsNative => {
+                assert!(run.status.success(), "{case}: {}", stderr(&run));
+                assert_eq!(shown, linux, "{case}");
+            }
+            Issue544 {
+                shown: expected,
+                exit,
+            } => {
+                assert_eq!(run.status.code(), Some(exit), "{case}: {}", stderr(&run));
+                assert_eq!(shown, expected, "{case}: issue 544's answer");
+                assert!(
+                    !stderr(&run).contains("procfs sanitize refused fdinfo"),
+                    "{case}: answered, not refused: {}",
+                    stderr(&run)
+                );
+            }
+        }
+    }
+}
+
+/// Another thread can replace a descriptor between Detcore reading an
+/// fdinfo's spelling and the kernel's open: with sequentialized threads at
+/// the open's scheduler turn (a chaos pick, or an expired
+/// `--target-timeslice`), so the open confirms its binding from the
+/// descriptor the kernel returned. Without sequentialized threads it can also
+/// do so before the binding is installed on the returned descriptor, or
+/// before a read (`dup2` of another task's `/proc/<pid>` or of another
+/// fdinfo), so Detcore withholds the lock-line account altogether. Another
+/// task's lock lines are never served under the reader's identity.
+/// - Under `--no-sequentialize-threads` the reader's own locked fdinfo,
+///   through its own `/proc/self` directory or through `/proc`, has its lock
+///   lines refused by name ("lock lines are not served", exit 122), as before
+///   the lock ledger; the same reads are served as natively with
+///   sequentialized threads (`another_process_fdinfo_lock_lines_are_refused_on_ptrace`).
+/// - The race (`directory-swap-race`): a second thread keeps moving a
+///   descriptor D between `/proc/<child>` and `/proc/<parent>` while the
+///   child reads `fdinfo/7` relative to D 2000 times; the parent holds a lock
+///   on b through its fd 7. With `--allow-unsupported-syscalls` a refused
+///   read is an EIO the guest counts, so the run goes on past the reads the
+///   spelling itself names as the parent's. No read may show a lock line
+///   under any inode but b's ("wrong=0"), natively or on ptrace, without
+///   sequentialized threads and with them (chaos seeds 1 and 3, a
+///   syscall-boundary timeslice). So that it cannot pass by never meeting
+///   the parent's file, the guest prints all its counts, and each run must
+///   have read the child's own fd 7 and met the parent's: natively served
+///   ("other"), on ptrace refused. Without sequentialized threads the guest
+///   cannot steer the race into the window between the spelling's read and
+///   the kernel's open, so that run is a stress case (without the open's link
+///   check, 545 of 2000 reads in one measurement); a chaos seed's schedule is
+///   the same every run (without the check, seed 1 shows 250 every time).
+#[test]
+fn another_task_fdinfo_lock_lines_stay_refused_when_a_dup2_moves_the_directory() {
+    let guest = futex_c_guest(
+        &PROC_FDINFO_OTHER_PROCESS_GUEST,
+        "proc_fdinfo_other_process",
+    )
+    .to_str()
+    .expect("guest path should be UTF-8");
+    let run = |case: &str, extra: &[&str]| {
+        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native = Command::new(guest)
+            .arg(native_directory.path())
+            .arg(case)
+            .output()
+            .expect("run proc-fdinfo-other-process natively");
+        assert!(native.status.success(), "{case} natively: {native:?}");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+        let mut args = vec![
+            "--backend",
+            "ptrace",
+            "run",
+            "--proc=standard",
+            "--base-env=minimal",
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest, directory_arg, case]);
+        (stdout(&native), hermit(&args))
+    };
+    const UNSEQUENTIALIZED: &str = "--no-sequentialize-threads";
+    for case in ["own-directory", "proc-directory-self"] {
+        let (linux, ptrace) = run(case, &[UNSEQUENTIALIZED]);
+        assert!(
+            linux.contains("POSIX WRITE owner=SELF"),
+            "{case} natively: {linux}"
+        );
+        // EXIT-CLASS: hermit (the fdinfo sanitizer's policy refusal)
+        assert_eq!(
+            ptrace.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{case} without sequentialized threads: {}",
+            stderr(&ptrace)
+        );
+        assert!(
+            stderr(&ptrace).contains("procfs sanitize refused fdinfo: lock lines are not served"),
+            "{case}: {}",
+            stderr(&ptrace)
+        );
+        assert_eq!(stdout(&ptrace), "", "{case}: nothing of the file is shown");
+    }
+    // The race's counts: reads, wrong, own (the child's fd 7), other (a read
+    // that showed the parent's), refused (an open or read error, EIO under
+    // --allow-unsupported-syscalls). Each side must have run both ways, so
+    // the race cannot pass by never meeting the parent's file.
+    let counts = |transcript: &str| -> [u64; 5] {
+        let line = transcript
+            .strip_prefix("directory-swap race: ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .unwrap_or_else(|| panic!("the race's line: {transcript:?}"));
+        let mut values = [0u64; 5];
+        let names = ["reads", "wrong", "own", "other", "refused"];
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), names.len(), "the race's line: {line}");
+        for ((value, name), field) in values.iter_mut().zip(names).zip(fields) {
+            let (key, number) = field.split_once('=').expect("key=value");
+            assert_eq!(key, name, "the race's line: {line}");
+            *value = number.parse().expect("a count");
+        }
+        values
+    };
+    // With sequentialized threads the second thread runs only where the
+    // scheduler switches at a syscall: under --chaos with a syscall-boundary
+    // timeslice, which also reaches the open's scheduler turn, after its
+    // spelling was read and before the kernel's open (at the default
+    // timeslice the second thread keeps its slice and the reads barely
+    // advance). Without the open's link check, seed 1 shows 250 wrong reads.
+    for extra in [
+        &[UNSEQUENTIALIZED, "--allow-unsupported-syscalls"][..],
+        &[
+            "--allow-unsupported-syscalls",
+            "--chaos",
+            "--seed=1",
+            "--target-timeslice=100000",
+        ][..],
+        &[
+            "--allow-unsupported-syscalls",
+            "--chaos",
+            "--seed=3",
+            "--target-timeslice=100000",
+        ][..],
+    ] {
+        let (linux, ptrace) = run("directory-swap-race", extra);
+        let [reads, wrong, own, other, refused] = counts(&linux);
+        assert_eq!(
+            (reads, wrong, refused),
+            (2000, 0, 0),
+            "the race natively: {linux}"
+        );
+        assert!(
+            own > 0 && other > 0,
+            "the race natively met both files: {linux}"
+        );
+        assert!(
+            ptrace.status.success(),
+            "the race {extra:?}: {}",
+            stderr(&ptrace)
+        );
+        let shown = stdout(&ptrace);
+        let [reads, wrong, own, _, refused] = counts(&shown);
+        assert_eq!((reads, wrong), (2000, 0), "the race {extra:?}: {shown}");
+        assert!(
+            own > 0 && refused > 0,
+            "the race {extra:?} met both files, the parent's refused: {shown}"
+        );
+    }
+}
+
+/// A recording serves the reader's own locked fdinfo's lock line, and its
+/// replay serves the same bytes; another task's lock lines stay refused in
+/// both. Replay holds the opened descriptor's
+/// number with a stand-in eventfd, so the open's confirmation of the fdinfo
+/// binding reads the link the recording read for that open
+/// (`recorded_open_path`), never the live one, which names no fdinfo there: a
+/// live read would unbind in replay what the recording served, and the
+/// replay would refuse its lock lines.
+///
+/// Under record the fdinfo's `ino:` and its lock line's inode are the
+/// recording's canonical number while `stat` shows the host's, so the guest
+/// marks both OTHER-INODE: this test does not compare raw inode numbers. It
+/// pins that the lock line is served (POSIX WRITE, owner SELF), that the
+/// replay matches, and, for another process's fdinfo (`posix`), that the
+/// recording refuses its lock lines by name (exit 122). Record mode has no
+/// `--allow-unsupported-syscalls` (it panics on unsupported calls), so the
+/// refusal ends the recording and leaves nothing to replay: a binding kept
+/// under record for another task's table would serve those lines here and
+/// turn this red.
+#[test]
+fn own_fdinfo_lock_lines_record_and_replay_alike() {
+    let guest = futex_c_guest(
+        &PROC_FDINFO_OTHER_PROCESS_GUEST,
+        "proc_fdinfo_other_process",
+    )
+    .to_str()
+    .expect("guest path should be UTF-8");
+    for (case, label) in [
+        ("own-directory", "own /proc/self directory's fdinfo/7"),
+        ("proc-directory-self", "/proc directory's self/fdinfo/7"),
+    ] {
+        let linux = format!("{label}: ino=INO\n{label}: POSIX WRITE owner=SELF inode=INO\n");
+        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native = Command::new(guest)
+            .arg(native_directory.path())
+            .arg(case)
+            .output()
+            .expect("run proc-fdinfo-other-process natively");
+        assert!(native.status.success(), "{case} natively: {native:?}");
+        assert_eq!(stdout(&native), linux, "{case} natively");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+        let args = ["record", "--verify", "--", guest, directory_arg, case];
+        let recorded = hermit(&args);
+        assert_success(&recorded, &args);
+        assert!(
+            stderr(&recorded).contains("Success: replay matched recording."),
+            "{case}: replay must match the recording: {recorded:?}"
+        );
+        assert!(
+            !stderr(&recorded).contains("procfs sanitize refused fdinfo"),
+            "{case}: served, not refused: {}",
+            stderr(&recorded)
+        );
+        // Under record the fdinfo shows the recording's canonical inode
+        // number while `stat` shows the host's, so the guest marks both the
+        // `ino:` line and the lock line's inode OTHER-INODE: raw inode numbers
+        // are not compared here. What this pins is that the lock line is
+        // served, with its owner, and that replay matches.
+        assert_eq!(
+            stdout(&recorded),
+            format!(
+                "{label}: ino=OTHER-INODE\n{label}: POSIX WRITE owner=SELF inode=OTHER-INODE\n"
+            ),
+            "{case}: the recording's bytes"
+        );
+    }
+    // Another process's fdinfo: the recording refuses its lock lines by name,
+    // and the refusal ends the recording, so no replay runs.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+    let args = ["record", "--verify", "--", guest, directory_arg, "posix"];
+    let recorded = hermit(&args);
+    // EXIT-CLASS: hermit (the fdinfo sanitizer's policy refusal)
+    assert_eq!(
+        recorded.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "posix under record: {}",
+        stderr(&recorded)
+    );
+    assert!(
+        stderr(&recorded).contains("procfs sanitize refused fdinfo: lock lines are not served"),
+        "posix: refused by name: {}",
+        stderr(&recorded)
+    );
+    assert!(
+        !stderr(&recorded).contains("replay matched recording"),
+        "posix: a refused recording is not replayed: {}",
+        stderr(&recorded)
+    );
+    assert_eq!(
+        stdout(&recorded),
+        "",
+        "posix: nothing of the other process's file is shown"
+    );
 }
 
 /// Where the guest's procfs is not the kernel's (KVM), Detcore renders

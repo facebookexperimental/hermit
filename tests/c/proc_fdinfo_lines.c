@@ -623,6 +623,9 @@ static void locks(const char* directory, int skip_flock, int skip_lease, int ski
     check("F_SETLEASE F_RDLCK", fcntl(reader, F_SETLEASE, F_RDLCK));
     show("after F_SETLEASE", reader);
     check("F_SETLEASE F_UNLCK", fcntl(reader, F_SETLEASE, F_UNLCK));
+    /* No lock line: the lease the guest released is gone, as Detcore last
+     * saw it. */
+    show("after F_SETLEASE F_UNLCK", reader);
   }
 
   if (!skip_posix) {
@@ -630,6 +633,11 @@ static void locks(const char* directory, int skip_flock, int skip_lease, int ski
     check("F_SETLK unlock 0-9", fcntl(fd, F_SETLK, &unlock));
     show("after the unlock", fd);
   }
+  /* No lock line either: the OFD lock the guest released, the last lock of
+   * that description. */
+  struct flock ofd_unlock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 100, .l_len = 0};
+  check("F_OFD_SETLK unlock 100-EOF", fcntl(fd, F_OFD_SETLK, &ofd_unlock));
+  show("after the OFD unlock", fd);
   close(reader);
   close(second);
   close(fd);

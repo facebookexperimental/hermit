@@ -17,6 +17,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::procfs::Bitmap;
+use detcore_model::procfs::Fdinfo;
 use detcore_model::procfs::FdinfoKind;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
@@ -1493,6 +1494,14 @@ pub(crate) struct ProcfsFile {
     #[serde(default)]
     rendered_from_memory_map: bool,
     target_fd: Option<i32>,
+    /// For an `fdinfo`, whose descriptor table its path names
+    /// ([`FdinfoOwner`]); `None` for every other file.
+    #[serde(default)]
+    fdinfo_owner: Option<FdinfoOwner>,
+    /// For an `fdinfo`, the task whose table it shows, bound at its open
+    /// ([`ProcfsFile::bind_fdinfo_table`]); `None` where none was bound.
+    #[serde(default)]
+    fdinfo_table: Option<FdinfoTable>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     /// For a task's `schedstat`, the task it describes, found when it was
     /// opened ([`ProcfsFile::bind_schedstat_thread`]); `None` where none was.
@@ -1989,6 +1998,45 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (`procfs::fdinfo::render`). Built by the caller, from the descriptor's
     /// state at this read (`Detcore::render_own_fdinfo`).
     pub(crate) fdinfo_rendering: Option<Vec<u8>>,
+    /// For a descriptor's fdinfo the kernel printed with `lock:` lines, what
+    /// those lines show in place of the host's values ([`FdinfoLockLines`]).
+    /// Built by the caller, which asks Detcore's global state. `None` refuses
+    /// any lock line by name, which only a snapshot without the caller's
+    /// account of them, or a unit test, gives.
+    pub(crate) fdinfo_locks: Option<FdinfoLockLines>,
+}
+
+/// What the `lock:` lines of a descriptor's fdinfo the kernel printed show
+/// to the guest. The kernel lists the locks held through the descriptor's
+/// open file description, in an order the guest's own calls decide
+/// (`show_fd_locks` in fs/locks.c), and the sanitizer keeps each line and
+/// that order, with three host values replaced: the owner (`owners`), the
+/// device (`device`) and the inode (the fdinfo's own virtual inode, which
+/// every line names: `__show_fd_locks` lists only locks taken through this
+/// description, so on its file). Of those it lists only the ones the shown
+/// table or the description owns, skipping a lock whose `flc_owner` is
+/// neither the shown task's `files_struct` nor the file: every OFD lock,
+/// flock and lease, and only the POSIX locks the shown table took. So a
+/// fdinfo's POSIX lines are its table's, which is why only a fdinfo of the
+/// reader's own table is accounted for (`Detcore::kernel_fdinfo_locks`).
+///
+/// ⚠️ BUILT BY THE CALLER, NEVER HERE, as `ProcfsSnapshotContext::
+/// mapping_identities` is: the owners come from Detcore's lock ledger, its
+/// flock model and its process table (`LockLedger::fdinfo_owners`), and the
+/// device from the pool `stat` determinizes devices through
+/// (`Detcore::lock_line_device`), none of which a pure sanitizer can reach.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FdinfoLockLines {
+    /// The kernel's `lock:` lines the caller decided on, in order
+    /// (`locks::fdinfo_lock_rows` of the same snapshot): the sanitizer serves
+    /// owners only for exactly these lines.
+    pub(crate) rows: Vec<locks::LockRowFacts>,
+    /// The owner each line shows, in order, or why Detcore cannot serve the
+    /// lines, for which the read is refused by name.
+    pub(crate) owners: Result<Vec<i64>, String>,
+    /// The device major and minor every line's object shows: the file's
+    /// device as the guest's `stat` numbers it.
+    pub(crate) device: (u32, u32),
 }
 
 impl ProcfsFile {
@@ -2166,7 +2214,9 @@ impl ProcfsFile {
         };
         let task = Self::per_process_name_of(&kind)
             .and_then(|filename| ProcfsTask::parse(task_path, filename));
-        Some(Self::of_kind(kind, task, target_fd))
+        let mut file = Self::of_kind(kind, task, target_fd);
+        file.fdinfo_owner = target_fd.and_then(|_| parse_fdinfo_owner(path_text));
+        Some(file)
     }
 
     /// A device's NUMA attribute the kernel opened, which reads `file`'s
@@ -2186,6 +2236,8 @@ impl ProcfsFile {
             memory_map: None,
             rendered_from_memory_map: false,
             target_fd,
+            fdinfo_owner: None,
+            fdinfo_table: None,
             bound_thread_identity: None,
             schedstat_thread: None,
             timer_slack_identity: None,
@@ -3354,6 +3406,7 @@ impl ProcfsFile {
             task_stat,
             task_status,
             fdinfo_rendering,
+            fdinfo_locks,
         } = context;
         // Linux prints a task's `Cpus_allowed` with `nr_cpu_ids` bits.
         let cpus_allowed = cpus_allowed.map(|cpus| (cpus, machine.cpus));
@@ -3506,7 +3559,7 @@ impl ProcfsFile {
                 &mut sanitize_refusal,
             ),
             ProcfsKind::Fdinfo => checked_or_refusal(
-                sanitize_fdinfo_checked(&contents, fdinfo_identity),
+                sanitize_fdinfo_checked(&contents, fdinfo_identity, fdinfo_locks.as_ref()),
                 &mut sanitize_refusal,
             ),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
@@ -3808,6 +3861,69 @@ impl ProcfsFile {
     pub(crate) fn target_fd(&self) -> Option<i32> {
         self.target_fd.filter(|_| !self.rendered)
     }
+
+    /// For an `fdinfo`, whose descriptor table its path names
+    /// ([`FdinfoOwner`]).
+    pub(crate) fn fdinfo_owner(&self) -> Option<FdinfoOwner> {
+        self.fdinfo_owner
+    }
+
+    /// Bind an `fdinfo` to the task its path named at this open, for an
+    /// opener that is thread `tid` of process `pid` (`opener`, in Detcore's
+    /// numbers), as the kernel resolves `self` and `thread-self` at the open
+    /// ([`FdinfoTable`]). `None` where the opener's numbers are not the
+    /// path's (a nested PID namespace, a file not classified by its spelling,
+    /// or a spelling the walk did not follow): nothing is bound, and the
+    /// read gets no lock-line account (`fdinfo_names_callers_table` in
+    /// syscalls/files.rs says what it shows instead).
+    pub(crate) fn bind_fdinfo_table(&mut self, opener: Option<(i32, i32)>) {
+        self.fdinfo_table = self
+            .fdinfo_owner
+            .zip(opener)
+            .map(|(owner, (pid, tid))| owner.resolve(pid, tid));
+    }
+
+    /// For an `fdinfo`, the task whose table it shows, as its open bound it
+    /// ([`ProcfsFile::bind_fdinfo_table`]).
+    pub(crate) fn fdinfo_table(&self) -> Option<FdinfoTable> {
+        self.fdinfo_table
+    }
+
+    /// Keep an `fdinfo`'s binding only if `opened`, the link of the
+    /// descriptor the kernel's open returned, names the same task by number
+    /// and the same descriptor: `/proc/<pid>/fdinfo/<fd>` names the process,
+    /// and `/proc/<pid>/task/<tid>/fdinfo/<fd>` the thread. The kernel prints
+    /// that link from the file it opened (`d_path`), whatever the spelling
+    /// was, so it names the task whose table the file shows
+    /// (`seq_fdinfo_open`) and the descriptor it describes. Any other link,
+    /// or none, unbinds: the read's lock lines are then refused by name
+    /// (`sanitize_fdinfo_checked`).
+    pub(crate) fn confirm_fdinfo_table(&mut self, opened: Option<&Path>) {
+        let opened = opened.and_then(Path::to_str);
+        let named = opened
+            .and_then(parse_fdinfo_owner)
+            .and_then(|owner| match owner {
+                FdinfoOwner::Process(process) => Some(FdinfoTable {
+                    process,
+                    thread: None,
+                }),
+                FdinfoOwner::Thread {
+                    process: Some(process),
+                    thread,
+                } => Some(FdinfoTable {
+                    process,
+                    thread: Some(thread),
+                }),
+                // A link names its task by number, never by a selector.
+                FdinfoOwner::SelfProcess
+                | FdinfoOwner::ThreadSelf
+                | FdinfoOwner::Thread { process: None, .. } => None,
+            });
+        let same_descriptor = opened.and_then(parse_fdinfo_target) == self.target_fd;
+        if self.fdinfo_table.is_some() && (named != self.fdinfo_table || !same_descriptor) {
+            self.fdinfo_table = None;
+        }
+    }
 }
 
 /// The task a `/proc/<pid>[/task/<tid>]/fdinfo/<name>` spelling (with `self`
@@ -3876,6 +3992,81 @@ fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
     }
     let target = task.parse::<i32>().ok().filter(|target| *target > 0)?;
     Some(Some(target))
+}
+
+/// Whose descriptor table a `/proc/.../fdinfo/<fd>` path names, as its
+/// spelling says once `..` is resolved: the opener's process (`self`), the
+/// opener's thread (`thread-self`), a process's by its number, or a thread's
+/// by its number below a process (`self` or a number, `None` for `self`).
+/// The kernel resolves the spelling when the file is opened and keeps that
+/// task's inode (`seq_fdinfo_open`, fs/proc/fd.c), so the file shows that
+/// task's table to whoever reads it later ([`FdinfoTable`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum FdinfoOwner {
+    SelfProcess,
+    ThreadSelf,
+    Process(i32),
+    Thread { process: Option<i32>, thread: i32 },
+}
+
+/// The task whose descriptor table an opened fdinfo shows, resolved at its
+/// open from the path's spelling ([`FdinfoOwner`]) and the opener's
+/// numbers: a process, or a thread of one. It stays with the open file
+/// description, through a fork and a descriptor's transfer, as the kernel's
+/// file keeps its inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FdinfoTable {
+    pub(crate) process: i32,
+    pub(crate) thread: Option<i32>,
+}
+
+impl FdinfoOwner {
+    /// The task this spelling names for an opener that is thread `tid` of
+    /// process `pid`.
+    fn resolve(self, pid: i32, tid: i32) -> FdinfoTable {
+        match self {
+            Self::SelfProcess => FdinfoTable {
+                process: pid,
+                thread: None,
+            },
+            Self::ThreadSelf => FdinfoTable {
+                process: pid,
+                thread: Some(tid),
+            },
+            Self::Process(process) => FdinfoTable {
+                process,
+                thread: None,
+            },
+            Self::Thread { process, thread } => FdinfoTable {
+                process: process.unwrap_or(pid),
+                thread: Some(thread),
+            },
+        }
+    }
+}
+
+fn parse_fdinfo_owner(path: &str) -> Option<FdinfoOwner> {
+    let relative = path.strip_prefix("/proc/")?;
+    match relative.split('/').collect::<Vec<_>>().as_slice() {
+        ["self", "fdinfo", _] => Some(FdinfoOwner::SelfProcess),
+        ["thread-self", "fdinfo", _] => Some(FdinfoOwner::ThreadSelf),
+        [process, "fdinfo", _] if is_numeric_id(process) => {
+            Some(FdinfoOwner::Process(process.parse().ok()?))
+        }
+        [process, "task", thread, "fdinfo", _]
+            if is_proc_process_name(process) && is_numeric_id(thread) =>
+        {
+            let process = match *process {
+                "self" => None,
+                number => Some(number.parse().ok()?),
+            };
+            Some(FdinfoOwner::Thread {
+                process,
+                thread: thread.parse().ok()?,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_fdinfo_target(path: &str) -> Option<i32> {
@@ -6238,7 +6429,7 @@ fn sanitize_self_sched_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
 #[cfg(test)]
 fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> Vec<u8> {
-    match sanitize_fdinfo_checked(contents, identity) {
+    match sanitize_fdinfo_checked(contents, identity, None) {
         Ok(bytes) => bytes,
         Err(reason) => {
             tracing::warn!("{reason}");
@@ -6247,14 +6438,17 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> V
     }
 }
 
+/// `lock_lines`: the caller's account of the kernel's `lock:` lines, given
+/// only for a fdinfo of one of the reader's own descriptors.
 fn sanitize_fdinfo_checked(
     contents: &[u8],
     identity: Option<(u64, i32, u64, u64)>,
+    lock_lines: Option<&FdinfoLockLines>,
 ) -> Result<Vec<u8>, String> {
     let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
-        // No virtual identity to substitute: a named, counted
-        // refusal like every other unserved shape, never an empty
-        // file.
+        // No virtual identity to substitute: a named, counted refusal like
+        // every other unserved shape, never an empty file, before the bytes
+        // are parsed, as before the lock ledger.
         return Err(counted_refusal_reason(
             "fdinfo",
             "no fd identity for the fdinfo snapshot",
@@ -6262,17 +6456,17 @@ fn sanitize_fdinfo_checked(
     };
     // Grammar-backed parse; identity substitution below is the same
     // policy the line surgery applied. Kinds this policy does not
-    // serve (epoll, inotify, fuse), files carrying lock lines, and
-    // unparseable input are refused by name and counted.
+    // serve (epoll, inotify, fuse) and unparseable input are refused by
+    // name and counted; lock lines are served only as the caller
+    // accounted for them (`serve_lock_lines`).
     let mut fdinfo = match parse_fdinfo(contents) {
         Ok(fdinfo) => fdinfo,
         Err(error) => return Err(counted_refusal_reason("fdinfo", error)),
     };
-    if !fdinfo.locks.is_empty() {
-        return Err(counted_refusal_reason(
-            "fdinfo",
-            "lock lines are not served",
-        ));
+    // An account's refusal stands with no lock line too: the guest's own
+    // lease, gone from the fdinfo (`locks::LockLedger::fdinfo_owners`).
+    if !fdinfo.locks.is_empty() || lock_lines.is_some_and(|lines| lines.owners.is_err()) {
+        serve_lock_lines(contents, &mut fdinfo, virtual_inode, lock_lines)?;
     }
     fdinfo.mnt_id = virtual_mount_id;
     fdinfo.ino = virtual_inode;
@@ -6292,6 +6486,64 @@ fn sanitize_fdinfo_checked(
         _ => return Err(counted_refusal_reason("fdinfo", "fd kind is not served")),
     }
     Ok(render_fdinfo(&fdinfo))
+}
+
+/// The refusal of a fdinfo's `lock:` lines no account of the caller's
+/// covers ([`serve_lock_lines`]), or that have no identity to be served with
+/// (`sanitize_fdinfo_checked`).
+const UNSERVED_LOCK_LINES: &str = "lock lines are not served";
+
+/// Replace the host values of `fdinfo`'s `lock:` lines, parsed from the
+/// kernel's `contents`, with what the caller's account says the guest sees
+/// ([`FdinfoLockLines`]): each line's owner, the file's device, and
+/// `virtual_inode`, the fdinfo's own. Refused by name, and counted: no
+/// account, the account's own refusal, an account of other lines than these,
+/// and a line on another file than the descriptor's, which Linux never lists
+/// there (`__show_fd_locks` lists only locks taken through this description).
+fn serve_lock_lines(
+    contents: &[u8],
+    fdinfo: &mut Fdinfo,
+    virtual_inode: u64,
+    lock_lines: Option<&FdinfoLockLines>,
+) -> Result<(), String> {
+    let Some(lines) = lock_lines else {
+        return Err(counted_refusal_reason("fdinfo", UNSERVED_LOCK_LINES));
+    };
+    let owners = lines
+        .owners
+        .as_ref()
+        .map_err(|reason| counted_refusal_reason("fdinfo", format!("lock lines: {reason}")))?;
+    if locks::fdinfo_lock_rows(contents).as_ref() != Some(&lines.rows)
+        || owners.len() != fdinfo.locks.len()
+    {
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "lock lines other than those Detcore accounted for",
+        ));
+    }
+    let file = (
+        fdinfo.ino,
+        fdinfo.locks[0].dev_major,
+        fdinfo.locks[0].dev_minor,
+    );
+    if fdinfo
+        .locks
+        .iter()
+        .any(|lock| (lock.inode, lock.dev_major, lock.dev_minor) != file)
+    {
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "a lock line names another file than the descriptor's",
+        ));
+    }
+    let (dev_major, dev_minor) = lines.device;
+    for (lock, owner) in fdinfo.locks.iter_mut().zip(owners) {
+        lock.owner = *owner;
+        lock.dev_major = dev_major;
+        lock.dev_minor = dev_minor;
+        lock.inode = virtual_inode;
+    }
+    Ok(())
 }
 
 fn numa_page_accounting_value(field: &str) -> Option<&str> {
@@ -10685,6 +10937,431 @@ THPeligible:    0\n"
             sanitize_fdinfo(fabricated, Some((9000, 0o200000, 42, 1))),
             b"pos:\t0\nflags:\t0200000\nmnt_id:\t1\nino:\t9000\n"
         );
+    }
+
+    /// The kernel's header of the fdinfo the lock-line tests read: inode
+    /// 1002 on mount 31, both host values.
+    const LOCKED_FDINFO_HEADER: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t31\nino:\t1002\n";
+
+    /// The descriptor's virtual identity: inode 9007, its flags, open file
+    /// 42 and mount 7, as `Detcore` builds `fdinfo_identity`.
+    const LOCKED_FDINFO_IDENTITY: Option<(u64, i32, u64, u64)> = Some((9007, 0o2100002, 42, 7));
+
+    /// [`LOCKED_FDINFO_HEADER`] as the guest sees it.
+    const SERVED_FDINFO_HEADER: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t7\nino:\t9007\n";
+
+    /// The guest process a kernel owner number in the lock-line tests names:
+    /// 3 is guest process 3 (the container's PID namespace numbers it as the
+    /// guest does); any other number, such as host process 4242, names none.
+    fn lock_test_guest_process(owner: i64) -> Option<crate::types::DetPid> {
+        (owner == 3).then(|| crate::types::DetPid::from_raw(3))
+    }
+
+    /// What the snapshot's caller builds for a fdinfo the kernel printed of a
+    /// descriptor of `open_file` (`Detcore::kernel_fdinfo_locks`): its lock
+    /// lines, the owners `ledger` gives them (guest process 3 is listed), and
+    /// 00:31 standing for the file's determinized device.
+    fn kernel_fdinfo_lock_lines(
+        ledger: &locks::LockLedger,
+        open_file: crate::types::OpenFileId,
+        contents: &[u8],
+    ) -> FdinfoLockLines {
+        let rows = locks::fdinfo_lock_rows(contents).expect("every lock line is a lock row");
+        // The fdinfo's own `ino:` line, as the caller reads it.
+        let file_inode = std::str::from_utf8(contents)
+            .expect("fdinfo text")
+            .lines()
+            .find_map(|line| line.strip_prefix("ino:"))
+            .map(str::trim);
+        let owners = ledger.fdinfo_owners(
+            open_file,
+            &rows,
+            &|process| process.as_raw() == 3,
+            &lock_test_guest_process,
+            file_inode,
+        );
+        FdinfoLockLines {
+            rows,
+            owners,
+            device: (0, 0x31),
+        }
+    }
+
+    /// The ledger's record that `open_file` holds the locks `lines` spell
+    /// (each `lock:` line's text after its number), as a fdinfo read after
+    /// a guest lock call through process 3's table records it.
+    fn ledger_holding(
+        ledger: &mut locks::LockLedger,
+        open_file: crate::types::OpenFileId,
+        lines: &[&str],
+    ) {
+        let text = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("lock:\t{}: {line}\n", index + 1))
+            .collect::<String>();
+        let held = locks::held_locks_in_fdinfo(text.as_bytes());
+        assert_eq!(
+            held.len(),
+            lines.len(),
+            "every lock is an OFD lock or a flock"
+        );
+        ledger.note_locks(crate::types::DetPid::from_raw(3), open_file, held, 1);
+    }
+
+    /// (a) A fdinfo the kernel printed with lock lines is served, not
+    /// refused: each line in the kernel's order (Linux's: a description's
+    /// flock locks, then its record locks in list order, then its leases),
+    /// spelled as Linux spells it, with the host's values replaced. Its
+    /// object is the file's determinized device and the fdinfo's own virtual
+    /// inode (every line names the description's file), and its owner is -1
+    /// for an OFD lock, the guest process a kernel number names for a POSIX
+    /// lock, a flock and an active lease, and 0 where the number names none,
+    /// as Linux shows a taker its PID namespace cannot see.
+    #[test]
+    fn fdinfo_lock_lines_are_served_with_guest_owners_and_virtual_identity() {
+        let process = crate::types::DetPid::from_raw(3);
+        let [first, second, inherited, leased] =
+            [0, 1, 2, 3].map(|sequence| crate::types::OpenFileId::new(process, sequence));
+        let mut ledger = locks::LockLedger::default();
+        let ofd = "OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF";
+        ledger_holding(&mut ledger, first, &[ofd]);
+        // This process's record lock on bytes 0 to 9 (namespace pid 3), then
+        // its OFD lock from byte 100, as Linux lists both on the
+        // description's fdinfo.
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:2a:1002 0 9\n\
+             lock:\t2: {ofd}\n"
+        );
+        let lines = kernel_fdinfo_lock_lines(&ledger, first, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:31:9007 0 9\n\
+                 lock:\t2: OFDLCK ADVISORY  READ -1 00:31:9007 100 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // A shared flock through a second open, taken by guest process 3.
+        let flock = "FLOCK  ADVISORY  READ 3 00:2a:1002 0 EOF";
+        ledger_holding(&mut ledger, second, &[flock]);
+        let contents = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {flock}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, second, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: FLOCK  ADVISORY  READ 3 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // A flock a host process (4242) took on a description the guest
+        // inherited, which the ledger read after the guest's own lock call
+        // through it: owner 0, never the host's number.
+        let host_flock = "FLOCK  ADVISORY  WRITE 4242 00:2a:1002 0 EOF";
+        ledger_holding(&mut ledger, inherited, &[host_flock]);
+        let contents = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {host_flock}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, inherited, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: FLOCK  ADVISORY  WRITE 0 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // An active read lease guest process 3 set with its own F_SETLEASE,
+        // which the ledger keeps: its taker is the kernel's number,
+        // translated.
+        ledger.note_lease(process, leased, Some("READ".to_owned()), 1);
+        let contents =
+            format!("{LOCKED_FDINFO_HEADER}lock:\t1: LEASE  ACTIVE    READ 3 00:2a:1002 0 EOF\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, leased, contents.as_bytes());
+        let served =
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines));
+        assert_eq!(
+            served,
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: LEASE  ACTIVE    READ 3 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+        // The host's raw device (00:2a) never reaches the guest.
+        let served = String::from_utf8(served.unwrap()).unwrap();
+        assert!(!served.contains("00:2a"), "{served}");
+    }
+
+    /// (d) A lock line naming another file than the descriptor's (here a
+    /// POSIX lock on inode 1003 in the fdinfo of inode 1002), which Linux
+    /// never lists there, is refused by name; and the guest's own lease gone
+    /// from a fdinfo with no lock line at all (the kernel removed it after a
+    /// break, on its own clock) is refused by name, not shown as no lease.
+    #[test]
+    fn fdinfo_lock_lines_on_another_file_or_a_vanished_lease_are_refused() {
+        let process = crate::types::DetPid::from_raw(3);
+        let description = crate::types::OpenFileId::new(process, 0);
+        let ledger = locks::LockLedger::default();
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:2a:1002 0 9\n\
+             lock:\t2: POSIX  ADVISORY  WRITE 3 00:2a:1003 20 29\n"
+        );
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, contents.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a line on another file is refused");
+        assert!(
+            refusal.contains("a lock line names another file than the descriptor's"),
+            "{refusal}"
+        );
+
+        let mut leased = locks::LockLedger::default();
+        leased.note_lease(process, description, Some("READ".to_owned()), 1);
+        let no_lock_line = LOCKED_FDINFO_HEADER.to_owned();
+        let lines = kernel_fdinfo_lock_lines(&leased, description, no_lock_line.as_bytes());
+        let refusal = sanitize_fdinfo_checked(
+            no_lock_line.as_bytes(),
+            LOCKED_FDINFO_IDENTITY,
+            Some(&lines),
+        )
+        .expect_err("the guest's vanished lease is refused");
+        assert!(refusal.contains("is gone from its fdinfo"), "{refusal}");
+        // With no account at all, the same fdinfo is shown: no lock line
+        // needs one.
+        assert!(
+            sanitize_fdinfo_checked(no_lock_line.as_bytes(), LOCKED_FDINFO_IDENTITY, None,).is_ok()
+        );
+    }
+
+    /// (b) Where the ledger cannot vouch for a description's OFD and flock
+    /// locks, a fdinfo listing one is refused by name, never served: its
+    /// locks are unknown (the ledger's own reason is named), or Detcore never
+    /// read them.
+    #[test]
+    fn fdinfo_lock_lines_refuse_by_name_where_the_ledger_cannot_vouch() {
+        let process = crate::types::DetPid::from_raw(3);
+        let [unknown, unread] =
+            [0, 1].map(|sequence| crate::types::OpenFileId::new(process, sequence));
+        let mut ledger = locks::LockLedger::default();
+        ledger.note_unknown(
+            process,
+            unknown,
+            "after F_OFD_SETLK on fd 3, its fdinfo could not be read (EMFILE)".to_owned(),
+            1,
+        );
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF\n"
+        );
+        for (open_file, reason) in [
+            (unknown, "its fdinfo could not be read (EMFILE)"),
+            (unread, "never read the locks of this open file description"),
+        ] {
+            let lines = kernel_fdinfo_lock_lines(&ledger, open_file, contents.as_bytes());
+            let refusal =
+                sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                    .expect_err("a lock the ledger cannot vouch for is refused");
+            assert!(
+                refusal.contains("procfs sanitize refused fdinfo") && refusal.contains(reason),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// (c) A lock line the ledger does not hold never passes through: a lock
+    /// the kernel lists through the description that the ledger did not read
+    /// it holding (another holder of a description shared with the host), a
+    /// lock the ledger holds that the kernel no longer lists, and lines other
+    /// than those the caller accounted for are refused by name; and a lock
+    /// with no caller's account at all is refused as before.
+    #[test]
+    fn fdinfo_lock_lines_the_ledger_does_not_hold_never_pass_through() {
+        let process = crate::types::DetPid::from_raw(3);
+        let description = crate::types::OpenFileId::new(process, 0);
+        let guest_ofd = "OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF";
+        let host_ofd = "OFDLCK ADVISORY  WRITE -1 00:2a:1002 0 0";
+        let mut ledger = locks::LockLedger::default();
+        ledger_holding(&mut ledger, description, &[guest_ofd]);
+
+        let with_host =
+            format!("{LOCKED_FDINFO_HEADER}lock:\t1: {host_ofd}\nlock:\t2: {guest_ofd}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, with_host.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(with_host.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a lock the ledger does not hold is refused");
+        assert!(
+            refusal.contains("a change Detcore did not see"),
+            "{refusal}"
+        );
+
+        let mut stale = locks::LockLedger::default();
+        ledger_holding(&mut stale, description, &[host_ofd, guest_ofd]);
+        let guest_only = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {guest_ofd}\n");
+        let lines = kernel_fdinfo_lock_lines(&stale, description, guest_only.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(guest_only.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a lock the kernel no longer lists is refused");
+        assert!(
+            refusal.contains("a change Detcore did not see"),
+            "{refusal}"
+        );
+
+        // The caller's account of other lines than the snapshot's.
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, guest_only.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(with_host.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("lines the caller did not account for are refused");
+        assert!(
+            refusal.contains("lock lines other than those Detcore accounted for"),
+            "{refusal}"
+        );
+
+        let refusal = sanitize_fdinfo_checked(guest_only.as_bytes(), LOCKED_FDINFO_IDENTITY, None)
+            .expect_err("lock lines with no account are refused");
+        assert!(refusal.contains("lock lines are not served"), "{refusal}");
+
+        // With no identity, a fdinfo is refused for its identity before its
+        // bytes are read, lock lines or none, as before the lock ledger.
+        for contents in [guest_only.as_str(), LOCKED_FDINFO_HEADER] {
+            let refusal = sanitize_fdinfo_checked(contents.as_bytes(), None, None)
+                .expect_err("a fdinfo with no identity is refused");
+            assert!(
+                refusal.contains("no fd identity for the fdinfo snapshot"),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// A fdinfo path names whose descriptor table: the opener's process
+    /// (`self`) or thread (`thread-self`), once `..` is resolved, or a
+    /// process's or a thread's by number; every other path names none. The
+    /// open binds it to a task, resolving `self` and `thread-self` with the
+    /// opener's numbers, and the binding stays with the file: a child that
+    /// reads its parent's `self` fdinfo after a fork reads the parent's.
+    #[test]
+    fn fdinfo_paths_name_their_descriptor_table() {
+        let owner = |path: &str| {
+            ProcfsFile::from_path(Path::new(path)).and_then(|file| file.fdinfo_owner())
+        };
+        assert_eq!(owner("/proc/self/fdinfo/7"), Some(FdinfoOwner::SelfProcess));
+        assert_eq!(
+            owner("/proc/thread-self/fdinfo/7"),
+            Some(FdinfoOwner::ThreadSelf)
+        );
+        assert_eq!(
+            owner("/proc/self/../self/fdinfo/7"),
+            Some(FdinfoOwner::SelfProcess)
+        );
+        let bound = |path: &str, opener: Option<(i32, i32)>| {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            file.bind_fdinfo_table(opener);
+            file.fdinfo_table()
+        };
+        assert_eq!(
+            bound("/proc/self/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: None
+            })
+        );
+        assert_eq!(
+            bound("/proc/thread-self/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: Some(5)
+            })
+        );
+        assert_eq!(
+            bound("/proc/self/task/6/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: Some(6)
+            })
+        );
+        assert_eq!(bound("/proc/self/fdinfo/7", None), None);
+        assert_eq!(owner("/proc/42/fdinfo/7"), Some(FdinfoOwner::Process(42)));
+        assert_eq!(
+            owner("/proc/42/fdinfo/../fdinfo/7"),
+            Some(FdinfoOwner::Process(42))
+        );
+        assert_eq!(
+            owner("/proc/self/task/43/fdinfo/7"),
+            Some(FdinfoOwner::Thread {
+                process: None,
+                thread: 43
+            })
+        );
+        assert_eq!(
+            owner("/proc/42/task/43/fdinfo/7"),
+            Some(FdinfoOwner::Thread {
+                process: Some(42),
+                thread: 43
+            })
+        );
+        assert_eq!(owner("/proc/self/status"), None);
+    }
+
+    /// A binding taken from the spelling stands only where the link of the
+    /// descriptor the kernel opened names the same task by number and the
+    /// same descriptor (`ProcfsFile::confirm_fdinfo_table`). Another task's
+    /// link, as after a `dup2` over the directory descriptor while the
+    /// opener waited for its turn, a thread's table for a process's, another
+    /// descriptor, a selector, an unrelated path or no link at all unbinds.
+    #[test]
+    fn a_fdinfo_binding_stands_only_where_the_opened_link_names_its_task() {
+        let process = |process| FdinfoTable {
+            process,
+            thread: None,
+        };
+        let thread = FdinfoTable {
+            process: 5,
+            thread: Some(6),
+        };
+        for (spelling, link, kept) in [
+            (
+                "/proc/self/fdinfo/7",
+                Some("/proc/5/fdinfo/7"),
+                Some(process(5)),
+            ),
+            (
+                "/proc/5/fdinfo/7",
+                Some("/proc/5/fdinfo/7"),
+                Some(process(5)),
+            ),
+            (
+                "/proc/thread-self/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/7"),
+                Some(thread),
+            ),
+            (
+                "/proc/self/task/6/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/7"),
+                Some(thread),
+            ),
+            ("/proc/5/fdinfo/7", Some("/proc/4/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", Some("/proc/5/fdinfo/8"), None),
+            ("/proc/self/fdinfo/7", Some("/proc/5/task/5/fdinfo/7"), None),
+            ("/proc/thread-self/fdinfo/7", Some("/proc/5/fdinfo/7"), None),
+            (
+                "/proc/thread-self/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/8"),
+                None,
+            ),
+            ("/proc/5/fdinfo/7", Some("/proc/self/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", Some("/proc/5/fdinfo"), None),
+            ("/proc/5/fdinfo/7", Some("/tmp/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", None, None),
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_fdinfo_table(Some((5, 6)));
+            assert!(file.fdinfo_table().is_some(), "{spelling} binds");
+            file.confirm_fdinfo_table(link.map(Path::new));
+            assert_eq!(file.fdinfo_table(), kept, "{spelling} opened as {link:?}");
+        }
+        // Nothing bound stays unbound.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/5/fdinfo/7")).unwrap();
+        file.bind_fdinfo_table(None);
+        file.confirm_fdinfo_table(Some(Path::new("/proc/5/fdinfo/7")));
+        assert_eq!(file.fdinfo_table(), None);
     }
 
     #[test]

@@ -2210,6 +2210,217 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
+/// Whether a kernel fdinfo bound at its open to `table`, the task whose
+/// descriptor table it shows (`procfs::FdinfoTable`), is of one of the
+/// reader's own descriptors, the reader being thread `tid` of process `pid`
+/// in Detcore's numbers (`Detcore::procfs_caller_ids`, `None` in a nested PID
+/// namespace): a bound thread must be the reader itself; a bound process must
+/// be the reader's, whose table (the leader's, which procfs shows for the
+/// process) the reader must hold (`holds_process_table`: the leader, or a
+/// thread that shares its table; a thread made without `CLONE_FILES` holds a
+/// copy). A file another task opened (a parent's, inherited through a fork
+/// or through a `/proc/self` directory descriptor; one received over
+/// `SCM_RIGHTS`), another process's fdinfo, a sibling thread's, the
+/// process's fdinfo read by a thread with a table of its own, and a file
+/// bound to nothing are not: there the descriptor shown is another table's,
+/// or one Detcore cannot establish, which the reader's descriptor of the same
+/// number says nothing about. Such a fdinfo gets no lock-line account, and is
+/// read as before the lock ledger, through the reader's descriptor of the same
+/// number: where the kernel's bytes reach the sanitizer, its lock lines are
+/// refused by name (`sanitize_fdinfo_checked`); where that descriptor is a
+/// file Detcore renders or a placeholder, its rendering answers instead, lock
+/// lines included; where the reader has none, the read fails with EBADF
+/// (https://github.com/facebookexperimental/hermit/issues/544).
+fn fdinfo_names_callers_table(
+    table: Option<crate::procfs::FdinfoTable>,
+    reader: Option<(i32, i32)>,
+    holds_process_table: bool,
+) -> bool {
+    match (table, reader) {
+        (Some(table), Some((pid, tid))) => {
+            table.process == pid
+                && match table.thread {
+                    Some(thread) => thread == tid,
+                    None => holds_process_table,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Where the task an open's spelling names came from, as
+/// [`Detcore::procfs_selector_opener`] decides it ([`procfs_selector_source`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SelectorSource {
+    /// The spelling names its task by number, or names none.
+    None,
+    /// A `self` or `thread-self` the call's own path spells, which Linux
+    /// resolves at this call, to the caller.
+    ThisCall,
+    /// A `self` or `thread-self` in the spelling of the directory descriptor
+    /// the relative path starts from, which Linux resolved at that
+    /// directory's open, to the task recorded on it
+    /// (`DetFd::procfs_selector_opener`).
+    Directory,
+    /// The spelling passes through a name the walk does not follow: a link
+    /// other than a selector (a task's `cwd`, `root` or `fd/N`, or an
+    /// ordinary symbolic link that happens to be called `self`), or any other
+    /// name outside the directories that reach a task's `fdinfo`. A `..` or a
+    /// selector's name after it says nothing of where Linux's lookup is, so
+    /// the spelling names no task Detcore can establish.
+    Unfollowed,
+}
+
+/// One directory, or the file below `fdinfo`, that [`procfs_selector_source`]'s
+/// walk can be at, with how a task directory's task was named.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProcfsWalkStep {
+    Root,
+    Proc,
+    /// A process directory: `<pid>`, or the one `self` or `thread-self`
+    /// reaches.
+    Process(ProcfsTaskName),
+    /// A process's `task` directory.
+    Tasks,
+    /// A thread directory: `task/<tid>`, or the one `thread-self` reaches.
+    Thread,
+    Fdinfo,
+    /// A name below `fdinfo`.
+    Entry,
+    /// Another directory of a task's, which is a directory and no link
+    /// (`fd`, `map_files`, `ns`, `net`, `attr`): a `..` from it is the task
+    /// again, and every name below it is a link or a file the walk does not
+    /// follow.
+    TaskDirectory,
+}
+
+/// The directories of a task's own, besides `task` and `fdinfo`, that are
+/// directories and no links (`tgid_base_stuff` and `tid_base_stuff`'s `DIR`
+/// entries, fs/proc/base.c).
+const PROCFS_TASK_DIRECTORIES: [&str; 5] = ["fd", "map_files", "ns", "net", "attr"];
+
+/// How the walk named a process directory: by number, or by a selector,
+/// spelled by the call's own path (`own`) or by the directory it starts from.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProcfsTaskName {
+    Number,
+    Selector { own: bool },
+}
+
+/// Whether `name` is a task number procfs looks up (`name_to_int`): decimal
+/// digits with no leading zero and no sign, at most `i32::MAX`. No task is 0.
+fn is_procfs_task_number(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        !name.is_empty()
+            && !name.starts_with('0')
+            && name.bytes().all(|byte| byte.is_ascii_digit())
+            && name.parse::<i32>().is_ok()
+    })
+}
+
+/// The steps one name below `step` takes the walk through, as Linux's lookup
+/// takes it, where the walk follows that name: `thread-self` is the link
+/// `<pid>/task/<tid>`, so a `..` after it is that process's `task`
+/// directory. `None` for a name the walk does not follow.
+fn procfs_walk_steps(
+    step: ProcfsWalkStep,
+    name: &std::ffi::OsStr,
+    own: bool,
+) -> Option<Vec<ProcfsWalkStep>> {
+    use ProcfsWalkStep::*;
+    let selector = ProcfsTaskName::Selector { own };
+    Some(match step {
+        Root if name == "proc" => vec![Proc],
+        Proc if name == "self" => vec![Process(selector)],
+        Proc if name == "thread-self" => vec![Process(selector), Tasks, Thread],
+        Proc if is_procfs_task_number(name) => vec![Process(ProcfsTaskName::Number)],
+        Process(_) if name == "task" => vec![Tasks],
+        Process(_) | Thread if name == "fdinfo" => vec![Fdinfo],
+        Process(_) | Thread if PROCFS_TASK_DIRECTORIES.iter().any(|known| name == *known) => {
+            vec![TaskDirectory]
+        }
+        Tasks if is_procfs_task_number(name) => vec![Thread],
+        Fdinfo => vec![Entry],
+        _ => return None,
+    })
+}
+
+/// [`SelectorSource`] for an open at `dirfd` of `path`, which reached
+/// `spelling`: the directory's recorded spelling (or the working
+/// directory's) joined with `path`, or `path` itself where it is absolute.
+///
+/// The spelling is walked one component at a time from `/`, as Linux's
+/// lookup walks it, and only through the names that reach a task's `fdinfo`:
+/// `/proc`, a task number or a selector directly below it, `task` and a
+/// thread's number, `fdinfo` and one name below it, and a task's other
+/// directories (`fd`, `map_files`, `ns`, `net`, `attr`), which only a `..`
+/// leaves, with `.` and `..` between them. A `..` climbs one of those directories, as it does on
+/// Linux, because none of them is reached through a link the walk does not
+/// model. Any other name stops the walk ([`SelectorSource::Unfollowed`]):
+/// past a `cwd`, a `root`, an `fd/N` or an ordinary symbolic link called
+/// `self`, a `..` climbs where the link led, which a lexical reading cannot
+/// know. So `../self/fdinfo/7` relative to a parent's `/proc/self` names
+/// the caller, and `cwd/self/../../fdinfo/7` relative to it names no task
+/// Detcore can establish, whatever `cwd/self` is.
+///
+/// The task a walk that ends below a process directory names is that
+/// directory's: by number ([`SelectorSource::None`]), or by a selector of the
+/// call's own path ([`SelectorSource::ThisCall`]) or of the directory
+/// descriptor's spelling ([`SelectorSource::Directory`]). A selector in the
+/// working directory's spelling resolves to the caller, as before: a
+/// residual for a working directory inherited through a fork. A spelling
+/// whose last components are not `path`'s (one a descriptor directory's
+/// link respelled) is not walked.
+fn procfs_selector_source(dirfd: i32, path: &Path, spelling: &Path) -> SelectorSource {
+    use std::path::Component;
+    let not_current = |component: &Component<'_>| !matches!(component, Component::CurDir);
+    let parts = spelling
+        .components()
+        .filter(not_current)
+        .collect::<Vec<_>>();
+    if parts.first() != Some(&Component::RootDir) {
+        return SelectorSource::None;
+    }
+    let own_parts = path.components().filter(not_current).collect::<Vec<_>>();
+    let Some(own_from) = parts.len().checked_sub(own_parts.len()) else {
+        return SelectorSource::Unfollowed;
+    };
+    if parts[own_from..] != own_parts[..] {
+        return SelectorSource::Unfollowed;
+    }
+    let mut walk = vec![ProcfsWalkStep::Root];
+    for (index, part) in parts.iter().enumerate().skip(1) {
+        match part {
+            Component::ParentDir => {
+                if walk.len() > 1 {
+                    walk.pop();
+                }
+            }
+            Component::Normal(name) => {
+                let step = *walk.last().expect("the walk keeps its root");
+                match procfs_walk_steps(step, name, index >= own_from) {
+                    Some(steps) => walk.extend(steps),
+                    None => return SelectorSource::Unfollowed,
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return SelectorSource::Unfollowed,
+        }
+    }
+    let process = walk.iter().find_map(|step| match step {
+        ProcfsWalkStep::Process(name) => Some(*name),
+        _ => None,
+    });
+    match process {
+        None | Some(ProcfsTaskName::Number) => SelectorSource::None,
+        Some(ProcfsTaskName::Selector { own: true }) => SelectorSource::ThisCall,
+        Some(ProcfsTaskName::Selector { own: false }) if dirfd == libc::AT_FDCWD => {
+            SelectorSource::ThisCall
+        }
+        Some(ProcfsTaskName::Selector { own: false }) => SelectorSource::Directory,
+    }
+}
+
 /// [`Detcore::ledger_takes_fact`]'s rule: the backend's fact stands in for an
 /// fdinfo only where the tool cannot read the guest's descriptors through the
 /// kernel's procfs (`tool_can_name_guest_descriptors` false), and only where
@@ -2763,6 +2974,245 @@ mod fdinfo_refusal_tests {
         // ptrace, DBT, SaBRe, LiteInst, in-guest, rendering or not.
         assert!(!ledger_takes_fact_where(true, true));
         assert!(!ledger_takes_fact_where(true, false));
+    }
+
+    /// Only a fdinfo bound at its open to the reader's own table has its
+    /// lock lines accounted for: one the reader's process opened through
+    /// `self` or its own number, or its own thread through `thread-self` or
+    /// below the process; the process's own fdinfo only for a reader that
+    /// holds the process's table. A fdinfo a parent opened through `self` and
+    /// a child reads after a fork (bound to the parent), another process's, a
+    /// sibling thread's, the process's read by a thread with a table of its
+    /// own (made without `CLONE_FILES`), one bound to nothing, and any read
+    /// from a nested PID namespace are not: their lines are refused.
+    #[test]
+    fn only_a_fdinfo_bound_to_the_readers_table_has_its_lock_lines_accounted_for() {
+        use crate::procfs::FdinfoTable;
+        let process = |process| FdinfoTable {
+            process,
+            thread: None,
+        };
+        let thread = |process, thread| FdinfoTable {
+            process,
+            thread: Some(thread),
+        };
+        // The reader is thread 5 of process 3, holding the process's table.
+        let own = |table| fdinfo_names_callers_table(Some(table), Some((3, 5)), true);
+        assert!(own(process(3)));
+        assert!(own(thread(3, 5)));
+        // The same thread with a table of its own: the process's fdinfo
+        // shows the leader's table, so only its own thread's is its.
+        assert!(!fdinfo_names_callers_table(
+            Some(process(3)),
+            Some((3, 5)),
+            false
+        ));
+        assert!(fdinfo_names_callers_table(
+            Some(thread(3, 5)),
+            Some((3, 5)),
+            false
+        ));
+        // A parent's `self` fdinfo read by its child 4 after a fork.
+        assert!(!fdinfo_names_callers_table(
+            Some(process(3)),
+            Some((4, 4)),
+            true
+        ));
+        // Another process, Hermit's init, a sibling thread.
+        assert!(!own(process(4)));
+        assert!(!own(process(1)));
+        assert!(!own(thread(3, 6)));
+        assert!(!own(thread(4, 5)));
+        assert!(!fdinfo_names_callers_table(None, Some((3, 5)), true));
+        assert!(!fdinfo_names_callers_table(Some(process(3)), None, true));
+    }
+
+    /// A `/proc` selector in an open's spelling is resolved at this call
+    /// where the guest's own path spells it: absolute, relative to the
+    /// working directory, or relative to a descriptor of `/proc` itself
+    /// (`self/fdinfo/7`). Where the selector came from the directory
+    /// descriptor's own spelling (`fdinfo/7` relative to a `/proc/self`
+    /// descriptor, `7` relative to `/proc/self/fdinfo`), it names the task
+    /// that directory was opened on. No selector, no source.
+    #[test]
+    fn a_procfs_selector_names_the_task_of_the_open_that_spelled_it() {
+        use SelectorSource::*;
+        let source = |dirfd, path: &str, spelling: &str| {
+            procfs_selector_source(dirfd, Path::new(path), Path::new(spelling))
+        };
+        let directory = 9;
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/self/fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                directory,
+                "/proc/thread-self/fdinfo/7",
+                "/proc/thread-self/fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "self/fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/self/fdinfo/7"),
+            Directory
+        );
+        assert_eq!(source(directory, "7", "/proc/self/fdinfo/7"), Directory);
+        // A `..` that climbs back to `/proc` and spells a selector of its own
+        // names the caller, whoever opened the directory.
+        assert_eq!(
+            source(directory, "../self/fdinfo/7", "/proc/self/../self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                directory,
+                "../../thread-self/fdinfo/7",
+                "/proc/self/fdinfo/../../thread-self/fdinfo/7"
+            ),
+            ThisCall
+        );
+        // One that stays below the directory's task keeps the directory's.
+        assert_eq!(
+            source(directory, "../fdinfo/7", "/proc/self/fdinfo/../fdinfo/7"),
+            Directory
+        );
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/thread-self/fdinfo/7"),
+            Directory
+        );
+        assert_eq!(source(directory, "fdinfo/7", "/proc/42/fdinfo/7"), None);
+        assert_eq!(
+            source(directory, "task/43/fdinfo/7", "/proc/42/task/43/fdinfo/7"),
+            None
+        );
+        // A `.` is no step, wherever it is.
+        assert_eq!(
+            source(directory, "./self/fdinfo/7", "/proc/./self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "./fdinfo/./7", "/proc/self/./fdinfo/./7"),
+            Directory
+        );
+        // A name the walk does not follow stops it: past a link other than a
+        // selector, a `..` climbs where the link led. An ordinary symbolic
+        // link called `self` below a task's `cwd` is no selector, and neither
+        // a selector's name nor a number after it names a task.
+        assert_eq!(
+            source(
+                directory,
+                "cwd/self/../../fdinfo/7",
+                "/proc/self/cwd/self/../../fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                directory,
+                "cwd/q/../../fdinfo/7",
+                "/proc/self/cwd/q/../../fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/root/proc/self/fdinfo/7",
+                "/proc/self/root/proc/self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/self/fd/5/7", "/proc/self/fd/5/7"),
+            Unfollowed
+        );
+        // A task's other directories are directories, not links: a `..`
+        // from one is the task again.
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/fd/../fdinfo/7",
+                "/proc/self/fd/../fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/task/12/ns/../fdinfo/7",
+                "/proc/self/task/12/ns/../fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "fd/../fdinfo/7", "/proc/self/fd/../fdinfo/7"),
+            Directory
+        );
+        // Below a directory the walk did not follow to `/proc`.
+        assert_eq!(source(directory, "self", "/tmp/self"), Unfollowed);
+        assert_eq!(
+            source(
+                directory,
+                "../proc/self/fdinfo/7",
+                "/tmp/../proc/self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        // `thread-self` is the link `<pid>/task/<tid>`: a `..` after it is
+        // the process's `task` directory, below which `self` is no name.
+        assert_eq!(
+            source(
+                directory,
+                "../self/fdinfo/7",
+                "/proc/thread-self/../self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                directory,
+                "../../fdinfo/7",
+                "/proc/thread-self/../../fdinfo/7"
+            ),
+            Directory
+        );
+        // Names outside the directories that reach a task's `fdinfo`, and
+        // numbers procfs does not look up.
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/locks", "/proc/locks"),
+            Unfollowed
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/042/fdinfo/7", "/proc/042/fdinfo/7"),
+            Unfollowed
+        );
+        // A name that merely starts like a selector is not one.
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/selfish/fdinfo/7",
+                "/proc/selfish/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        // A spelling whose last components are not the call's own path (a
+        // descriptor directory's link respelled) is not walked.
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/self/fdinfo/8"),
+            Unfollowed
+        );
+        // A relative spelling (a directory descriptor with no record) names
+        // no task.
+        assert_eq!(source(directory, "fdinfo/7", "fdinfo/7"), None);
     }
 
     /// The locks of a `descriptor_status` fact are spelled as the fdinfo
@@ -5315,6 +5765,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::observed_path(guest, dirfd, path)
     }
 
+    /// The pid and tid, as `/proc` spells them, of the task a `self` or
+    /// `thread-self` selector in an open's spelling (`spelling`, the path the
+    /// call at `dirfd` of `path` reached) names: the caller's, where the
+    /// guest's own path spells the selector (absolute, or relative to a
+    /// descriptor of `/proc` itself, or to the working directory), as Linux
+    /// resolves it at the call; the one recorded on the directory
+    /// descriptor the relative path starts from (`DetFd::procfs_selector_opener`),
+    /// where the selector came from that directory's own spelling, as Linux
+    /// pins the directory to its task at the directory's open. `None` with no
+    /// selector, in a nested PID namespace, for a directory descriptor with
+    /// no record (one received without one), and for a spelling that passes
+    /// through a name [`procfs_selector_source`] does not follow. A working directory
+    /// entered by such a spelling and inherited through a fork is resolved
+    /// to the caller, not to the task it was entered for: a residual.
+    pub(crate) fn procfs_selector_opener<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+        spelling: &Path,
+    ) -> Option<(i32, i32)> {
+        match procfs_selector_source(dirfd, path, spelling) {
+            SelectorSource::None | SelectorSource::Unfollowed => None,
+            SelectorSource::ThisCall => self.procfs_caller_ids(guest),
+            SelectorSource::Directory => guest
+                .thread_state()
+                .with_detfd(dirfd, |detfd| detfd.procfs_selector_opener())
+                .ok()
+                .flatten(),
+        }
+    }
+
     /// The procfs directory descriptor `dirfd` is open on, where Detcore has
     /// no record of the descriptor, as the guest names it: the kernel's name
     /// for it (its `/proc/thread-self/fd/N` link, `Self::descriptor_kernel_link`),
@@ -7444,6 +7926,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
                 // which may be outside the level.
                 let mut recordreplay_task_directory = false;
+                // The descriptor's link as the recording read it, under record
+                // and replay (`recorded_open_path`), for the fdinfo binding's
+                // confirmation below.
+                let mut recorded_open_link = None;
                 if procfs.is_none() || self.cfg.recordreplay_modes {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
@@ -7476,6 +7962,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     } else {
                         None
                     };
+                    if self.cfg.recordreplay_modes {
+                        recorded_open_link = resolved.clone();
+                    }
                     // Under record and replay, a `/proc` name outside the
                     // run's level that a spelling the lookup check does not
                     // resolve reached, named by the link the recording read
@@ -7690,6 +8179,110 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .as_mut()
                         .expect("a classified procfs file disappeared")
                         .bind_schedstat_thread(thread);
+                }
+                // The task a `self` or `thread-self` selector in this open's
+                // spelling names (`procfs_selector_opener`), kept with the
+                // open file below, so that a name later opened relative to it
+                // is that task's.
+                // A path through the caller's own descriptor links to a
+                // directory Detcore serves (`/proc/self/fd/N/...`) is walked
+                // as the decisions above respelled it
+                // (`descriptor_directory::decided_path`): through each link as
+                // Linux resolves it, below the directory's canonical spelling,
+                // which names its task by number. Every component of that
+                // absolute path is this call's, so it is walked as one.
+                let (walked_path, walked_spelling) = match &guest_spelled {
+                    Some(_) => (observed_path.as_path(), observed_path.as_path()),
+                    None => (path.as_path(), observed_path.as_path()),
+                };
+                let selector_opener =
+                    self.procfs_selector_opener(guest, call.dirfd(), walked_path, walked_spelling);
+                // Whether the walk followed the spelling to the task it names
+                // (`SelectorSource::Unfollowed`).
+                let spelling_followed =
+                    procfs_selector_source(call.dirfd(), walked_path, walked_spelling)
+                        != SelectorSource::Unfollowed;
+                // A descriptor's fdinfo shows the table of the task its path
+                // named at the open, `self` and `thread-self` resolved then
+                // (`seq_fdinfo_open` keeps that task's inode), not the table
+                // of whoever reads it later, after a fork or a descriptor's
+                // transfer. Bound only by a spelling, outside a nested PID
+                // namespace (`Detcore::procfs_caller_ids`), as above. Only a
+                // fdinfo bound to the reader's own table has its lock lines
+                // served, and only with sequentialized threads
+                // (`fdinfo_locks` at the read); any other is read as before
+                // the lock ledger (`fdinfo_names_callers_table` says how).
+                if procfs
+                    .as_ref()
+                    .is_some_and(|file| file.fdinfo_owner().is_some())
+                {
+                    // A selector names the task `procfs_selector_opener`
+                    // resolved it to: the opener, where the guest's own path
+                    // spells it (absolute, or relative to a descriptor of
+                    // `/proc` itself), or the task the directory descriptor
+                    // the path is relative to was opened on (a parent's
+                    // `/proc/self`, inherited through a fork), as Linux pins
+                    // that directory at its open. A number names its own task.
+                    // A spelling the walk did not follow binds no table, by
+                    // number or selector alike: its lexical reading may name a
+                    // task the kernel's lookup never reached.
+                    let names_selector = procfs.as_ref().is_some_and(|file| {
+                        matches!(
+                            file.fdinfo_owner(),
+                            Some(
+                                crate::procfs::FdinfoOwner::SelfProcess
+                                    | crate::procfs::FdinfoOwner::ThreadSelf
+                                    | crate::procfs::FdinfoOwner::Thread { process: None, .. }
+                            )
+                        )
+                    });
+                    let opener = if names_selector {
+                        selector_opener
+                    } else {
+                        self.procfs_caller_ids(guest)
+                    }
+                    .filter(|_| classified_by_spelling && spelling_followed);
+                    // Opened as the kernel opened it: where the kernel
+                    // refused the open (`proc_fdinfo_access_allowed`), its
+                    // EACCES has already reached the guest.
+                    procfs
+                        .as_mut()
+                        .expect("a classified procfs file disappeared")
+                        .bind_fdinfo_table(opener);
+                    // ⚠️ THE SPELLING WAS READ BEFORE THIS CALL'S SCHEDULER
+                    // TURN (`resource_request` above), which is a scheduling
+                    // point even with sequentialized threads (a chaos pick, or
+                    // an expired `--target-timeslice`). Another thread can
+                    // run there and change where the lookup starts (`dup2` of
+                    // another task's `/proc/<pid>` over the directory
+                    // descriptor, or a `chdir`): the spelling then names this
+                    // reader's table while the kernel opened another task's
+                    // fdinfo. So the binding stands only if the descriptor the
+                    // kernel returned names the same task and descriptor by
+                    // its own link (`ProcfsFile::confirm_fdinfo_table`; one
+                    // more injected `readlinkat`, which is no scheduling
+                    // point, so nothing runs between the kernel's open and
+                    // this check). A read trusts the binding only with
+                    // sequentialized threads (`fdinfo_locks` at the read).
+                    // Under record and replay the link is the one the
+                    // recording read for this open, above: replay's slot may
+                    // hold a stand-in eventfd, whose live link names no
+                    // fdinfo, so a live read would unbind there what the
+                    // recording served.
+                    if procfs
+                        .as_ref()
+                        .is_some_and(|file| file.fdinfo_table().is_some())
+                    {
+                        let opened = if self.cfg.recordreplay_modes {
+                            recorded_open_link.clone()
+                        } else {
+                            Self::descriptor_kernel_link(guest, fd).await
+                        };
+                        procfs
+                            .as_mut()
+                            .expect("a classified procfs file disappeared")
+                            .confirm_fdinfo_table(opened.as_deref());
+                    }
                 }
                 // The path the descriptor's link names, for a per-process
                 // file the backend keeps itself and does not name (the KVM
@@ -7969,6 +8562,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     if let Some((reached, incarnation)) = reached.clone() {
                         detfd.set_procfs_reached(reached, incarnation);
+                    }
+                    if let Some(ids) = selector_opener {
+                        detfd.set_procfs_selector_opener(ids);
                     }
                     if link_itself {
                         detfd.set_procfs_link_itself();
@@ -9889,6 +10485,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target_fd = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
+        // Whose descriptor this fdinfo names. Its open bound it to a
+        // descriptor table (`procfs_fdinfo_table`): the reader's own
+        // (`fdinfo_names_callers_table`), another task's, or none (a nested
+        // PID namespace, a file classified by its kernel link, a directory
+        // descriptor with no record, or a spelling the walk did not follow).
+        // As for a descriptor link (`DescriptorLinkOpener`),
+        // the leader holds the table procfs shows for the process, and so
+        // does every thread that shares it (`process_files`).
+        let fdinfo_table = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_fdinfo_table())?;
+        let holds_process_table = {
+            let detpid = self.own_detpid(guest);
+            let state = guest.thread_state();
+            state.dettid == detpid || state.holds_process_files()
+        };
+        let names_callers_table = fdinfo_names_callers_table(
+            fdinfo_table,
+            self.procfs_caller_ids(guest),
+            holds_process_table,
+        );
         // The kernel's fdinfo for a procfs file Detcore renders describes the
         // memfd standing in for it. Linux's names the file: Detcore's cursor,
         // the guest's procfs mount and the file's inode. The cursor is the one
@@ -9925,6 +10542,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => None,
         };
         let placeholder_inode = placeholder.as_ref().map(|(_, inode)| *inode);
+        // Whether these are the kernel's fdinfo bytes, whose `lock:` lines
+        // name host values (`fdinfo_locks` below).
+        let kernel_fdinfo = rendered_target.is_none() && placeholder.is_none();
         let contents = match (rendered_target, placeholder) {
             (Some((_, offset)), _) => rendered_procfs::rendered_target_fdinfo(
                 offset as u64,
@@ -10035,6 +10655,56 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))
         } else {
             None
+        };
+        // What the `lock:` lines of a descriptor's fdinfo the kernel printed
+        // show the guest (`procfs::FdinfoLockLines`), decided here, where
+        // Detcore's global state and device pool can be asked. Not for a
+        // fdinfo Detcore renders, whose lines it makes itself
+        // (`Self::render_own_fdinfo`). Boxed, so that this call's future
+        // holds its answer alone. Only for a fdinfo of one of the reader's
+        // own descriptors, as its open bound it (`fdinfo_names_callers_table`
+        // above). Any other fdinfo gets no account and is read as before the
+        // lock ledger (`fdinfo_names_callers_table` says how).
+        //
+        // ⚠️ ONLY WITH SEQUENTIALIZED THREADS. The binding was read from the
+        // open's spelling, before the kernel's open, and confirmed from the
+        // opened descriptor's own link after it. Without sequentialized
+        // threads another thread can, between any two of these steps, `dup2`
+        // another task's `/proc/<pid>` over the directory descriptor the
+        // lookup starts from, another fdinfo over the descriptor the kernel
+        // returned before the binding is installed on it, or another fdinfo
+        // over this read's descriptor: the binding would then admit another
+        // task's lock lines under the reader's identity, which base refused.
+        // The link check narrows that window but does not close it, so there
+        // the account is withheld: the read is as before the lock ledger, the
+        // kernel's lock lines refused by name where they reach the sanitizer.
+        // With sequentialized threads only one guest thread runs at a time:
+        // the open's check runs under its turn, right after the kernel's open,
+        // and a `dup2` between the open and this read moves the other
+        // description's record, binding included, onto this descriptor
+        // (`dup_fd_after_replacement`).
+        let fdinfo_locks = match target_fd
+            .filter(|_| names_callers_table && guest.config().sequentialize_threads)
+        {
+            Some(target_fd)
+                if kernel_fdinfo
+                    && !guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.procfs_is_rendered_fdinfo())? =>
+            {
+                let (open_file, lock_tracked) =
+                    guest.thread_state().with_detfd(target_fd, |detfd| {
+                        (detfd.open_file_id(), detfd.is_lock_tracked())
+                    })?;
+                Box::pin(Self::kernel_fdinfo_locks(
+                    guest,
+                    open_file,
+                    lock_tracked,
+                    &contents,
+                ))
+                .await
+            }
+            _ => None,
         };
         // The guest's CPUID instruction is answered from Detcore's table
         // exactly when CPUID is virtualized and the backend delivers the
@@ -10396,6 +11066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     task_stat,
                     task_status: task_status.clone(),
                     fdinfo_rendering: fdinfo_rendering.clone(),
+                    fdinfo_locks: fdinfo_locks.clone(),
                 },
             );
         })?;
@@ -14482,6 +15153,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 Ok(result)
             }
+            // Elsewhere the kernel holds the lease and prints it in the
+            // description's fdinfo. The ledger keeps the lease this call took
+            // or released, from its kind and its result alone (recorded, so a
+            // replay keeps the same), and vouches for a fdinfo's lease lines
+            // against it (`procfs::locks::LockLedger::note_lease`). No fdinfo
+            // is read, so the recording is unchanged. A failed call changes
+            // nothing.
+            F_SETLEASE(kind) => {
+                let result = self.record_or_replay(guest, call).await?;
+                let lease = match kind {
+                    libc::F_RDLCK => Some("READ"),
+                    libc::F_WRLCK => Some("WRITE"),
+                    _ => None,
+                };
+                self.note_description_lease(guest, fd, lease).await;
+                Ok(result)
+            }
             _ => {
                 trace!(
                     "[detcore-finishme]: fcntl unhandled cases: {:?}",
@@ -14490,6 +15178,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(self.record_or_replay(guest, call).await?)
             }
         }
+    }
+
+    /// The guest's own `F_SETLEASE` through `fd` succeeded, leaving its open
+    /// file description holding a lease of `lease`'s access, or none: the
+    /// ledger keeps it for this description
+    /// (`procfs::locks::LockLedger::note_lease`), which it follows from now
+    /// on (`DetFd::set_lock_tracked`). A descriptor Detcore keeps no model of
+    /// is left out; a fdinfo of it is then not vouched for.
+    async fn note_description_lease<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        lease: Option<&str>,
+    ) {
+        let Ok(open_file) = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_lock_tracked();
+            detfd.open_file_id()
+        }) else {
+            return;
+        };
+        let slots = guest.thread_state().slots_naming(open_file);
+        crate::tool_global::note_description_lease(
+            guest,
+            open_file,
+            lease.map(str::to_owned),
+            slots,
+        )
+        .await;
     }
 
     /// Record which OFD and flock locks the open file description `fd` names
@@ -15034,6 +15750,66 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.refuse_lock_bookkeeping(guest, reason).await
             }
         }
+    }
+
+    /// What the `lock:` lines of a fdinfo the kernel printed (`contents`) of
+    /// a descriptor of `open_file` show the guest (`procfs::FdinfoLockLines`):
+    /// each line's owner, from Detcore's lock ledger, flock model and process
+    /// table (`procfs::locks::LockLedger::fdinfo_owners`), and the file's
+    /// device as a lock line Detcore renders shows it
+    /// ([`Self::lock_line_device`]). `None` where the file has no lock line,
+    /// or one Detcore cannot parse, which the sanitizer refuses by name.
+    async fn kernel_fdinfo_locks<G: Guest<Self>>(
+        guest: &mut G,
+        open_file: OpenFileId,
+        lock_tracked: bool,
+        contents: &[u8],
+    ) -> Option<crate::procfs::FdinfoLockLines> {
+        let rows = crate::procfs::locks::fdinfo_lock_rows(contents)?;
+        if rows.is_empty() {
+            // No lock line: shown as it is, unless the guest's own lease on
+            // the description, or an OFD or flock lock the ledger last read
+            // it holding, is gone from it, a removal Detcore did not see, or
+            // the ledger's record of it may be stale for the file the
+            // fdinfo's `ino:` line names, or is unknown
+            // (`procfs::locks::LockLedger::fdinfo_owners`), which the
+            // sanitizer then refuses by name. Only a description whose locks
+            // the ledger follows can hold a lock or lease the guest took.
+            if !lock_tracked {
+                return None;
+            }
+            let owners = crate::tool_global::fdinfo_lock_owners(
+                guest,
+                open_file,
+                Vec::new(),
+                fdinfo_inode(contents),
+            )
+            .await;
+            return owners.is_err().then_some(crate::procfs::FdinfoLockLines {
+                rows,
+                owners,
+                device: (0, 0),
+            });
+        }
+        // Every line names the description's own file (`__show_fd_locks`
+        // lists only locks taken through it), so the first names its
+        // device; the sanitizer refuses a line that names another.
+        let mut object = rows.first()?.lock.object.split(':');
+        let major = u32::from_str_radix(object.next()?, 16).ok()?;
+        let minor = u32::from_str_radix(object.next()?, 16).ok()?;
+        let device = Self::lock_line_device(guest, libc::makedev(major, minor)).await;
+        let owners = crate::tool_global::fdinfo_lock_owners(
+            guest,
+            open_file,
+            rows.clone(),
+            fdinfo_inode(contents),
+        )
+        .await;
+        Some(crate::procfs::FdinfoLockLines {
+            rows,
+            owners,
+            device: (libc::major(device), libc::minor(device)),
+        })
     }
 
     /// Stop the run, by name, with the policy-refusal exit, because Detcore

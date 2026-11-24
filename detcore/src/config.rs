@@ -454,6 +454,28 @@ mod tests {
         // access to the guest. 60 on its own base, then 61, then 62 at its
         // rebase onto main's 61. Digests measured at this head.
         (62, "faab2e5b78560755", "878bf500cb907b38"),
+        // Adds `GlobalRequest::FdinfoLockOwners` and its response: the owner
+        // each `lock:` line of a fdinfo the kernel printed shows, or why the
+        // lines cannot be served (`procfs::locks::LockLedger::fdinfo_owners`).
+        // The request carries `procfs::locks::LockRowFacts` and the inode
+        // number the fdinfo's `ino:` line names. Also
+        // `GlobalRequest::DescriptionLease` and its response: the lease a
+        // guest's own `F_SETLEASE` left a description holding
+        // (`procfs::locks::LockLedger::note_lease`), in the same unshipped
+        // revision, which also digests the lock types the global RPC carries
+        // (`PROCFS_LOCKS_WIRE`: `HeldLock`, `LockRowFacts`). after(main's 62);
+        // digest measured at that change's earlier head.
+        (63, "ab96e5dcab88f7a4", "878bf500cb907b38"),
+        // The same change, with the procfs open file model an exec carries in
+        // digest (`PROCFS_FILE_WIRE`: `ProcfsFile`, to which the change adds
+        // `fdinfo_owner` and `fdinfo_table`, `FdinfoOwner` and `FdinfoTable`),
+        // and the open file description the shared open-file model encodes
+        // (`OPEN_FILE_MODEL_WIRE`, to which it adds `procfs_selector_opener`).
+        // Bincode encodes those fields by position in `PrepareExec`,
+        // `MarkPastFirstExecve` and a `SharedOpenFile` model, and a build at
+        // 63 digested none of them, so the two refuse each other.
+        // after(63); digest measured at this head.
+        (64, "3b3fb004a092d7b3", "878bf500cb907b38"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -545,6 +567,33 @@ mod tests {
     /// finding 1 of the review of 29b3e6a8).
     const SIGALRM_CONTROL_WIRE: [&str; 1] = ["pub enum SigalrmControl {"];
 
+    /// The lock types procfs/locks.rs defines that global requests and
+    /// responses carry (`GlobalRequest::FdinfoLockOwners`, `LockOwners`,
+    /// `SecondIdentityLocks`, `GuestLockRows`, ...): a lock as `/proc/locks`
+    /// and fdinfo spell it, and the facts of one row.
+    const PROCFS_LOCKS_WIRE: [&str; 2] = ["pub struct HeldLock {", "pub struct LockRowFacts {"];
+
+    /// The procfs open file model, in procfs.rs, that `ExecFdState` carries
+    /// across an exec (`GlobalRequest::PrepareExec` and `MarkPastFirstExecve`,
+    /// through `ExecMapsFile` and `ExecProcfsRecord`), and the fdinfo binding
+    /// types its fields hold (`FdinfoOwner`, `FdinfoTable`). Bincode encodes
+    /// its serialized fields by position, so a field added, removed,
+    /// reordered or retyped changes every such message, `#[serde(default)]`
+    /// or not; a `#[serde(skip)]` field does not encode at all. Types it
+    /// carries from elsewhere are not listed (minibeads dh-uxyyj).
+    const PROCFS_FILE_WIRE: [&str; 3] = [
+        "pub(crate) struct ProcfsFile {",
+        "pub(crate) enum FdinfoOwner {",
+        "pub(crate) struct FdinfoTable {",
+    ];
+
+    /// The open file description, in fd.rs, that the shared open-file model
+    /// (`OpenFileModel`) encodes in bincode and `GlobalRequest::SharedOpenFile`
+    /// carries between peers as bytes, which the enums' own digest therefore
+    /// cannot see. It holds a `ProcfsFile` and, among others, the
+    /// `procfs_selector_opener` this revision adds.
+    const OPEN_FILE_MODEL_WIRE: [&str; 1] = ["struct OpenFileDescription {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -589,9 +638,13 @@ mod tests {
     /// scheduled event's wire items in `schedule`, of the trace reply's
     /// wire items in `source` and `replayer`, of the nested wire types
     /// in `host_input` (`HOST_INPUT_WIRE`), of 2b-1's payload types in
-    /// `source` and `task_stat`, of 2b-3's in `source`, and of the SIGALRM
-    /// control in `source` (`SIGALRM_CONTROL_WIRE`): their variants, fields,
-    /// payload types, order and attributes, not their documentation.
+    /// `source` and `task_stat`, of 2b-3's in `source`, of the SIGALRM
+    /// control in `source` (`SIGALRM_CONTROL_WIRE`), of the lock types in
+    /// procfs/locks.rs (`PROCFS_LOCKS_WIRE`), of the procfs open file model
+    /// in procfs.rs (`PROCFS_FILE_WIRE`), and of the open file description
+    /// the shared open-file model encodes, in fd.rs (`OPEN_FILE_MODEL_WIRE`):
+    /// their variants, fields, payload types, order and attributes, not
+    /// their documentation.
     fn definition_digest(
         source: &str,
         payload: &str,
@@ -621,6 +674,9 @@ mod tests {
         .join("\n");
         let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
         let sigalrm_control = wire_items(source, &SIGALRM_CONTROL_WIRE);
+        let procfs_locks = wire_items(include_str!("procfs/locks.rs"), &PROCFS_LOCKS_WIRE);
+        let procfs_file = wire_items(include_str!("procfs.rs"), &PROCFS_FILE_WIRE);
+        let open_file_model = wire_items(include_str!("fd.rs"), &OPEN_FILE_MODEL_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -631,6 +687,9 @@ mod tests {
             (7, procfs.as_bytes()),
             (8, exec_strings.as_bytes()),
             (10, sigalrm_control.as_bytes()),
+            (12, procfs_locks.as_bytes()),
+            (13, procfs_file.as_bytes()),
+            (14, open_file_model.as_bytes()),
         ])
     }
 
@@ -803,6 +862,37 @@ mod tests {
         assert_eq!(
             resources_definition_digest(&resources_documented),
             resources_digest
+        );
+        // A field of the procfs open file model, which an exec carries in its
+        // global RPC (`PROCFS_FILE_WIRE`), is in the digest, `#[serde(default)]`
+        // or not: bincode encodes by position. Its documentation is not.
+        let procfs = include_str!("procfs.rs");
+        let procfs_file = wire_items(procfs, &PROCFS_FILE_WIRE);
+        let table = "    #[serde(default)]\n    fdinfo_table: Option<FdinfoTable>,\n";
+        let without = procfs.replacen(table, "", 1);
+        assert_ne!(without, procfs);
+        assert_ne!(wire_items(&without, &PROCFS_FILE_WIRE), procfs_file);
+        let documented =
+            procfs.replacen(table, &format!("    /// Documentation only.\n{table}"), 1);
+        assert_ne!(documented, procfs);
+        assert_eq!(wire_items(&documented, &PROCFS_FILE_WIRE), procfs_file);
+        // So is a field of the open file description a shared open-file model
+        // carries (`OPEN_FILE_MODEL_WIRE`).
+        let fd = include_str!("fd.rs");
+        let open_file_model = wire_items(fd, &OPEN_FILE_MODEL_WIRE);
+        let selector = "    #[serde(default)]\n    procfs_selector_opener: Option<(i32, i32)>,\n";
+        let without = fd.replacen(selector, "", 1);
+        assert_ne!(without, fd);
+        assert_ne!(wire_items(&without, &OPEN_FILE_MODEL_WIRE), open_file_model);
+        let documented = fd.replacen(
+            selector,
+            &format!("    /// Documentation only.\n{selector}"),
+            1,
+        );
+        assert_ne!(documented, fd);
+        assert_eq!(
+            wire_items(&documented, &OPEN_FILE_MODEL_WIRE),
+            open_file_model
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
         // added to it, or a change to which fields its `Serialize` writes,
