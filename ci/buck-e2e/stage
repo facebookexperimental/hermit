@@ -382,7 +382,7 @@ done
 "$staged/src/ci/hermetic/run-in-pinned-root.sh" --check-image ||
     { echo "ci/buck-e2e/stage: the pinned-root image is required to prepare the compat fixtures (see above)" >&2; exit 1; }
 mkdir -p "$tmp/fixture-out"
-"$staged/src/ci/hermetic/run-in-pinned-root.sh" --src "$staged" --out "$tmp/fixture-out" --src-rw -- \
+"$staged/src/ci/hermetic/run-in-pinned-root.sh" --src "$staged" --out "$tmp/fixture-out" --src-rw --cargo-home none -- \
     bash -c 'cd /src/src && ./tests/compat/prepare_real_compat_fixtures.sh /src/run-state/strict-compat/real-compat-fixtures' >/dev/null
 echo "$sha" >"$staged/SOURCE_SHA"
 echo "staged $(du -sh "$staged" | cut -f1) for $sha"

@@ -226,7 +226,11 @@ ignored-test arguments after `--` without appending a misplaced worker flag.
 Other wrapped commands retain the scheduler's appended arguments as literal
 arguments to their original command.
 
-The wrapper imports only Cargo's registry and Git caches from `--cargo-home`.
+The wrapper imports only Cargo's registry and Git caches from `--cargo-home`,
+bind-mounted writable, because an explicit home is a build-phase home that
+Cargo extracts into. Without `--cargo-home`, the caller's `$HOME/.cargo`
+caches are instead seeded under a private overlay, so the caller's live
+caches are never written; `--cargo-home none` imports no caches at all.
 The image supplies executables and configuration; host Cargo configuration and
 rustup proxies do not cross that boundary. `VALIDATE_RUN_STATE` and structured
 result paths are mounted explicitly so the original producers and consumers

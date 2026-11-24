@@ -5,7 +5,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Exercise the actual wrapper's cache mounts without starting a container."""
+"""Exercise the actual wrapper's cache mounts, mostly without a container.
+
+One live case (SeededOverlayLive) starts a real container where podman and
+the pinned image are available, and skips by name where they are not.
+"""
 
 import hashlib
 import json
@@ -137,6 +141,7 @@ class CargoCacheMounts(unittest.TestCase):
         extra_env=None,
         extra_forwarded=None,
         prefix=None,
+        home=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -165,6 +170,15 @@ class CargoCacheMounts(unittest.TestCase):
             env.update(extra_env)
         if extra_forwarded:
             forwarded += extra_forwarded
+        # `home` pins the HOME the wrapper sees: a path, or "" for unset.
+        # Seeding reads the caller's HOME, so no seeded-mode case may
+        # inherit this process's real one.
+        if home is not None:
+            if home == "":
+                env.pop("HOME", None)
+            else:
+                env["HOME"] = str(home)
+        cargo_args = [] if cargo_home is None else ["--cargo-home", cargo_home]
         result = subprocess.run(
             [
                 *(prefix or []),
@@ -174,8 +188,7 @@ class CargoCacheMounts(unittest.TestCase):
                 str(source),
                 "--out",
                 output,
-                "--cargo-home",
-                cargo_home,
+                *cargo_args,
                 "--digest",
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 *forwarded,
@@ -430,6 +443,12 @@ class CargoCacheMounts(unittest.TestCase):
                 f"type=bind,source={self.root}/cargo/registry,destination=/build/.cargo/registry",
                 f"type=bind,source={self.root}/cargo/git,destination=/build/.cargo/git",
             ],
+        )
+        # The explicit home stays a writable bind: it is a build-phase home
+        # cargo extracts into, never the caller's live ~/.cargo.
+        self.assertTrue(
+            all("ro=true" not in mount and "readonly" not in mount for mount in imports),
+            imports,
         )
         self.assertIn(
             f"type=bind,source={self.root}/source,destination=/src,ro=true", mounts
@@ -794,6 +813,132 @@ class CargoCacheMounts(unittest.TestCase):
                 ]
             ],
         )
+
+    def make_home_with_caches(self):
+        home = self.root / "home"
+        for directory in (".cargo/registry", ".cargo/git", ".cargo/bin"):
+            (home / directory).mkdir(parents=True, exist_ok=True)
+        (home / ".cargo/config.toml").write_text(
+            "host configuration must not be imported\n"
+        )
+        (home / ".cargo/bin/cargo-clippy").write_text(
+            "host executable must not be imported\n"
+        )
+        return home
+
+    def cargo_volumes(self, argv):
+        return [
+            argv[index + 1]
+            for index, arg in enumerate(argv)
+            if arg == "--volume" and ":/build/.cargo/" in argv[index + 1]
+        ]
+
+    def test_default_seeds_home_caches_under_a_private_overlay(self):
+        home = self.make_home_with_caches()
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(
+            self.cargo_volumes(argv),
+            [
+                f"{home}/.cargo/registry:/build/.cargo/registry:O",
+                f"{home}/.cargo/git:/build/.cargo/git:O",
+            ],
+        )
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertFalse(any(".cargo/bin" in arg for arg in argv))
+        self.assertIn(
+            f"seeding cargo dependency caches from {home}/.cargo under a private overlay",
+            result.stderr,
+        )
+        for cache in ("registry", "git"):
+            self.assertTrue(
+                (self.root / "output/home/.cargo" / cache).is_dir(), cache
+            )
+
+    def test_default_without_home_caches_seeds_nothing(self):
+        home = self.root / "empty-home"
+        home.mkdir()
+        result, calls = self.invoke(
+            cargo_home=None, home=home, command=["cargo", "build"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(self.cargo_volumes(argv), [])
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+        self.assertIn("offline cargo builds need populated caches", result.stderr)
+        self.assertNotIn("caches are mounted read-only", result.stderr)
+
+    def test_cargo_home_none_seeds_nothing_even_with_home_caches(self):
+        home = self.make_home_with_caches()
+        result, calls = self.invoke(cargo_home="none", home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(self.cargo_volumes(argv), [])
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+
+    def test_home_unset_seeds_nothing_and_names_it(self):
+        result, calls = self.invoke(
+            cargo_home=None, home="", command=["cargo", "build"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.cargo_volumes(calls[1]), [])
+        self.assertIn("HOME is unset, so no cargo caches are seeded", result.stderr)
+
+    def test_empty_cargo_home_value_is_refused_by_name(self):
+        result, calls = self.invoke(cargo_home="")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--cargo-home was given an empty value", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_no_home_caches_with_a_non_cargo_payload_is_silent(self):
+        home = self.root / "empty-home"
+        home.mkdir()
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.cargo_volumes(calls[1]), [])
+        self.assertNotIn("offline cargo builds", result.stderr)
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+
+    def test_seeded_home_path_with_a_colon_is_refused_by_name(self):
+        home = self.root / "ho:me"
+        (home / ".cargo/registry").mkdir(parents=True)
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(
+            "an overlay volume cannot name a source path containing ':'",
+            result.stderr,
+        )
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "image",
+                    "exists",
+                    "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ]
+            ],
+        )
+
+    def test_buck_cells_and_fixture_stage_pin_no_cargo_caches(self):
+        buck_e2e = WRAPPER.parent.parent / "buck-e2e"
+        cell = (buck_e2e / "cell.sh").read_text()
+        self.assertIn(
+            '"$wrapper" --src "$R" --out "$W/pinned" --src-rw --cargo-home none',
+            cell,
+        )
+        stage = (buck_e2e / "stage").read_text()
+        self.assertIn("--src-rw --cargo-home none --", stage)
 
     def test_run_state_uses_the_same_host_directory_for_each_pinned_command(self):
         run_state = self.root / "run state"
@@ -2365,6 +2510,217 @@ class PinnedGuestPathContract(unittest.TestCase):
         # test.record_replay's curl_recording_replays_offline_with_identical_logs
         # finds curl on PATH (https://github.com/rrnewton/hermit/issues/3786).
         self.assertIn("/usr/bin/curl", paths, "record_replay curl guest")
+
+
+class SeededOverlayLive(unittest.TestCase):
+    """The seeded default must never write the caller's cargo home.
+
+    Builds a scratch HOME whose .cargo holds a registry crate that is
+    cached but not extracted and a git dependency that is in the db but
+    not checked out, runs the real wrapper on its default (seeded) path,
+    and requires the scratch .cargo to be byte-identical afterwards:
+    extractions and checkouts may only land in the container-private
+    overlay upper layer. Skips by name where podman, the pinned image,
+    or the fixture tools are unavailable.
+    """
+
+    def cargo_manifest(self, cargo_home):
+        lines = []
+        for path in sorted(p for p in cargo_home.rglob("*") if p.is_file()):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            lines.append(f"{path.relative_to(cargo_home)} {path.stat().st_size} {digest}")
+        return hashlib.sha256("\n".join(lines).encode()).hexdigest(), lines
+
+    def run_fixture(self, args, cwd, env=None):
+        return subprocess.run(
+            args, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
+        )
+
+    def test_seeded_default_build_leaves_host_cargo_home_byte_unchanged(self):
+        if Path("/run/.containerenv").exists():
+            self.skipTest("inside a container; nested podman is not used")
+        if shutil.which("podman") is None:
+            self.skipTest("podman not on PATH")
+        image = WRAPPER.with_name("image.digest").read_text().strip()
+        exists = subprocess.run(
+            ["podman", "image", "exists", image],
+            capture_output=True, text=True, timeout=120,
+        )
+        if exists.returncode != 0:
+            self.skipTest(f"pinned image {image} not in the local podman store")
+        # Past this point the case must run: missing tools are failures,
+        # not skips a host could quietly sit on.
+        for tool in ("cargo", "git"):
+            if shutil.which(tool) is None:
+                self.fail(
+                    f"{tool} not on PATH although podman and the pinned image "
+                    "exist; the seeded-overlay case must run here"
+                )
+        scratch = tempfile.TemporaryDirectory(prefix="seeded-overlay-live-")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        gitlib = root / "gitlib"
+        (gitlib / "src").mkdir(parents=True)
+        (gitlib / "Cargo.toml").write_text(
+            '[package]\nname = "gitprobe-lib"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n'
+        )
+        (gitlib / "src/lib.rs").write_text("pub fn answer() -> i32 {\n    42\n}\n")
+        neutral = repository_neutral_env()
+        for args in (
+            ["git", "init", "-b", "main", "-q"],
+            ["git", "add", "Cargo.toml", "src/lib.rs"],
+            ["git", "-c", "user.name=seeded-overlay-live",
+             "-c", "user.email=seeded-overlay-live@invalid",
+             "commit", "-qm", "gitprobe-lib"],
+        ):
+            done = self.run_fixture(args, gitlib, env=neutral)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        src = root / "consumer"
+        for directory in (
+            "src", "agent-utils/rs/target",
+            "agent-utils/rs/.agent-utils-locks",
+            "agent-utils/rs/.agent-utils-snapshots",
+        ):
+            (src / directory).mkdir(parents=True, exist_ok=True)
+        (src / "Cargo.toml").write_text(
+            '[package]\nname = "seeded-overlay-live"\nversion = "0.1.0"\n'
+            'edition = "2021"\n\n[dependencies]\nseededreg = "=0.1.0"\n'
+            f'gitprobe-lib = {{ git = "file://{gitlib}" }}\n\n[workspace]\n'
+        )
+        (src / "src/main.rs").write_text(
+            "fn main() {\n"
+            '    println!("seeded-live reg={} answer={}", '
+            "seededreg::val(), gitprobe_lib::answer());\n}\n"
+        )
+        home = root / "home"
+        cargo_home = home / ".cargo"
+        lock_env = {**os.environ, "CARGO_HOME": str(cargo_home)}
+        # Prime the git db through a git-only crate: cargo --offline will
+        # not clone a git dependency, so the db must exist before the real
+        # lock step. The priming clone is a local file:// fetch, and the
+        # checkout it makes is deleted again with the fixture clean-up.
+        prime = root / "prime"
+        (prime / "src").mkdir(parents=True)
+        (prime / "Cargo.toml").write_text(
+            '[package]\nname = "prime"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            f'[dependencies]\ngitprobe-lib = {{ git = "file://{gitlib}" }}\n\n[workspace]\n'
+        )
+        (prime / "src/main.rs").write_text(
+            'fn main() { println!("{}", gitprobe_lib::answer()); }\n'
+        )
+        primed = self.run_fixture(
+            ["cargo", "generate-lockfile"], prime, env=lock_env
+        )
+        if primed.returncode != 0:
+            self.fail(
+                "cannot prime the scratch git db "
+                f"({primed.stderr.strip()[-200:]})"
+            )
+        # Self-contained registry fixture: package a tiny local crate and
+        # write its .crate archive plus a synthesized sparse-index cache
+        # entry (with the crate's sha256 as its checksum) into the scratch
+        # registry. Nothing is read from the caller's real cargo home, so
+        # the case runs identically on any host with podman and the image.
+        regcrate = root / "regcrate"
+        (regcrate / "src").mkdir(parents=True)
+        (regcrate / "Cargo.toml").write_text(
+            '[package]\nname = "seededreg"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n'
+        )
+        (regcrate / "src/lib.rs").write_text("pub fn val() -> i32 {\n    7\n}\n")
+        packaged = self.run_fixture(
+            ["cargo", "package", "--offline"], regcrate,
+            env={**os.environ, "CARGO_HOME": str(root / "pkg-home/.cargo")},
+        )
+        if packaged.returncode != 0:
+            self.fail(
+                "cannot package the fixture registry crate "
+                f"({packaged.stderr.strip()[-200:]})"
+            )
+        crate_path = regcrate / "target/package/seededreg-0.1.0.crate"
+        if not crate_path.exists():
+            self.fail(f"packaged fixture crate missing at {crate_path}")
+        # The index directory name carries a cargo-computed hash; cargo's
+        # own debug output names it, version-independent, on the offline
+        # attempt that is expected to fail before the entry exists.
+        probe = subprocess.run(
+            ["cargo", "generate-lockfile", "--offline"], cwd=src,
+            env={**lock_env, "CARGO_LOG": "debug"},
+            capture_output=True, text=True, timeout=300,
+        )
+        found = re.search(r"index\.crates\.io-[0-9a-z]+", probe.stdout + probe.stderr)
+        if found is None:
+            self.fail("cannot discover the sparse index directory name from cargo debug output")
+        index_id = found.group(0)
+        cache_dst = cargo_home / "registry/cache" / index_id
+        cache_dst.mkdir(parents=True)
+        shutil.copyfile(crate_path, cache_dst / crate_path.name)
+        index_root = cargo_home / "registry/index" / index_id
+        (index_root / ".cache/se/ed").mkdir(parents=True)
+        (index_root / "config.json").write_text(
+            '{\n  "dl": "https://static.crates.io/crates",\n  "api": "https://crates.io"\n}\n'
+        )
+        meta = {
+            "name": "seededreg", "vers": "0.1.0", "deps": [],
+            "cksum": hashlib.sha256(crate_path.read_bytes()).hexdigest(),
+            "features": {}, "yanked": False,
+        }
+        (index_root / ".cache/se/ed/seededreg").write_bytes(
+            b"\x03" + (2).to_bytes(4, "little")
+            + b'etag: "seeded-overlay-live"\x00' + b"0.1.0\x00"
+            + json.dumps(meta, separators=(",", ":")).encode() + b"\x00"
+        )
+        locked = self.run_fixture(
+            ["cargo", "generate-lockfile", "--offline"], src, env=lock_env
+        )
+        if locked.returncode != 0:
+            self.fail(
+                "cannot lock against the synthesized scratch registry "
+                f"({locked.stderr.strip()[-200:]})"
+            )
+        for extracted in cargo_home.glob("registry/src/*/seededreg-0.1.0"):
+            shutil.rmtree(extracted)
+        for checkout in cargo_home.glob("git/checkouts/*"):
+            shutil.rmtree(checkout)
+        self.assertTrue(list(cargo_home.glob("git/db/*")), "git db populated")
+        self.assertEqual(list(cargo_home.glob("registry/src/*/seededreg-0.1.0")), [])
+        self.assertEqual(list(cargo_home.glob("git/checkouts/*")), [])
+        before_hash, before = self.cargo_manifest(cargo_home)
+        env = {**os.environ, "HOME": str(home)}
+        # Swapping HOME would also move rootless podman's default store and
+        # config (both derive from HOME when XDG is unset), making the
+        # pinned image "absent" on a default-layout host. Pin both XDG
+        # roots to the caller's real ones so podman looks exactly where it
+        # did before the swap.
+        real_home = Path.home()
+        # An empty XDG value is unset for podman's path derivation too.
+        env["XDG_DATA_HOME"] = (
+            os.environ.get("XDG_DATA_HOME") or str(real_home / ".local/share")
+        )
+        env["XDG_CONFIG_HOME"] = (
+            os.environ.get("XDG_CONFIG_HOME") or str(real_home / ".config")
+        )
+        result = subprocess.run(
+            [
+                "bash", str(WRAPPER),
+                "--src", str(src), "--out", str(root / "out"), "--src-rw",
+                "--", "bash", "-c",
+                "cd /src && cargo build --locked --offline && "
+                "./target/debug/seeded-overlay-live",
+            ],
+            env=env, capture_output=True, text=True, timeout=900,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("seeded-live reg=7 answer=42", result.stdout)
+        self.assertIn("seeding cargo dependency caches", result.stderr)
+        after_hash, after = self.cargo_manifest(cargo_home)
+        changed = [line for line in before if line not in after][:5]
+        added = [line for line in after if line not in before][:5]
+        self.assertEqual(
+            before_hash, after_hash,
+            f"seeded run changed the host cargo home: changed={changed} added={added}",
+        )
+        self.assertEqual(list(cargo_home.glob("registry/src/*/seededreg-0.1.0")), [])
+        self.assertEqual(list(cargo_home.glob("git/checkouts/*")), [])
 
 
 if __name__ == "__main__":

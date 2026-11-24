@@ -519,7 +519,7 @@ exec "$@"'
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
-        "$wrapper" --src "$R" --out "$W/pinned" --src-rw "${bundle_lower[@]}" \
+        "$wrapper" --src "$R" --out "$W/pinned" --src-rw --cargo-home none "${bundle_lower[@]}" \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
         --env HERMIT_EPOCH -- \

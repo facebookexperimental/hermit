@@ -51,7 +51,11 @@
 # executables and configuration are deliberately not mounted: the image owns
 # its toolchain and network policy. This is the local equivalent of the shard
 # jobs' `Swatinem/rust-cache` restore, not a workaround: in both cases the cache
-# is an input carried across the phase boundary.
+# is an input carried across the phase boundary. An explicit home is a
+# build-phase home and is bind-mounted WRITABLE, as before. Without
+# --cargo-home, the caller's $HOME/.cargo caches are seeded under a private
+# overlay instead, so the caller's live caches are never written; pass
+# --cargo-home none for no caches at all.
 #
 # DAGRUN_TEST_COUNTS_PATH is scheduler-owned on the host. When requested through
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
@@ -68,7 +72,7 @@ set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
-src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; bundle_lower=""; hermit_bundle=""; hermit_bundle_given=false
+src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; cargo_home_given=false; bundle_lower=""; hermit_bundle=""; hermit_bundle_given=false
 project_src=""; project_out=""; project_descriptor=""; project_mode="ro=true"
 proc_locks_runtime=false
 check_image=false
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
                 '--bundle-lower DIR mounts DIR read-only at /bundle-lower, as the lower layer of an overlay the command mounts itself.' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
                 '--project-src/--project-out/--project-descriptor admit one distinct /project workspace and target; the original core stays at /src. --project-src-rw is separate from --src-rw.' \
+                '--cargo-home DIR bind-mounts DIR'\''s registry and git caches writable (a build-phase cargo home, extracted into by cargo); none: no caches. Default: seed from $HOME/.cargo under a private overlay when it has caches, so the host caches are never written (printed).' \
                 '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.' \
                 'HERMIT_PINNED_IMAGE_PROBE_BOUND_S=SECONDS replaces the 120 s WALL bound on each of the two exact-image probe attempts (a positive integer; unset: 120). Production leaves it unset.'
             exit 0 ;;
@@ -93,7 +98,7 @@ while [[ $# -gt 0 ]]; do
         --digest) digest=$2; shift 2 ;;
         --check-image) check_image=true; shift ;;
         --src-rw) src_mode="ro=false"; shift ;;
-        --cargo-home) cargo_home=$2; shift 2 ;;
+        --cargo-home) cargo_home=$2; cargo_home_given=true; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --nextest-calibration) nextest_calibration=true; shift ;;
         --bundle-lower) bundle_lower=$2; shift 2 ;;
@@ -174,7 +179,7 @@ check_pinned_image() {
 }
 
 if "$check_image"; then
-    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$hermit_bundle_given" == false && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$cargo_home_given" == false && "$hermit_bundle_given" == false && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
@@ -193,6 +198,41 @@ fi
 # DAG in validate.
 src=$(realpath -m -- "$src")
 out=$(realpath -m -- "$out")
+if [[ "$cargo_home_given" == true && -z "$cargo_home" ]]; then
+    echo "run-in-pinned-root: --cargo-home was given an empty value; pass a directory, none, or omit it to seed from \$HOME/.cargo" >&2
+    exit 2
+fi
+cargo_home_none=false
+if [[ "$cargo_home" == none ]]; then
+    cargo_home_none=true
+    cargo_home=""
+fi
+# Resolve the seeded default once, here, so the mount loop below is the only
+# place either form becomes a podman argument. Seeding applies only when the
+# caller named no cargo home at all; --cargo-home none opts out, and an
+# explicit directory keeps the exact pre-seeding semantics.
+cargo_seeded=false
+if [[ -z "$cargo_home" && "$cargo_home_none" == false ]]; then
+    # Seeded by default (owner direction): without --cargo-home, an offline
+    # cargo build fails inside with a download error and nothing pointing at
+    # the missing caches. Seed from the caller's own Cargo home when it has
+    # dependency caches; the mount loop seeds them under a private overlay,
+    # never a writable bind, so the host caches are never written.
+    if [[ -z "${HOME:-}" ]]; then
+        echo "run-in-pinned-root: HOME is unset, so no cargo caches are seeded; pass --cargo-home DIR for host caches, or --cargo-home none to make that explicit" >&2
+    elif [[ -d "$HOME/.cargo/registry" || -d "$HOME/.cargo/git" ]]; then
+        cargo_home=$(realpath -m -- "$HOME/.cargo")
+        cargo_seeded=true
+        echo "run-in-pinned-root: seeding cargo dependency caches from $cargo_home under a private overlay (host caches are never written); pass --cargo-home none to opt out" >&2
+    else
+        for arg in "$@"; do
+            if [[ ${arg##*/} == cargo ]]; then
+                echo "run-in-pinned-root: offline cargo builds need populated caches: run a networked cargo fetch so \$HOME/.cargo has registry/git caches to seed, or pass --cargo-home DIR with a populated build-phase home, or expect \"failed to download\" errors" >&2
+                break
+            fi
+        done
+    fi
+fi
 if [[ -n "$cargo_home" ]]; then
     cargo_home=$(realpath -m -- "$cargo_home")
 fi
@@ -538,11 +578,27 @@ if [[ -n "$cargo_home" ]]; then
     # disabled network, even though the image carries its own pinned clippy.
     # Import only dependency caches into a separate Cargo home so `/bin` remains
     # the sole source of Cargo subcommands in the pinned root.
+    #
+    # The two forms differ in who may write. An explicit --cargo-home is a
+    # build-phase home (validate's split home) that cargo is expected to
+    # extract into, so it keeps the writable bind it has always had. The
+    # seeded default is the caller's live ~/.cargo, which a container must
+    # never write: it goes in as a podman overlay volume (:O), so cargo
+    # extracts into a container-private upper layer that dies with the
+    # container, and the host caches stay byte-unchanged.
     mkdir -p "$pinned_home/.cargo"
     for cache in registry git; do
         if [[ -d "$cargo_home/$cache" ]]; then
             mkdir -p "$pinned_home/.cargo/$cache"
-            cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
+            if [[ "$cargo_seeded" == true ]]; then
+                [[ "$cargo_home" != *:* ]] || {
+                    echo "run-in-pinned-root: cannot seed cargo caches from '$cargo_home': an overlay volume cannot name a source path containing ':'; pass --cargo-home DIR or --cargo-home none" >&2
+                    exit 2
+                }
+                cargo_mount+=(--volume "$cargo_home/$cache:/build/.cargo/$cache:O")
+            else
+                cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
+            fi
         fi
     done
 fi
