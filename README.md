@@ -53,13 +53,21 @@ On Fedora or CentOS:
 sudo dnf install -y libunwind-devel xz-devel
 ```
 
+Install Rust with rustup, then load Cargo into the current shell:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+rustc --version
+```
+
 ## Install From Source
 
-Clone the maintained fork and install the CLI into Cargo's binary directory,
+Clone the repository and install the CLI into Cargo's binary directory,
 normally `~/.cargo/bin`:
 
 ```bash
-git clone --recurse-submodules https://github.com/rrnewton/hermit
+git clone --recurse-submodules https://github.com/facebookexperimental/hermit
 cd hermit
 cargo install --locked --path hermit-cli
 hermit --version
