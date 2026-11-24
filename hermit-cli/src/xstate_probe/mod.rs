@@ -178,6 +178,56 @@ pub fn check_forced_extra_bits(xcr0: u64) -> Result<(), ProbeRefusal> {
     Ok(())
 }
 
+/// A test-only variable that forces the probe's refusal outcome, so a
+/// hermetic test can run the refusal accounting above the probe
+/// (admission, naming, the exit-122 policy refusal) on any host.
+/// Refuse-only, like [`XCR0_EXTRA_TEST_ENV`]: every value, malformed
+/// included, refuses — there is no value that admits, passes or
+/// measures — and a forced refusal is never persisted to the
+/// per-host cache or the shared verdict, and never read back as a
+/// reused one, so it cannot outlive the process that set it. Unset
+/// in every real run; no node, DAG or .bzl sets it.
+pub const PROBE_REFUSAL_TEST_ENV: &str = "HERMIT_TEST_XSTATE_PROBE_REFUSAL";
+
+/// The forced refusal for a value of [`PROBE_REFUSAL_TEST_ENV`]:
+/// hand copies of the producers' texts. `fpu-reload` is
+/// [`Probe::compare`]'s reload form (its lead constant verbatim),
+/// `fpu-reload-reused` wraps that same reason in
+/// [`reused_refusal`], and `calibration` copies the
+/// interrupts-taken calibration sentence. An unrecognized value
+/// refuses too, naming the seam.
+fn forced_refusal_from(value: Option<&std::ffi::OsStr>) -> Option<ProbeRefusal> {
+    let value = value?;
+    let fresh = || {
+        format!(
+            "{FPU_RELOAD_INSTABILITY} XSTATE_BV 0x2fd against 0x2ff, \
+             first difference at save-area byte 512 \
+             (forced by {PROBE_REFUSAL_TEST_ENV} for tests)"
+        )
+    };
+    Some(match value.to_str() {
+        Some("fpu-reload") => fresh(),
+        Some("fpu-reload-reused") => reused_refusal(fresh(), 1),
+        Some("calibration") => format!(
+            "the interrupts-taken counter failed calibration: \
+             the counter saw 232 interrupts but the CPU took only 220 in all \
+             (forced by {PROBE_REFUSAL_TEST_ENV} for tests)"
+        ),
+        _ => format!(
+            "{PROBE_REFUSAL_TEST_ENV}={value:?} is not fpu-reload, \
+             fpu-reload-reused or calibration"
+        ),
+    })
+}
+
+/// The forced refusal when [`PROBE_REFUSAL_TEST_ENV`] is set, else
+/// `None`. Callers return it before any cached or shared verdict
+/// can stand in for measuring and never publish it, so the seam is
+/// confined to the process that set it.
+pub fn forced_probe_refusal() -> Option<ProbeRefusal> {
+    forced_refusal_from(std::env::var_os(PROBE_REFUSAL_TEST_ENV).as_deref())
+}
+
 /// Whether the probe may run RDPKRU and WRPKRU: exactly when XCR0 enables the
 /// PKRU component and the kernel enables protection keys (CPUID.7.0:ECX.OSPKE,
 /// from CR4.PKE); either instruction raises #UD without the latter. A host
@@ -694,6 +744,12 @@ fn reused_refusal(reason: String, age_secs: u64) -> ProbeRefusal {
 /// Runs the qualification on a new thread pinned to an idle, low-numbered CPU.
 /// Returns the report, or the reason v3 cannot be offered on this host.
 pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
+    // The refuse-only test seam, before any shared or cached
+    // verdict can stand in for measuring: with it unset nothing
+    // here runs.
+    if let Some(forced) = forced_probe_refusal() {
+        return Err(forced);
+    }
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     // The lock serializes probes of every Hermit build of this user
@@ -1860,6 +1916,37 @@ mod tests {
                 && !FPU_RELOAD_INSTABILITY.starts_with(HYPERVISOR_EXIT_INSTABILITY),
             "only the reload refusal carries the lead admission matches"
         );
+    }
+
+    /// The forced-refusal seam can only refuse: unset is the only
+    /// value with no refusal, every set value refuses (malformed
+    /// included), and the refused bytes are the producers' own
+    /// forms, so no value admits, passes or measures.
+    #[test]
+    fn the_forced_refusal_seam_never_admits() {
+        use std::ffi::OsStr;
+        assert_eq!(forced_refusal_from(None), None);
+        let fresh =
+            forced_refusal_from(Some(OsStr::new("fpu-reload"))).expect("fpu-reload refuses");
+        assert!(fresh.starts_with(FPU_RELOAD_INSTABILITY), "{fresh}");
+        let reused = forced_refusal_from(Some(OsStr::new("fpu-reload-reused")))
+            .expect("fpu-reload-reused refuses");
+        assert!(reused.starts_with(&fresh), "{reused}");
+        assert!(reused.contains("(reused refusal:"), "{reused}");
+        let calibration =
+            forced_refusal_from(Some(OsStr::new("calibration"))).expect("calibration refuses");
+        assert!(
+            calibration.starts_with("the interrupts-taken counter failed calibration:"),
+            "{calibration}"
+        );
+        for refusal in [&fresh, &reused, &calibration] {
+            assert!(refusal.contains(PROBE_REFUSAL_TEST_ENV), "{refusal}");
+        }
+        for bad in ["", "pass", "admit", "none", "FPU-RELOAD"] {
+            let refusal =
+                forced_refusal_from(Some(OsStr::new(bad))).expect("every set value refuses");
+            assert!(refusal.contains(PROBE_REFUSAL_TEST_ENV), "{refusal}");
+        }
     }
 
     fn coordinated_paths(

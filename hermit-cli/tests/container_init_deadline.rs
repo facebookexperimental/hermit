@@ -221,9 +221,22 @@ impl Drop for SessionGuard {
     }
 }
 
+/// The stderr file a spawned run writes, by spawn order, so a Hermit
+/// refusal that ends the run before its init forks can be read.
+static SPAWN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn spawn_stderr_path() -> std::path::PathBuf {
+    let count = SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("container-init-spawn-{count}.stderr"))
+}
+
 /// Spawn `argv` as the leader of its own session, so the test can account for
 /// every process the run creates by scanning for that session id.
-fn spawn_in_new_session(argv: &[&str], envs: &[(&str, &str)]) -> io::Result<Child> {
+fn spawn_in_new_session(
+    argv: &[&str],
+    envs: &[(&str, &str)],
+) -> io::Result<(Child, std::path::PathBuf)> {
+    let stderr_path = spawn_stderr_path();
     let mut command = Command::new(argv[0]);
     command.args(&argv[1..]);
     command.envs(envs.iter().copied());
@@ -231,7 +244,7 @@ fn spawn_in_new_session(argv: &[&str], envs: &[(&str, &str)]) -> io::Result<Chil
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(fs::File::create(&stderr_path)?);
     // SAFETY: `setsid` is async-signal-safe and allocates nothing. It is called
     // in the forked child before exec, where this process is not already a
     // session leader, so it cannot fail.
@@ -243,7 +256,7 @@ fn spawn_in_new_session(argv: &[&str], envs: &[(&str, &str)]) -> io::Result<Chil
             Ok(())
         });
     }
-    command.spawn()
+    command.spawn().map(|child| (child, stderr_path))
 }
 
 fn hermit_bin() -> &'static str {
@@ -255,7 +268,7 @@ fn hermit_bin() -> &'static str {
 /// Start a hung run and wait until its container init exists, so that any
 /// later assertion is about a run that genuinely reached the dangerous state.
 fn start_hung_run(argv: &[&str], envs: &[(&str, &str)]) -> (Child, SessionGuard, i32) {
-    let child = spawn_in_new_session(argv, envs)
+    let (mut child, stderr_path) = spawn_in_new_session(argv, envs)
         .unwrap_or_else(|error| panic!("failed to spawn {argv:?}: {error}"));
     let session = child.id() as i32;
     let guard = SessionGuard(session);
@@ -266,6 +279,21 @@ fn start_hung_run(argv: &[&str], envs: &[(&str, &str)]) -> (Child, SessionGuard,
             .find(|pid| is_namespace_init(*pid))
     });
 
+    if init.is_none() {
+        // A Hermit that refused the run before forking its init (a
+        // host-fact x86-64-v3 refusal of the /bin/sh guest) ends the
+        // case here as a counted skip, not as the vacuous pass the
+        // panic below guards against.
+        let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        hermit_test::abort_on_host_fact_v3_refusal_for(
+            "container_init_deadline",
+            Some(Path::new("/bin/sh")),
+            true,
+            code,
+            &stderr,
+        );
+    }
     let init = init.unwrap_or_else(|| {
         panic!(
             "hermit never forked a container init within {STARTUP_BUDGET:?} for {argv:?}; \

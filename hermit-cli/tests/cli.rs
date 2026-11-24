@@ -610,7 +610,8 @@ fn hermit_has_liteinst() -> bool {
 }
 
 fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
-    hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
+    let label = format!("hermit {args:?}");
+    hermit_test::hermit_output_with(&label, || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         append_hermit_args(&mut command, args);
         let mut child = command
@@ -628,6 +629,7 @@ fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
         let output = child
             .wait_with_output()
             .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"));
+        hermit_test::abort_on_host_fact_v3_refusal(&label, &command, &output);
         (output, ())
     })
     .0
@@ -2787,6 +2789,10 @@ fn v3_run_or_refusal_with<T>(
     qualification: impl Fn() -> Result<(), String>,
     mut attempt: impl FnMut() -> (Option<i32>, String, String, T),
 ) -> Option<(String, String, T)> {
+    // This policy answers for a v3 refusal itself (required failure,
+    // one retry on a qualifying host, second refusal fails): the
+    // harness counted-skip hook must not pre-empt it.
+    let _suppressed = hermit_test::suppress_v3_skip();
     for retry in [false, true] {
         let (status, stdout, log, extra) = attempt();
         match status {
@@ -35638,14 +35644,22 @@ fn run_with_deadline(
     open_stdin: bool,
 ) -> (Option<std::process::ExitStatus>, String) {
     let label = format!("{command:?}");
-    hermit_test::hermit_output_with(&label, || {
+    let bead = hermit_test::v3_skip_enabled_for(&command)
+        .then(|| hermit_test::v3_skip_bead(&command))
+        .flatten();
+    let result = hermit_test::hermit_output_with(&label, || {
         let (status, stderr) = run_with_deadline_once(&mut command, directory, limit, open_stdin);
         (
             output_of(status, Vec::new(), stderr.clone().into_bytes()),
             (status, stderr),
         )
     })
-    .1
+    .1;
+    if let Some(bead) = bead {
+        let output = output_of(result.0, Vec::new(), result.1.clone().into_bytes());
+        hermit_test::abort_on_host_fact_v3_refusal_with_bead(&label, bead, &output);
+    }
+    result
 }
 
 /// One attempt of [`run_with_deadline`], for a caller that handles a skid
@@ -64785,6 +64799,9 @@ impl UnpinnedRun {
 
     /// `hermit <args>`, with `env` set: its exit status, stdout and stderr.
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        // Callers assert on the refusal/auto-choice output itself:
+        // the counted-skip hook must not abort the run first.
+        let _suppressed = hermit_test::suppress_v3_skip();
         let mut command = hermit_command(args);
         command
             .env_remove("HERMIT_CPU_PROFILE")

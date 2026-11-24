@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 #[path = "common/skid_overshoot.rs"]
 mod skid_overshoot;
 
@@ -57,6 +59,29 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
         },
         &|_| {},
     );
+
+    // The script's guests are the host's bzip2/gzip: a host-fact v3
+    // refusal of one of its Hermit runs ends the case as a counted
+    // skip here, before the success assertion can fail it.
+    {
+        let bzip2 = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("bzip2"))
+                .find(|candidate| candidate.is_file())
+        });
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        hermit_test::abort_on_host_fact_v3_refusal_for(
+            "compression",
+            bzip2.as_deref(),
+            true,
+            output.status.code(),
+            &text,
+        );
+    }
 
     assert!(
         output.status.success(),

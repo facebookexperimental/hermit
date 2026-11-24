@@ -1935,6 +1935,11 @@ fn cached_probe_at(
     warn: &mut dyn FnMut(&str),
     probe: impl FnOnce() -> Result<xstate_probe::ProbeReport, xstate_probe::ProbeRefusal>,
 ) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    // The refuse-only probe test seam answers before the cache, so
+    // no stored pass can mask it and nothing forced is persisted.
+    if let Some(forced) = xstate_probe::forced_probe_refusal() {
+        return Err(forced);
+    }
     let Some(path) = path else {
         warn(
             "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes seconds; \

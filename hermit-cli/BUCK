@@ -126,6 +126,7 @@ LIBHERMIT_TEST_SRCS = {
         "reverie_pin.rs",
         "src/in_guest_delivery_harness/guest.c",
         "tests/common/exclusive_rewrite_summary.rs",
+        "tests/common/host_fact_v3.rs",
         "tests/common/readonly_proc.rs",
         "tests/common/test_skip.rs",
         "tests/fixtures/chosen-before-reserved-input.json",
@@ -647,6 +648,7 @@ rust_binary(
         for src in [
             "hermit-cli/tests/cpu_profile_v2_rootfs.rs",
             "hermit-cli/tests/common/hermit_binary.rs",
+            "hermit-cli/tests/common/host_fact_v3.rs",
             "hermit-cli/tests/common/skid_overshoot.rs",
             "hermit-cli/tests/common/test_skip.rs",
             "hermit-cli/tests/fixtures/isa/cpuid_v2_probe.c",

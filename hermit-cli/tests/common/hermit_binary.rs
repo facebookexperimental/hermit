@@ -20,6 +20,16 @@ use std::sync::OnceLock;
 #[path = "skid_overshoot.rs"]
 pub mod skid_overshoot;
 
+// The typed x86-64-v3 host-fact refusal classifier `hermit_output`
+// applies, and the skip marker it records. Not every including
+// binary calls them.
+#[allow(dead_code)]
+#[path = "host_fact_v3.rs"]
+pub mod host_fact_v3;
+#[allow(dead_code)]
+#[path = "test_skip.rs"]
+pub mod test_skip;
+
 /// Attempts a Hermit run gets when Hermit refuses it for a late PMU interrupt
 /// (exit 122, `cause=skid-overshoot`): the one shared skid budget
 /// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]). A refusal measures the
@@ -45,7 +55,7 @@ pub fn hermit_output(label: &str, command: &mut Command) -> Output {
 #[allow(dead_code)]
 pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Command) -> Output {
     pin_canonical_epoch(command);
-    skid_overshoot::retry_typed_skid_refusal(
+    let output = skid_overshoot::retry_typed_skid_refusal(
         label,
         max_attempts,
         || {
@@ -56,7 +66,229 @@ pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Comm
         },
         &|_| {},
     )
-    .1
+    .1;
+    abort_on_host_fact_v3_refusal(label, command, &output);
+    output
+}
+
+std::thread_local! {
+    /// How many suppress_v3_skip guards this test thread holds. The
+    /// hook records nothing and never aborts while any is held: a
+    /// caller that handles a v3 refusal itself (the v3-run policies
+    /// in cli.rs, an unpinned auto-choice run) keeps its own rules.
+    static V3_SKIP_SUPPRESSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Suppress the v3 counted-skip hook on this thread until dropped:
+/// hermit runs it drives answer for a v3 refusal themselves.
+#[must_use = "the guard suppresses only while held"]
+#[allow(dead_code)]
+pub struct V3SkipSuppressed(());
+
+#[allow(dead_code)]
+pub fn suppress_v3_skip() -> V3SkipSuppressed {
+    V3_SKIP_SUPPRESSED.with(|held| held.set(held.get() + 1));
+    V3SkipSuppressed(())
+}
+
+impl Drop for V3SkipSuppressed {
+    fn drop(&mut self) {
+        V3_SKIP_SUPPRESSED.with(|held| held.set(held.get() - 1));
+    }
+}
+
+/// Whether the hook may act at all here: only under run_node.py,
+/// which alone sets HERMIT_RUN_NODE_SKIP_ISSUES=1 for its cases (so
+/// the open-source nextest producer never sees these markers), never
+/// where v3 is required (HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 fails
+/// by name instead), never under a suppression guard, and never on
+/// a seam-made verdict (HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS
+/// names a synthetic XCR0, not this host's qualification).
+/// A variable's value for a launch: the command's own setting (or
+/// removal) where it names one, else this process's. The seam tests
+/// set the seam variable on the Hermit command, not the test
+/// process, so the command is the first place to look.
+fn command_env(cmd: Option<&Command>, key: &str) -> Option<String> {
+    if let Some(cmd) = cmd {
+        if let Some((_, value)) = cmd.get_envs().find(|(name, _)| *name == key) {
+            return value.and_then(OsStr::to_str).map(str::to_owned);
+        }
+    }
+    std::env::var(key).ok()
+}
+
+/// Whether the hook may act for `cmd` (for funnel callers that
+/// decide their bead before the command is consumed by spawning).
+#[allow(dead_code)]
+pub fn v3_skip_enabled_for(cmd: &Command) -> bool {
+    v3_skip_enabled(Some(cmd))
+}
+
+fn v3_skip_enabled(cmd: Option<&Command>) -> bool {
+    std::env::var_os("HERMIT_RUN_NODE_SKIP_ISSUES").is_some_and(|v| v == "1")
+        && command_env(cmd, "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Some("1")
+        && command_env(cmd, "HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS").is_none()
+        && V3_SKIP_SUPPRESSED.with(|held| held.get() == 0)
+}
+
+/// The bead a host-fact v3 refusal of `command` names, where the
+/// launch requests x86-64-v3 at all (host_fact_v3::bead_for on the
+/// command's facts): its explicit profile (flag, else the command's
+/// or this process's HERMIT_CPU_PROFILE), whether the launch can
+/// present v3 ([`admits_x86_64_v3`]), and, for an auto choice only,
+/// whether its guest declares more than v2
+/// ([`guest_needs_above_v2`]). `None` where the launch never
+/// requests v3 — a SaBRe, DBT, LiteInst, namespace-only,
+/// strace-only, no-virtualize-cpuid or gdbserver launch, an
+/// explicit non-v3 profile, or a guest that declares no more than
+/// v2 — so such a case is never skipped for v3.
+#[allow(dead_code)]
+pub fn v3_skip_bead(cmd: &Command) -> Option<&'static str> {
+    let args = cmd.get_args().collect::<Vec<_>>();
+    let end = args
+        .iter()
+        .position(|arg| *arg == "--")
+        .unwrap_or(args.len());
+    let options = &args[..end];
+    let mut explicit: Option<String> = None;
+    for (index, option) in options.iter().enumerate() {
+        if let Some(profile) = option
+            .to_str()
+            .and_then(|o| o.strip_prefix("--cpu-profile="))
+        {
+            explicit = Some(profile.to_owned());
+        } else if *option == "--cpu-profile" {
+            if let Some(profile) = options.get(index + 1).and_then(|v| v.to_str()) {
+                explicit = Some(profile.to_owned());
+            }
+        }
+    }
+    if explicit.is_none() {
+        let named = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "HERMIT_CPU_PROFILE")
+            .map(|(_, value)| value.and_then(OsStr::to_str).map(str::to_owned));
+        explicit = match named {
+            Some(profile) => profile,
+            None => std::env::var("HERMIT_CPU_PROFILE").ok(),
+        };
+    }
+    let admits = admits_x86_64_v3(cmd);
+    let needs = explicit.is_none() && admits && guest_needs_above_v2(cmd);
+    host_fact_v3::bead_for(explicit.as_deref(), admits, needs)
+}
+
+/// Abort this case at once if `output` is Hermit's host-fact
+/// x86-64-v3 refusal of a launch that requested v3: record the
+/// counted skip for its bead, then panic with the abort payload so
+/// the refusal is the case's failure and nothing after it runs.
+/// The runner counts the case `skipped` only where the marker and
+/// this payload agree.
+#[allow(dead_code)]
+pub fn abort_on_host_fact_v3_refusal(label: &str, cmd: &Command, output: &Output) {
+    if !v3_skip_enabled(Some(cmd)) {
+        return;
+    }
+    let Some(bead) = v3_skip_bead(cmd) else {
+        return;
+    };
+    abort_on_host_fact_v3_refusal_with_bead(label, bead, output);
+}
+
+/// [`abort_on_host_fact_v3_refusal`] for a harness that already
+/// knows its guest declares more than x86-64-v2 at `program` (or
+/// that no guest declaration applies, `None`) and whether its launch
+/// can present v3, because its Hermit command is not a `Command`
+/// this module can read (a shell script, a wrapper pipeline). An
+/// explicit process-level `HERMIT_CPU_PROFILE` counts as in
+/// [`v3_skip_bead`]: an explicit x86-64-v3 requests v3 without a
+/// guest declaration, and any other explicit profile never does.
+#[allow(dead_code)]
+pub fn abort_on_host_fact_v3_refusal_for(
+    label: &str,
+    program: Option<&Path>,
+    admits: bool,
+    code: Option<i32>,
+    stderr: &str,
+) {
+    if !v3_skip_enabled(None) {
+        return;
+    }
+    let explicit = std::env::var("HERMIT_CPU_PROFILE").ok();
+    let needs = program.is_some_and(needs_above_v2);
+    if host_fact_v3::bead_for(explicit.as_deref(), admits, needs).is_none() {
+        return;
+    }
+    let Some(refusal) = host_fact_v3::host_fact_refusal(code, stderr) else {
+        return;
+    };
+    record_v3_skip_abort(label, host_fact_v3::SKIP_ISSUE_XSAVE, refusal);
+}
+
+/// [`abort_on_host_fact_v3_refusal`] with the bead its caller
+/// already decided (`v3_skip_bead` on its own command, captured
+/// before the command was consumed by spawning it).
+#[allow(dead_code)]
+pub fn abort_on_host_fact_v3_refusal_with_bead(label: &str, bead: &str, output: &Output) {
+    if !v3_skip_enabled(None) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let Some(refusal) = host_fact_v3::host_fact_refusal(output.status.code(), &stderr) else {
+        return;
+    };
+    record_v3_skip_abort(label, bead, refusal);
+}
+
+/// Record the counted skip for `bead` into `skip_file` (the
+/// runner's sidecar where `None`): the marker half of the abort,
+/// returning the payload the abort leaves by. Split from the abort
+/// so a unit test can drive it with a private file and an explicit
+/// enabled flag, with no process-environment change.
+fn record_v3_skip(label: &str, bead: &str, refusal: &str, skip_file: Option<&Path>) -> String {
+    let reason = host_fact_v3::skip_issue_reason(bead, refusal);
+    match skip_file {
+        Some(path) => test_skip::record_test_skip_to(Some(path), label, &reason),
+        // The runner's sidecar, named by HERMIT_TEST_SKIP_FILE:
+        // record_test_skip_to's None only prints, so resolve here.
+        None => test_skip::record_test_skip(label, &reason),
+    }
+    host_fact_v3::skip_abort_payload(bead, refusal)
+}
+
+/// The abort itself, on arguments: where `enabled` is false it
+/// returns having recorded nothing; where true it records the
+/// marker into `skip_file`, prints the abort payload, and exits
+/// with SKIP_ABORT_EXIT. Exiting, not panicking, is what makes the
+/// abort uncatchable: no catch_unwind or sibling thread can
+/// continue the case past it.
+fn v3_skip_abort_core(
+    label: &str,
+    bead: &str,
+    refusal: &str,
+    enabled: bool,
+    skip_file: Option<&Path>,
+) {
+    if !enabled {
+        return;
+    }
+    let payload = record_v3_skip(label, bead, refusal, skip_file);
+    // Straight to /dev/stderr, not eprintln!: libtest captures the
+    // print macros' output per test and an exiting process never
+    // flushes that capture, which would lose the payload the
+    // runner requires beside the marker and this exit status.
+    if let Ok(mut dev_stderr) = std::fs::OpenOptions::new().append(true).open("/dev/stderr") {
+        use std::io::Write as _;
+        let _ = writeln!(dev_stderr, "{payload}");
+    } else {
+        eprintln!("{payload}");
+    }
+    std::process::exit(host_fact_v3::SKIP_ABORT_EXIT);
+}
+
+fn record_v3_skip_abort(label: &str, bead: &str, refusal: &str) -> ! {
+    v3_skip_abort_core(label, bead, refusal, true, None);
+    unreachable!("an enabled abort exits the process")
 }
 
 /// [`hermit_output`] for a caller that makes each attempt itself, with state
@@ -651,4 +883,125 @@ pub fn recorded_preemption_inner_mut(record: &mut serde_json::Value) -> &mut ser
         return &mut record["slice_boundary_recording"]["preemptions"];
     }
     record
+}
+
+#[cfg(test)]
+mod v3_skip_tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    fn refused_output() -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(
+                (detcore_model::HERMIT_POLICY_REFUSAL_EXIT) << 8,
+            ),
+            stdout: Vec::new(),
+            stderr: concat!(
+                "HERMIT_POLICY_REFUSAL class=policy-refusal\n",
+                "Error: --cpu-profile x86-64-v3 refused: XINUSE is not ",
+                "stable across a host FPU reload: XSTATE_BV 0x2fd\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        }
+    }
+
+    // The bead matrix itself (SaBRe-shaped and explicit-profile
+    // launches included) is unit-tested as bead_for in
+    // host_fact_v3.rs, whose tests never touch a Hermit invocation
+    // and so stay out of generate.py's CPUID-faulting derivation.
+    // What remains here is only the abort's own behavior.
+
+    #[test]
+    fn the_core_records_into_a_private_skip_file_only_when_enabled() {
+        // lead-014's never-returns property, at the split core: the
+        // enabled core records the marker and exits the process, so
+        // no in-process test can call it and return; what is asserted
+        // here is its recording half against a private file (no
+        // process-environment change) and that a disabled core
+        // records nothing and does return.
+        let sidecar =
+            std::env::temp_dir().join(format!("hermit-v3-skip-unit-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sidecar);
+        std::fs::write(&sidecar, "").unwrap();
+        v3_skip_abort_core(
+            "unit",
+            host_fact_v3::SKIP_ISSUE_XSAVE,
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2fd",
+            false,
+            Some(&sidecar),
+        );
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "");
+        let payload = record_v3_skip(
+            "unit",
+            host_fact_v3::SKIP_ISSUE_XSAVE,
+            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2fd",
+            Some(&sidecar),
+        );
+        assert!(
+            payload.starts_with("HERMIT-TEST-SKIP-ABORT: dh-38lkn5:"),
+            "{payload}"
+        );
+        let recorded = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(
+            recorded.starts_with("HERMIT-TEST-SKIP: unit\tSKIP-ISSUE: dh-38lkn5:"),
+            "{recorded}"
+        );
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn the_real_abort_records_and_exits_86_in_a_child() {
+        // The real abort path, in a child of this test binary with
+        // the runner enable and a private skip file on ITS command
+        // environment only (no process-env change here): exit 86,
+        // the marker in that file, the payload on stderr. The
+        // disabled-core case above covers hook inertness; this
+        // environment's own enable state is irrelevant by design.
+        const CHILD: &str = "HERMIT_V3_SKIP_ABORT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            abort_on_host_fact_v3_refusal_with_bead(
+                "unit",
+                host_fact_v3::SKIP_ISSUE_XSAVE,
+                &refused_output(),
+            );
+            return;
+        }
+        let sidecar =
+            std::env::temp_dir().join(format!("hermit-v3-skip-child-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&sidecar);
+        std::fs::write(&sidecar, "").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["the_real_abort_records_and_exits_86_in_a_child"])
+            .env(CHILD, "1")
+            .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
+            .env("HERMIT_TEST_SKIP_FILE", &sidecar)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(host_fact_v3::SKIP_ABORT_EXIT),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("HERMIT-TEST-SKIP-ABORT: dh-38lkn5:"),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recorded = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(recorded.contains("SKIP-ISSUE: dh-38lkn5:"), "{recorded}");
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn a_non_refusal_returns_normally() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        abort_on_host_fact_v3_refusal_with_bead("unit", host_fact_v3::SKIP_ISSUE_XSAVE, &output);
+    }
 }
