@@ -161,6 +161,10 @@ fn strict_verify_output(
         .stderr(Stdio::piped());
 
     let rendered = format!("{command:?}");
+    // Decided before spawning consumes the command, as the funnel's
+    // own callers do: the bead this launch's host-fact refusal
+    // would name, if it requests x86-64-v3 at all.
+    let v3_bead = hermit_test::v3_skip_bead(&command);
     // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
     let (output, ()) = hermit_test::hermit_output_with(&rendered, || {
         let mut child = command
@@ -179,6 +183,18 @@ fn strict_verify_output(
             .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
         (output, ())
     });
+    // A refusal Hermit classifies and caches as a host fact in the
+    // shared dh-38lkn5 class (decided by is_host_fact_reason,
+    // reused lines included) becomes the same counted skip as the
+    // other v3 cases; every other reused refusal (calibration,
+    // deadlines) still returns here and fails the caller's checks.
+    if let Some(bead) = v3_bead {
+        hermit_test::abort_on_host_fact_v3_refusal_with_bead(
+            "command_strict_verify",
+            bead,
+            &output,
+        );
+    }
     (output, rendered)
 }
 

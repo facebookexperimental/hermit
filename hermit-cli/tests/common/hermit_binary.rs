@@ -996,6 +996,97 @@ mod v3_skip_tests {
     }
 
     #[test]
+    fn reused_refusals_split_by_host_fact_in_a_child() {
+        // The conversion used by harnesses that already know their
+        // guest program (abort_on_host_fact_v3_refusal_for): a
+        // planted reused host-fact refusal records the counted skip
+        // and exits 86 in a child, while a planted reused transient
+        // (calibration) refusal returns normally so the case fails
+        // on its own assertions. A copy that skipped both would
+        // exit 86 in the transient child and fail this test.
+        const CHILD: &str = "HERMIT_V3_SKIP_FOR_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let reason = if mode == "host-fact" {
+                "XINUSE is not stable across a host FPU reload: XSTATE_BV \
+                 0x2fd against 0x2ff (reused refusal: measured by another \
+                 Hermit process on this host 3s ago and reused for up to \
+                 60s instead of measuring again)"
+            } else if mode == "did-not-finish" {
+                // A deadline refusal stays transient before and after
+                // the gate-v6 decided-verdict consolidation.
+                "the XINUSE probe did not finish within 120 seconds \
+                 (reused refusal: measured by another Hermit process \
+                 on this host 3s ago and reused for up to 60s instead of \
+                 measuring again)"
+            } else {
+                "the interrupts-taken counter failed calibration: the \
+                 counter saw 232 interrupts but the CPU took only 220 in \
+                 all (reused refusal: measured by another Hermit process \
+                 on this host 3s ago and reused for up to 60s instead of \
+                 measuring again)"
+            };
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8,
+                ),
+                stdout: Vec::new(),
+                stderr: format!(
+                    "HERMIT_POLICY_REFUSAL class=policy-refusal\n\
+                     Error: --cpu-profile x86-64-v3 refused: {reason}\n"
+                )
+                .into_bytes(),
+            };
+            abort_on_host_fact_v3_refusal_for(
+                "unit",
+                None,
+                true,
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        for (mode, want_skip) in [
+            ("host-fact", true),
+            ("transient", false),
+            ("did-not-finish", false),
+        ] {
+            let sidecar = std::env::temp_dir().join(format!(
+                "hermit-v3-skip-for-{mode}-{}.txt",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&sidecar);
+            std::fs::write(&sidecar, "").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["reused_refusals_split_by_host_fact_in_a_child"])
+                .env(CHILD, mode)
+                .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
+                .env_remove("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS")
+                .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
+                .env("HERMIT_CPU_PROFILE", "x86-64-v3")
+                .env("HERMIT_TEST_SKIP_FILE", &sidecar)
+                .output()
+                .unwrap();
+            let recorded = std::fs::read_to_string(&sidecar).unwrap();
+            if want_skip {
+                assert_eq!(
+                    output.status.code(),
+                    Some(host_fact_v3::SKIP_ABORT_EXIT),
+                    "{mode} stderr:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    recorded.contains("SKIP-ISSUE: dh-38lkn5:"),
+                    "{mode}: {recorded}"
+                );
+            } else {
+                assert_eq!(output.status.code(), Some(0), "{mode}");
+                assert_eq!(recorded, "", "{mode}");
+            }
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+
+    #[test]
     fn a_non_refusal_returns_normally() {
         let output = Output {
             status: std::process::ExitStatus::from_raw(0),
