@@ -887,7 +887,6 @@ fn selector_links(link: &Path) -> usize {
 /// a lookup in another descriptor universe.
 // Wired into the injection seam by the next commit in this stack;
 // exercised here only by the `guest_fd_components` unit tests.
-#[cfg_attr(not(test), allow(dead_code))]
 fn caller_fd_name_is_malformed(link: &Path, own: Option<(i32, i32)>) -> bool {
     let names: Vec<&str> = link
         .components()
@@ -947,7 +946,6 @@ fn caller_fd_name_is_malformed(link: &Path, own: Option<(i32, i32)>) -> bool {
 /// `/proc/self/fd/N` spellings into any host resolver.
 // Wired into the injection seam by the next commit in this stack;
 // exercised here only by the `guest_fd_components` unit tests.
-#[cfg_attr(not(test), allow(dead_code))]
 fn guest_fd_respell_decision(
     path: &[u8],
     own: Option<(i32, i32)>,
@@ -1005,6 +1003,15 @@ pub(crate) struct RespelledOperand {
     /// `None` for one looked up from where the guest's was (the same
     /// descriptor, or the working directory).
     pub(crate) dirfd: Option<usize>,
+    /// The guest descriptor the respelled call is looked up from, where
+    /// the respelling is a guest descriptor link's (`guest_fd_respell_decision`):
+    /// the call's descriptor argument (at [`Self::RespelledOperand::dirfd`]'s
+    /// index) is given this guest descriptor instead of `AT_FDCWD`. The
+    /// backend beneath the injection translates a guest descriptor as it
+    /// does any `*at` call's (KVM: the executor's guest-to-host table; ptrace:
+    /// the guest's own table, which the respelled form names alike), so no
+    /// host descriptor number ever appears here.
+    pub(crate) dirfd_fd: Option<RawFd>,
     /// The index of the path argument.
     pub(crate) path: usize,
     /// The respelled path, without its NUL.
@@ -5509,9 +5516,108 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
     ) -> bool {
         let sysno = call.number();
-        (!relative_operands(sysno).is_empty() || !absolute_operands(sysno).is_empty())
-            && OPENED_ANY.load(Ordering::SeqCst)
-            && Self::serves_placeholders(guest)
+        let looks_up_a_path =
+            !relative_operands(sysno).is_empty() || !absolute_operands(sysno).is_empty();
+        looks_up_a_path
+            && ((OPENED_ANY.load(Ordering::SeqCst) && Self::serves_placeholders(guest))
+                || Self::guest_fd_caller(guest).is_some())
+    }
+
+    /// The caller's pid and tid as the guest numbers them, where a guest
+    /// descriptor link of the caller's may be respelled
+    /// ([`guest_fd_respell_decision`], dh-23x5y5): Detcore keeps the
+    /// caller's descriptor model (not the in-guest backends, whose table
+    /// the runtime shares and whose forwarded calls already resolve in
+    /// the guest's own context), the run is not recording or replaying a
+    /// forwarded call's shape, and the caller's root still reaches the
+    /// procfs the spellings name (not after a guest `chroot`, nor in a
+    /// nested PID namespace). Read from the thread's state alone.
+    fn guest_fd_caller<G: Guest<Self>>(guest: &G) -> Option<(i32, i32)> {
+        let config = guest.config();
+        if config.backend.tool_shares_guest_descriptor_table || config.recordreplay_modes {
+            return None;
+        }
+        let state = guest.thread_state();
+        if state.changed_root.load(Ordering::SeqCst) || state.nested_pid_namespace {
+            return None;
+        }
+        Some((state.detpid?.as_raw(), state.dettid.as_raw()))
+    }
+
+    /// `path`, looked up from `dirfd` (`None` for a call that looks it up
+    /// from the working directory or the root), respelled where it leads
+    /// through a descriptor link of the caller's own to a descriptor that
+    /// is no placeholder ([`guest_fd_respell_decision`]): the guest
+    /// descriptor and the remainder below it, for the call to be staged
+    /// as its `*at` form at that descriptor. On ptrace the respelled form
+    /// is what in-guest resolution already computes, so the injected call
+    /// resolves alike and nothing is resolved twice in two universes;
+    /// where the executor is beneath (KVM), it receives only a guest
+    /// descriptor and a relative remainder, the shape its own dirfd
+    /// translation already maps, and no guest `/proc/self/fd` spelling
+    /// reaches its host resolver (which keeps refusing magic links).
+    /// M4c (guest-procfs resolution, S3) must compose with this
+    /// respelling, not replace it, and must preserve its link counting
+    /// and its native-`ELOOP` cases.
+    async fn guest_fd_respelled<G: Guest<Self>>(
+        guest: &mut G,
+        dirfd: Option<RawFd>,
+        path: &[u8],
+        follows: bool,
+    ) -> Result<Option<(RawFd, Vec<u8>)>, Errno> {
+        let Some(own) = Self::guest_fd_caller(guest) else {
+            return Ok(None);
+        };
+        let absolute: Vec<u8> = if path.starts_with(b"/") {
+            path.to_vec()
+        } else {
+            let base = dirfd.unwrap_or(libc::AT_FDCWD);
+            if Self::placeholder_of(guest, base).is_some() {
+                return Ok(None);
+            }
+            let relative = Path::new(OsStr::from_bytes(path));
+            if Self::starts_at_a_recorded_link(guest, base, relative) {
+                return Ok(None);
+            }
+            match Self::observed_path(guest, base, relative) {
+                Ok(observed) if observed.is_absolute() => {
+                    observed.into_os_string().into_encoded_bytes()
+                }
+                _ => return Ok(None),
+            }
+        };
+        Self::guest_fd_respelled_absolute(guest, &absolute, own, follows, 0)
+    }
+
+    /// [`Self::guest_fd_respelled`] of an absolute spelling the walk has
+    /// reached, with `followed_links` symbolic links already followed to
+    /// reach it. A link to a placeholder descriptor is the placeholder
+    /// machinery's, not this respelling's; a process-table link a thread
+    /// that does not hold that table cannot validate is left alone.
+    fn guest_fd_respelled_absolute<G: Guest<Self>>(
+        guest: &G,
+        absolute: &[u8],
+        own: (i32, i32),
+        follows: bool,
+        followed_links: usize,
+    ) -> Result<Option<(RawFd, Vec<u8>)>, Errno> {
+        if let Some((link, _)) = descriptor_link_prefix(absolute)
+            && let Some(descriptor) =
+                crate::syscalls::namespace::own_descriptor_link(&link, Some(own))
+        {
+            if Self::placeholder_of(guest, descriptor.fd).is_some() {
+                return Ok(None);
+            }
+            if descriptor.table == crate::syscalls::namespace::DescriptorTable::Process {
+                let state = guest.thread_state();
+                if state.dettid.as_raw() != own.0 && !state.holds_process_files() {
+                    return Ok(None);
+                }
+            }
+        }
+        guest_fd_respell_decision(absolute, Some(own), follows, followed_links, |fd| {
+            guest.thread_state().with_detfd(fd, |_| ()).is_ok()
+        })
     }
 
     /// The path operands of `call` that lead below a placeholder directory,
@@ -5529,9 +5635,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) -> Result<Vec<RespelledOperand>, Errno> {
-        if !Self::serves_placeholders(guest) {
-            return Ok(Vec::new());
-        }
         let (sysno, args) = call.into_parts();
         let read_operand = |guest: &G, pointer: usize| -> Option<Vec<u8>> {
             PathPtr::from_ptr(pointer as *const libc::c_char)
@@ -5571,22 +5674,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let dirfd = dirfd_index.map(|index| argument(&args, index) as i32);
             let follows = follows_final(sysno, &args, path_index);
-            let Some((bytes, absolute)) =
+            let placeholder = if Self::serves_placeholders(guest) {
                 Self::respelled_lookup(guest, dirfd, &path, follows, resolve).await?
-            else {
-                continue;
+            } else {
+                None
             };
-            if resolve & SCOPED_RESOLVE != 0 {
-                return Err(Errno::EXDEV);
+            if let Some((bytes, absolute)) = placeholder {
+                if resolve & SCOPED_RESOLVE != 0 {
+                    return Err(Errno::EXDEV);
+                }
+                if bytes.len() >= PATH_LIMIT {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                respelled.push(RespelledOperand {
+                    dirfd: if absolute { dirfd_index } else { None },
+                    dirfd_fd: None,
+                    path: path_index,
+                    bytes,
+                });
+                continue;
             }
-            if bytes.len() >= PATH_LIMIT {
-                return Err(Errno::ENAMETOOLONG);
+            // A guest descriptor link below no placeholder, respelled to
+            // its guest descriptor and remainder (dh-23x5y5). Only a call
+            // with a descriptor argument can carry that form; a plain
+            // absolute call's exact link is already the backend's exact
+            // case (and glibc's `open`/`stat` reach here as their `*at`
+            // forms in any case).
+            if let Some(dirfd_index) = dirfd_index
+                && let Some((fd, remainder)) =
+                    Self::guest_fd_respelled(guest, dirfd, &path, follows).await?
+            {
+                if remainder.len() >= PATH_LIMIT {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                respelled.push(RespelledOperand {
+                    dirfd: Some(dirfd_index),
+                    dirfd_fd: Some(fd),
+                    path: path_index,
+                    bytes: remainder,
+                });
             }
-            respelled.push(RespelledOperand {
-                dirfd: if absolute { dirfd_index } else { None },
-                path: path_index,
-                bytes,
-            });
         }
         Ok(respelled)
     }

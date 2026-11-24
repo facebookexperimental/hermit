@@ -323,7 +323,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut staged = Vec::with_capacity(respelled.len());
                 for operand in respelled {
                     if let Some(dirfd) = operand.dirfd {
-                        values[dirfd] = libc::AT_FDCWD as isize as usize;
+                        values[dirfd] = operand
+                            .dirfd_fd
+                            .map_or(libc::AT_FDCWD as isize as usize, |fd| fd as isize as usize);
                     }
                     let mut bytes = operand.bytes;
                     if own_tasks
