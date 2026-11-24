@@ -208,9 +208,22 @@ self_test() {
     # The verifier runs under test are children, so they inherit this too.
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+    # Resolve ONE real git, once, for every fixture and verifier run below, so
+    # this self-test's cost is git's own. The first git on PATH can be a
+    # wrapper that starts more processes on every call, which multiplies the
+    # cost of the hundreds of calls below by an amount that swings with host
+    # load. Git installs its own binary in its exec path, so that is the same
+    # git without whatever wraps it. A git whose exec path holds no git is used
+    # as found. The line printed names both.
+    local path_git exec_path
+    path_git=$(command -v git) || fail 'self-test needs git on PATH'
+    git_bin=$path_git
+    if exec_path=$("$path_git" --exec-path) && [[ -f $exec_path/git && -x $exec_path/git ]]; then
+        git_bin=$exec_path/git
+    fi
+    printf 'self-test git: %s (first git on PATH: %s)\n' "$git_bin" "$path_git"
     root=$(mktemp -d)
     self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
-    git_bin=$(command -v git)
     agent_seed=$root/agent-utils-seed
     rr_seed=$root/rr-seed
     super=$root/super
