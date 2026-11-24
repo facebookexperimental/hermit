@@ -30,8 +30,21 @@ CPUID_FAULTING_REASON = "host-inapplicable: Hermit's ptrace backend virtualizes 
 def run_gated_only():
     return []
 
-def gated_test(name, test, env = {}, labels = [], abi_probe = None, pmu_probe = None, allow_cpuid_re = True, counted_retries = 0):
-    _unused = (name, test, env, labels, abi_probe, pmu_probe, allow_cpuid_re, counted_retries)  # @unused
+def gated_test(
+    name,
+    test,
+    env = {},
+    labels = [],
+    abi_probe = None,
+    pmu_probe = None,
+    allow_cpuid_re = True,
+    counted_retries = 0,
+    gates = None,
+    only_cases = [],
+    run_ignored_cases = [],
+    require_gates = False,
+):
+    _unused = (name, test, env, labels, abi_probe, pmu_probe, allow_cpuid_re, counted_retries, gates, only_cases, run_ignored_cases, require_gates)  # @unused
 
 def hermit_host_test(name, test, args = [], env = {}, labels = [], allow_cpuid_re = True):
     _unused = (allow_cpuid_re,)  # @unused

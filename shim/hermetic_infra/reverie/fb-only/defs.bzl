@@ -34,8 +34,20 @@ REVERIE_ONCALL = "hermit"
 def run_gated_only():
     return []
 
-def gated_test(name, test, env = {}, labels = [], native_abi_probe = False, counted_retries = 0):
-    _unused = (name, test, env, labels, native_abi_probe, counted_retries)  # @unused
+def gated_test(
+    name,
+    test,
+    env = {},
+    labels = [],
+    native_abi_probe = False,
+    counted_retries = 0,
+    gates = None,
+    only_cases = [],
+    pmu_probe = False,
+    run_ignored_cases = [],
+    require_gates = False,
+):
+    _unused = (name, test, env, labels, native_abi_probe, counted_retries, gates, only_cases, pmu_probe, run_ignored_cases, require_gates)  # @unused
 
 def excluded_paths_test(name = "excluded-paths-test"):
     _unused = (name,)  # @unused
