@@ -9651,6 +9651,7 @@ fn write_plan_after_scorecard_check(
     });
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
+    let canonical_caps = canonical.resource_caps.clone();
     let mut dag = canonical;
     dag.resource_caps = BTreeMap::from([
         ("cargo_writer".into(), 1),
@@ -9666,6 +9667,7 @@ fn write_plan_after_scorecard_check(
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
+    inherit_canonical_grants(&mut dag, &canonical_caps);
     let (
         manifest_guest_memory_budget_bytes,
         manifest_guest_memory_required_bytes,
@@ -9850,6 +9852,30 @@ fn audit_dag_retained(
         allow_plain_rename,
         expect_pinned,
     )
+}
+
+/// Grant each resource a step demands, and this graph does not grant itself,
+/// exactly as the canonical DAG grants it. The nodes cloned from the canonical
+/// graph keep its contracts: today that is the Buck build node's one buck2
+/// daemon per checkout (`buck_daemon`, which validate.json grants once). A
+/// demand the canonical graph grants nothing for stays ungranted, so
+/// `audit_dag` still refuses it by name. A grant this graph sets itself
+/// (cargo_writer, manifest_guest, kvm_guest and each cell's exclusive
+/// resources) is never replaced, and a canonical grant no step demands is not
+/// copied.
+fn inherit_canonical_grants(dag: &mut DagConfig, canonical_caps: &BTreeMap<String, i64>) {
+    let inherited: Vec<(String, i64)> = dag
+        .steps
+        .iter()
+        .flat_map(|step| step.hint.resources.keys())
+        .filter(|resource| !dag.resource_caps.contains_key(*resource))
+        .filter_map(|resource| {
+            canonical_caps
+                .get(resource)
+                .map(|capacity| (resource.clone(), *capacity))
+        })
+        .collect();
+    dag.resource_caps.extend(inherited);
 }
 
 fn audit_dag_impl(
@@ -28110,6 +28136,38 @@ mod host_workdir_preflight_real_plan_tests {
         assert!(verdict.unwrap().is_empty());
         assert!(requesting > 1, "{requesting}");
     }
+
+    /// Both real plans keep the Buck build node's demand for the one buck2
+    /// daemon per checkout, and grant it exactly as validate.json does.
+    #[test]
+    fn a_real_plan_grants_the_buck_daemon_as_validate_does() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let canonical =
+            dag_from_json(&fs::read_to_string(root.join(PORTABLE_DAG)).unwrap()).unwrap();
+        let granted = canonical.resource_caps.get("buck_daemon").copied();
+        assert_eq!(granted, Some(1), "validate.json's buck_daemon grant moved");
+        for (tag, pinned_root) in [("buck-host", false), ("buck-pinned", true)] {
+            let (guard, _metadata, dag) = real_plan(tag, pinned_root);
+            guard.remove().unwrap();
+            let buck = dag
+                .steps
+                .iter()
+                .find(|step| step.tag() == "build.buck_release_artifact")
+                .expect("the plan lost its Buck build node");
+            assert_eq!(buck.hint.resources.get("buck_daemon"), Some(&1), "{tag}");
+            assert_eq!(
+                dag.resource_caps.get("buck_daemon").copied(),
+                granted,
+                "{tag}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -34798,6 +34856,86 @@ mod pressure_planning_tests {
         }
         dag.resource_caps.insert(unused, 1);
         assert_eq!(audit_dag(&dag, 1, 100, &times, false), Ok(()));
+    }
+
+    #[test]
+    fn a_cloned_node_gets_the_canonical_grant_it_demands_and_nothing_else() {
+        let cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; sync -- results.in-progress.jsonl || status=$?; mv -- results.in-progress.jsonl results.jsonl || status=$?; sync -- . || status=$?; exit \"$status\"";
+        // The pressure graph's own grants, a node cloned from the canonical
+        // graph that demands the one buck2 daemon per checkout, and a cell.
+        let dag = dag_from_json(
+            &json!({
+                "resource_caps": {"cargo_writer": 1, "manifest_guest": 1},
+                "steps": [
+                    {
+                        "group": "build",
+                        "job": "buck_release_artifact",
+                        "cmd": "true",
+                        "deps": [],
+                        "timeout": 20,
+                        "cpu_timeout": 40,
+                        "hint": {"resources": {"buck_daemon": 1}, "hard_mem_max_bytes": 1024}
+                    },
+                    {
+                        "group": "cell",
+                        "job": "fixture",
+                        "cmd": cmd,
+                        "deps": ["build.buck_release_artifact"],
+                        "timeout": 20,
+                        "cpu_timeout": 40,
+                        "hint": {"resources": {"manifest_guest": 1}, "hard_mem_max_bytes": 1024}
+                    },
+                    {
+                        "group": "pressure",
+                        "job": "summarize",
+                        "cmd": "true",
+                        "deps": ["cell.fixture"],
+                        "timeout": 10,
+                        "cpu_timeout": 10,
+                        "hint": {"hard_mem_max_bytes": 1024}
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
+        // Before inheriting, the audit refuses the Buck node by name.
+        let Err(error) = audit_dag(&dag, 1, 100, &times, false) else {
+            panic!("the audit accepted a buck_daemon demand that nothing grants");
+        };
+        assert_eq!(
+            error,
+            "build.buck_release_artifact requests 1 unit(s) of buck_daemon, but the DAG grants 0"
+        );
+        // validate.json's grants: the demanded one is inherited; the graph's
+        // own manifest_guest grant is not replaced, and a canonical grant no
+        // step demands is not copied.
+        let canonical = BTreeMap::from([
+            ("buck_daemon".to_string(), 1),
+            ("integration_test_binaries.cli".to_string(), 1),
+            ("manifest_guest".to_string(), 20),
+        ]);
+        let mut inherited = dag.clone();
+        inherit_canonical_grants(&mut inherited, &canonical);
+        assert_eq!(
+            inherited.resource_caps,
+            BTreeMap::from([
+                ("buck_daemon".to_string(), 1),
+                ("cargo_writer".to_string(), 1),
+                ("manifest_guest".to_string(), 1),
+            ])
+        );
+        assert_eq!(audit_dag(&inherited, 1, 100, &times, false), Ok(()));
+        // A canonical graph that grants no buck_daemon leaves the demand
+        // ungranted, and the audit still refuses it.
+        let mut ungranted = dag.clone();
+        inherit_canonical_grants(
+            &mut ungranted,
+            &BTreeMap::from([("manifest_guest".to_string(), 20)]),
+        );
+        assert_eq!(ungranted.resource_caps, dag.resource_caps);
+        assert_eq!(audit_dag(&ungranted, 1, 100, &times, false), Err(error));
     }
 }
 
