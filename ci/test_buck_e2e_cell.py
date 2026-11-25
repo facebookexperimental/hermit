@@ -47,12 +47,8 @@ runs locally, and each parity candidate shares its ptrace reference's route.
 CpuidOnReRouteTest evaluates the same plan with that switch on.
 
 Every test that execs defs.bzl (those classes, and one CellTest case) reads it
-through defs_source(). ShipIt strips defs.bzl from the GitHub export,
-facebookexperimental/hermit, with every other .bzl file until dh-2y5z03 V4. There
-those tests are skipped and the run prints one line beginning SKIPPED. Only an
-absent defs.bzl with GITHUB_REPOSITORY naming the export skips (DefsSkipTest): any
-other checkout missing the file still fails, and an export that has it runs every
-test. V4 deletes the skip.
+through defs_source(). The GitHub export, facebookexperimental/hermit, carries
+defs.bzl, so these tests run everywhere, and a checkout missing it fails.
 """
 
 from __future__ import annotations
@@ -69,7 +65,6 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import test_buck_e2e_ingest as ingest_test
 
@@ -77,9 +72,6 @@ import test_buck_e2e_ingest as ingest_test
 CI = Path(__file__).resolve().parent
 CELL_SH = CI / "buck-e2e" / "cell.sh"
 DEFS = CI / "buck-e2e" / "defs.bzl"
-DEFS_NAME = "ci/buck-e2e/defs.bzl"
-# The GitHub export ShipIt publishes, which has no .bzl file until dh-2y5z03 V4.
-EXPORT_REPOSITORY = "facebookexperimental/hermit"
 PLAN = CI / "expected-e2e-plan.json"
 RE_EXCLUSIONS = CI / "buck-e2e" / "re_exclusions.json"
 TEST, MODE, BACKEND = "c-programs/cpuid-probe", "verify", "dbt"
@@ -2074,70 +2066,9 @@ def _defs_load(module: str, *symbols: str, **aliases: str) -> None:
         raise AssertionError(f"unexpected load in defs.bzl: {module!r} {sorted(requested)}")
 
 
-def defs_skip_reason(defs: Path, repository: str | None) -> str | None:
-    """The SKIPPED line for the GitHub export, or None to run the tests that exec defs.bzl.
-
-    It skips only when repository is EXPORT_REPOSITORY and nothing at all is at defs:
-    any other checkout missing the file still fails, and an export that has it runs
-    every test. dh-2y5z03 V4 deletes this skip.
-    """
-    if repository != EXPORT_REPOSITORY:
-        return None
-    try:
-        defs.lstat()
-    except FileNotFoundError:
-        return (f"SKIPPED on {EXPORT_REPOSITORY}: {DEFS_NAME} is absent, because ShipIt "
-                "strips every .bzl file from this export; the tests that exec it are "
-                "skipped until dh-2y5z03 V4 exports the Buck graph and deletes this skip")
-    return None
-
-
-DEFS_SKIP = defs_skip_reason(DEFS, os.environ.get("GITHUB_REPOSITORY"))
-
-
 def defs_source() -> str:
-    """defs.bzl's text. On the GitHub export without it, skips the calling test instead."""
-    if DEFS_SKIP:
-        raise unittest.SkipTest(DEFS_SKIP)
+    """defs.bzl's text."""
     return DEFS.read_text()
-
-
-class DefsSkipTest(unittest.TestCase):
-    """The tests that exec defs.bzl skip only on the export, and only without the file."""
-
-    def setUp(self) -> None:
-        self.dir = Path(tempfile.mkdtemp(prefix="test-buck-e2e-cell-defs-"))
-        self.addCleanup(shutil.rmtree, self.dir)
-        self.defs = self.dir / "defs.bzl"
-
-    def test_only_the_export_without_the_file_skips(self) -> None:
-        reason = defs_skip_reason(self.defs, EXPORT_REPOSITORY)
-        self.assertIsNotNone(reason)
-        self.assertTrue(reason.startswith("SKIPPED on facebookexperimental/hermit: "), reason)
-        self.assertIn(DEFS_NAME, reason)
-        self.assertIn("dh-2y5z03 V4", reason)
-        for other in (None, "rrnewton/hermit", "", "FacebookExperimental/hermit",
-                      "facebookexperimental/hermit-fork", "facebookexperimental/hermit "):
-            self.assertIsNone(defs_skip_reason(self.defs, other), other)
-
-    def test_the_export_with_the_file_runs_every_test(self) -> None:
-        self.defs.write_text("")
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-        # Something at the path that is not a readable file is not absent either:
-        # the tests run and fail on it rather than skip.
-        self.defs.unlink()
-        self.defs.symlink_to(self.dir / "nowhere")
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-        self.defs.unlink()
-        self.defs.mkdir()
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-
-    def test_a_test_that_reads_defs_is_skipped_with_the_reason(self) -> None:
-        reason = defs_skip_reason(self.defs, EXPORT_REPOSITORY)
-        with mock.patch.object(sys.modules[__name__], "DEFS_SKIP", reason):
-            with self.assertRaises(unittest.SkipTest) as skipped:
-                defs_source()
-        self.assertEqual(str(skipped.exception), reason)
 
 
 def evaluate_cells(routing: str, pmu_on_re: str | None = "true", cpuid_on_re: str | None = None,
@@ -2734,6 +2665,4 @@ class PmuOnReDefaultTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if DEFS_SKIP:
-        print(f"test_buck_e2e_cell.py: {DEFS_SKIP}", flush=True)
     unittest.main()
