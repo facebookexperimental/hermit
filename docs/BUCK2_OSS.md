@@ -604,8 +604,7 @@ How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
     other mode reads.
 
   buck2 labels both testing knobs; buck2's own open-source CI uses the first for
-  the same reason. Any other `BUCK2_TEST_*` variable, or
-  `BUCK2_SETTINGS_OVERRIDE`, makes the node exit 2.
+  the same reason. Any other `BUCK2_TEST_*` variable makes the node exit 2.
 - **In every form, right after the knobs and before any buck2 runs**, it exits 2
   on:
   - a buck2 settings file (`.bucksettings.toml` or `.bucksettings.local.toml`)

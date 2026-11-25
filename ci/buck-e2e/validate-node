@@ -45,7 +45,7 @@
 #   - BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1 skips /etc/buckconfig.d/*, /etc/buckconfig,
 #     ~/.buckconfig.d/* and ~/.buckconfig.local;
 #   - BUCK2_TEST_EXTRA_EXTERNAL_CONFIG adds stock-runner.buckconfig, which no other mode reads.
-# Any other BUCK2_TEST_* variable, or BUCK2_SETTINGS_OVERRIDE, refuses (exit 2).
+# Any other BUCK2_TEST_* variable refuses (exit 2).
 # Right after exporting them, in every form, before any buck2 runs, it refuses a buck2
 # settings file in HOME or at the checkout's root, and an untracked or linked
 # .buckconfig.local or .buckconfig.d at the checkout's root (the shared action cache link of

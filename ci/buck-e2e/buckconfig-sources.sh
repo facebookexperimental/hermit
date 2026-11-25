@@ -19,14 +19,14 @@ stock_config_rel=ci/buck-e2e/stock-runner.buckconfig
 # Export the two buck2 knobs every buck2 of a Buck-only run gets, the daemon included:
 # BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1 skips /etc/buckconfig.d/*, /etc/buckconfig,
 # ~/.buckconfig.d/* and ~/.buckconfig.local; BUCK2_TEST_EXTRA_EXTERNAL_CONFIG adds the run's
-# own settings file, which no other mode reads. Other buck2 test knobs and a settings
-# override reach buck2 outside any buckconfig, so they refuse.
+# own buckconfig file, which no other mode reads. Other buck2 test knobs
+# reach buck2 outside any buckconfig, so they refuse.
 export_stock_buckconfig_env() {
     local name
     for name in $(compgen -e); do
         case $name in
             BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG | BUCK2_TEST_EXTRA_EXTERNAL_CONFIG) ;;
-            BUCK2_TEST_* | BUCK2_SETTINGS_OVERRIDE)
+            BUCK2_TEST_*)
                 echo "validate-node: buck-stock refuses $name in its environment: it changes buck2 outside the checkout's buckconfig; unset it" >&2
                 exit 2
                 ;;
