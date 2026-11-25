@@ -1315,6 +1315,35 @@ mod e2e_payload_identity_tests {
         }
     }
 
+    /// The release identity check passes in this checkout with
+    /// GITHUB_REPOSITORY unset, as in a fresh clone. Where the checkout's
+    /// commit does not carry shim/BUCK (the export's shape), it skips that file
+    /// by name instead of failing to read it.
+    #[test]
+    fn buck_identity_needs_no_repository_claim() {
+        let root = test_source_root();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "e2e_payload_identity_tests::buck_identity_matches_the_release_rustc_flags",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove("GITHUB_REPOSITORY")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        if !root.join("shim/BUCK").exists() && head_lacks(&root, "shim/BUCK") {
+            assert!(
+                stderr.contains("validate.rs: SKIPPED: shim/BUCK is absent"),
+                "{stderr}"
+            );
+        }
+    }
+
     /// shim/BUCK's release flag list agrees with the recorded identity.
     fn release_flags_match(buck: &serde_json::Value, shim: &str) {
         let start = shim
@@ -1345,57 +1374,87 @@ mod e2e_payload_identity_tests {
         }
     }
 
+    /// Git in an export-shape fixture repository, as a fixed committer.
+    fn export_fixture_git(root: &Path, args: &[&str]) {
+        let output = scratch_git()
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
-    fn only_an_absent_buck_file_on_the_export_is_skipped() {
+    fn only_a_buck_file_the_checkouts_commit_does_not_track_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        // An export-shaped checkout: its commit tracks hermit-cli's Buck files
+        // and the Makefile, and not shim/BUCK. No environment variable takes
+        // part: the answer comes from the checkout alone.
         std::fs::create_dir_all(root.join("hermit-cli")).unwrap();
-        let export = Some(EXPORT_REPOSITORY);
-        for absent in [
+        for tracked in [
             "hermit-cli/BUCK",
-            "shim/BUCK",
             "hermit-cli/release_alias.bzl",
-            "x/defs.BZL",
+            "Makefile",
         ] {
-            assert!(export_strip_applies(root, absent, export), "{absent}");
-            for other in [
-                None,
-                Some("rrnewton/hermit"),
-                Some(""),
-                Some("FacebookExperimental/hermit"),
-                Some("facebookexperimental/hermit-fork"),
-                Some("facebookexperimental/hermit "),
-            ] {
-                assert!(
-                    !export_strip_applies(root, absent, other),
-                    "{absent} {other:?}"
-                );
-            }
+            std::fs::write(root.join(tracked), "").unwrap();
         }
-        // Only Buck files: any other missing file still fails on the export.
+        export_fixture_git(root, &["init", "-q"]);
+        export_fixture_git(root, &["add", "hermit-cli", "Makefile"]);
+        export_fixture_git(root, &["commit", "-qm", "export-shaped fixture"]);
+        // Buck files neither the commit nor the disk carries are skipped.
+        for absent in ["shim/BUCK", "x/defs.BZL", "hermit-cli/other.bzl"] {
+            assert!(export_strip_applies(root, absent), "{absent}");
+        }
+        // Only Buck files: any other file the commit lacks still fails.
         for other_file in [
             "hermit-cli/Cargo.toml",
             "hermit-cli/BUCK.v2",
             "x/BUCKET",
-            "Makefile",
+            "README.md",
         ] {
-            assert!(
-                !export_strip_applies(root, other_file, export),
-                "{other_file}"
-            );
+            assert!(!export_strip_applies(root, other_file), "{other_file}");
         }
+        // A file the commit tracks still fails when it is missing on disk.
+        std::fs::remove_file(root.join("hermit-cli/BUCK")).unwrap();
+        assert!(!export_strip_applies(root, "hermit-cli/BUCK"));
         // Present, or anything at all at the path, is not absent.
-        std::fs::write(root.join("hermit-cli/BUCK"), "").unwrap();
-        assert!(!export_strip_applies(root, "hermit-cli/BUCK", export));
-        std::fs::create_dir(root.join("hermit-cli/release_alias.bzl")).unwrap();
-        assert!(!export_strip_applies(
-            root,
-            "hermit-cli/release_alias.bzl",
-            export
-        ));
+        assert!(!export_strip_applies(root, "hermit-cli/release_alias.bzl"));
+        std::fs::create_dir(root.join("shim")).unwrap();
+        std::fs::write(root.join("shim/BUCK"), "").unwrap();
+        assert!(!export_strip_applies(root, "shim/BUCK"));
         std::fs::create_dir(root.join("x")).unwrap();
         std::os::unix::fs::symlink("nowhere", root.join("x/defs.BZL")).unwrap();
-        assert!(!export_strip_applies(root, "x/defs.BZL", export));
+        assert!(!export_strip_applies(root, "x/defs.BZL"));
+        std::fs::create_dir_all(root.join("y/defs.bzl")).unwrap();
+        assert!(!export_strip_applies(root, "y/defs.bzl"));
+        // Where git cannot answer (a repository with no commit yet), nothing
+        // is skipped: the caller reads the file and fails by name.
+        let empty = tempfile::tempdir().unwrap();
+        export_fixture_git(empty.path(), &["init", "-q"]);
+        assert!(!export_strip_applies(empty.path(), "shim/BUCK"));
+        // Nor for a tree with no repository of its own inside an UNRELATED
+        // repository: git would answer for the enclosing one, whose commit
+        // does not track inner/shim/BUCK, so that answer is refused.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("tracked"), "").unwrap();
+        export_fixture_git(outer.path(), &["init", "-q"]);
+        export_fixture_git(outer.path(), &["add", "tracked"]);
+        export_fixture_git(outer.path(), &["commit", "-qm", "unrelated repository"]);
+        let inner = outer.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(!export_strip_applies(&inner, "shim/BUCK"));
         // The line names what removes the skip. V4 exports hermit-cli's Buck
         // files; the open-source Buck layer under shim/ waits for dh-8zi9o4.
         for shared in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
@@ -3513,55 +3572,94 @@ fn assert_submodule_fixture_source(
     Ok(())
 }
 
-/// The GitHub export ShipIt publishes, which carries no BUCK or .bzl file; see
-/// `stripped_from_export`.
+/// The GitHub export ShipIt publishes, whose commits do not carry the Buck
+/// files it strips; see `stripped_from_export`.
 const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
 
-/// Whether `relative` is a Buck file that ShipIt strips (a BUCK or .bzl file),
-/// nothing at all is at it below `root`, and `repository` is exactly
-/// `EXPORT_REPOSITORY`. Anywhere else, or with the file present, it is false,
-/// so a checkout missing the file still fails. Each skip it allows comes out as
-/// `export_skip_line` says.
-fn export_strip_applies(root: &Path, relative: &str, repository: Option<&str>) -> bool {
+/// Whether the checkout at `root` does not carry the Buck file `relative` (a
+/// BUCK or .bzl file): nothing at all is at it, and the commit checked out
+/// there does not track it. That is the shape of a ShipIt export, decided from
+/// the checkout itself, so it holds for a fresh clone with no environment set.
+/// A checkout whose commit tracks the file still fails when the file is
+/// missing, and so does any checkout where git cannot answer (no repository,
+/// no commit). Each skip it allows comes out as `export_skip_line` says.
+fn export_strip_applies(root: &Path, relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     let buck_file = name == "BUCK" || name.to_ascii_lowercase().ends_with(".bzl");
     let absent = matches!(
         std::fs::symlink_metadata(root.join(relative)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     );
-    buck_file && absent && repository == Some(EXPORT_REPOSITORY)
+    buck_file && absent && head_lacks(root, relative)
 }
 
-/// The SKIPPED line for skipping `what` because `relative` is absent on the
-/// export. The file decides what removes the skip. dh-2y5z03 V4 exports the
-/// shared Buck files, such as hermit-cli's, and deletes their skips. The
-/// open-source Buck layer under shim/ stays off the export even after V4, so
-/// its skips name dh-8zi9o4, which decides where that layer lives after the
-/// branch flip, and come out when that is resolved.
+/// Whether the commit checked out at `root` does not track `relative`: `root`
+/// is the top level of a git worktree (so git answers for the checkout at
+/// `root`, not for some repository that merely encloses it), and HEAD's tree
+/// lists nothing at that path. Any failure to answer is false, so the caller
+/// reads the file and fails by name. The checkout is named by its path, so
+/// inherited repository-location variables are dropped
+/// ([`without_repository_location`]), and lazy fetching is off: the answer
+/// comes from objects already present.
+fn head_lacks(root: &Path, relative: &str) -> bool {
+    let git = |args: &[&str]| {
+        let mut git = Command::new("git");
+        without_repository_location(&mut git);
+        git.arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+    };
+    let top_level = match git(&["rev-parse", "--show-toplevel"]) {
+        Ok(output) if output.status.success() => {
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n'))
+        }
+        _ => return false,
+    };
+    match (top_level.canonicalize(), root.canonicalize()) {
+        (Ok(top_level), Ok(root)) if top_level == root => {}
+        _ => return false,
+    }
+    matches!(
+        git(&["ls-tree", "--name-only", "HEAD", "--", relative]),
+        Ok(output) if output.status.success() && output.stdout.is_empty()
+    )
+}
+
+/// The SKIPPED line for skipping `what` because this checkout's commit does
+/// not carry `relative`, as on the export. The file decides what removes the
+/// skip. dh-2y5z03 V4 exports the shared Buck files, such as hermit-cli's, and
+/// deletes their skips. The open-source Buck layer under shim/ stays off the
+/// export even after V4, so its skips name dh-8zi9o4, which decides where that
+/// layer lives after the branch flip, and come out when that is resolved.
 fn export_skip_line(relative: &str, what: &str) -> String {
     if relative.starts_with("shim/") {
         format!(
-            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent: it belongs \
-             to the open-source Buck layer, which this export does not carry; {what} needs \
-             that layer, and this skip comes out when dh-8zi9o4 (where that layer lives \
-             after the branch flip) is resolved"
+            "validate.rs: SKIPPED: {relative} is absent and this checkout's commit does \
+             not track it: it belongs to the open-source Buck layer, which the \
+             {EXPORT_REPOSITORY} export does not carry; {what} needs that layer, and this \
+             skip comes out when dh-8zi9o4 (where that layer lives after the branch flip) \
+             is resolved"
         )
     } else {
         format!(
-            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent, because \
-             ShipIt strips it from this export; {what} is skipped until dh-2y5z03 V4 \
-             exports it and deletes this skip"
+            "validate.rs: SKIPPED: {relative} is absent and this checkout's commit does \
+             not track it, as ShipIt strips it from the {EXPORT_REPOSITORY} export; \
+             {what} is skipped until dh-2y5z03 V4 exports it and deletes this skip"
         )
     }
 }
 
-/// `export_strip_applies` for this process's GITHUB_REPOSITORY. When it holds,
-/// the caller skips `what` (the part that reads the file), and this prints its
+/// `export_strip_applies` for the checkout at `root`. When it holds, the
+/// caller skips `what` (the part that reads the file), and this prints its
 /// `export_skip_line` to stderr directly, so a test harness's output capture
 /// does not hide it.
 fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
-    let repository = std::env::var("GITHUB_REPOSITORY").ok();
-    let applies = export_strip_applies(root, relative, repository.as_deref());
+    let applies = export_strip_applies(root, relative);
     if applies {
         let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
     }

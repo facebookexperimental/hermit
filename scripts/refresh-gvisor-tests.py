@@ -163,16 +163,53 @@ def self_test():
             fh.write(b"// extra\n")
         problems = verify_manifest(tree, manifest)
         assert any("not in hash manifest" in p for p in problems), problems
-        # The export skip: a missing generated BUCK on the export alone.
-        absent = os.path.join(tmp, "absent", "BUCK")
-        assert export_skips("../BUCK", absent, EXPORT_REPOSITORY)
-        for other in (None, "", "rrnewton/hermit", "facebookexperimental/hermit-fork"):
-            assert not export_skips("../BUCK", absent, other), other
-        assert not export_skips("gen.bzl", absent, EXPORT_REPOSITORY)
-        assert not export_skips("../BUCK", victim, EXPORT_REPOSITORY)
+        # The export skip, decided from the checkout with GITHUB_REPOSITORY
+        # unset, as in a fresh clone: an export-shaped checkout whose commit
+        # tracks kept/BUCK and not the generated BUCK.
+        os.environ.pop("GITHUB_REPOSITORY", None)
+        export = os.path.join(tmp, "export")
+        os.makedirs(os.path.join(export, "kept"))
+        with open(os.path.join(export, "kept", "BUCK"), "w") as fh:
+            fh.write("")
+
+        def fixture_git(repo, *args):
+            env = {k: v for k, v in os.environ.items() if k not in REPOSITORY_LOCATION}
+            subprocess.run(["git", "-C", repo, "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.invalid"] + list(args),
+                           env=env, check=True, capture_output=True)
+
+        fixture_git(export, "init", "-q")
+        fixture_git(export, "add", "kept")
+        fixture_git(export, "commit", "-qm", "export-shaped fixture")
+        absent = os.path.join(export, "gen", "BUCK")
+        assert export_skips("../BUCK", absent, export)
+        assert not export_skips("gen.bzl", absent, export)
+        assert not export_skips("../BUCK", victim, export)
+        # A file the commit tracks is stale when missing, never skipped.
+        tracked = os.path.join(export, "kept", "BUCK")
+        os.remove(tracked)
+        assert not export_skips("../BUCK", tracked, export)
+        # Where git cannot answer (no commit yet, a tree with no repository of
+        # its own inside an UNRELATED repository, or a path outside the
+        # checkout), nothing is skipped.
+        outer = os.path.join(tmp, "outer")
+        os.makedirs(os.path.join(outer, "inner"))
+        with open(os.path.join(outer, "tracked"), "w") as fh:
+            fh.write("")
+        fixture_git(outer, "init", "-q")
+        fixture_git(outer, "add", "tracked")
+        fixture_git(outer, "commit", "-qm", "unrelated repository")
+        inner = os.path.join(outer, "inner")
+        assert not export_skips("../BUCK", os.path.join(inner, "gen", "BUCK"), inner)
+        empty = os.path.join(tmp, "empty")
+        os.makedirs(empty)
+        fixture_git(empty, "init", "-q")
+        assert not export_skips("../BUCK", os.path.join(empty, "gen", "BUCK"), empty)
+        assert not export_skips("../BUCK", os.path.join(tmp, "elsewhere", "BUCK"), export)
         line = export_skip_line(os.path.join(BUILD, "../BUCK"))
-        assert line.startswith("refresh-gvisor-tests: SKIPPED on facebookexperimental/hermit:"
-                               " third-party/gvisor-syscall-tests/BUCK is absent:"), line
+        assert line.startswith("refresh-gvisor-tests: SKIPPED:"
+                               " third-party/gvisor-syscall-tests/BUCK is absent and"
+                               " this checkout's commit does not track it:"), line
         assert "open-source Buck layer" in line and "dh-8zi9o4" in line, line
         assert "V4" not in line, line
         print("refresh-gvisor-tests self-test: ok (clean, one-byte edit, extra file,"
@@ -190,25 +227,65 @@ def dep_versions(module_text):
     return out
 
 
-def export_skips(name, path, repository):
+# Git exports these to hooks and `git rebase --exec` steps, and they override
+# `git -C`; head_lacks names the checkout by its path, so it drops them.
+REPOSITORY_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                       "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                       "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def head_lacks(root, relative):
+    """Whether the commit checked out at `root` does not track `relative`:
+    `root` is the top level of a git worktree (so git answers for the checkout
+    at `root`, not for some repository that merely encloses it), and HEAD's
+    tree lists nothing at that path. Any failure to answer (no repository, no
+    commit, a path outside it) is False, so the file still counts as stale.
+    Lazy fetching is off: the answer comes from objects already present."""
+    env = {k: v for k, v in os.environ.items() if k not in REPOSITORY_LOCATION}
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_LAZY_FETCH"] = "1"
+
+    def git(*args):
+        return subprocess.run(["git", "-C", root] + list(args), env=env,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+
+    try:
+        top = git("rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            return False
+        top_level = top.stdout.decode("utf-8", "surrogateescape").rstrip("\n")
+        if os.path.realpath(top_level) != os.path.realpath(root):
+            return False
+        listed = git("ls-tree", "--name-only", "HEAD", "--", relative)
+    except OSError:
+        return False
+    return listed.returncode == 0 and listed.stdout == b""
+
+
+def export_skips(name, path, root=ROOT):
     """Whether --check skips the generated file `name` at `path`: only a BUCK
-    file, only when nothing at all is at the path, and only when `repository`
-    is exactly EXPORT_REPOSITORY. Anywhere else a missing generated file is
-    still stale. That BUCK file belongs to the open-source Buck layer, which
-    the export does not carry even after dh-2y5z03 V4 (V4 lists it among the
-    files it keeps stripped). So the skip comes out when dh-8zi9o4, which
-    decides where that layer lives after the branch flip, is resolved."""
+    file, only when nothing at all is at the path, and only when the commit
+    checked out at `root` does not track it either. That is the shape of the
+    GitHub export (EXPORT_REPOSITORY), decided from the checkout itself, so it
+    holds for a fresh clone with no environment set. A checkout whose commit
+    tracks the file still finds it stale when it is missing. That BUCK file
+    belongs to the open-source Buck layer, which the export does not carry
+    even after dh-2y5z03 V4 (V4 lists it among the files it keeps stripped).
+    So the skip comes out when dh-8zi9o4, which decides where that layer lives
+    after the branch flip, is resolved."""
     return (os.path.basename(name) == "BUCK" and not os.path.lexists(path)
-            and repository == EXPORT_REPOSITORY)
+            and head_lacks(root, os.path.relpath(os.path.normpath(path), root)))
 
 
 def export_skip_line(path):
     """The SKIPPED line --check prints for the generated BUCK at `path`."""
-    return ("refresh-gvisor-tests: SKIPPED on %s: %s is absent: it belongs to the"
-            " open-source Buck layer, which this export does not carry; its"
-            " staleness check needs that layer, and this skip comes out when"
-            " dh-8zi9o4 (where that layer lives after the branch flip) is resolved"
-            % (EXPORT_REPOSITORY, os.path.relpath(os.path.normpath(path), ROOT)))
+    return ("refresh-gvisor-tests: SKIPPED: %s is absent and this checkout's commit"
+            " does not track it: it belongs to the open-source Buck layer, which the"
+            " %s export does not carry; its staleness check needs that layer, and"
+            " this skip comes out when dh-8zi9o4 (where that layer lives after the"
+            " branch flip) is resolved"
+            % (os.path.relpath(os.path.normpath(path), ROOT), EXPORT_REPOSITORY))
 
 
 def check():
@@ -224,7 +301,7 @@ def check():
     bad = []
     for name, text in files.items():
         p = os.path.join(BUILD, name)
-        if export_skips(name, p, os.environ.get("GITHUB_REPOSITORY")):
+        if export_skips(name, p):
             print(export_skip_line(p))
             continue
         if not os.path.exists(p) or open(p).read() != text:
