@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,6 +128,22 @@ static int all_zero(char* fields[64], int first, int last) {
   return 1;
 }
 
+/* Waits until the task whose stat is `path` sleeps (state S): a task that
+ * has just written its report and is about to block still shows R until it
+ * blocks, and a reader can run first. Returns 0 if it never sleeps. */
+static int wait_until_asleep(const char* path) {
+  for (int tries = 0; tries < 100000; tries++) {
+    char line[4096];
+    char* f[64];
+    if (read_file_at(AT_FDCWD, path, line, sizeof line) >= 0 && split_stat(line, f) == 52 &&
+        strcmp(f[2], "S") == 0) {
+      return 1;
+    }
+    sched_yield();
+  }
+  return 0;
+}
+
 #define PF_EXITING 0x4ULL
 #define PF_FORKNOEXEC 0x40ULL
 
@@ -191,6 +208,9 @@ static void parent_from_child(void) {
   char line[4096];
   char* f[64];
   snprintf(path, sizeof path, "/proc/%d/stat", (int)getppid());
+  if (!wait_until_asleep(path)) {
+    fail("parent never blocked");
+  }
   if (read_file_at(AT_FDCWD, path, line, sizeof line) < 0 || split_stat(line, f) != 52) {
     fail("parent stat from the child");
     return;
@@ -280,11 +300,19 @@ static void live(void) {
     fail("read child report");
     return;
   }
+  char path[128];
+  snprintf(path, sizeof path, "/proc/%d/stat", (int)child);
+  if (!wait_until_asleep(path)) {
+    fail("child never blocked");
+  }
+  snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)child, (int)tid);
+  if (!wait_until_asleep(path)) {
+    fail("thread never blocked");
+  }
   /* Only now does the parent open its own stat: the child read the parent's
    * before the parent had (a process records its outside parent at its
    * first clone, too). */
   load_own();
-  char path[128];
   char line[4096];
   char other[4096];
   char* f[64];

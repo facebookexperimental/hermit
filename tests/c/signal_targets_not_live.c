@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -160,6 +161,18 @@ int main(void) {
   if (pthread_create(&thread, NULL, exit_at_once, &thread_id) != 0 ||
       pthread_join(thread, NULL) != 0) {
     return 6;
+  }
+  /* pthread_join returns at the kernel's CLONE_CHILD_CLEARTID wake
+   * (mm_release, early in do_exit), before release_task unhashes the
+   * thread; until then Linux still finds it, and tgkill answers 0. Wait
+   * until procfs no longer lists the thread. */
+  char task[64];
+  snprintf(task, sizeof task, "/proc/self/task/%d", (int)thread_id);
+  for (int tries = 0; access(task, F_OK) == 0; tries++) {
+    if (tries == 100000) {
+      return 7;
+    }
+    sched_yield();
   }
   report("exited thread, tgkill", tgkill_(getpid(), thread_id, SIGUSR1));
   report("exited thread, tgkill 0", tgkill_(getpid(), thread_id, 0));
