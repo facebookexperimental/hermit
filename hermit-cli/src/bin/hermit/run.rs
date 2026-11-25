@@ -11796,6 +11796,132 @@ fn no_pin_threads_refuses_what_would_pin_the_run() {
     assert_eq!(opts.det_opts.det_config.cpu_profile_source, None);
 }
 
+/// `hermit run --image=IMAGE` with no program, at the default
+/// `--cpu-profile auto`: the auto choice reads the guest program, so the
+/// image's Entrypoint/Cmd fills it first. A panic here means the choice asked
+/// for the program before it existed.
+#[test]
+fn an_image_run_without_a_program_takes_it_from_the_image_at_admission() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let image = tmp.path().join("image");
+    write_entrypoint_oci_dir(&image, "/bin/guest");
+    let image = format!("--image=oci-dir:{}", image.display());
+    let mut opts = RunOpts::try_parse_from(["fakehermit", image.as_str()]).unwrap();
+    assert_eq!(
+        opts.det_opts.det_config.cpu_profile,
+        detcore_model::cpu_profile::CpuProfile::Auto
+    );
+    assert!(opts.program.is_none());
+    opts.admit_cpu_profile().unwrap();
+    assert_eq!(opts.program.as_deref(), Some(Path::new("/bin/guest")));
+    // The fixture's /bin/guest is no executable the auto choice can read, so
+    // auto stays unresolved here (the run's own checks report it), on every host.
+    assert_eq!(
+        opts.det_opts.det_config.cpu_profile,
+        detcore_model::cpu_profile::CpuProfile::Auto
+    );
+}
+
+/// `hermit run --image=IMAGE -- PROGRAM`, with an Entrypoint in the image's
+/// config, at the default `--cpu-profile auto`: the guest execs Entrypoint[0]
+/// with PROGRAM as an argument (OCI), so the auto choice reads Entrypoint[0]
+/// in the image: admission composes that command before the choice, not only
+/// for a run that omits its program.
+#[test]
+fn an_image_run_with_a_program_composes_the_entrypoint_before_the_auto_profile() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let image = tmp.path().join("image");
+    write_entrypoint_oci_dir(&image, "/bin/guest");
+    let image = format!("--image=oci-dir:{}", image.display());
+    let mut opts = RunOpts::try_parse_from(["fakehermit", image.as_str(), "given"]).unwrap();
+    assert_eq!(opts.program.as_deref(), Some(Path::new("given")));
+    opts.admit_cpu_profile().unwrap();
+    assert_eq!(opts.program.as_deref(), Some(Path::new("/bin/guest")));
+    assert_eq!(opts.args, ["given"]);
+}
+
+/// `hermit run` with neither a program nor an image, at the default
+/// `--cpu-profile auto`: choosing the profile refuses the run by name, never
+/// asking for a program that does not exist.
+#[test]
+fn a_run_without_a_program_or_an_image_is_refused_by_name_before_its_profile_is_chosen() {
+    let mut opts = RunOpts::try_parse_from(["fakehermit"]).unwrap();
+    assert_eq!(
+        opts.det_opts.det_config.cpu_profile,
+        detcore_model::cpu_profile::CpuProfile::Auto
+    );
+    assert!(opts.program.is_none() && opts.image.is_none());
+    let error = format!("{:#}", opts.admit_cpu_profile().unwrap_err());
+    assert!(
+        error.contains("no guest program given; pass a program after `--`"),
+        "{error}"
+    );
+}
+
+/// Writes an `oci-dir` image at `root`: one layer holding the regular file
+/// `entrypoint` (mode 0755), and a config whose Entrypoint is that path.
+#[cfg(test)]
+fn write_entrypoint_oci_dir(root: &Path, entrypoint: &str) {
+    let path = entrypoint.trim_start_matches('/');
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o755);
+    header.set_mtime(1_700_000_000);
+    header.set_size(5);
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_data(&mut header, path, &b"guest"[..])
+        .unwrap();
+    let layer = builder.into_inner().unwrap();
+    let blob = |bytes: &[u8]| -> String {
+        let hex = detcore::Digest::new(bytes).to_string();
+        let file = root.join("blobs").join("sha256").join(&hex);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, bytes).unwrap();
+        hex
+    };
+    std::fs::create_dir_all(root).unwrap();
+    let layout = br#"{"imageLayoutVersion":"1.0.0"}"#;
+    std::fs::write(root.join("oci-layout"), layout).unwrap();
+    let layer_hex = blob(&layer);
+    let config = serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {"Entrypoint": [entrypoint]},
+        "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{layer_hex}")]},
+    });
+    let config = serde_json::to_vec(&config).unwrap();
+    let config_hex = blob(&config);
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{config_hex}"),
+            "size": config.len(),
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": format!("sha256:{layer_hex}"),
+            "size": layer.len(),
+        }],
+    });
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = blob(&manifest);
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{manifest_hex}"),
+            "size": manifest.len(),
+            "platform": {"architecture": "amd64", "os": "linux"},
+        }],
+    });
+    let index = serde_json::to_vec(&index).unwrap();
+    std::fs::write(root.join("index.json"), index).unwrap();
+}
+
 /// `--no-pin-threads` refuses an explicit `--pinned-cpu` policy, which only a
 /// pinned run reads and which would otherwise be silently inert. The default
 /// policy is not explicit and is not refused. The placement settings
@@ -14269,6 +14395,10 @@ impl RunOpts {
             });
             return Ok(());
         }
+        // The choice below reads the guest program, so it must exist first: an
+        // omitted one comes from the image's Entrypoint/Cmd, or is refused by
+        // name, as `validate_args` does (whose own call is then a no-op).
+        self.resolve_image_default_program()?;
         // A program that cannot run keeps its own fault (127 or 126), which
         // `validate_program` reports in its place among the run's checks:
         // auto stays unresolved, and nothing is admitted or launched for it.
