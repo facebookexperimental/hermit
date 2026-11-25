@@ -14,7 +14,11 @@ path = "cas_sequence_easy.rs"
 [[bin]]
 name = "hello_race"
 path = "hello_race.rs"
+# test = false for the reason recorded at the hello_race target in BUCK.
+test = false
 
 [[bin]]
 name = "hello_race_mini"
 path = "hello_race_mini.rs"
+# test = false for the reason recorded at the hello_race_mini target in BUCK.
+test = false

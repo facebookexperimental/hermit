@@ -61,7 +61,7 @@ build, which reads only `BUCK` and `TARGETS`, ignores them. Internally the root
 
 The shim gives every `rust_library` and `rust_binary` without
 `unittests = False` the implicit `<name>-unittest` test target that Meta's
-build generates (29 targets), built from the same sources plus `test_srcs`.
+build generates (27 targets), built from the same sources plus `test_srcs`.
 Those targets evaluate under `buck2 targets //...`; their open-source build and
 pass status are not yet established.
 

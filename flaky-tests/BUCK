@@ -76,9 +76,12 @@ rust_binary(
     crate_root = "hello_race.rs",
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
-    # The implicit hello_race-unittest runs the same race and exits 1 on the
-    # antagonistic schedule; keep it out of CI like run_hello_race.
-    test_labels = [tpx_labels.local_only],
+    # Retired by name: hello_race-unittest. Its #[test] body exits the
+    # process from inside the test on the antagonistic schedule, and
+    # run_hello_race above already runs this same source and run_test() body
+    # deterministically under Hermit, so the native form adds no
+    # coverage. Recorded here so the retirement is not a silent delete.
+    unittests = False,
 )
 
 rust_binary(
@@ -88,9 +91,29 @@ rust_binary(
     crate_root = "hello_race_mini.rs",
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
-    # The implicit hello_race_mini-unittest runs the same two-thread race and
-    # exits 1 on the antagonistic schedule; keep it out of CI.
-    test_labels = [tpx_labels.local_only],
+    # Retired by name: hello_race_mini-unittest. The source has no
+    # #[test] at all, so the implicit unittest target was vacuous; its
+    # coverage moved to run_hello_race_mini below, which runs this
+    # same binary deterministically under Hermit. Recorded here so
+    # the retirement is not a silent delete.
+    unittests = False,
+)
+
+# The hello_race_mini guest is the simplest store race (it exits 1 on
+# the antagonistic schedule); this target runs it under Hermit
+# chaos-verify and passes only on Hermit's determinism verdict, the
+# same shape as run_hello_race. Keep local_only until a passing
+# HEAD run in fbcode//mode/dev-nosan; then check the first continuous
+# coverage-mode run.
+hermit_host_test(
+    name = "run_hello_race_mini",
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "$(location :hello_race_mini)",
+        "$(location //hermetic_infra/hermit/tests:e2e_defaults_yaml)",
+    ],
+    labels = [tpx_labels.local_only],
+    test = "run_hello_race_mini_hermit.sh",
 )
 
 # The cas_sequence_easy guest completes its CAS handoff (and exits 1)

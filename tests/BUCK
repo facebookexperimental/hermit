@@ -602,6 +602,16 @@ export_file(
     visibility = ["//hermetic_infra/hermit/tests/..."],
 )
 
+# The project timeout defaults (cpu_timeout_seconds mirrors
+# DEFAULT_TEST_CPU_TIMEOUT_SECONDS in ci/manifest-plan/src/timeouts.rs),
+# for wrappers that inherit the default by reference instead of
+# restating it.
+export_file(
+    name = "e2e_defaults_yaml",
+    src = "e2e/manifests/defaults.yaml",
+    visibility = ["//hermetic_infra/hermit/flaky-tests:"],
+)
+
 cpp_binary(
     name = "memoryPress",
     srcs = ["//hermetic_infra/hermit/tests/c:memoryPress.c"],
