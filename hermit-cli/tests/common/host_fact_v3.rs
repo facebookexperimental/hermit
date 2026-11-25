@@ -16,7 +16,8 @@
 //! refusals (interrupt-counter calibration, an inconclusive cell,
 //! the wall deadline, a lost PMU counter, I/O or peer failures, the
 //! repetitions and hypervisor-exit instabilities) are never host
-//! facts and never qualify.
+//! facts and never qualify. The Buck shell-test runner reaches
+//! this same predicate through `host_fact_v3_verdict.rs` beside it.
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 

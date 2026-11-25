@@ -671,6 +671,37 @@ rust_binary(
     ],
 )
 
+# The callable form of the x86-64-v3 host-fact refusal predicate for
+# run_probed.py (fb-only/gated_tests): the shell-test runner asks this
+# binary whether a failed command's exit status and stderr are a
+# decided host-fact refusal, so host_fact_v3.rs stays the one
+# classifier every runner shares. Buck-only, like
+# cpu-profile-v2-rootfs-test above: no Cargo target names the file.
+rust_binary(
+    name = "host-fact-v3-verdict",
+    autocargo = {"ignore_rule": True},
+    crate = "host_fact_v3_verdict",
+    crate_root = "hermit-cli/tests/common/host_fact_v3_verdict.rs",
+    mapped_srcs = {
+        src.removeprefix("hermit-cli/"): src
+        for src in [
+            "hermit-cli/tests/common/host_fact_v3_verdict.rs",
+            "hermit-cli/tests/common/host_fact_v3.rs",
+        ]
+    },
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # host_fact_v3.rs's unit tests run in the harnesses that include
+    # hermit_binary.rs; this binary only exposes the predicate.
+    unittests = False,
+    # $(exe ...) for this binary is expanded by _host_admission in
+    # every package that calls hermit_host_test.
+    visibility = ["//hermetic_infra/hermit/..."],
+    deps = [
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+    ],
+)
+
 # The v2 guest run on a v3-class host (admitted by hermit_host_test's
 # x86-64-v3+cpuid-faulting probe, which is the point: the host being v3
 # must not stop Hermit presenting v2 to a CentOS 9 guest). The fixture
