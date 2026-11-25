@@ -2614,8 +2614,8 @@ fn populated_after(
 }
 
 /// Every process listed in the cgroup at `root` and in the cgroups below it,
-/// as "<cgroup relative to root>: <pid> <comm>", so a failure names what
-/// lingers. A process that exits while this reads shows as "<exited>".
+/// as `<cgroup relative to root>: <pid> <comm>`, so a failure names what
+/// lingers. A process that exits while this reads shows as `<exited>`.
 fn cgroup_members(root: &Path) -> Vec<String> {
     let mut members = Vec::new();
     let mut pending = vec![root.to_path_buf()];
