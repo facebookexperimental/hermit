@@ -11,7 +11,7 @@
 //! [dependencies]
 //! chrono = "0.4"
 //! csv = "1"
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "769ce02010f10e058d06899e7c82c7f4d2babe5e" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "132dd98d1518973ec7d53b0537e53fdb83b62f20" }
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
