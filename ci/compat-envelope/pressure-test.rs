@@ -5792,6 +5792,25 @@ fn manifest_guest_memory_line(
     )
 }
 
+/// Write `caps_line` (a [`manifest_guest_memory_line`]) to `out`, THEN run the
+/// occupancy guard: a refused plan prints its highest safe caps exactly as a
+/// fitting one does, because the width-sizing caller (pressure_schedule's
+/// `memory_safe_guests`) reads them from either, and otherwise falls back to a
+/// width nothing checked. The plan prints that line only here.
+///
+/// A failed write panics with `println!`'s own message, so the plan's stdout
+/// behaves as it did when this was a `println!`.
+fn print_caps_then_require_occupancy(
+    out: &mut dyn std::io::Write,
+    caps_line: &str,
+    occupancy: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = writeln!(out, "{caps_line}") {
+        panic!("failed printing to stdout: {error}");
+    }
+    occupancy()
+}
+
 fn print_unavailable(metadata: &RunMetadata) {
     if metadata.unavailable_cells > 0 {
         let population =
@@ -9680,35 +9699,33 @@ fn write_plan_after_scorecard_check(
             .memory_budget_override
             .or_else(observed_manifest_guest_memory_budget),
     )?;
-    // Print the highest safe caps before the occupancy guard can refuse:
-    // a width-sizing caller reads them from a refused plan exactly as from
-    // a fitting one, and otherwise falls back to a width nothing checked.
-    // `plan` and `run` print this line here, not again from the metadata.
-    println!(
-        "{}",
-        manifest_guest_memory_line(
-            selection.manifest_guest_cap(),
-            selection.kvm_guest_cap(),
-            Some(manifest_guest_memory_required_bytes),
-            Some(CONTROL_PLANE_HEADROOM_BYTES),
-            manifest_guest_memory_budget_bytes,
-            selection.scheduler_jobs(),
-            manifest_guest_max_safe_cap,
-            kvm_guest_max_safe_cap,
-        )
-    );
-    require_cell_occupancy_fits(
-        &cells,
-        &exclusive,
-        &budgets,
-        selection.cell_timeout_seconds,
-        selection.no_retry,
-        run_timeout_seconds,
-        selection.run_count(),
-        selection.scheduler_jobs(),
+    // Print the highest safe caps before the occupancy guard can refuse
+    // (print_caps_then_require_occupancy says why). `plan` and `run` print
+    // this line here, not again from the metadata.
+    let caps_line = manifest_guest_memory_line(
         selection.manifest_guest_cap(),
         selection.kvm_guest_cap(),
-    )?;
+        Some(manifest_guest_memory_required_bytes),
+        Some(CONTROL_PLANE_HEADROOM_BYTES),
+        manifest_guest_memory_budget_bytes,
+        selection.scheduler_jobs(),
+        manifest_guest_max_safe_cap,
+        kvm_guest_max_safe_cap,
+    );
+    print_caps_then_require_occupancy(&mut std::io::stdout(), &caps_line, || {
+        require_cell_occupancy_fits(
+            &cells,
+            &exclusive,
+            &budgets,
+            selection.cell_timeout_seconds,
+            selection.no_retry,
+            run_timeout_seconds,
+            selection.run_count(),
+            selection.scheduler_jobs(),
+            selection.manifest_guest_cap(),
+            selection.kvm_guest_cap(),
+        )
+    })?;
     let expected_runs = cells.len().saturating_mul(selection.run_count());
     audit_dag(
         &dag,
@@ -34790,6 +34807,100 @@ mod pressure_planning_tests {
         // guest a private /tmp, share the four guest slots and fit.
         assert_eq!(fits(&split, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
         assert_eq!(fits(&ptrace, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
+    }
+
+    #[test]
+    fn a_refused_plan_prints_its_highest_safe_caps_before_the_occupancy_refusal() {
+        // The width-sizing caller reads the caps line from a refused plan as
+        // from a fitting one, so the plan writes it BEFORE the occupancy
+        // guard runs. The fixture is a measured refused plan: one green KVM
+        // verify cell, two repetitions of 770s each, -j 1, both guest caps 1,
+        // a 150,000,000,000-byte budget and a 1,200s bound. Its two lines are
+        // that plan's stdout and refusal, verbatim.
+        let caps_line = manifest_guest_memory_line(
+            1,
+            1,
+            Some(117_037_858_816),
+            Some(CONTROL_PLANE_HEADROOM_BYTES),
+            Some(150_000_000_000),
+            1,
+            Some(1),
+            Some(1),
+        );
+        let expected_line = "Manifest guests: cap 1 (KVM cap 1), declared peak 117037858816 bytes including retained 1073741824-byte control headroom; observed budget 150000000000 bytes; highest safe caps at -j 1: manifest=1, KVM=1\n";
+        let cell = TrackedCell {
+            id: CellId {
+                lane: "portable".into(),
+                category: "c-programs".into(),
+                test: "c-programs/add-key-enosys".into(),
+                mode: "verify".into(),
+                backend: "kvm".into(),
+            },
+            status: "green".into(),
+            not_applicable_reason: None,
+        };
+        let budget = CellBudget {
+            cpu_timeout_seconds: 360,
+            timeout_seconds: 180,
+            attempts: Some(1),
+        };
+        assert_eq!(pressure_timeout(&budget, None, false), Ok(770));
+        let budgets = BTreeMap::from([(
+            (
+                cell.id.test.clone(),
+                cell.id.mode.clone(),
+                cell.id.backend.clone(),
+            ),
+            budget,
+        )]);
+        let cells = vec![cell];
+        let guard = |run_timeout_seconds: i64| {
+            require_cell_occupancy_fits(
+                &cells,
+                &|cell| dbt_host_tmp_resource(cell).into_iter().collect(),
+                &budgets,
+                None,
+                false,
+                run_timeout_seconds,
+                2,
+                1,
+                1,
+                1,
+            )
+        };
+        struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (run_timeout_seconds, expected) in [
+            (
+                1_200,
+                Err("selected 2 cell run(s) have at least 1540s of declared worst-case cell occupancy at -j 1, manifest_guest=1, and kvm_guest=1, which cannot fit the 1200s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout".to_string()),
+            ),
+            // The control: a bound the same runs fit passes, with the same
+            // line written first.
+            (1_541, Ok(())),
+        ] {
+            let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut sink = Sink(written.clone());
+            let result = print_caps_then_require_occupancy(&mut sink, &caps_line, || {
+                // The ORDER: the whole caps line is written when the guard runs.
+                assert_eq!(
+                    String::from_utf8_lossy(&written.borrow()),
+                    expected_line,
+                    "the occupancy guard ran before the caps line was written"
+                );
+                guard(run_timeout_seconds)
+            });
+            assert_eq!(result, expected, "bound {run_timeout_seconds}s");
+            assert_eq!(String::from_utf8_lossy(&written.borrow()), expected_line);
+        }
     }
 
     #[test]
