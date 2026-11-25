@@ -25923,6 +25923,60 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 .then_some(())
                 .ok_or_else(|| format!("git {} failed", args.join(" ")))
         };
+        // Materialize the agent-utils submodule (and only it: the same
+        // scope as the update below) with `git clone --shared` from the
+        // checkout's own populated tree first, so the update borrows its
+        // object store through alternates instead of copying ~3 GB of
+        // objects into the fixture. This code runs in every self-test
+        // part (four by default), and the full copies' page cache drove
+        // selftest.scorecard_commands to its memory cap in the full
+        // validate (four copies, about 12 GB of writes, measured
+        // 2026-11-25). agent-utils' nested gitlinks (ext/minibeads,
+        // about 1 MB) are still cloned by the update below, as before.
+        // The source tree is only read: --shared never writes to, gcs
+        // or reconfigures the checkout's object stores, and no
+        // submodule sync/deinit or config unset happens here. Other
+        // top-level gitlinks are never touched, so an unpopulated one
+        // in the source checkout cannot fail this fixture.
+        let agent_utils_pin = git_rev_parse(&result_command_root, "HEAD:agent-utils")?;
+        let agent_utils_target = result_command_root.join("agent-utils");
+        if !agent_utils_target.join(".git").exists() {
+            let shared = Command::new("git")
+                .args(["clone", "--quiet", "--shared", "--no-checkout"])
+                .arg(command_root.join("agent-utils"))
+                .arg(&agent_utils_target)
+                .output()
+                .map_err(|e| format!("cannot shared-clone agent-utils: {e}"))?;
+            if !shared.status.success() {
+                return Err(format!(
+                    "shared clone of agent-utils into {} failed: {}",
+                    agent_utils_target.display(),
+                    String::from_utf8_lossy(&shared.stderr).trim()
+                ));
+            }
+            // Fail closed if the shared clone did not borrow objects:
+            // without its alternates the update below would silently
+            // copy the whole store again.
+            if !agent_utils_target
+                .join(".git/objects/info/alternates")
+                .is_file()
+            {
+                return Err(format!(
+                    "shared clone of agent-utils into {} has no alternates",
+                    agent_utils_target.display()
+                ));
+            }
+            git_ok(
+                &agent_utils_target,
+                &["checkout", "--quiet", &agent_utils_pin],
+            )
+            .map_err(|e| {
+                format!(
+                    "checkout agent-utils in {}: {e}",
+                    agent_utils_target.display()
+                )
+            })?;
+        }
         let local_agent_utils = format!(
             "submodule.agent-utils.url={}",
             command_root.join("agent-utils").display()
