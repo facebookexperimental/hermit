@@ -31,6 +31,8 @@
 # names the checkout; pathspecs are literal and lazy fetching is off.
 
 set -u
+# Each `cd` below enters the path it names, never one a caller's CDPATH finds.
+unset CDPATH
 
 # The paths the GitHub export has never carried: ShipIt strips them, and no
 # commit in its history has held them. Only these may be skipped. shim/BUCK and

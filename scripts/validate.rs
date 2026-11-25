@@ -1258,6 +1258,71 @@ mod e2e_payload_identity_tests {
             .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"))
     }
 
+    /// The GitHub export ShipIt publishes, whose commits do not carry the files
+    /// it strips; see `stripped_from_export`.
+    const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
+
+    /// Whether the checkout at `root` does not carry `relative`, as
+    /// `ci/checkout-carries.sh` from the checkout at `tool_root` decides: the one
+    /// shared rule, which skips only a path the export has never carried, absent
+    /// here, at the top level of a git worktree whose commit does not track it.
+    /// That is the export's shape, decided from the checkout itself, so it holds
+    /// for a fresh clone with no environment set. Every other outcome, including
+    /// the tool being absent or failing to run, is false, so the caller reads the
+    /// file and fails by name. The tool runs under bash, so a lost execute bit or
+    /// a noexec mount cannot stop it; its own line, when git cannot answer, and
+    /// bash's when the tool is missing, go to stderr, as does one line when bash
+    /// itself cannot start. Each skip it allows comes out as `export_skip_line`
+    /// says.
+    fn export_strip_applies(tool_root: &Path, root: &Path, relative: &str) -> bool {
+        let tool_path = tool_root.join("ci/checkout-carries.sh");
+        let mut tool = Command::new("bash");
+        without_repository_location(&mut tool);
+        let status = tool
+            .arg(&tool_path)
+            .arg(root)
+            .arg(relative)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(status) => status.code() == Some(1),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "validate.rs: could not start bash for {}: {error}; {relative} counts as carried",
+                    tool_path.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// The SKIPPED line for skipping `what` because this checkout does not carry
+    /// `relative`, a file of the open-source Buck layer that the export has never
+    /// carried. Its skip comes out when dh-8zi9o4, which decides where that layer
+    /// lives after the branch flip, is resolved.
+    fn export_skip_line(relative: &str, what: &str) -> String {
+        format!(
+            "validate.rs: SKIPPED: {relative} is absent and this checkout's commit does not \
+             track it: it belongs to the open-source Buck layer, which the {EXPORT_REPOSITORY} \
+             export does not carry; {what} needs that layer, and this skip comes out when \
+             dh-8zi9o4 (where that layer lives after the branch flip) is resolved"
+        )
+    }
+
+    /// `export_strip_applies` for the checkout at `root`. When it holds, the
+    /// caller skips `what` (the part that reads the file), and this prints its
+    /// `export_skip_line` to stderr directly, so a test harness's output capture
+    /// does not hide it.
+    fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
+        let applies = export_strip_applies(root, root, relative);
+        if applies {
+            let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
+        }
+        applies
+    }
+
     #[test]
     fn artifact_node_publishes_each_recorded_path() {
         let root = test_source_root();
@@ -3571,71 +3636,6 @@ fn assert_submodule_fixture_source(
     }
 
     Ok(())
-}
-
-/// The GitHub export ShipIt publishes, whose commits do not carry the files
-/// it strips; see `stripped_from_export`.
-const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
-
-/// Whether the checkout at `root` does not carry `relative`, as
-/// `ci/checkout-carries.sh` from the checkout at `tool_root` decides: the one
-/// shared rule, which skips only a path the export has never carried, absent
-/// here, at the top level of a git worktree whose commit does not track it.
-/// That is the export's shape, decided from the checkout itself, so it holds
-/// for a fresh clone with no environment set. Every other outcome, including
-/// the tool being absent or failing to run, is false, so the caller reads the
-/// file and fails by name. The tool runs under bash, so a lost execute bit or
-/// a noexec mount cannot stop it; its own line, when git cannot answer, and
-/// bash's when the tool is missing, go to stderr, as does one line when bash
-/// itself cannot start. Each skip it allows comes out as `export_skip_line`
-/// says.
-fn export_strip_applies(tool_root: &Path, root: &Path, relative: &str) -> bool {
-    let tool_path = tool_root.join("ci/checkout-carries.sh");
-    let mut tool = Command::new("bash");
-    without_repository_location(&mut tool);
-    let status = tool
-        .arg(&tool_path)
-        .arg(root)
-        .arg(relative)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status();
-    match status {
-        Ok(status) => status.code() == Some(1),
-        Err(error) => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "validate.rs: could not start bash for {}: {error}; {relative} counts as carried",
-                tool_path.display()
-            );
-            false
-        }
-    }
-}
-
-/// The SKIPPED line for skipping `what` because this checkout does not carry
-/// `relative`, a file of the open-source Buck layer that the export has never
-/// carried. Its skip comes out when dh-8zi9o4, which decides where that layer
-/// lives after the branch flip, is resolved.
-fn export_skip_line(relative: &str, what: &str) -> String {
-    format!(
-        "validate.rs: SKIPPED: {relative} is absent and this checkout's commit does not \
-         track it: it belongs to the open-source Buck layer, which the {EXPORT_REPOSITORY} \
-         export does not carry; {what} needs that layer, and this skip comes out when \
-         dh-8zi9o4 (where that layer lives after the branch flip) is resolved"
-    )
-}
-
-/// `export_strip_applies` for the checkout at `root`. When it holds, the
-/// caller skips `what` (the part that reads the file), and this prints its
-/// `export_skip_line` to stderr directly, so a test harness's output capture
-/// does not hide it.
-fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
-    let applies = export_strip_applies(root, root, relative);
-    if applies {
-        let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
-    }
-    applies
 }
 
 // Keep the development overlay and its staged population identical by using
