@@ -146,8 +146,11 @@ struct Shared {
 
 #[test]
 fn actual_pid_reuse_refuses_copied_owner_before_poll() {
-    super::isolated(
+    super::isolated_budgeted(
         "origin_tests::actual_pid_reuse_refuses_copied_owner_before_poll",
+        // Worst run: loaded n=10 max 0.200 s, light max 0.180 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             namespace_case(|bound| {
                 let mapping = unsafe {
@@ -272,8 +275,11 @@ fn actual_pid_reuse_refuses_copied_owner_before_poll() {
 
 #[test]
 fn nested_pid1_refuses_and_original_namespace_recovers() {
-    super::isolated(
+    super::isolated_budgeted(
         "origin_tests::nested_pid1_refuses_and_original_namespace_recovers",
+        // Worst run: loaded n=10 max 0.200 s, light max 0.160 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             namespace_case(|bound| {
                 let (diagnostic, entry, polls) = inert_owner();
@@ -304,8 +310,11 @@ fn nested_pid1_refuses_and_original_namespace_recovers() {
 
 #[test]
 fn owner_thread_recovers_after_process_leader_exits() {
-    super::isolated(
+    super::isolated_budgeted(
         "origin_tests::owner_thread_recovers_after_process_leader_exits",
+        // Worst run: loaded n=10 max 0.180 s, light max 0.160 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             namespace_case(|bound| {
                 let witness = pipe();

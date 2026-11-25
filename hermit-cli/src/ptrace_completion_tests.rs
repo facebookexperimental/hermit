@@ -24,22 +24,170 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-// Irreversible thread-exit/panic retention must not poison the rest of libtest.
-// Each outer case selects exactly one child test. Its three-second deadline
-// starts BEFORE re-exec; the separate rescue cannot satisfy any assertion.
-fn isolated(name: &str, body: impl FnOnce()) {
-    isolated_with_env(name, &[], body)
+fn process_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) },
+        0
+    );
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-fn isolated_with_env(name: &str, environment: &[(&str, &std::path::Path)], body: impl FnOnce()) {
-    isolated_with_child_setup(name, environment, || Ok(()), body)
+// The child tree's CPU: utime+stime+cutime+cstime summed over every live
+// process in the tree, so a worker reaped by a still-live middle process
+// counts immediately through that process's cutime/cstime. pgid_cpu in
+// tests/external_signal_interrupt.rs walks the same children tree, but
+// takes cutime+cstime at the root only and utime+stime at every process.
+//
+// Fail-closed contract: only the unreaped root must be readable. A
+// descendant that exits between its parent's `children` listing and its own
+// stat read has vanished; the read can fail with either ENOENT (NotFound)
+// or ESRCH (proc_single_show if it was reaped between open and read). CPU
+// it was reaped with is already in an ancestor's cutime/cstime term of this
+// same sum, so it is skipped. Every other failure returns Err naming the
+// cause; callers route it through the kill path before panicking, so a
+// measurement error never leaks the child.
+fn tree_cpu(root: u32) -> Result<Duration, String> {
+    let clk_tck = {
+        let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if tck > 0 { tck as u64 } else { 100 }
+    };
+    let mut ticks: u64 = 0;
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if seen.len() > 4096 {
+            return Err(format!(
+                "process tree of {root} exceeds the 4096-process cap"
+            ));
+        }
+        if !seen.insert(pid) {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if pid != root
+                    && (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH)) =>
+            {
+                // Vanished descendant: skip it (see the contract above).
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("cannot read /proc/{pid}/stat: {error}"));
+            }
+        };
+        let Some(close) = stat.rfind(')') else {
+            return Err(format!("malformed /proc/{pid}/stat"));
+        };
+        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        if fields.len() < 15 {
+            return Err(format!("short /proc/{pid}/stat ({} fields)", fields.len()));
+        }
+        for i in [11, 12, 13, 14] {
+            let tick = fields[i]
+                .parse::<u64>()
+                .map_err(|_| format!("unparsable tick field {i} in /proc/{pid}/stat"))?;
+            ticks = ticks.saturating_add(tick);
+        }
+        if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+            for task in tasks.flatten() {
+                if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                    stack.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|text| text.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    Ok(Duration::from_secs_f64(ticks as f64 / clk_tck as f64))
+}
+
+// SIGKILL the child's whole process group and reap the child. Every failure
+// path out of the sampling loop goes through here first, so no panic —
+// budget trip, backstop trip or measurement error — leaves the group running.
+fn kill_child_group(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let rescue = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < rescue {
+        match child.try_wait() {
+            // A wait error while rescuing must not mask the caller's named
+            // budget or measurement failure; the group kill has been sent.
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+// One isolated case's child-CPU budget is the primary limit (CPU-primary
+// testing rule); the wall backstop below only catches a child that hangs
+// without burning CPU. Load inflates wall time far more than CPU time,
+// but contention also inflates measured child CPU itself (the
+// real_random loaded medians are 0.92-1.12 s against 0.41-0.49 s at
+// light load), so budgets are sized from loaded measurements rather
+// than light ones. Every isolated case declares its budget at its call
+// site — there is no default. Each budget is 1.5x the worst recorded
+// run, completed or censored, across every same-measurand sample of
+// the same test body (the loaded sample and the earlier recorded
+// light-load samples), rounded up to the next 0.1 s; a run killed at
+// a budget counts at its kill reading, with the budget taking the
+// first bucket strictly above 1.5x that reading. The
+// loaded sample was measured 2026-11-23 (a throwaway instrument build
+// with budgets lifted, the env-gated HERMIT_MEASURE_CHILD_CPU print in
+// this wrapper emitting one MEASURE line per completed child from
+// tree_cpu itself), run directly per case (libtest --exact) in
+// dev-nosan, 8 workers confined to one full core (AllowedCPUs=0,158)
+// on an AMD EPYC 9D85 host (CPUID faulting present): 245 passed runs
+// over 24 cases, n=10 per case (a_tracer_thread_operation n=15). The
+// light-load samples are the earlier n=20-per-mode runs of the same
+// bodies, plus pooled re-measurements of original_runtime_guards and
+// mid_startup; one original_runtime_guards run there was killed at the
+// former 0.2 s budget, proving a completion above 0.2 s, so that case
+// takes the first bucket strictly above 1.5x 0.2 s. A 2026-11-24
+// loaded re-measurement of readv_live_import and the four other
+// real_random cases on the current observer body (same arm and
+// instrument, n=20 each) is also a sizing sample for those five.
+// Budgets run 0.3-2.9 s. Each call site's comment names the governing
+// maxima. Sources on minibeads dh-74hbms: loaded full-set table and
+// raw-record hashes (comment dh-74hbms-ccdcd578607), earlier
+// light-load per-run table (comment dh-74hbms-c16418f641d), the
+// combined-rule check with the five light-governed cases (comment
+// dh-74hbms-c3f8ae4dea3), and the two re-measurements (comments
+// dh-74hbms-cb289d91ad5 and dh-74hbms-c6bbd55ac68). Intel hosts are
+// unmeasured; no host-class factor is inferred.
+
+// Wall backstop for one isolated case: a generous outer hang-catcher,
+// never a load-sensitive gate, so it is sized from the LOADED wall
+// measurement above like the CPU budgets. The largest in-process wall
+// time under that load was 7.062 s; 57 s is the ceiling of 8x that
+// maximum (56.5 s), anchored to that 2026-11-23 sample: against the
+// worst wall time recorded since (8.997 s, in the re-measurements) its
+// margin is 6.3x, and the later samples are not folded in. This
+// relaxes the previous 21 s backstop, which was
+// sized from light-load wall times, for every isolated case and with it
+// the child's own pre-start deadline (HERMIT_OWNER_TEST_DEADLINE). Only
+// a hang reaches it; the CPU budget remains the primary bound.
+const CHILD_WALL_BACKSTOP_NS: u64 = 57_000_000_000;
+
+// Run one isolated case under the measured child-CPU budget its caller declares.
+fn isolated_budgeted(name: &str, cpu_budget: Duration, body: impl FnOnce()) {
+    isolated_with_child_setup_budgeted(name, &[], cpu_budget, || Ok(()), body)
 }
 
 // `child_setup` runs after fork and before exec: it must use only async-signal-safe
 // operations. Opt-in credential changes must never affect the outer libtest process.
-fn isolated_with_child_setup(
+fn isolated_with_child_setup_budgeted(
     name: &str,
     environment: &[(&str, &std::path::Path)],
+    cpu_budget: Duration,
     child_setup: fn() -> std::io::Result<()>,
     body: impl FnOnce(),
 ) {
@@ -56,7 +204,8 @@ fn isolated_with_child_setup(
         println!("OWNER_CASE {name} passed before original deadline");
         return;
     }
-    let deadline = monotonic_ns() + 3_000_000_000;
+    let started_ns = monotonic_ns();
+    let deadline = started_ns + CHILD_WALL_BACKSTOP_NS;
     let test = format!("ptrace_completion::tests::{name}");
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -75,25 +224,151 @@ fn isolated_with_child_setup(
         });
     }
     let mut child = command.spawn().unwrap();
+    // CPU is sampled at a coarse cadence; try_wait stays tight. Completion
+    // is detected with waitid(WNOWAIT) so the final CPU reading is taken
+    // while the zombie still holds its accounting, before reaping.
+    let mut child_cpu = Duration::ZERO;
+    let mut last_sample = 0u64;
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(monotonic_ns() < deadline, "late child completion {status}");
+        let now_ns = monotonic_ns();
+        let wall = Duration::from_nanos(now_ns - started_ns);
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if waited != 0 {
+            let error = std::io::Error::last_os_error();
+            let pid = child.id();
+            kill_child_group(&mut child);
+            panic!("child CPU measurement failed: waitid on {pid}: {error}");
+        }
+        if unsafe { info.si_pid() } != 0 {
+            child_cpu = match tree_cpu(child.id()) {
+                Ok(cpu) => cpu,
+                Err(reason) => {
+                    // The root is an unreaped zombie here; kill any surviving
+                    // members of its process group and reap it before
+                    // failing so the measurement error leaks nothing.
+                    kill_child_group(&mut child);
+                    let status = child.wait().unwrap();
+                    panic!(
+                        "child CPU measurement failed: {reason} \
+                         (child already exited: {status})"
+                    );
+                }
+            };
+            let status = child.wait().unwrap();
+            assert!(
+                child_cpu < cpu_budget && now_ns < deadline,
+                "late child completion {status}: {:.3} s CPU of {:.3} s CPU budget (wall limit {:.3} s) after {:.3} s wall",
+                child_cpu.as_secs_f64(),
+                cpu_budget.as_secs_f64(),
+                Duration::from_nanos(CHILD_WALL_BACKSTOP_NS).as_secs_f64(),
+                wall.as_secs_f64()
+            );
             assert!(status.success(), "selected child test failed: {status}");
             return;
         }
-        if monotonic_ns() >= deadline {
-            eprintln!("OWNER_CASE {name} original deadline FAILED; separate rescue begins");
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let rescue = Instant::now() + Duration::from_secs(2);
-            while child.try_wait().unwrap().is_none() && Instant::now() < rescue {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            panic!("selected child test exceeded original three-second deadline");
+        if now_ns - last_sample >= 25_000_000 {
+            last_sample = now_ns;
+            child_cpu = match tree_cpu(child.id()) {
+                Ok(cpu) => cpu,
+                Err(reason) => {
+                    eprintln!("OWNER_CASE {name} CPU measurement FAILED; separate rescue begins");
+                    kill_child_group(&mut child);
+                    panic!("child CPU measurement failed: {reason}");
+                }
+            };
+        }
+        if child_cpu >= cpu_budget || now_ns >= deadline {
+            let bound = if child_cpu >= cpu_budget {
+                "CPU budget"
+            } else {
+                "wall backstop"
+            };
+            eprintln!("OWNER_CASE {name} {bound} FAILED; separate rescue begins");
+            kill_child_group(&mut child);
+            panic!(
+                "selected child test exceeded its {bound}: {:.3} s CPU of {:.3} s CPU budget (wall limit {:.3} s) after {:.3} s wall",
+                child_cpu.as_secs_f64(),
+                cpu_budget.as_secs_f64(),
+                Duration::from_nanos(CHILD_WALL_BACKSTOP_NS).as_secs_f64(),
+                wall.as_secs_f64()
+            );
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+// Permanent negative test: a child that only burns CPU must trip its CPU
+// budget (800 ms, above this binary's startup CPU) while its wall time stays
+// far below the backstop, proving the limit that fires is the CPU budget.
+#[test]
+#[should_panic(expected = "exceeded its CPU budget")]
+fn a_cpu_burning_child_trips_its_cpu_budget() {
+    isolated_budgeted(
+        "a_cpu_burning_child_trips_its_cpu_budget",
+        Duration::from_millis(800),
+        || {
+            let start_cpu = process_cpu_ns();
+            let mut acc = 0u64;
+            // Bound the spin by this child's own process CPU, not wall time;
+            // 2 s is comfortably beyond the 800 ms budget that must kill it.
+            while process_cpu_ns() - start_cpu < 2_000_000_000 {
+                acc = acc.wrapping_add(1);
+                std::hint::black_box(acc);
+            }
+        },
+    );
+}
+
+// Red control at the smallest resized case budget: the same planted
+// spinner must also trip a 300 ms budget by name, so the loaded resize
+// cannot silently stop enforcing the budget class most cases now carry.
+#[test]
+#[should_panic(expected = "exceeded its CPU budget")]
+fn a_cpu_burning_child_trips_the_smallest_case_budget() {
+    isolated_budgeted(
+        "a_cpu_burning_child_trips_the_smallest_case_budget",
+        Duration::from_millis(300),
+        || {
+            let start_cpu = process_cpu_ns();
+            let mut acc = 0u64;
+            // Bound the spin by this child's own process CPU; 1 s is
+            // comfortably beyond the 300 ms budget that must kill it.
+            while process_cpu_ns() - start_cpu < 1_000_000_000 {
+                acc = acc.wrapping_add(1);
+                std::hint::black_box(acc);
+            }
+        },
+    );
+}
+
+// The measurement contract: a live root reads fine, and a missing root
+// fails closed by name (only a vanished *descendant* may be skipped).
+#[test]
+fn tree_cpu_reads_a_live_root_and_fails_closed_on_a_missing_one() {
+    // Burn at least 30 ms of this process's own CPU before reading. A fresh
+    // opt process can legitimately have accumulated less than one 10 ms
+    // /proc tick, so positivity must be established rather than assumed.
+    let start_cpu = process_cpu_ns();
+    let mut acc = 0u64;
+    while process_cpu_ns() - start_cpu < 30_000_000 {
+        acc = acc.wrapping_add(1);
+        std::hint::black_box(acc);
+    }
+    let own = tree_cpu(std::process::id()).expect("own process must be readable");
+    assert!(own > Duration::ZERO, "own CPU should be positive: {own:?}");
+    let missing = tree_cpu(u32::MAX).expect_err("a missing root must fail closed");
+    assert!(
+        missing.contains("cannot read /proc/4294967295/stat"),
+        "missing-root error must name the stat it could not read: {missing}"
+    );
 }
 
 fn pending<T: std::fmt::Debug>(result: Result<T, Error>) -> HermitCleanupUnconfirmed {
@@ -112,8 +387,12 @@ fn refusal<T: std::fmt::Debug>(
 
 #[test]
 fn original_runtime_guards_and_admission_survive_checkpoint() {
-    isolated(
+    isolated_budgeted(
         "original_runtime_guards_and_admission_survive_checkpoint",
+        // Worst run: loaded n=10 max 0.190 s, light max 0.190 s plus one
+        // run killed at the former 0.2 s budget -> 0.4 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(400),
         || {
             let polls = Rc::new(Cell::new(0));
             let path = Rc::new(RefCell::new(PathBuf::new()));
@@ -172,28 +451,34 @@ fn original_runtime_guards_and_admission_survive_checkpoint() {
 /// refused from any other thread.
 #[test]
 fn a_tracer_thread_operation_resumes_from_its_caller() {
-    isolated("a_tracer_thread_operation_resumes_from_its_caller", || {
-        let caller = std::thread::current().id();
-        let on_tracer = move || {
-            std::thread::current().id() != caller
-                && std::thread::current().name() == Some("hermit-tracer")
-        };
-        let diagnostic = pending(run_on_tracer_thread(None, move |control| async move {
-            let started = on_tracer();
-            control.yield_checkpoint().await;
-            Ok(started && on_tracer())
-        }));
-        let other = diagnostic.clone();
-        std::thread::spawn(move || {
-            refusal(other.resume::<bool>(), |e| {
-                matches!(e, RecoveryRefusal::WrongIdentity)
+    isolated_budgeted(
+        "a_tracer_thread_operation_resumes_from_its_caller",
+        // Worst run: loaded n=15 max 0.170 s, light max 0.190 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
+        || {
+            let caller = std::thread::current().id();
+            let on_tracer = move || {
+                std::thread::current().id() != caller
+                    && std::thread::current().name() == Some("hermit-tracer")
+            };
+            let diagnostic = pending(run_on_tracer_thread(None, move |control| async move {
+                let started = on_tracer();
+                control.yield_checkpoint().await;
+                Ok(started && on_tracer())
+            }));
+            let other = diagnostic.clone();
+            std::thread::spawn(move || {
+                refusal(other.resume::<bool>(), |e| {
+                    matches!(e, RecoveryRefusal::WrongIdentity)
+                })
             })
-        })
-        .join()
-        .unwrap();
-        assert!(diagnostic.resume::<bool>().unwrap());
-        assert!(run_on_tracer_thread(None, move |_| async move { Ok(on_tracer()) }).unwrap());
-    });
+            .join()
+            .unwrap();
+            assert!(diagnostic.resume::<bool>().unwrap());
+            assert!(run_on_tracer_thread(None, move |_| async move { Ok(on_tracer()) }).unwrap());
+        },
+    );
 }
 
 /// Runs `child` in a forked child and returns its exit status: 0 when it
@@ -232,8 +517,11 @@ fn in_forked_child(child: impl FnOnce() -> bool) -> Option<i32> {
 /// https://github.com/rrnewton/hermit/issues/4389).
 #[test]
 fn a_forked_child_launches_on_a_tracer_thread_of_its_own() {
-    isolated(
+    isolated_budgeted(
         "a_forked_child_launches_on_a_tracer_thread_of_its_own",
+        // Worst run: loaded n=10 max 0.170 s, light max 0.230 s -> 0.4 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(400),
         || {
             assert_eq!(
                 run_on_tracer_thread(None, |_| async { Ok(1u32) }).unwrap(),
@@ -256,22 +544,28 @@ fn a_forked_child_launches_on_a_tracer_thread_of_its_own() {
 /// identity check refuses it, as before the tracer thread.
 #[test]
 fn a_forked_child_cannot_resume_its_parents_operation() {
-    isolated("a_forked_child_cannot_resume_its_parents_operation", || {
-        let diagnostic = pending(run_on_tracer_thread(None, |control| async move {
-            control.yield_checkpoint().await;
-            Ok(5u32)
-        }));
-        let other = diagnostic.clone();
-        let child = in_forked_child(move || {
-            other
-                .resume::<u32>()
-                .unwrap_err()
-                .downcast::<RecoveryRefusal>()
-                .is_ok_and(|e| matches!(e, RecoveryRefusal::WrongIdentity))
-        });
-        assert_eq!(child, Some(0));
-        assert_eq!(diagnostic.resume::<u32>().unwrap(), 5);
-    });
+    isolated_budgeted(
+        "a_forked_child_cannot_resume_its_parents_operation",
+        // Worst run: loaded n=10 max 0.160 s, light max 0.150 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
+        || {
+            let diagnostic = pending(run_on_tracer_thread(None, |control| async move {
+                control.yield_checkpoint().await;
+                Ok(5u32)
+            }));
+            let other = diagnostic.clone();
+            let child = in_forked_child(move || {
+                other
+                    .resume::<u32>()
+                    .unwrap_err()
+                    .downcast::<RecoveryRefusal>()
+                    .is_ok_and(|e| matches!(e, RecoveryRefusal::WrongIdentity))
+            });
+            assert_eq!(child, Some(0));
+            assert_eq!(diagnostic.resume::<u32>().unwrap(), 5);
+        },
+    );
 }
 
 /// Enters a user namespace, plus `extra` namespaces, mapping the caller to
@@ -342,9 +636,12 @@ fn enter_user_and_mount_namespaces() -> std::io::Result<()> {
 /// re-check of the tracer thread).
 #[test]
 fn a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer() {
-    isolated_with_child_setup(
+    isolated_with_child_setup_budgeted(
         "a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer",
         &[],
+        // Worst run: loaded n=10 max 0.170 s, light max 0.180 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         enter_user_namespace,
         || {
             // A PID namespace for this process's children, then a fork into it
@@ -410,9 +707,12 @@ fn the_pid_namespace_is_read_from_its_entry() {
 /// directory mounted there (which has no `mnt` entry either) (Codex review).
 #[test]
 fn a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces() {
-    isolated_with_child_setup(
+    isolated_with_child_setup_budgeted(
         "a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces",
         &[],
+        // Worst run: loaded n=10 max 0.180 s, light max 0.180 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         enter_user_and_mount_namespaces,
         || {
             let pid = std::process::id();
@@ -476,9 +776,12 @@ fn a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces() {
 /// https://github.com/rrnewton/hermit/issues/4389 follow-up).
 #[test]
 fn without_a_readable_pid_namespace_launches_stay_on_the_caller() {
-    isolated_with_child_setup(
+    isolated_with_child_setup_budgeted(
         "without_a_readable_pid_namespace_launches_stay_on_the_caller",
         &[],
+        // Worst run: loaded n=10 max 0.190 s, light max 0.210 s -> 0.4 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(400),
         enter_user_and_mount_namespaces,
         || {
             assert_eq!(
@@ -523,30 +826,39 @@ fn without_a_readable_pid_namespace_launches_stay_on_the_caller() {
 
 #[test]
 fn nested_runtime_refuses_before_factory() {
-    isolated("nested_runtime_refuses_before_factory", || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let called = Cell::new(false);
-        runtime.block_on(async {
-            refusal(
-                run(None, |_| {
-                    called.set(true);
-                    async { Ok(()) }
-                }),
-                |e| matches!(e, RecoveryRefusal::NestedRuntime),
-            );
-        });
-        assert!(!called.get());
-        assert!(run(None, |_| async { Ok(()) }).is_ok());
-    });
+    isolated_budgeted(
+        "nested_runtime_refuses_before_factory",
+        // Worst run: loaded n=10 max 0.160 s, light max 0.280 s -> 0.5 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(500),
+        || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let called = Cell::new(false);
+            runtime.block_on(async {
+                refusal(
+                    run(None, |_| {
+                        called.set(true);
+                        async { Ok(()) }
+                    }),
+                    |e| matches!(e, RecoveryRefusal::NestedRuntime),
+                );
+            });
+            assert!(!called.get());
+            assert!(run(None, |_| async { Ok(()) }).is_ok());
+        },
+    );
 }
 
 #[test]
 fn repeated_checkpoint_keeps_one_owner_and_reentry_refuses() {
-    isolated(
+    isolated_budgeted(
         "repeated_checkpoint_keeps_one_owner_and_reentry_refuses",
+        // Worst run: loaded n=10 max 0.150 s, light max 0.170 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             let visits = Rc::new(Cell::new(0));
             let copy = visits.clone();
@@ -596,8 +908,11 @@ impl Future for PanicFuture {
 }
 #[test]
 fn initial_poll_panic_retains_future_and_poison_refuses_repoll() {
-    isolated(
+    isolated_budgeted(
         "initial_poll_panic_retains_future_and_poison_refuses_repoll",
+        // Worst run: loaded n=10 max 0.170 s, light max 0.200 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             let polls = Arc::new(AtomicUsize::new(0));
             let drops = Arc::new(AtomicUsize::new(0));
@@ -623,8 +938,11 @@ fn initial_poll_panic_retains_future_and_poison_refuses_repoll() {
 
 #[test]
 fn origin_thread_exit_retains_resources_and_process_admission() {
-    isolated(
+    isolated_budgeted(
         "origin_thread_exit_retains_resources_and_process_admission",
+        // Worst run: loaded n=10 max 0.160 s, light max 0.210 s -> 0.4 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(400),
         || {
             let drops = Arc::new(AtomicUsize::new(0));
             let copy = drops.clone();
@@ -654,8 +972,11 @@ fn origin_thread_exit_retains_resources_and_process_admission() {
 
 #[test]
 fn absolute_startup_deadline_and_failed_cleanup_checkpoint() {
-    isolated(
+    isolated_budgeted(
         "absolute_startup_deadline_and_failed_cleanup_checkpoint",
+        // Worst run: loaded n=10 max 0.430 s, light max 0.380 s -> 0.7 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(700),
         || {
             let started = Rc::new(Cell::new(false));
             let copy = started.clone();
@@ -693,8 +1014,11 @@ fn absolute_startup_deadline_and_failed_cleanup_checkpoint() {
 
 #[test]
 fn origin_pidfd_and_primary_serialization_refuse_false_proofs() {
-    isolated(
+    isolated_budgeted(
         "origin_pidfd_and_primary_serialization_refuse_false_proofs",
+        // Worst run: loaded n=10 max 0.160 s, light max 0.150 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             let process = OriginalProcess::capture(std::process::id()).unwrap();
             process.check().unwrap();
@@ -736,8 +1060,11 @@ mod origin_tests;
 
 #[test]
 fn mid_startup_timeout_retains_original_waiter_and_resources() {
-    isolated(
+    isolated_budgeted(
         "mid_startup_timeout_retains_original_waiter_and_resources",
+        // Worst run: loaded n=10 max 0.420 s, light max 0.440 s -> 0.7 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(700),
         || {
             let polls = Rc::new(Cell::new(0));
             let resumed = Rc::new(Cell::new(false));
@@ -795,8 +1122,13 @@ include!("ptrace_random_failure_tests.rs");
 /// as a subreaper, giving adoption the same parent identity as namespace init.
 #[test]
 fn captured_output_timeout_names_the_orphan_after_its_root_exits() {
-    isolated(
+    isolated_budgeted(
         "captured_output_timeout_names_the_orphan_after_its_root_exits",
+        // Worst run: loaded n=10 max 0.550 s, light max 0.400 s, plus a
+        // censored calibration run killed at 0.710 s of the former 0.7 s
+        // budget (1-core head calibration run 4) -> 1.1 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(1100),
         || {
             use std::os::unix::ffi::OsStrExt;
 
@@ -877,8 +1209,11 @@ fn captured_output_timeout_names_the_orphan_after_its_root_exits() {
 
 #[test]
 fn terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive() {
-    isolated(
+    isolated_budgeted(
         "terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive",
+        // Worst run: loaded n=10 max 0.170 s, light max 0.160 s -> 0.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3.
+        Duration::from_millis(300),
         || {
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();

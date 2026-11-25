@@ -32,6 +32,20 @@ mod real_random {
         fn text(&self) -> String {
             String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
         }
+
+        // Search only the bytes appended since `searched` (plus the
+        // needle-length overlap a boundary-spanning match needs), so a
+        // polling caller pays per new byte, not per whole log. Returns
+        // whether the needle occurs at or after the overlap start and
+        // the offset to resume from.
+        fn find_from(&self, searched: usize, needle: &[u8]) -> (bool, usize) {
+            let log = self.0.lock().unwrap();
+            let overlap = needle.len().saturating_sub(1);
+            let from = searched.saturating_sub(overlap).min(log.len());
+            let found =
+                !needle.is_empty() && log[from..].windows(needle.len()).any(|w| w == needle);
+            (found, log.len())
+        }
     }
 
     struct Mapping(*mut AtomicU32);
@@ -173,7 +187,13 @@ mod real_random {
         );
     }
 
-    pub(super) fn case(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
+    pub(super) fn case(
+        name: &str,
+        fatal: bool,
+        trace_diagnostics: bool,
+        operation: Operation,
+        cpu_budget: Duration,
+    ) {
         // These cases drive a Detcore session on the calling thread, and
         // a debug session overflows the test thread's default 2 MiB stack
         // under plain `cargo test`, so run the case on a thread with an
@@ -182,7 +202,7 @@ mod real_random {
         std::thread::Builder::new()
             .name(name.clone())
             .stack_size(16 << 20)
-            .spawn(move || case_body(&name, fatal, trace_diagnostics, operation))
+            .spawn(move || case_body(&name, fatal, trace_diagnostics, operation, cpu_budget))
             .unwrap()
             .join()
             .unwrap();
@@ -375,12 +395,20 @@ mod real_random {
         );
     }
 
-    fn case_body(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
+    fn case_body(
+        name: &str,
+        fatal: bool,
+        trace_diagnostics: bool,
+        operation: Operation,
+        cpu_budget: Duration,
+    ) {
         if pmu_unavailable(name) {
             return;
         }
         if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
-            isolated(name, || exercise(fatal, trace_diagnostics, operation));
+            isolated_budgeted(name, cpu_budget, || {
+                exercise(fatal, trace_diagnostics, operation)
+            });
             return;
         }
         let parent_tid = unsafe { libc::syscall(libc::SYS_gettid) };
@@ -421,12 +449,13 @@ mod real_random {
             "permission-probe",
             include_bytes!("../tests/fixtures/ptrace_copy_permission.c"),
         );
-        isolated_with_child_setup(
+        isolated_with_child_setup_budgeted(
             name,
             &[
                 ("HERMIT_RANDOM_FAILURE_GUEST", &binary),
                 ("HERMIT_RANDOM_PERMISSION_PROBE", &probe),
             ],
+            cpu_budget,
             restrict_ptrace_copy,
             || unreachable!(),
         );
@@ -554,6 +583,7 @@ mod real_random {
                 }
                 control.register(tracer.termination_handle());
                 let observer = async {
+                    let mut log_searched = 0usize;
                     loop {
                         if future_mapping.field(0).load(Ordering::SeqCst) == 1
                             && future_mapping.field(1).load(Ordering::SeqCst) == 1
@@ -569,10 +599,15 @@ mod real_random {
                                     .lines()
                                     .any(|line| line == format!("TracerPid:\t{tracer_tid}"))
                             );
-                            let text = future_log.text();
                             let event =
                                 format!("[detcore, dtid {child}] inbound timer preemption event");
-                            if text.contains(&event) {
+                            // Incremental search: cloning and scanning the
+                            // whole log every 1 ms made this observer's CPU
+                            // grow with wall time instead of guest work.
+                            let (found, searched) =
+                                future_log.find_from(log_searched, event.as_bytes());
+                            log_searched = searched;
+                            if found {
                                 let (tid, observed) =
                                     restricted_thread_credentials("actual-tracer-before-gate");
                                 assert_eq!(tid, original_tid);
@@ -825,6 +860,10 @@ fn real_random_copy_failure_retires_initialized_sibling_and_timer() {
         true,
         false,
         real_random::Operation::Getrandom,
+        // Worst run: re-measured loaded n=20 max 1.480 s (prior loaded
+        // 1.300 s, light 0.470 s) -> 2.3 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3, re-measure dh-74hbms-c6bbd55ac68.
+        Duration::from_millis(2300),
     );
 }
 #[test]
@@ -834,6 +873,10 @@ fn real_random_live_copy_preserves_sibling_and_timer_success() {
         false,
         false,
         real_random::Operation::Getrandom,
+        // Worst run: re-measured loaded n=20 max 1.690 s (prior loaded
+        // 1.320 s, light 0.490 s) -> 2.6 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3, re-measure dh-74hbms-c6bbd55ac68.
+        Duration::from_millis(2600),
     );
 }
 
@@ -844,6 +887,10 @@ fn real_random_copy_failure_with_trace_diagnostics() {
         true,
         true,
         real_random::Operation::Getrandom,
+        // Worst run: re-measured loaded n=20 max 1.550 s (equals prior
+        // loaded max; light 0.540 s) -> 2.4 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3, re-measure dh-74hbms-c6bbd55ac68.
+        Duration::from_millis(2400),
     );
 }
 
@@ -854,6 +901,10 @@ fn real_random_readv_import_failure_retires_initialized_sibling_and_timer() {
         true,
         false,
         real_random::Operation::Readv,
+        // Worst run: re-measured loaded n=20 max 1.760 s (prior loaded
+        // 1.460 s, light 0.510 s) -> 2.7 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3, re-measure dh-74hbms-c6bbd55ac68.
+        Duration::from_millis(2700),
     );
 }
 
@@ -864,5 +915,10 @@ fn real_random_readv_live_import_preserves_sibling_and_timer_success() {
         false,
         false,
         real_random::Operation::Readv,
+        // Worst run: re-measured loaded n=20 max 1.910 s (prior loaded
+        // 1.260 s, light 0.580 s), plus a pair run killed at the former
+        // 1.9 s budget -> 2.9 s.
+        // Sources: loaded dh-74hbms-ccdcd578607, light dh-74hbms-c16418f641d, combined dh-74hbms-c3f8ae4dea3, re-measure dh-74hbms-cb289d91ad5.
+        Duration::from_millis(2900),
     );
 }
