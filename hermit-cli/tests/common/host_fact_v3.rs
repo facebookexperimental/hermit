@@ -117,37 +117,50 @@ pub fn is_host_fact_reason(reason: &str) -> bool {
     XCR0_FORMS.iter().any(|form| sentence.starts_with(form))
 }
 
-/// The host-fact refusal reason of one finished Hermit run, or
-/// `None` unless the run exited with the policy-refusal status,
-/// carries Hermit's policy-refusal classification line, and its
-/// `--cpu-profile x86-64-v3 refused:` reason is a host fact
-/// ([`is_host_fact_reason`]). A skid-overshoot refusal, a refusal
-/// beside a second failure marker, or a marker without the exit
-/// status never qualifies.
+/// The first host-fact refusal reason of one finished command,
+/// whose stderr may hold several Hermit runs (a shell script under
+/// one runner), or `None` unless every refusal in it qualifies:
+/// the command exited with the policy-refusal status, there is at
+/// least one classification line, every classification line is
+/// answered by exactly one `--cpu-profile x86-64-v3 refused:`
+/// reason (equal counts), and every such reason is a host fact
+/// ([`is_host_fact_reason`]). A skid-overshoot or other `cause=`
+/// refusal, a `HERMIT_*` failure marker, a panic, an unanswered or
+/// unclassified refusal, or any non-host-fact reason anywhere in
+/// the output never qualifies, so a later refusal cannot hide
+/// behind an earlier host fact; repeated host-fact refusals (two
+/// Hermit processes) qualify by the first reason.
 pub fn host_fact_refusal(code: Option<i32>, stderr: &str) -> Option<&str> {
     if code != Some(HERMIT_POLICY_REFUSAL_EXIT) {
         return None;
     }
-    let mut refusal = None;
-    let mut classified = false;
+    let mut first_refusal = None;
+    let mut classifications = 0usize;
+    let mut refusals = 0usize;
     for line in stderr.lines() {
         let line = line.trim_end();
         if line.starts_with("HERMIT_POLICY_REFUSAL class=policy-refusal cause=") {
             return None;
         }
         if line == "HERMIT_POLICY_REFUSAL class=policy-refusal" {
-            classified = true;
+            classifications += 1;
         } else if line.starts_with("HERMIT_") || line.contains("panicked at") {
             return None;
         }
         if let Some((_, reason)) = line.split_once(REFUSAL_PREFIX) {
-            if refusal.is_some() {
+            if !is_host_fact_reason(reason) {
                 return None;
             }
-            refusal = Some(reason);
+            refusals += 1;
+            if first_refusal.is_none() {
+                first_refusal = Some(reason);
+            }
         }
     }
-    refusal.filter(|reason| classified && is_host_fact_reason(reason))
+    if classifications == 0 || refusals != classifications {
+        return None;
+    }
+    first_refusal
 }
 
 /// The bead for a launch, from its decided facts: an explicit
@@ -164,6 +177,29 @@ pub fn bead_for(explicit_profile: Option<&str>, admits: bool, needs: bool) -> Op
         None if admits && needs => Some(SKIP_ISSUE_XSAVE),
         None => None,
     }
+}
+
+/// The environment variables whose presence forbids the counted
+/// skip on every path (the Rust harness and the verdict binary
+/// alike): v3 explicitly required by the test's configuration, or
+/// a test seam that makes Hermit refuse on any host, whose planted
+/// texts copy host-fact forms and so cannot be told from a host
+/// fact by stderr alone.
+pub const REQUIRE_V3_ENV: &str = "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3";
+pub const XCR0_SEAM_ENV: &str = "HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS";
+pub const PROBE_REFUSAL_SEAM_ENV: &str = "HERMIT_TEST_XSTATE_PROBE_REFUSAL";
+
+/// Whether the launch environment forbids the counted skip:
+/// `REQUIRE_V3_ENV=1` (the case must run or fail by name), or
+/// either refusal seam set to any value (the refusal may be
+/// seam-made, not this host's qualification). `get` resolves a
+/// variable for the launch: the harness passes its command-aware
+/// lookup, the verdict binary its own process environment, which
+/// its runner sets to the test's. Pure in `get`.
+pub fn env_forbids_skip(mut get: impl FnMut(&str) -> Option<String>) -> bool {
+    get(REQUIRE_V3_ENV).as_deref() == Some("1")
+        || get(XCR0_SEAM_ENV).is_some()
+        || get(PROBE_REFUSAL_SEAM_ENV).is_some()
 }
 
 /// The `SKIP-ISSUE: <bead>: <reason>` skip-marker reason for a

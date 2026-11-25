@@ -100,10 +100,11 @@ impl Drop for V3SkipSuppressed {
 /// Whether the hook may act at all here: only under run_node.py,
 /// which alone sets HERMIT_RUN_NODE_SKIP_ISSUES=1 for its cases (so
 /// the open-source nextest producer never sees these markers), never
-/// where v3 is required (HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 fails
-/// by name instead), never under a suppression guard, and never on
-/// a seam-made verdict (HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS
-/// names a synthetic XCR0, not this host's qualification).
+/// under a suppression guard, and never where the launch
+/// environment forbids the skip (host_fact_v3::env_forbids_skip:
+/// v3 required, or a refusal seam made the verdict synthetic).
+/// That environment rule is the one rule both paths share; the
+/// verdict binary applies it to its own (the test's) environment.
 /// A variable's value for a launch: the command's own setting (or
 /// removal) where it names one, else this process's. The seam tests
 /// set the seam variable on the Hermit command, not the test
@@ -126,8 +127,7 @@ pub fn v3_skip_enabled_for(cmd: &Command) -> bool {
 
 fn v3_skip_enabled(cmd: Option<&Command>) -> bool {
     std::env::var_os("HERMIT_RUN_NODE_SKIP_ISSUES").is_some_and(|v| v == "1")
-        && command_env(cmd, "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Some("1")
-        && command_env(cmd, "HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS").is_none()
+        && !host_fact_v3::env_forbids_skip(|key| command_env(cmd, key))
         && V3_SKIP_SUPPRESSED.with(|held| held.get() == 0)
 }
 

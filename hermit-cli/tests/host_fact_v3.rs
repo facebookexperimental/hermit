@@ -230,6 +230,68 @@ mod host_fact_v3_tests {
         assert_eq!(host_fact_refusal(None, &refused(reason)), None);
         let unclassified = format!("Error: --cpu-profile x86-64-v3 refused: {reason}\n");
         assert_eq!(host_fact_refusal(Some(122), &unclassified), None);
+        assert_eq!(host_fact_refusal(Some(122), ""), None);
+    }
+
+    #[test]
+    fn every_refusal_in_the_output_must_be_a_host_fact() {
+        let host_fact = "XCR0 0x67 enables only some of the AVX-512 components";
+        let other_host_fact = "XCR0 0x2ef enables only some of the MPX components";
+        let calibration = "the interrupts-taken counter failed calibration: saw 232";
+        // Two identical host-fact refusals qualify, by the first.
+        let pair = format!("{}{}", refused(host_fact), refused(host_fact));
+        assert_eq!(host_fact_refusal(Some(122), &pair), Some(host_fact));
+        // Two different host-fact refusals qualify too (lead's rule:
+        // every refusal a decided host fact, no identity required).
+        let differing = format!("{}{}", refused(host_fact), refused(other_host_fact));
+        assert_eq!(host_fact_refusal(Some(122), &differing), Some(host_fact));
+        // One classification answered by two refusals does not,
+        // whether they differ or are identical (no dedup either).
+        for second in [other_host_fact, host_fact] {
+            let crowded = format!(
+                "{}Error: --cpu-profile x86-64-v3 refused: {second}\n",
+                refused(host_fact)
+            );
+            assert_eq!(host_fact_refusal(Some(122), &crowded), None, "{second}");
+        }
+        // A host fact followed by a non-host-fact refusal does not.
+        let mixed = format!("{}{}", refused(host_fact), refused(calibration));
+        assert_eq!(host_fact_refusal(Some(122), &mixed), None);
+        // An unanswered classification line does not.
+        let unanswered = format!(
+            "{}HERMIT_POLICY_REFUSAL class=policy-refusal\n",
+            refused(host_fact)
+        );
+        assert_eq!(host_fact_refusal(Some(122), &unanswered), None);
+        // Nor does a cause= refusal, another failure marker, or a panic.
+        for extra in [
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1\n",
+            "HERMIT_INTERNAL_FAILURE class=container-child-panic\n",
+            "thread 'main' panicked at src/main.rs:1:1:\n",
+        ] {
+            let poisoned = format!("{}{extra}", refused(host_fact));
+            assert_eq!(host_fact_refusal(Some(122), &poisoned), None, "{extra}");
+        }
+    }
+
+    #[test]
+    fn env_rule_forbids_required_and_seam_made_refusals_only() {
+        let none = |_: &str| None;
+        assert!(!env_forbids_skip(none));
+        for (key, value) in [
+            (REQUIRE_V3_ENV, "1"),
+            (XCR0_SEAM_ENV, "0"),
+            (PROBE_REFUSAL_SEAM_ENV, "fpu-reload"),
+        ] {
+            assert!(
+                env_forbids_skip(|k| (k == key).then(|| value.to_owned())),
+                "{key}"
+            );
+        }
+        // REQUIRED set to anything but "1" does not forbid.
+        assert!(!env_forbids_skip(
+            |k| (k == REQUIRE_V3_ENV).then(|| "0".to_owned())
+        ));
     }
 }
 
@@ -436,8 +498,9 @@ mod v3_skip_tests {
                     .args(["reused_refusals_split_by_host_fact_in_a_child"])
                     .env(CHILD, mode)
                     .env("HERMIT_V3_SKIP_FOR_CHILD_VIA", via)
-                    .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
-                    .env_remove("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS")
+                    .env_remove(host_fact_v3::REQUIRE_V3_ENV)
+                    .env_remove(host_fact_v3::XCR0_SEAM_ENV)
+                    .env_remove(host_fact_v3::PROBE_REFUSAL_SEAM_ENV)
                     .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
                     .env("HERMIT_CPU_PROFILE", "x86-64-v3")
                     .env("HERMIT_TEST_SKIP_FILE", &sidecar)
@@ -462,5 +525,66 @@ mod v3_skip_tests {
                 let _ = std::fs::remove_file(&sidecar);
             }
         }
+    }
+
+    #[test]
+    fn a_seam_in_the_child_environment_blocks_the_abort() {
+        // The harness-side call of the shared rule: with the
+        // forced-refusal seam set in the child's own environment,
+        // the same refused output that aborts with 86 above must
+        // return normally and record nothing. Reverting
+        // v3_skip_enabled to inline checks turns this red.
+        const CHILD: &str = "HERMIT_V3_SKIP_SEAM_CHILD";
+        const MARKER: &str = "HERMIT_V3_SKIP_SEAM_CHILD_MARKER";
+        if std::env::var_os(CHILD).is_some() {
+            abort_on_host_fact_v3_refusal_with_bead(
+                "unit",
+                host_fact_v3::SKIP_ISSUE_XSAVE,
+                &refused_output(),
+            );
+            // Reached only if the abort did not fire, so the parent
+            // can tell a child that ran this test from one that ran
+            // none (both would otherwise exit 0, sidecar empty); a
+            // file, because libtest captures stdout on success.
+            let marker = std::env::var_os(MARKER).expect("marker path set by parent");
+            std::fs::write(marker, "ran\n").unwrap();
+            return;
+        }
+        let sidecar =
+            std::env::temp_dir().join(format!("hermit-v3-skip-seam-{}.txt", std::process::id()));
+        let marker = std::env::temp_dir().join(format!(
+            "hermit-v3-skip-seam-ran-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(&sidecar, "").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["a_seam_in_the_child_environment_blocks_the_abort"])
+            .env(CHILD, "1")
+            .env(MARKER, &marker)
+            .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
+            .env_remove(host_fact_v3::REQUIRE_V3_ENV)
+            .env_remove(host_fact_v3::XCR0_SEAM_ENV)
+            .env(host_fact_v3::PROBE_REFUSAL_SEAM_ENV, "fpu-reload")
+            .env("HERMIT_TEST_SKIP_FILE", &sidecar)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Exactly one child test ran, and it reached past the abort.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "");
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(&marker);
     }
 }

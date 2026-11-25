@@ -2640,6 +2640,24 @@ fn host_capabilities_cpu_profile_json_verdict_matches_exit_status() {
     }
 }
 
+/// The shared skip rule's seam names stay the producers' constants,
+/// or its seam clauses stop silently. Here, not in hermit_binary.rs:
+/// that file is also compiled without the hermit crate (Buck's
+/// cpu-profile-v2-rootfs-test) and for aarch64, where xstate_probe
+/// does not exist.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn seam_names_match_the_producers() {
+    assert_eq!(
+        hermit_test::host_fact_v3::XCR0_SEAM_ENV,
+        hermit::xstate_probe::XCR0_EXTRA_TEST_ENV
+    );
+    assert_eq!(
+        hermit_test::host_fact_v3::PROBE_REFUSAL_SEAM_ENV,
+        hermit::xstate_probe::PROBE_REFUSAL_TEST_ENV
+    );
+}
+
 /// The JSON refusal arm, forced on every host by the XCR0 test seam:
 /// exit 122 with `qualified: false`, the coverage refusal and no probe.
 /// On a host that refuses an earlier fixed check the seam is never

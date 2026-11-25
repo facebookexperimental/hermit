@@ -18,7 +18,9 @@
 //! Usage: `host-fact-v3-verdict EXIT_STATUS`, with the command's
 //! stderr on stdin. Exit 0 prints the one `SKIP-ISSUE:` line of a
 //! decided host-fact refusal; exit 1 (nothing printed) is every
-//! other run; exit 2 is a usage or read error.
+//! other run, including where the shared environment rule
+//! (`env_forbids_skip`) forbids the skip; exit 2 is a usage or
+//! read error.
 
 #[allow(dead_code)]
 #[path = "host_fact_v3.rs"]
@@ -48,6 +50,12 @@ fn verdict() -> i32 {
     if std::io::stdin().lock().read_to_end(&mut stderr).is_err() {
         eprintln!("host-fact-v3-verdict: cannot read stdin");
         return 2;
+    }
+    // The one environment rule both paths share: a required or
+    // seam-made refusal is never a skip, whatever its text says.
+    // The runner passes the test's environment to this process.
+    if host_fact_v3::env_forbids_skip(|key| std::env::var(key).ok()) {
+        return 1;
     }
     let stderr = String::from_utf8_lossy(&stderr);
     match host_fact_v3::host_fact_refusal(Some(status), &stderr) {
