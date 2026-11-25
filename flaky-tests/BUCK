@@ -10,7 +10,6 @@ load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
-load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
 
 oncall("hermit")
 
@@ -150,33 +149,6 @@ buck_sh_test(
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "//hermetic_infra/hermit/tests:nanosleep-threads-simple",
-)
-
-cpp_unittest(
-    name = "use_configurable_flaky_service",
-    srcs = [
-        "use_configurable_flaky_service.cpp",
-    ],
-    # A deliberately flaky fixture: the local fake service fails about half
-    # its requests on purpose and the client crashes on large errors. Keep
-    # it out of CI. Loopback only; no external network or credentials.
-    labels = [tpx_labels.local_only],
-    # In-process client and server in one private namespace; reaches no
-    # host or external network.
-    network_access = network_access_utils.private(),
-    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only. The
-    # open-source Buck build's shim has no curl.
-    target_compatible_with = [
-        "fbcode//opensource/macros:broken-in-oss",
-        "ovr_config//cpu:x86_64",
-    ],
-    deps = [
-        "fbsource//third-party/fmt:fmt",
-        "fbsource//third-party/googletest:gtest",
-    ],
-    external_deps = [
-        "curl",
-    ],
 )
 
 # The original host-side harness, restored unchanged under a native

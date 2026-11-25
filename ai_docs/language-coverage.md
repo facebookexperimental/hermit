@@ -18,7 +18,7 @@ inventory after this audit:
 | --- | ---: | --- |
 | Rust | 79 | Primary implementation, unit, integration, and guest-test language. |
 | C | 40 | Broad syscall guests, deterministic scenarios, chaos tests, and benchmark fixtures. |
-| C++ | 3 | Flaky guests only on main; larger OSS workloads are open PRs. |
+| C++ | 2 | Flaky guests only on main; larger OSS workloads are open PRs. |
 | Python | 10 | Harnesses/utilities plus one opt-in OSS CPython entropy test. |
 | Shell | 29 | Test and experiment orchestration, not a compiler-runtime claim. |
 | Go | 2 | One legacy lit hello-world guest and one opt-in entropy test. |
@@ -126,11 +126,10 @@ waits, resource metadata, and sysinfo uptime.
 
 ### C++
 
-Main contains only three C++ flaky guests:
+Main contains only two C++ flaky guests:
 
-- `flaky-tests/bind/bind_random.cpp`;
-- `flaky-tests/bind/bind_same.cpp`; and
-- `flaky-tests/use_configurable_flaky_service.cpp`.
+- `flaky-tests/bind/bind_random.cpp`; and
+- `flaky-tests/bind/bind_same.cpp`.
 
 They use the host C++ compiler when built by legacy/manual flows. No current
 Cargo manifest exposes them as default integration tests. LULESH, LevelDB, and

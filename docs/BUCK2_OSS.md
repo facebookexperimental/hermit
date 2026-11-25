@@ -87,10 +87,9 @@ Reverie's stand-ins `gated_test`, `excluded_paths_test` and
 also define no target. With Reverie at c3f8de29 or later, Reverie's BUCK files
 evaluate in this tree.
 
-`flaky-tests:use_configurable_flaky_service` is marked `broken-in-oss` (the
-shim has no curl), as are the root package's `backend-abstraction-repository`,
-`cargo-lock-repository` and `oss-release-values-stand-in`, which feed internal
-contract checks. This tree runs the backend-abstraction check as
+The root package's `backend-abstraction-repository`,
+`cargo-lock-repository` and `oss-release-values-stand-in` are marked
+`broken-in-oss`; they feed internal contract checks. This tree runs the backend-abstraction check as
 `scripts/check-detcore-backend-abstraction.sh` and checks the stand-in
 `release.bzl` values with `scripts/check-reverie-pin.rs`.
 
