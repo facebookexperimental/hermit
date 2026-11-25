@@ -853,10 +853,10 @@ class CargoCacheMounts(unittest.TestCase):
             f"seeding cargo dependency caches from {home}/.cargo under a private overlay",
             result.stderr,
         )
+        out = self.root / "output"
+        pinned_home = out / "home"
         for cache in ("registry", "git"):
-            self.assertTrue(
-                (self.root / "output/home/.cargo" / cache).is_dir(), cache
-            )
+            self.assertTrue((pinned_home / ".cargo" / cache).is_dir(), cache)
 
     def test_default_without_home_caches_seeds_nothing(self):
         home = self.root / "empty-home"
