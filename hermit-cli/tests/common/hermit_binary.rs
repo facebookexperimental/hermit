@@ -245,7 +245,12 @@ pub fn abort_on_host_fact_v3_refusal_with_bead(label: &str, bead: &str, output: 
 /// returning the payload the abort leaves by. Split from the abort
 /// so a unit test can drive it with a private file and an explicit
 /// enabled flag, with no process-environment change.
-fn record_v3_skip(label: &str, bead: &str, refusal: &str, skip_file: Option<&Path>) -> String {
+pub(crate) fn record_v3_skip(
+    label: &str,
+    bead: &str,
+    refusal: &str,
+    skip_file: Option<&Path>,
+) -> String {
     let reason = host_fact_v3::skip_issue_reason(bead, refusal);
     match skip_file {
         Some(path) => test_skip::record_test_skip_to(Some(path), label, &reason),
@@ -262,7 +267,7 @@ fn record_v3_skip(label: &str, bead: &str, refusal: &str, skip_file: Option<&Pat
 /// with SKIP_ABORT_EXIT. Exiting, not panicking, is what makes the
 /// abort uncatchable: no catch_unwind or sibling thread can
 /// continue the case past it.
-fn v3_skip_abort_core(
+pub(crate) fn v3_skip_abort_core(
     label: &str,
     bead: &str,
     refusal: &str,
@@ -883,230 +888,4 @@ pub fn recorded_preemption_inner_mut(record: &mut serde_json::Value) -> &mut ser
         return &mut record["slice_boundary_recording"]["preemptions"];
     }
     record
-}
-
-#[cfg(test)]
-mod v3_skip_tests {
-    use std::os::unix::process::ExitStatusExt;
-
-    use super::*;
-
-    fn refused_output() -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(
-                (detcore_model::HERMIT_POLICY_REFUSAL_EXIT) << 8,
-            ),
-            stdout: Vec::new(),
-            stderr: concat!(
-                "HERMIT_POLICY_REFUSAL class=policy-refusal\n",
-                "Error: --cpu-profile x86-64-v3 refused: XINUSE is not ",
-                "stable across a host FPU reload: XSTATE_BV 0x2fd\n",
-            )
-            .as_bytes()
-            .to_vec(),
-        }
-    }
-
-    // The bead matrix itself (SaBRe-shaped and explicit-profile
-    // launches included) is unit-tested as bead_for in
-    // host_fact_v3.rs, whose tests never touch a Hermit invocation
-    // and so stay out of generate.py's CPUID-faulting derivation.
-    // What remains here is only the abort's own behavior.
-
-    #[test]
-    fn the_core_records_into_a_private_skip_file_only_when_enabled() {
-        // lead-014's never-returns property, at the split core: the
-        // enabled core records the marker and exits the process, so
-        // no in-process test can call it and return; what is asserted
-        // here is its recording half against a private file (no
-        // process-environment change) and that a disabled core
-        // records nothing and does return.
-        let sidecar =
-            std::env::temp_dir().join(format!("hermit-v3-skip-unit-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&sidecar);
-        std::fs::write(&sidecar, "").unwrap();
-        v3_skip_abort_core(
-            "unit",
-            host_fact_v3::SKIP_ISSUE_XSAVE,
-            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2fd",
-            false,
-            Some(&sidecar),
-        );
-        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "");
-        let payload = record_v3_skip(
-            "unit",
-            host_fact_v3::SKIP_ISSUE_XSAVE,
-            "XINUSE is not stable across a host FPU reload: XSTATE_BV 0x2fd",
-            Some(&sidecar),
-        );
-        assert!(
-            payload.starts_with("HERMIT-TEST-SKIP-ABORT: dh-38lkn5:"),
-            "{payload}"
-        );
-        let recorded = std::fs::read_to_string(&sidecar).unwrap();
-        assert!(
-            recorded.starts_with("HERMIT-TEST-SKIP: unit\tSKIP-ISSUE: dh-38lkn5:"),
-            "{recorded}"
-        );
-        let _ = std::fs::remove_file(&sidecar);
-    }
-
-    #[test]
-    fn the_real_abort_records_and_exits_86_in_a_child() {
-        // The real abort path, in a child of this test binary with
-        // the runner enable and a private skip file on ITS command
-        // environment only (no process-env change here): exit 86,
-        // the marker in that file, the payload on stderr. The
-        // disabled-core case above covers hook inertness; this
-        // environment's own enable state is irrelevant by design.
-        const CHILD: &str = "HERMIT_V3_SKIP_ABORT_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            abort_on_host_fact_v3_refusal_with_bead(
-                "unit",
-                host_fact_v3::SKIP_ISSUE_XSAVE,
-                &refused_output(),
-            );
-            return;
-        }
-        let sidecar =
-            std::env::temp_dir().join(format!("hermit-v3-skip-child-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&sidecar);
-        std::fs::write(&sidecar, "").unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["the_real_abort_records_and_exits_86_in_a_child"])
-            .env(CHILD, "1")
-            .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
-            .env("HERMIT_TEST_SKIP_FILE", &sidecar)
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(host_fact_v3::SKIP_ABORT_EXIT),
-            "stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("HERMIT-TEST-SKIP-ABORT: dh-38lkn5:"),
-            "stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let recorded = std::fs::read_to_string(&sidecar).unwrap();
-        assert!(recorded.contains("SKIP-ISSUE: dh-38lkn5:"), "{recorded}");
-        let _ = std::fs::remove_file(&sidecar);
-    }
-
-    #[test]
-    fn reused_refusals_split_by_host_fact_in_a_child() {
-        // The conversion used by harnesses that already know their
-        // guest program (abort_on_host_fact_v3_refusal_for): a
-        // planted reused host-fact refusal records the counted skip
-        // and exits 86 in a child, while a planted reused transient
-        // (calibration) refusal returns normally so the case fails
-        // on its own assertions. A copy that skipped both would
-        // exit 86 in the transient child and fail this test.
-        const CHILD: &str = "HERMIT_V3_SKIP_FOR_CHILD";
-        if let Ok(mode) = std::env::var(CHILD) {
-            let reason = if mode == "host-fact" {
-                "XINUSE is not stable across a host FPU reload: XSTATE_BV \
-                 0x2fd against 0x2ff (reused refusal: measured by another \
-                 Hermit process on this host 3s ago and reused for up to \
-                 60s instead of measuring again)"
-            } else if mode == "did-not-finish" {
-                // A deadline refusal stays transient before and after
-                // the gate-v6 decided-verdict consolidation.
-                "the XINUSE probe did not finish within 120 seconds \
-                 (reused refusal: measured by another Hermit process \
-                 on this host 3s ago and reused for up to 60s instead of \
-                 measuring again)"
-            } else {
-                "the interrupts-taken counter failed calibration: the \
-                 counter saw 232 interrupts but the CPU took only 220 in \
-                 all (reused refusal: measured by another Hermit process \
-                 on this host 3s ago and reused for up to 60s instead of \
-                 measuring again)"
-            };
-            let output = Output {
-                status: std::process::ExitStatus::from_raw(
-                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8,
-                ),
-                stdout: Vec::new(),
-                stderr: format!(
-                    "HERMIT_POLICY_REFUSAL class=policy-refusal\n\
-                     Error: --cpu-profile x86-64-v3 refused: {reason}\n"
-                )
-                .into_bytes(),
-            };
-            // Drive the entry point each harness shape uses: the
-            // program-deciding `_for` form, or the Command-shaped
-            // with_bead form the strict-verify call site ships.
-            if std::env::var("HERMIT_V3_SKIP_FOR_CHILD_VIA").as_deref() == Ok("with_bead") {
-                abort_on_host_fact_v3_refusal_with_bead(
-                    "unit",
-                    host_fact_v3::SKIP_ISSUE_XSAVE,
-                    &output,
-                );
-            } else {
-                abort_on_host_fact_v3_refusal_for(
-                    "unit",
-                    None,
-                    true,
-                    output.status.code(),
-                    &String::from_utf8_lossy(&output.stderr),
-                );
-            }
-            return;
-        }
-        for (mode, want_skip) in [
-            ("host-fact", true),
-            ("transient", false),
-            ("did-not-finish", false),
-        ] {
-            for via in ["for", "with_bead"] {
-                let sidecar = std::env::temp_dir().join(format!(
-                    "hermit-v3-skip-for-{mode}-{via}-{}.txt",
-                    std::process::id()
-                ));
-                let _ = std::fs::remove_file(&sidecar);
-                std::fs::write(&sidecar, "").unwrap();
-                let output = Command::new(std::env::current_exe().unwrap())
-                    .args(["reused_refusals_split_by_host_fact_in_a_child"])
-                    .env(CHILD, mode)
-                    .env("HERMIT_V3_SKIP_FOR_CHILD_VIA", via)
-                    .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
-                    .env_remove("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS")
-                    .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
-                    .env("HERMIT_CPU_PROFILE", "x86-64-v3")
-                    .env("HERMIT_TEST_SKIP_FILE", &sidecar)
-                    .output()
-                    .unwrap();
-                let recorded = std::fs::read_to_string(&sidecar).unwrap();
-                if want_skip {
-                    assert_eq!(
-                        output.status.code(),
-                        Some(host_fact_v3::SKIP_ABORT_EXIT),
-                        "{mode} stderr:\n{}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    assert!(
-                        recorded.contains("SKIP-ISSUE: dh-38lkn5:"),
-                        "{mode}: {recorded}"
-                    );
-                } else {
-                    assert_eq!(output.status.code(), Some(0), "{mode} via {via}");
-                    assert_eq!(recorded, "", "{mode} via {via}");
-                }
-                let _ = std::fs::remove_file(&sidecar);
-            }
-        }
-    }
-
-    #[test]
-    fn a_non_refusal_returns_normally() {
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
-        abort_on_host_fact_v3_refusal_with_bead("unit", host_fact_v3::SKIP_ISSUE_XSAVE, &output);
-    }
 }
