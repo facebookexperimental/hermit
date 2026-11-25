@@ -23,8 +23,9 @@
 // superproject index while watching the submodule HEAD, so the
 // documented advance sequence (checkout, build, stage) embedded the
 // pre-advance pin. Where there is no submodule checkout (Eden), the
-// marker is read instead; the recorded gitlink and the manifest parse
-// remain as fallbacks for trees without either.
+// marker is read instead; the recorded gitlink, the tree's release
+// values, and the manifest parse remain as fallbacks for trees without
+// either.
 
 fn pin_git(root: &std::path::Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
@@ -101,10 +102,33 @@ fn reverie_gitlink_pin(root: &std::path::Path) -> Option<String> {
     fields.next().and_then(pin_full_sha)
 }
 
+/// The Reverie pin recorded in the tree's own release values. The
+/// open-source tree keeps that stand-in under the shim cell; the internal
+/// Hermit tree keeps the file it loads at `fb-only/release.bzl`. If both
+/// exist they must agree, exactly as the pin checker requires every
+/// derived site to name the recorded pin.
+fn reverie_release_pin(root: &std::path::Path) -> Option<String> {
+    let mut found: Option<String> = None;
+    for relative in [
+        "shim/hermetic_infra/hermit/fb-only/release.bzl",
+        "fb-only/release.bzl",
+    ] {
+        let Ok(text) = std::fs::read_to_string(root.join(relative)) else {
+            continue;
+        };
+        let pin = parse_reverie_release_pin(&text)?;
+        if found.as_deref().is_some_and(|seen| seen != pin) {
+            return None;
+        }
+        found = Some(pin);
+    }
+    found
+}
+
 /// The Reverie pin of the checkout rooted at `root`, in the order the
 /// build actually sees the sources: submodule checkout HEAD, Eden
-/// marker, recorded gitlink, pre-migration manifest. `None` renders
-/// as `"unknown"` at callers.
+/// marker, recorded gitlink, release values, pre-migration manifest.
+/// `None` renders as `"unknown"` at callers.
 fn reverie_pin_at(root: &std::path::Path) -> Option<String> {
     if let Some(pin) = reverie_checkout_head(root) {
         return Some(pin);
@@ -113,6 +137,9 @@ fn reverie_pin_at(root: &std::path::Path) -> Option<String> {
         return Some(pin);
     }
     if let Some(pin) = reverie_gitlink_pin(root) {
+        return Some(pin);
+    }
+    if let Some(pin) = reverie_release_pin(root) {
         return Some(pin);
     }
     let text = std::fs::read_to_string(root.join("detcore/Cargo.toml")).ok()?;

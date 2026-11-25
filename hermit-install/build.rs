@@ -255,7 +255,8 @@ include!("../hermit-cli/reverie_gitlink.rs");
 
 /// Watch exactly what `reverie_pin_at` reads first — the submodule
 /// checkout's HEAD (plus its symbolic-ref target and packed-refs, so
-/// a `git -C reverie pull` counts) and the Eden marker — for the same
+/// a `git -C reverie pull` counts), the Eden marker, and the
+/// release-values file its git-less fallback reads — for the same
 /// reason as THE PIN FILES above, and deliberately NOT the
 /// superproject git index/HEAD: watching those would restage the
 /// LiteInst runtime on every `git add`/checkout, while staging a
@@ -300,6 +301,15 @@ fn emit_pin_watches(repository: &Path) {
     let marker = repository.join("reverie.submodule.txt");
     if marker.exists() {
         paths.push(marker);
+    }
+    for relative in [
+        "shim/hermetic_infra/hermit/fb-only/release.bzl",
+        "fb-only/release.bzl",
+    ] {
+        let release_values = repository.join(relative);
+        if release_values.exists() {
+            paths.push(release_values);
+        }
     }
     paths.sort();
     paths.dedup();

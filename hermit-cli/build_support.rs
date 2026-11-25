@@ -202,8 +202,8 @@ pub fn registry_build(identity: Option<&str>) -> Result<bool, String> {
 /// Manifests name no revision since the path-dependency migration; the
 /// checkout is what the build actually compiles (the pin checker
 /// separately refuses a checkout sitting off its recorded gitlink; the
-/// Eden marker, recorded gitlink, and manifest reads remain as
-/// fallbacks in `reverie_pin_at`). Returns
+/// Eden marker, recorded gitlink, release values, and manifest reads
+/// remain as fallbacks in `reverie_pin_at`). Returns
 /// `unknown` rather than failing the build, because a
 /// missing pin must not stop a developer compiling -- the loader treats
 /// `unknown` as "cannot verify" and says so instead of asserting a match.
@@ -245,7 +245,8 @@ pub fn reverie_pin_in(crate_dir: &Path) -> String {
 /// itself), resolved through the submodule's own Git so linked
 /// worktrees and plain nested checkouts name the real files; plus,
 /// in a Sapling/Eden checkout where there is no git metadata, the
-/// `reverie.submodule.txt` marker the reader reads there. Staging a
+/// `reverie.submodule.txt` marker the reader reads there, and the
+/// release-values file its git-less fallback reads. Staging a
 /// gitlink without moving the checkout changes neither the compiled
 /// sources nor the embedded pin, by design: the pin names what was
 /// compiled, and the pin checker separately refuses a checkout that
@@ -281,6 +282,15 @@ pub fn reverie_pin_watch_paths_in(root: &Path) -> Vec<PathBuf> {
     let marker = root.join("reverie.submodule.txt");
     if marker.exists() {
         paths.push(marker);
+    }
+    for relative in [
+        "shim/hermetic_infra/hermit/fb-only/release.bzl",
+        "fb-only/release.bzl",
+    ] {
+        let release_values = root.join(relative);
+        if release_values.exists() {
+            paths.push(release_values);
+        }
     }
     paths.sort();
     paths.dedup();

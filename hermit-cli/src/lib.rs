@@ -10389,6 +10389,40 @@ mod tests {
             );
             assert_eq!(parse_reverie_pin(&text), None);
         }
+
+        fn release_assignment(rev: &str) -> String {
+            format!("HERMIT_REVERIE_PIN = \"{rev}\"\n")
+        }
+
+        #[test]
+        fn a_single_release_revision_is_read() {
+            let text = format!("# HERMIT_REVERIE_PIN = \"{B}\"\n{}", release_assignment(A));
+            assert_eq!(parse_reverie_release_pin(&text).as_deref(), Some(A));
+        }
+
+        #[test]
+        fn duplicate_or_disagreeing_release_revisions_are_refused() {
+            let duplicate = format!("{}{}", release_assignment(A), release_assignment(A));
+            assert_eq!(parse_reverie_release_pin(&duplicate), None);
+            let disagreeing = format!("{}{}", release_assignment(A), release_assignment(B));
+            assert_eq!(parse_reverie_release_pin(&disagreeing), None);
+        }
+
+        #[test]
+        fn malformed_release_revisions_are_refused() {
+            for text in [
+                "HERMIT_REVERIE_PIN = \"beef\"\n",
+                "HERMIT_REVERIE_PIN = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+                "HERMIT_REVERIE_PIN = 1111111111111111111111111111111111111111\n",
+                "PIN = HERMIT_REVERIE_PIN\n",
+            ] {
+                assert_eq!(parse_reverie_release_pin(text), None, "{text:?}");
+            }
+            assert_eq!(
+                parse_reverie_release_pin("HERMIT_VERSION = \"0.5.7\"\n"),
+                None
+            );
+        }
     }
 
     /// SaBRe's guest plugin has no subscriber, so it forwards DETLOG records by

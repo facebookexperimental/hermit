@@ -1052,10 +1052,11 @@ fn run() -> proof::Result<()> {
     let mut runner = proof::Runner::new(evidence.join("logs"), Duration::from_secs(900), 64 << 20)?;
     let manifest = root.join("Cargo.toml");
     // The pin is a provenance label: submodule checkout HEAD, the Eden
-    // marker, or the recorded gitlink (see reverie_pin_at). Content
-    // identity rides in the resolved compiled-source record.
+    // marker, the recorded gitlink, or the tree's release values (see
+    // reverie_pin_at). Content identity rides in the resolved
+    // compiled-source record.
     let pin = reverie_pin_at(&root).ok_or(
-        "no Reverie pin label: no submodule checkout, reverie.submodule.txt marker, or gitlink names one full revision",
+        "no Reverie pin label: no submodule checkout, reverie.submodule.txt marker, gitlink, or release values names one full revision",
     )?;
     let manifest_text = fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
     let path_sourced = reverie_is_path_sourced(&manifest_text)?;

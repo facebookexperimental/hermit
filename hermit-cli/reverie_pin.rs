@@ -64,3 +64,40 @@ fn parse_reverie_pin(text: &str) -> Option<String> {
     }
     found
 }
+
+/// Extract the one active `HERMIT_REVERIE_PIN` value from release.bzl.
+///
+/// This follows the pin checker's release-value rule: comments do not
+/// count, any other active mention of the name makes the file ambiguous,
+/// and there must be exactly one `HERMIT_REVERIE_PIN = "<40-hex>"`
+/// assignment. A missing, duplicate, malformed, or non-40-hex assignment
+/// yields `None`, never a first-match guess.
+fn parse_reverie_release_pin(text: &str) -> Option<String> {
+    const NAME: &str = "HERMIT_REVERIE_PIN";
+    let mut found: Option<String> = None;
+    for line in text.lines() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if !code.contains(NAME) {
+            continue;
+        }
+        let quoted = code
+            .strip_prefix(NAME)
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .and_then(|rest| rest.trim_start().strip_prefix('"'))?;
+        let value = quoted
+            .strip_suffix('"')
+            .filter(|value| !value.contains('"'))?;
+        if value.len() != 40
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return None;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(value.to_owned());
+    }
+    found
+}

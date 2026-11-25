@@ -31,10 +31,11 @@ fi
 # Name the marker pin the way the build itself identifies its Reverie
 # sources, mirroring reverie_pin_at in hermit-cli/reverie_gitlink.rs: the
 # submodule checkout's HEAD when one is initialized, else the Eden marker
-# file, else the recorded gitlink. Manifests may spell Reverie by path
-# (no revision to grep), and Cargo plus the content qualifier
-# independently bind the resolved package graph either way; repository-
-# wide pin uniformity stays with ci/run-reverie-pin-check.sh.
+# file, else the recorded gitlink, else the tree's release values.
+# Manifests may spell Reverie by path (no revision to grep), and Cargo
+# plus the content qualifier independently bind the resolved package
+# graph either way; repository-wide pin uniformity stays with
+# ci/run-reverie-pin-check.sh.
 reverie_pin=
 if [[ -e $root_dir/reverie/.git ]]; then
     reverie_pin=$(git -C "$root_dir/reverie" rev-parse HEAD 2>/dev/null || true)
@@ -49,7 +50,49 @@ if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ ]]; then
     reverie_pin=$(git -C "$root_dir" rev-parse HEAD:reverie 2>/dev/null || true)
 fi
 if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ ]]; then
-    echo "cannot name the Reverie pin: no initialized reverie submodule checkout, reverie.submodule.txt marker, or gitlink at $root_dir" >&2
+    release_pin=
+    release_pin_source=
+    release_pin_problem=
+    for release_file in \
+        "$root_dir/shim/hermetic_infra/hermit/fb-only/release.bzl" \
+        "$root_dir/fb-only/release.bzl"; do
+        [[ -f $release_file ]] || continue
+        if [[ ! -r $release_file ]]; then
+            [[ -n $release_pin_problem ]] || release_pin_problem="$release_file: release values are unreadable"
+            continue
+        fi
+        release_file_count=0
+        release_file_pin=
+        while IFS= read -r release_line || [[ -n $release_line ]]; do
+            release_code=${release_line%%#*}
+            [[ $release_code == *HERMIT_REVERIE_PIN* ]] || continue
+            if [[ $release_code =~ ^[[:space:]]*HERMIT_REVERIE_PIN[[:space:]]*=[[:space:]]*\"([0-9a-f]{40})\"[[:space:]]*$ ]]; then
+                release_file_count=$((release_file_count + 1))
+                release_file_pin=${BASH_REMATCH[1]}
+            else
+                [[ -n $release_pin_problem ]] || release_pin_problem="$release_file: active HERMIT_REVERIE_PIN is not one exact lowercase 40-hex assignment: $release_line"
+            fi
+        done <"$release_file"
+        if ((release_file_count == 0)); then
+            [[ -n $release_pin_problem ]] || release_pin_problem="$release_file: no active HERMIT_REVERIE_PIN assignment"
+        elif ((release_file_count > 1)); then
+            [[ -n $release_pin_problem ]] || release_pin_problem="$release_file: duplicate active HERMIT_REVERIE_PIN assignments ($release_file_count)"
+        elif [[ -n $release_pin && $release_pin != "$release_file_pin" ]]; then
+            [[ -n $release_pin_problem ]] || release_pin_problem="$release_file: HERMIT_REVERIE_PIN $release_file_pin disagrees with $release_pin_source ($release_pin)"
+        else
+            release_pin=$release_file_pin
+            release_pin_source=$release_file
+        fi
+    done
+    if [[ -z $release_pin_problem && $release_pin =~ ^[0-9a-f]{40}$ ]]; then
+        reverie_pin=$release_pin
+        echo "stage-liteinst-runtime: Reverie pin from release values: $release_pin_source" >&2
+    elif [[ -n $release_pin_problem ]]; then
+        echo "stage-liteinst-runtime: $release_pin_problem" >&2
+    fi
+fi
+if [[ ! $reverie_pin =~ ^[0-9a-f]{40}$ ]]; then
+    echo "cannot name the Reverie pin: no initialized reverie submodule checkout, reverie.submodule.txt marker, gitlink, or release values at $root_dir" >&2
     exit 2
 fi
 if [[ -n ${HERMIT_LITEINST_REVERIE_PIN:-} && $reverie_pin != "$HERMIT_LITEINST_REVERIE_PIN" ]]; then
