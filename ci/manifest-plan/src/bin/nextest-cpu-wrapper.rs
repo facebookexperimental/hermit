@@ -2595,6 +2595,72 @@ fn process_exists(pid: i32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether `cgroup` still has a live member after polling it for at most
+/// `bound`. It returns as soon as the cgroup reads empty.
+fn populated_after(
+    cgroup: &hermit_manifest_plan::invocation_cgroup::InvocationCgroup,
+    bound: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if !cgroup.populated()? {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Every process listed in the cgroup at `root` and in the cgroups below it,
+/// as "<cgroup relative to root>: <pid> <comm>", so a failure names what
+/// lingers. A process that exits while this reads shows as "<exited>".
+fn cgroup_members(root: &Path) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let relative = directory.strip_prefix(root).unwrap_or(&directory);
+        let label = if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.display().to_string()
+        };
+        match fs::read_to_string(directory.join("cgroup.procs")) {
+            Ok(procs) => {
+                for pid in procs.split_whitespace() {
+                    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .map(|comm| comm.trim().to_string())
+                        .unwrap_or_else(|_| "<exited>".into());
+                    members.push(format!("{label}: {pid} {comm}"));
+                }
+            }
+            Err(error) => members.push(format!("{label}: cgroup.procs unreadable: {error}")),
+        }
+        if let Ok(entries) = fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+    members
+}
+
+/// The populated line of the cgroup at `path`, or that it is gone.
+fn attempt_cgroup_state(path: &Path) -> String {
+    match fs::read_to_string(path.join("cgroup.events")) {
+        Ok(events) => events
+            .lines()
+            .find(|line| line.starts_with("populated "))
+            .map(str::to_string)
+            .unwrap_or_else(|| "cgroup.events has no populated line".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "gone".into(),
+        Err(error) => format!("cgroup.events unreadable: {error}"),
+    }
+}
+
 fn write_proc_control(
     root: &Path,
     pid: u32,
@@ -2805,12 +2871,20 @@ fn external_signal_escaped_child_control(
         };
         // Observe the failure before the independent safety cleanup below.
         let descendant_present = process_exists(descendant_pid);
-        let populated = outer.populated()?;
+        // The wrapper's pidfd turns terminal only after it proved its attempt
+        // cgroup empty, but on a loaded host a member of the outer cgroup can
+        // still be finishing its exit at that instant. Give it the window the
+        // wrapper itself has to reap its children after cgroup.kill, which is
+        // also the bound of the rescue below. A member still present after
+        // that fails, and the failure names every process that lingers.
+        let populated = populated_after(&outer, CHILD_REAP_DEADLINE)?;
         let records = read_attempt_records(&root.join("attempts"))?;
         if hard_deadline || descendant_present || populated || records.len() != 1 {
             return Err(format!(
-                "external wall cancellation lost owned cleanup: hard_deadline={hard_deadline}, descendant_present={descendant_present}, populated={populated}, attempt_records={}",
-                records.len()
+                "external wall cancellation lost owned cleanup: hard_deadline={hard_deadline}, descendant_present={descendant_present}, populated={populated} (after up to {CHILD_REAP_DEADLINE:?}), attempt_records={}; outer cgroup members: [{}]; attempt cgroup: {}",
+                records.len(),
+                cgroup_members(outer.path()).join(", "),
+                attempt_cgroup_state(&attempt_path)
             ));
         }
         let record = find_record(&records, "wait-for-escaped-sleeper")?;
