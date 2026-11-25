@@ -1263,7 +1263,7 @@ mod e2e_payload_identity_tests {
     const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
 
     /// Whether the checkout at `root` does not carry `relative`, as
-    /// `ci/checkout-carries.sh` from the checkout at `tool_root` decides: the one
+    /// `ci/checkout-carries.sh` in the tool root, `tool_root`, decides: the one
     /// shared rule, which skips only a path the export has never carried, absent
     /// here, at the top level of a git worktree whose commit does not track it.
     /// That is the export's shape, decided from the checkout itself, so it holds
