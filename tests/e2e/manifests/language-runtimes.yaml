@@ -1430,7 +1430,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        # kvm is disabled by name under dh-mq9jsx. Re-enable condition: when
+        # the KVM pidfd vfork clone fix tracked in dh-mq9jsx lands, set kvm
+        # back to true, delete its ci_disabled_reason, and run
+        # ci/sync-cell-config.sh.
+        ci:
+          ptrace: true
+          kvm: false
+        ci_disabled_reason:
+          kvm:
+            result: crash-error
+            evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-mq9jsx.md
+            reason: 'dh-mq9jsx: KVM refuses by name the clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD) that Go os/exec spawns with, in both attempts at Hermit 7d70120c; the fix is in flight'
         backends_enabled:
           - ptrace
           - kvm

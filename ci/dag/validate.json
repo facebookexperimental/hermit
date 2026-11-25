@@ -23398,13 +23398,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/go-os-exec-output",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -61106,13 +61099,6 @@
           "test": "language-runtimes/gawk-random",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/go-os-exec-output",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",

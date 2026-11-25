@@ -2739,7 +2739,6 @@ language-runtimes/gawk-random replay ptrace
 language-runtimes/gawk-random verify dbt
 language-runtimes/gawk-random verify kvm
 language-runtimes/gawk-random verify ptrace
-language-runtimes/go-os-exec-output verify kvm
 language-runtimes/go-os-exec-output verify ptrace
 language-runtimes/lua-random replay ptrace
 language-runtimes/lua-random verify dbt

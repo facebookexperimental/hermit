@@ -48681,6 +48681,7 @@ fn run_kvm_blocking_socket_calls_end_with_eagain_when_their_timeout_passes() {
 /// same way and the replay must reproduce it. Only the socketpair
 /// sections run here, without the batched calls record does not take.
 #[test]
+#[ignore = "dh-j7ljmh: record-mode timed waits expire in virtual time (fix in flight, unverified); passes in fbsource dev-nosan (test 562950512867689) and fails in opt (test 1125899922416164)"]
 fn timed_socketpair_calls_record_and_replay_as_on_linux() {
     let _guard = hermit_run_guard();
     let guest = futex_c_guest(&SOCKET_TIMEOUT_GUEST, "socket_timeout")

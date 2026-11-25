@@ -12,18 +12,18 @@ The headline counts sum **all modes** for each backend. For ptrace, **1195** sel
 
 **Selected by full** means included in the full regression suite. **Not selected by full** means an applicable combination outside that suite. **Not applicable** means the test configuration does not enable that program, mode, and backend combination. Selection is not a test result: an unselected cell may have passed, failed, or never run.
 
-Of **17822** total cells, **2437** are selected by full, **1845** are not selected by full, and **13540** are **Not applicable**.
+Of **17822** total cells, **2436** are selected by full, **1846** are not selected by full, and **13540** are **Not applicable**.
 
 | Backend | Selected by full | Not selected by full | Not applicable | Total cells |
 | --- | ---: | ---: | ---: | ---: |
 | `ptrace` | 1195 | 359 | 1260 | 2814 |
 | `dbt` | 0 | 561 | 2253 | 2814 |
-| `kvm` | 611 | 140 | 2063 | 2814 |
+| `kvm` | 610 | 141 | 2063 | 2814 |
 | `sabre` | 0 | 480 | 2334 | 2814 |
 | `liteinst` | 316 | 136 | 2362 | 2814 |
 | `in-guest-trap` | 315 | 136 | 2363 | 2814 |
 | `native` | 0 | 33 | 905 | 938 |
-| **Total** | **2437** | **1845** | **13540** | **17822** |
+| **Total** | **2436** | **1846** | **13540** | **17822** |
 
 `dbt` (dynamic binary translation) retains the test catalogue for the [separately developed DynamoRIO implementation](https://github.com/rrnewton/hermit-dynamorio): **561** applicable cells, **0** selected by full. This is not a current Hermit command-line backend choice.
 
@@ -35,11 +35,11 @@ Each backend entry is `selected by full / total cells`, including not-applicable
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | Total cells |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 615 / 938 | 0 / 938 | 611 / 938 | 0 / 938 | 316 / 938 | 315 / 938 | — | 1857 | 1775 | 1996 | 5628 |
+| `verify` | 615 / 938 | 0 / 938 | 610 / 938 | 0 / 938 | 316 / 938 | 315 / 938 | — | 1856 | 1776 | 1996 | 5628 |
 | `replay` | 573 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | — | 573 | 37 | 5018 | 5628 |
 | `chaos` | 7 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | 0 / 938 | — | 7 | 0 | 5621 | 5628 |
 | `naked` | — | — | — | — | — | — | 0 / 938 | 0 | 33 | 905 | 938 |
-| **Total** | | | | | | | | **2437** | **1845** | **13540** | **17822** |
+| **Total** | | | | | | | | **2436** | **1846** | **13540** | **17822** |
 
 ## Ptrace workloads
 
@@ -63,7 +63,7 @@ The reference backend's tests span small syscall exercises, applications, and la
 | `system-utils` | 41 / 41 | 40 / 41 | 0 / 41 | 81 | 123 |
 | `util-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
 
-The full compatibility suite runs 2442 checks: the 2437 selected matrix cells above (including 7 chaos tests), plus 5 additional commands listed below. All must produce a fresh passing result for the validation run to succeed.
+The full compatibility suite runs 2441 checks: the 2436 selected matrix cells above (including 7 chaos tests), plus 5 additional commands listed below. All must produce a fresh passing result for the validation run to succeed.
 
 ### Additional regression tests
 
@@ -100,11 +100,11 @@ The matrix retains these backend names and modes; catalogue membership does not 
 - Baseline: `native`
 - Modes: `chaos`, `naked`, `replay`, `verify`
 
-The full regression suite selects **2437 / 17822** cells (**13.67%**). Of the total, **13540** are not applicable. Excluding those gives **2437 / 4282** applicable cells (**56.91%**). These describe the same selection with different denominators; neither is a pass rate. Adding programs, backends, or modes changes the denominator, so comparisons over time must use the same population.
+The full regression suite selects **2436 / 17822** cells (**13.67%**). Of the total, **13540** are not applicable. Excluding those gives **2436 / 4282** applicable cells (**56.89%**). These describe the same selection with different denominators; neither is a pass rate. Adding programs, backends, or modes changes the denominator, so comparisons over time must use the same population.
 
 ### What the tests check
 
-Full `verify` comparisons run the same backend twice and compare exit status, standard output, standard error, and nonempty INFO event logs. Log comparison removes host wall-clock prefixes and consistently renames host addresses while preserving their identity and order; virtual time, branch counts, syscall values, and other event details must match. All **1857** selected `verify` cells require this full comparison.
+Full `verify` comparisons run the same backend twice and compare exit status, standard output, standard error, and nonempty INFO event logs. Log comparison removes host wall-clock prefixes and consistently renames host addresses while preserving their identity and order; virtual time, branch counts, syscall values, and other event details must match. All **1856** selected `verify` cells require this full comparison.
 
 `replay` checks a recording against its replay. `chaos` checks repeatability for each selected scheduling seed. Repeated runs on one backend do not establish agreement with another backend; the tracker reports [cross-backend agreement](https://hermetic-infra.org/compatibility/latest/#parity) separately.
 
