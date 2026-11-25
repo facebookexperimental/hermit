@@ -3420,6 +3420,14 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
         .any(|arg| arg == STRICT_EXECUTION_FLAG)
 }
 
+/// Whether git records a regular file with these permission bits as
+/// executable (mode 100755) rather than 100644. Git reads only the owner's
+/// execute bit (its `ce_permissions`: `(mode & 0100) ? 0755 : 0644`), so 0700
+/// and 0755 are both executable to it, and 0654 is not.
+fn git_executable(mode: u32) -> bool {
+    mode & 0o100 != 0
+}
+
 fn assert_submodule_fixture_source(
     root: &Path,
     checkout: &Path,
@@ -3464,7 +3472,7 @@ fn assert_submodule_fixture_source(
             }
             Ok(a.is_file()
                 && b.is_file()
-                && a.permissions().mode() & 0o111 == b.permissions().mode() & 0o111
+                && git_executable(a.permissions().mode()) == git_executable(b.permissions().mode())
                 && std::fs::read(&original)? == std::fs::read(&copied)?)
         })()
         .map_err(|error| format!("submodule service result: cannot compare {relative}: {error}"))?;
@@ -40390,8 +40398,11 @@ mod submodule_service_tests {
         std::fs::write(root.join("payload"), b"same source\n").unwrap();
         std::fs::set_permissions(root.join("payload"), std::fs::Permissions::from_mode(0o644))
             .unwrap();
+        std::fs::write(root.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         symlink("payload", root.join("link")).unwrap();
-        git(&root, &["add", "--", "payload", "link"]);
+        git(&root, &["add", "--", "payload", "tool", "link"]);
         git(
             &root,
             &["commit", "--quiet", "-m", "source binding fixture"],
@@ -40431,6 +40442,34 @@ mod submodule_service_tests {
             std::fs::Permissions::from_mode(0o644),
         )
         .unwrap();
+        // Executable as git reads it: the owner's execute bit alone. A clean
+        // source whose tracked executable (100755) is 0700 matches its 0755
+        // clone, and group or other execute bits without the owner's leave a
+        // 100644 file non-executable.
+        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        // A copy whose exec state really differs (0644 against the 100755
+        // entry) still fails by name.
+        std::fs::set_permissions(copied.join("tool"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            format!("{source_refusal}tool")
+        );
+        std::fs::set_permissions(copied.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         std::fs::remove_file(copied.join("link")).unwrap();
         symlink("other-target", copied.join("link")).unwrap();
         assert_eq!(
