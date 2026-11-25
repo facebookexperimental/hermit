@@ -226,10 +226,17 @@ fn isolated_with_child_setup_budgeted(
     let mut child = command.spawn().unwrap();
     // CPU is sampled at a coarse cadence; try_wait stays tight. Completion
     // is detected with waitid(WNOWAIT) so the final CPU reading is taken
-    // while the zombie still holds its accounting, before reaping.
+    // while the zombie still holds its accounting, before reaping. Every
+    // exit from the watch loop passes through the single wait() below, so
+    // the child is reaped on all paths; failures are named after it.
+    enum Watch {
+        Completed { now_ns: u64, wall: Duration },
+        Failed(String),
+        MeasureAfterExit(String),
+    }
     let mut child_cpu = Duration::ZERO;
     let mut last_sample = 0u64;
-    loop {
+    let outcome = 'watch: loop {
         let now_ns = monotonic_ns();
         let wall = Duration::from_nanos(now_ns - started_ns);
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -245,45 +252,35 @@ fn isolated_with_child_setup_budgeted(
             let error = std::io::Error::last_os_error();
             let pid = child.id();
             kill_child_group(&mut child);
-            panic!("child CPU measurement failed: waitid on {pid}: {error}");
+            break 'watch Watch::Failed(format!(
+                "child CPU measurement failed: waitid on {pid}: {error}"
+            ));
         }
         if unsafe { info.si_pid() } != 0 {
-            child_cpu = match tree_cpu(child.id()) {
-                Ok(cpu) => cpu,
+            match tree_cpu(child.id()) {
+                Ok(cpu) => {
+                    child_cpu = cpu;
+                    break 'watch Watch::Completed { now_ns, wall };
+                }
                 Err(reason) => {
                     // The root is an unreaped zombie here; kill any surviving
-                    // members of its process group and reap it before
-                    // failing so the measurement error leaks nothing.
+                    // members of its process group before failing so the
+                    // measurement error leaks nothing.
                     kill_child_group(&mut child);
-                    let status = child.wait().unwrap();
-                    panic!(
-                        "child CPU measurement failed: {reason} \
-                         (child already exited: {status})"
-                    );
+                    break 'watch Watch::MeasureAfterExit(reason);
                 }
-            };
-            let status = child.wait().unwrap();
-            assert!(
-                child_cpu < cpu_budget && now_ns < deadline,
-                "late child completion {status}: {:.3} s CPU of {:.3} s CPU budget (wall limit {:.3} s) after {:.3} s wall",
-                child_cpu.as_secs_f64(),
-                cpu_budget.as_secs_f64(),
-                Duration::from_nanos(CHILD_WALL_BACKSTOP_NS).as_secs_f64(),
-                wall.as_secs_f64()
-            );
-            assert!(status.success(), "selected child test failed: {status}");
-            return;
+            }
         }
         if now_ns - last_sample >= 25_000_000 {
             last_sample = now_ns;
-            child_cpu = match tree_cpu(child.id()) {
-                Ok(cpu) => cpu,
+            match tree_cpu(child.id()) {
+                Ok(cpu) => child_cpu = cpu,
                 Err(reason) => {
                     eprintln!("OWNER_CASE {name} CPU measurement FAILED; separate rescue begins");
                     kill_child_group(&mut child);
-                    panic!("child CPU measurement failed: {reason}");
+                    break 'watch Watch::Failed(format!("child CPU measurement failed: {reason}"));
                 }
-            };
+            }
         }
         if child_cpu >= cpu_budget || now_ns >= deadline {
             let bound = if child_cpu >= cpu_budget {
@@ -293,15 +290,41 @@ fn isolated_with_child_setup_budgeted(
             };
             eprintln!("OWNER_CASE {name} {bound} FAILED; separate rescue begins");
             kill_child_group(&mut child);
-            panic!(
+            break 'watch Watch::Failed(format!(
                 "selected child test exceeded its {bound}: {:.3} s CPU of {:.3} s CPU budget (wall limit {:.3} s) after {:.3} s wall",
                 child_cpu.as_secs_f64(),
                 cpu_budget.as_secs_f64(),
                 Duration::from_nanos(CHILD_WALL_BACKSTOP_NS).as_secs_f64(),
                 wall.as_secs_f64()
-            );
+            ));
         }
         std::thread::sleep(Duration::from_millis(2));
+    };
+    // Only the arms whose pre-restructure code unwrapped the wait do so
+    // here; a failed wait on a failure path must never replace that
+    // path's named panic with an anonymous unwrap panic.
+    let waited = child.wait();
+    match outcome {
+        Watch::Completed { now_ns, wall } => {
+            let status = waited.unwrap();
+            assert!(
+                child_cpu < cpu_budget && now_ns < deadline,
+                "late child completion {status}: {:.3} s CPU of {:.3} s CPU budget (wall limit {:.3} s) after {:.3} s wall",
+                child_cpu.as_secs_f64(),
+                cpu_budget.as_secs_f64(),
+                Duration::from_nanos(CHILD_WALL_BACKSTOP_NS).as_secs_f64(),
+                wall.as_secs_f64()
+            );
+            assert!(status.success(), "selected child test failed: {status}");
+        }
+        Watch::Failed(message) => panic!("{message}"),
+        Watch::MeasureAfterExit(reason) => {
+            let status = waited.unwrap();
+            panic!(
+                "child CPU measurement failed: {reason} \
+                 (child already exited: {status})"
+            );
+        }
     }
 }
 
