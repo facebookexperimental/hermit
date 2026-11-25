@@ -211,7 +211,14 @@ fn isolated_with_child_setup_budgeted(
     command
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
         .env("HERMIT_OWNER_TEST_ROLE", name)
-        .env("HERMIT_OWNER_TEST_DEADLINE", deadline.to_string());
+        .env("HERMIT_OWNER_TEST_DEADLINE", deadline.to_string())
+        // The child's CPU is the budget measurand, so its environment must
+        // not let the runner's backtrace setting into the measurement: a
+        // symbolized backtrace for a deliberate panic costs ~0.2 s of child
+        // CPU under RUST_BACKTRACE=1 (measured), which is runner state,
+        // not case behavior. Per-case environment below may still override.
+        .env("RUST_BACKTRACE", "0")
+        .env("RUST_LIB_BACKTRACE", "0");
     for (key, value) in environment {
         command.env(key, value);
     }
