@@ -182,6 +182,12 @@ mult_raw = os.environ.get("HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER")
 if mult_raw is None:
     mult = 1.0
 else:
+    # Rust's f64 parser (timeouts.rs) refuses surrounding whitespace,
+    # digit-group underscores and non-ASCII digits that Python's
+    # float() accepts; refuse exactly those here so both parsers agree.
+    if mult_raw != mult_raw.strip() or "_" in mult_raw or not mult_raw.isascii():
+        print(f"FAIL: HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER must be a positive finite number, got {mult_raw!r}", file=sys.stderr)
+        raise SystemExit(1)
     try:
         mult = float(mult_raw)
     except ValueError:
@@ -207,7 +213,7 @@ err_file="$(mktemp)" || { echo "FAIL: mktemp for stderr failed" >&2; exit 1; }
 json_file="$(mktemp)" || { echo "FAIL: mktemp for verify json failed" >&2; exit 1; }
 times_file="$(mktemp)" || { echo "FAIL: mktemp for cpu times failed" >&2; exit 1; }
 
-echo "config: ptrace backend (default), default log level, cpu-profile=auto (explicit), network=local (explicit), seed=0, sched-seed=0, max-timeslice=disabled, sched-heuristic=default (none passed), wall timeout ${inner_wall_timeout_secs}s, cpu outer backstop ${cpu_budget_secs}s whole tree (per-process ${cpu_budget_secs}s soft/${cpu_hard_secs}s hard); relaxations: --verify-allow=both"
+echo "config: ptrace backend (default), default log level, cpu-profile=auto (explicit), network=local (explicit), seed=0, sched-seed=0, max-timeslice=disabled, sched-heuristic=default (none passed), wall timeout ${inner_wall_timeout_secs}s, cpu outer backstop ${cpu_budget_secs}s whole tree (per-process ${cpu_budget_secs}s soft/${cpu_hard_secs}s hard), counter caps 99/791/5616937500; relaxations: --verify-allow=both"
 
 ( ulimit -S -t "$cpu_budget_secs" || { echo "FAIL-SETUP: ulimit soft cpu limit failed" >&2; exit 126; }; ulimit -H -t "$cpu_hard_secs" || { echo "FAIL-SETUP: ulimit hard cpu limit failed" >&2; exit 126; }; exec timeout --verbose --kill-after=10s "${inner_wall_timeout_secs}s" "$hermit_bin" run \
     --strict \
@@ -330,6 +336,15 @@ echo "--- verify json ---"
 cat "$json_file"
 echo
 
+# Load-invariant counter gate (in the parse below): every
+# recorded run of this guest reports scheduler turns 66,
+# syscalls 527 and virtual nanoseconds 3,744,625,000 in
+# runtime.run1 (run1 == run2 by parity), including loaded runs
+# whose CPU seconds rose with host load. The caps are
+# ceil(1.5x) of those values. --cpu-profile=auto can present
+# v2 or v3 by host; the 1.5x absorbs that difference. A missing
+# or unreadable counter fails by name, never passes.
+
 guest_exit="$(python3 -I - "$json_file" <<'PY'
 import json
 import sys
@@ -345,9 +360,23 @@ if report.get("bitwise_parity") is not True:
     raise SystemExit(1)
 compared = report.get("compared_log_messages") or {}
 left, right = compared.get("left"), compared.get("right")
-if not isinstance(left, int) or not isinstance(right, int) or left <= 0 or left != right:
+if type(left) is not int or type(right) is not int or left <= 0 or left != right:
     print(f"FAIL: verify json INFO comparison vacuous or uneven: left={left!r} right={right!r}", file=sys.stderr)
     raise SystemExit(1)
+runtime = report.get("runtime") or {}
+run1 = runtime.get("run1") or {}
+caps = {"scheduler_turns": 99, "syscalls": 791, "virtual_nanoseconds": 5616937500}
+seen = {}
+for name, cap in caps.items():
+    value = run1.get(name)
+    if type(value) is not int or value < 0:
+        print(f"FAIL: verify json counter {name} missing or unreadable: {value!r}", file=sys.stderr)
+        raise SystemExit(1)
+    seen[name] = value
+    if value > cap:
+        print(f"FAIL: verify json counter {name}={value} exceeds cap {cap} (load-invariant runaway gate)", file=sys.stderr)
+        raise SystemExit(1)
+print(f"counters: scheduler_turns={seen['scheduler_turns']} syscalls={seen['syscalls']} virtual_nanoseconds={seen['virtual_nanoseconds']} (caps 99/791/5616937500)", file=sys.stderr)
 guest_exit, guest_signal = report.get("guest_exit_code"), report.get("guest_signal")
 if guest_exit not in (0, 1) or guest_signal is not None:
     print(f"FAIL: verify json guest outcome is not a clean exit: exit={guest_exit!r} signal={guest_signal!r}", file=sys.stderr)
@@ -377,5 +406,5 @@ if ! grep -qxF "$expected_final" "$out_file"; then
     exit 1
 fi
 
-echo "PASS: hello_race_mini deterministic under Hermit strict chaos-verify (ptrace backend, default log level; relaxations: --verify-allow=both; guest exit $guest_exit with $expected_final, bitwise parity; cpu ${cpu_total_s}s of ${cpu_budget_secs}s outer backstop)"
+echo "PASS: hello_race_mini deterministic under Hermit strict chaos-verify (ptrace backend, default log level; relaxations: --verify-allow=both; guest exit $guest_exit with $expected_final, bitwise parity, counters within caps; cpu ${cpu_total_s}s of ${cpu_budget_secs}s outer backstop)"
 exit 0

@@ -609,7 +609,7 @@ export_file(
 export_file(
     name = "e2e_defaults_yaml",
     src = "e2e/manifests/defaults.yaml",
-    visibility = ["//hermetic_infra/hermit/flaky-tests:"],
+    visibility = ["//hermetic_infra/hermit/flaky-tests:run_hello_race_mini"],
 )
 
 cpp_binary(
