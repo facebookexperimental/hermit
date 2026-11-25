@@ -1036,13 +1036,24 @@ mod v3_skip_tests {
                 )
                 .into_bytes(),
             };
-            abort_on_host_fact_v3_refusal_for(
-                "unit",
-                None,
-                true,
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stderr),
-            );
+            // Drive the entry point each harness shape uses: the
+            // program-deciding `_for` form, or the Command-shaped
+            // with_bead form the strict-verify call site ships.
+            if std::env::var("HERMIT_V3_SKIP_FOR_CHILD_VIA").as_deref() == Ok("with_bead") {
+                abort_on_host_fact_v3_refusal_with_bead(
+                    "unit",
+                    host_fact_v3::SKIP_ISSUE_XSAVE,
+                    &output,
+                );
+            } else {
+                abort_on_host_fact_v3_refusal_for(
+                    "unit",
+                    None,
+                    true,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stderr),
+                );
+            }
             return;
         }
         for (mode, want_skip) in [
@@ -1050,39 +1061,42 @@ mod v3_skip_tests {
             ("transient", false),
             ("did-not-finish", false),
         ] {
-            let sidecar = std::env::temp_dir().join(format!(
-                "hermit-v3-skip-for-{mode}-{}.txt",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_file(&sidecar);
-            std::fs::write(&sidecar, "").unwrap();
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args(["reused_refusals_split_by_host_fact_in_a_child"])
-                .env(CHILD, mode)
-                .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
-                .env_remove("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS")
-                .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
-                .env("HERMIT_CPU_PROFILE", "x86-64-v3")
-                .env("HERMIT_TEST_SKIP_FILE", &sidecar)
-                .output()
-                .unwrap();
-            let recorded = std::fs::read_to_string(&sidecar).unwrap();
-            if want_skip {
-                assert_eq!(
-                    output.status.code(),
-                    Some(host_fact_v3::SKIP_ABORT_EXIT),
-                    "{mode} stderr:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(
-                    recorded.contains("SKIP-ISSUE: dh-38lkn5:"),
-                    "{mode}: {recorded}"
-                );
-            } else {
-                assert_eq!(output.status.code(), Some(0), "{mode}");
-                assert_eq!(recorded, "", "{mode}");
+            for via in ["for", "with_bead"] {
+                let sidecar = std::env::temp_dir().join(format!(
+                    "hermit-v3-skip-for-{mode}-{via}-{}.txt",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&sidecar);
+                std::fs::write(&sidecar, "").unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["reused_refusals_split_by_host_fact_in_a_child"])
+                    .env(CHILD, mode)
+                    .env("HERMIT_V3_SKIP_FOR_CHILD_VIA", via)
+                    .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
+                    .env_remove("HERMIT_TEST_CPU_PROFILE_XCR0_EXTRA_BITS")
+                    .env("HERMIT_RUN_NODE_SKIP_ISSUES", "1")
+                    .env("HERMIT_CPU_PROFILE", "x86-64-v3")
+                    .env("HERMIT_TEST_SKIP_FILE", &sidecar)
+                    .output()
+                    .unwrap();
+                let recorded = std::fs::read_to_string(&sidecar).unwrap();
+                if want_skip {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(host_fact_v3::SKIP_ABORT_EXIT),
+                        "{mode} stderr:\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(
+                        recorded.contains("SKIP-ISSUE: dh-38lkn5:"),
+                        "{mode}: {recorded}"
+                    );
+                } else {
+                    assert_eq!(output.status.code(), Some(0), "{mode} via {via}");
+                    assert_eq!(recorded, "", "{mode} via {via}");
+                }
+                let _ = std::fs::remove_file(&sidecar);
             }
-            let _ = std::fs::remove_file(&sidecar);
         }
     }
 
