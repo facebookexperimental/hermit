@@ -1834,6 +1834,20 @@ mod tests {
         let pmu_key = crate::nextest_binaries::selection_key(&pmu_selection);
         assert_eq!(full.get(&pmu_key), Some(&pmu_selection));
         assert!(!portable.contains_key(&pmu_key));
+        // The privileged-only autofs node is not run by the full lane, but
+        // full preparation is the producer its privileged barrier verifies,
+        // so its exact selection is prepared by full and by no portable node.
+        let autofs = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.autofs_cases")
+            .unwrap();
+        assert_command_selection(autofs).unwrap();
+        let autofs_selection: Vec<String> =
+            serde_json::from_str(&autofs.env[SELECTION_ENV]).unwrap();
+        let autofs_key = crate::nextest_binaries::selection_key(&autofs_selection);
+        assert_eq!(full.get(&autofs_key), Some(&autofs_selection));
+        assert!(!portable.contains_key(&autofs_key));
         let mut narrowed = ledger.clone();
         narrowed.cmd = narrowed
             .cmd
@@ -1847,8 +1861,8 @@ mod tests {
         let error = assert_command_selection(&separatorless).unwrap_err();
         assert!(error.contains("no `--`"), "{error}");
         // The hardware CLI selection, the inherited-terminal selection, the
-        // KVM gap-ledger selection and the PMU integration selection are
-        // full-only, and nothing else is.
+        // KVM gap-ledger selection, the PMU integration selection and the
+        // privileged-only autofs selection are full-only, and nothing else is.
         let full_only: BTreeSet<String> = full
             .keys()
             .filter(|key| !portable.contains_key(*key))
@@ -1860,7 +1874,8 @@ mod tests {
                 hardware_key.clone(),
                 terminal_key.clone(),
                 ledger_key.clone(),
-                pmu_key.clone()
+                pmu_key.clone(),
+                autofs_key.clone()
             ])
         );
         for (key, selection) in &portable {

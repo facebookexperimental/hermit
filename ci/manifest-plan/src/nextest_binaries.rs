@@ -1685,8 +1685,23 @@ fn config_selections_for_project(
     project: Option<&Path>,
     cohort: PreparedCohort,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let selected =
-        dagrun::select_steps_by_labels(graph, &[profile.into()]).map_err(|e| e.to_string())?;
+    // The full lane's workspace producer is also the producer the privileged
+    // barrier verifies (`assert privileged --prepared-by full`), so the full
+    // preparation population is the union of the full and privileged
+    // selections. Deriving it here, from the graph's labels, keeps a
+    // privileged-only node's exact Cargo selection prepared without running
+    // that node in the full lane. A graph with no privileged label (unit
+    // fixtures) keeps the single-label population.
+    let mut labels = vec![profile.to_string()];
+    if profile == "full"
+        && graph
+            .steps
+            .iter()
+            .any(|step| step.labels.iter().any(|label| label == "privileged"))
+    {
+        labels.push("privileged".into());
+    }
+    let selected = dagrun::select_steps_by_labels(graph, &labels).map_err(|e| e.to_string())?;
     let mut selections = BTreeMap::new();
     for step in selected.steps {
         if let Some(args) = step.env.get(SELECTION_ENV) {
@@ -7037,5 +7052,54 @@ esac
         graph.steps[1].env.insert(COHORT_ENV.into(), "bogus".into());
         assert!(config_selections(&graph, "full").is_err());
         assert!(config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).is_err());
+    }
+
+    #[test]
+    fn full_preparation_includes_privileged_only_selections() {
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let template = graph
+            .steps
+            .iter()
+            .find(|step| step.env.contains_key(SELECTION_ENV))
+            .unwrap()
+            .clone();
+        let mut full_step = template.clone();
+        full_step.group = "test".into();
+        full_step.job = "full_only".into();
+        full_step.deps.clear();
+        full_step.labels = vec!["full".into()];
+        full_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args("-p hermit-run --features liteinst --lib")).unwrap(),
+        );
+        full_step.env.remove(COHORT_ENV);
+        full_step.env.remove(PROJECT_ENV);
+        let mut privileged_step = template;
+        privileged_step.group = "privileged-test".into();
+        privileged_step.job = "privileged_only".into();
+        privileged_step.deps.clear();
+        privileged_step.labels = vec!["privileged".into()];
+        privileged_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args(
+                "-p hermit-run --features liteinst --test mount_introspection",
+            ))
+            .unwrap(),
+        );
+        privileged_step.env.remove(COHORT_ENV);
+        privileged_step.env.remove(PROJECT_ENV);
+        graph.steps = vec![full_step, privileged_step];
+
+        let full = config_selections(&graph, "full").unwrap();
+        let privileged = config_selections(&graph, "privileged").unwrap();
+        assert_eq!(privileged.len(), 1);
+        for (key, selection) in &privileged {
+            assert_eq!(
+                full.get(key),
+                Some(selection),
+                "full preparation omits privileged-only selection {selection:?}"
+            );
+        }
+        assert_eq!(full.len(), 2);
     }
 }
