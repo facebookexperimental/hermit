@@ -12,7 +12,34 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
+
+/// The array length when the guest is given no argument, as every variant but
+/// the chaos one runs it (tests/BUCK).
 const NUM_ELEMENTS: usize = 20_000_000;
+
+/// The array length: the first argument when there is one, else NUM_ELEMENTS.
+///
+/// The chaos variant runs the guest twice under `--chaos`, and every chaos
+/// change point is a deterministic preemption. At NUM_ELEMENTS a dev-built
+/// Hermit could not finish both runs inside the test timeout, so tests/BUCK
+/// passes that variant a smaller count. Only the length moves: the loops below,
+/// their bodies and the bounds check in `set` are the same at every length.
+fn num_elements() -> usize {
+    let Some(arg) = env::args().nth(1) else {
+        return NUM_ELEMENTS;
+    };
+    let n: usize = arg
+        .parse()
+        .unwrap_or_else(|e| panic!("mem_race: argument {arg:?} is not an element count: {e}"));
+    // Each worker claims half of the array, and count_switch_points reads
+    // element 0, so the count must be even and positive.
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "mem_race: the element count must be even and at least 2, got {n}"
+    );
+    eprintln!("mem_race: {n} elements, from the argument");
+    n
+}
 
 /// A shared array the workers mutate concurrently through `&self`.
 ///
@@ -99,8 +126,8 @@ fn count_switch_points(shared_data: &SharedCells) -> u64 {
 /// In guest mode two threads will try to fill up half of the data array with their thread id as
 /// value. The threads grab indices through an atomic int. For sufficiently large arrays we expect
 /// the thread ids to show up interleaved.
-fn run_test() -> u64 {
-    let shared_data = SharedCells::zeroed(NUM_ELEMENTS);
+fn run_test(num_elements: usize) -> u64 {
+    let shared_data = SharedCells::zeroed(num_elements);
     let shared_idx = Arc::new(AtomicUsize::new(0));
 
     // `tag` is the distinct per-worker value written into the array. It used to be
@@ -118,7 +145,7 @@ fn run_test() -> u64 {
         // disjoint indices); what raced was the construction of the `&mut`. So do NOT
         // "fix" this with atomics: that changes the memory operations the test exists
         // to exercise, and it is not what was ever wrong here.
-        for _ in 0..(NUM_ELEMENTS / 2) {
+        for _ in 0..(data.len() / 2) {
             let idx = idx.fetch_add(1, Ordering::SeqCst);
             data.set(idx, tag);
         }
@@ -146,15 +173,16 @@ fn run_test() -> u64 {
 }
 
 fn main() {
+    let num_elements = num_elements();
     if env::var("HERMIT_MODE") == Ok("strict".to_string()) {
         eprintln!("Running sequentialized, deterministically.");
-        let switches = run_test();
+        let switches = run_test(num_elements);
         assert!(
             switches > 1,
             "Expecting deterministic preemptions when using RCB timers"
         );
     } else {
         eprintln!("Running mem_race, but not expecting determinism.");
-        let _switches = run_test();
+        let _switches = run_test(num_elements);
     }
 }

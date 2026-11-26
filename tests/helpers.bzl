@@ -88,23 +88,7 @@ def build_test(
         )
 
     if chaos:
-        # Run tests in hermit run mode, strict settings, chaotic scheduling:
-
-        # Warning: hacky tuning! The max-timeslice here is
-        # arbitrary, and is basically selected to be the smallest
-        # number that we can tolerate for chaos tests. Smaller numbers
-        # create more priority change points, which are deterministic
-        # preemptions and thus quite slow. Frequent change points thus
-        # slow down *all* tests. The slowest/deadlocking tests have specific
-        # disables for chaos mode.
-        hermit_verify(
-            "hermit_run_chaos__" + name,
-            guest = "$(location " + bin_target + ")",
-            guest_args = [],
-            args = ["run", "--isolate-workdir"],
-            hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--max-timeslice=1000000"],
-            env = {},
-        )
+        hermit_run_chaos_test(name, bin_target)
     if chaosreplay:
         # Also run with replay of recorded preemptions.
         hermit_verify(
@@ -132,6 +116,30 @@ def build_test(
             ),
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
         )
+
+def hermit_run_chaos_test(name, bin_target, guest_args = []):
+    """`hermit_run_chaos__<name>`: hermit-verify runs `bin_target` with
+    `guest_args` twice under `hermit run --chaos` and compares the runs. Every
+    chaos variant is declared here, so a guest given arguments (tests/BUCK)
+    keeps the same flags as the generic ones."""
+
+    # Run tests in hermit run mode, strict settings, chaotic scheduling:
+
+    # Warning: hacky tuning! The max-timeslice here is
+    # arbitrary, and is basically selected to be the smallest
+    # number that we can tolerate for chaos tests. Smaller numbers
+    # create more priority change points, which are deterministic
+    # preemptions and thus quite slow. Frequent change points thus
+    # slow down *all* tests. The slowest/deadlocking tests have specific
+    # disables for chaos mode.
+    hermit_verify(
+        "hermit_run_chaos__" + name,
+        guest = "$(location " + bin_target + ")",
+        guest_args = guest_args,
+        args = ["run", "--isolate-workdir"],
+        hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--max-timeslice=1000000"],
+        env = {},
+    )
 
 def resolve_target_name(path, kind):
     # Accept a plain path or a label (//...:file.c); the target name comes

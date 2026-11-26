@@ -25,6 +25,7 @@ load(
     "hermit_bin_test",
     "hermit_chaos_stress_test",
     "hermit_python_test",
+    "hermit_run_chaos_test",
     "hermit_rust_test",
     "hermit_shell_test",
     "hermit_verify_c_bin",
@@ -461,10 +462,16 @@ tracereplay_exempt_rs = [
     "rust/thread_random.rs",
 ]
 
+# Guests whose chaos variant is declared below, by name, to pass the guest
+# arguments the generic variant cannot.
+chaos_with_guest_args_rs = [
+    "rust/mem_race.rs",
+]
+
 [
     hermit_rust_test(
         allocator = "malloc" if p in single_threaded_rs else None,
-        chaos = True,
+        chaos = p not in chaos_with_guest_args_rs,
         # TODO(T124815884): add disabled test(s) as they work:
         chaosreplay = (p != "rust/thread_random.rs") and (p != "rust/poll_spin.rs"),
         no_deterministic_io = False,
@@ -485,6 +492,25 @@ tracereplay_exempt_rs = [
     )
     for p in glob(["rust/*.rs"])
 ]
+
+# mem_race's chaos variant: the generic flags (helpers.bzl), with a smaller
+# array than the guest's 20,000,000-element default, which every other
+# mem_race variant keeps. hermit-verify runs the guest twice, and at the default
+# one dev-nosan run took 220-466 s on CI, so the pair could not finish inside
+# the 600 s test timeout. Measured 2026-11-25/26: the counts
+# fit TS(n) = 37.1224 + 395.306122*n/1e6 gives TS(20M) = 7943 (worst
+# residual 0.698%). At the 466 s worst CI basis, 600k gives modeled
+# per-test CPU 35.2237 s from the sweep median (pre-sweep basis
+# 35.9050 s; stated allowance 53.9 CPU-s at 1.5x, not enforced by
+# this comment or target), while 1M predicts 54.46 s and 2M predicts
+# 100.84 s. The detection sweep at 600k catches the planted race
+# 10/10 (7/10 at 100k, 2/10 at 10k, 0/10 at 1k), with the clean
+# control at 0/10; the same sweep at 1M also catches 10/10, 0/10.
+hermit_run_chaos_test(
+    name = "rs_mem_race",
+    bin_target = ":rustbin_mem_race",
+    guest_args = ["600000"],
+)
 
 [
     hermit_rust_test(
