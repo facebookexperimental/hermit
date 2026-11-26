@@ -543,6 +543,13 @@ fn relro_address(guest: &Path, notes: &[(String, u32, Vec<u8>)]) -> u64 {
 /// The address ranges of `guest`'s code in a core: each mapping `NT_FILE`
 /// lists under the guest's file name that an executable `PT_LOAD` covers.
 fn guest_code(guest: &Path, core: &[u8], notes: &[(String, u32, Vec<u8>)]) -> Vec<Range<u64>> {
+    code_ranges(guest.file_name().unwrap().as_bytes(), core, notes)
+}
+
+/// The address ranges of the code of the file named `name` in a core: each
+/// mapping `NT_FILE` lists under that file name that an executable `PT_LOAD`
+/// covers.
+fn code_ranges(name: &[u8], core: &[u8], notes: &[(String, u32, Vec<u8>)]) -> Vec<Range<u64>> {
     let (_, _, files) = notes
         .iter()
         .find(|(_, kind, _)| *kind == NT_FILE)
@@ -551,7 +558,6 @@ fn guest_code(guest: &Path, core: &[u8], notes: &[(String, u32, Vec<u8>)]) -> Ve
     // file, then the names, each ending in a NUL.
     let count = u64_at(files, 0) as usize;
     let names = files[16 + count * 24..].split(|&byte| byte == 0);
-    let name = guest.file_name().unwrap().as_bytes();
     let loads = loads(core);
     (0..count)
         .zip(names)
@@ -893,13 +899,139 @@ fn cores_stay_within_the_per_core_and_total_caps() {
     }
     let total: u64 = kept.iter().map(|(_, bytes)| bytes).sum();
     assert!(total <= max_total, "the cores take {total} bytes: {kept:?}");
-    assert!(
-        stored.iter().any(|&bytes| bytes >= 8 * MIB),
-        "no core kept a whole 8 MiB child's memory, so the caps were never \
-         approached from a full core: {stored:?}\n{}",
+    // What a full core of a child holds is decided by the coredump filter the
+    // guest inherits from this test and its runner (inherited_coredump_filter),
+    // through the two bits matched here. The guest maps only private memory
+    // (malloc and one private anonymous page), so the filter's other bits
+    // select nothing in it but the ELF-header pages (bit 4). Each arm asserts
+    // the outcome Linux's dump selection gives for its bits.
+    let filter = inherited_coredump_filter();
+    match (
+        filter & COREDUMP_ANONYMOUS_PRIVATE != 0,
+        filter & COREDUMP_FILE_BACKED_PRIVATE != 0,
+    ) {
+        // The kernel default 0x33, as on development hosts: a full core of an
+        // 8 MiB child (its buffer, stack, written pages and ELF headers) fits
+        // the 9 MiB per-core cap, so the caps are approached from full cores.
+        (true, false) => assert!(
+            stored.iter().any(|&bytes| bytes >= 8 * MIB),
+            "no core kept a whole 8 MiB child's memory, so the caps were never \
+             approached from a full core: {stored:?}\n{}",
+            stderr(&output)
+        ),
+        // Bit 2 as well, as on fbsource's Sandcastle workers (0x37): a full
+        // core also holds the child's libc, loader and binary, so not even an
+        // 8 MiB child fits the 9 MiB cap, and every core falls to the stack
+        // tier, which stores each thread's live stack and the ELF-header
+        // pages.
+        (true, true) => assert!(
+            stored.iter().all(|&bytes| bytes < MIB),
+            "coredump_filter {filter:#x} selects anonymous and file-backed private \
+             mappings, yet a core kept more than the stack tier stores: {stored:?}\n{}",
+            stderr(&output)
+        ),
+        // Neither the anonymous private memory that holds each child's buffer
+        // and stack nor any file-backed private mapping: a core stores at
+        // most the ELF-header pages.
+        (false, false) => assert!(
+            stored.iter().all(|&bytes| bytes < MIB),
+            "coredump_filter {filter:#x} selects no private mapping, yet a core kept \
+             more than the ELF-header pages: {stored:?}\n{}",
+            stderr(&output)
+        ),
+        // The file-backed private mappings but not the anonymous ones: a full
+        // core holds the child's libc, loader and binary, never its buffer.
+        (false, true) => assert!(
+            stored.iter().all(|&bytes| bytes < 8 * MIB),
+            "coredump_filter {filter:#x} selects no anonymous private memory, yet a \
+             core kept a child's buffer: {stored:?}\n{}",
+            stderr(&output)
+        ),
+    }
+    assert!(!stderr(&output).contains("not kept"), "{}", stderr(&output));
+}
+
+/// `coredump_filter` bit 0: anonymous private memory
+/// (Documentation/filesystems/proc.rst, "Configure coredump filter").
+const COREDUMP_ANONYMOUS_PRIVATE: u32 = 1 << 0;
+/// `coredump_filter` bit 2: file-backed private memory.
+const COREDUMP_FILE_BACKED_PRIVATE: u32 = 1 << 2;
+
+/// The `coredump_filter` this test process carries, which is the guest's: the
+/// kernel copies it to a child at fork and keeps it across exec (proc(5)),
+/// neither `timeout` nor Hermit writes it, and Hermit reads the dying guest
+/// thread's own file when it decides what a core stores (detcore's
+/// `coredump_filter` and `dump_rule`, which select what Linux's own dump
+/// does). The filter comes from whatever runs the tests: development hosts
+/// carry the kernel default 0x33, while fbsource's Sandcastle workers also
+/// select file-backed private mappings (bit 2). The tests read it rather than
+/// set it, because a write to /proc from the test is a host procfs write that
+/// the bundle host's read-only /proc refuses. The value read is printed, so a
+/// run's output records which arm it asserted.
+fn inherited_coredump_filter() -> u32 {
+    let text = fs::read_to_string("/proc/self/coredump_filter")
+        .expect("failed to read /proc/self/coredump_filter");
+    let filter = u32::from_str_radix(text.trim(), 16)
+        .unwrap_or_else(|error| panic!("bad coredump_filter {text:?}: {error}"));
+    println!("inherited coredump_filter {filter:#x}");
+    filter
+}
+
+/// A segfaulting guest's core holds the code of its libc exactly when the
+/// inherited filter selects file-backed private mappings (bit 2), as Linux's
+/// own dump does: all of each executable libc mapping with the bit, at most
+/// an ELF-header page of it without.
+#[test]
+fn a_cores_libc_code_follows_the_file_backed_filter_bit() {
+    let (guest, root) = guest("file-backed-libc");
+    let cores = root.join("cores");
+    // SAFETY: sysconf has no preconditions.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let filter = inherited_coredump_filter();
+    let output = hermit(
+        &["--fatal-core-dir", cores.to_str().unwrap()],
+        &guest,
+        &["segv"],
+    );
+    assert!(!output.status.success(), "{}", stderr(&output));
+    let kept = files(&cores);
+    assert_eq!(
+        kept.len(),
+        1,
+        "expected one core: {kept:?}\n{}",
         stderr(&output)
     );
-    assert!(!stderr(&output).contains("not kept"), "{}", stderr(&output));
+    let core = decode_core(&cores.join(&kept[0].0));
+    let notes = notes(&core);
+    let libc_code = code_ranges(b"libc.so.6", &core, &notes);
+    assert!(!libc_code.is_empty(), "the core maps no libc code");
+    let loads = loads(&core);
+    for range in &libc_code {
+        let &(_, _, filesz, memsz) = loads
+            .iter()
+            .find(|&&(flags, vaddr, _, memsz)| {
+                flags & 1 != 0 && vaddr <= range.start && range.end <= vaddr + memsz
+            })
+            .unwrap();
+        if filter & COREDUMP_FILE_BACKED_PRIVATE != 0 {
+            assert_eq!(
+                filesz, memsz,
+                "coredump_filter {filter:#x} selects file-backed private mappings, yet \
+                 the core stored {filesz} of libc's {memsz} code bytes at {range:x?}"
+            );
+        } else {
+            // Without bit 2 a private file mapping is stored whole only once
+            // it holds anonymous pages (a written page: Linux's anon_vma rule,
+            // detcore's holds_anonymous_pages). Nothing writes libc's code:
+            // the guest does not, and Hermit's timer arms hardware
+            // breakpoints, never an int3 in the guest's text.
+            assert!(
+                memsz > page && filesz <= page,
+                "coredump_filter {filter:#x} leaves out file-backed private mappings, \
+                 yet the core stored {filesz} of libc's {memsz} code bytes at {range:x?}"
+            );
+        }
+    }
 }
 
 #[test]
