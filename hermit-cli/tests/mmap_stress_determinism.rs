@@ -129,7 +129,6 @@ fn mmap_stress_layout_and_checksum_are_deterministic() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + mount namespaces"]
 fn mmap_stress_reaches_strict_verify_l2() {
     let _guard = hermit_run_lock();
     let mut command = Command::new("timeout");

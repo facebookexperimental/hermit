@@ -130,7 +130,6 @@ fn io_uring_ring_payload_is_deterministic() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + mount namespaces"]
 fn io_uring_ring_reaches_strict_verify_l2() {
     let _guard = hermit_run_lock();
     let mut command = Command::new("timeout");
