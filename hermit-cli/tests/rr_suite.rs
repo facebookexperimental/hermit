@@ -201,7 +201,7 @@ fn rr_scratch_directories_are_fresh_and_cleaned() {
 /// and every guest inherit it. A guest that dies by a core-dumping signal
 /// (an rr test's failed test_assert aborts) otherwise waits, before its exit
 /// stop, for the kernel to dump it to the host's core_pattern; where that is a
-/// pipe to a helper (devbig hosts: /usr/local/bin/coredumper) the wait is the
+/// pipe to a core-dump helper process the wait is the
 /// helper's, outside the test's control, and Hermit waits on the guest. A limit
 /// of 1, not 0, because a core_pattern pipe ignores every other limit
 /// (fs/coredump.c do_coredump: 1 aborts the dump). Guests do not see it:
