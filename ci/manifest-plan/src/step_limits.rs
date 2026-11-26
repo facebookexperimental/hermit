@@ -82,7 +82,7 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
     ),
     (
         "check.script_unit_tests",
-        "2 WALL kills at up to 901 s under concurrent validations to 2026-11-02 (553 passing runs, largest wall 896 s); 1.5 times the kill wall needs 1352 s",
+        "2 WALL kills at up to 901 s under concurrent validations to 2026-11-02 (553 passing runs, largest wall 896 s), which set 1500 s (1.5 times the kill wall); raised 2026-11-25 to 2400 s with the five-job width cut (review estimate of the worst five-job wall about 1,580 s; re-derive from the measured in-full five-job walls once they exist)",
     ),
     (
         "build.buck_release_artifact",

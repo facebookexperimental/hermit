@@ -12078,8 +12078,10 @@ the host syscall-table test will fail by name\n"
         };
         let local = find(&committed, SCRIPT_UNIT_TESTS_TAG);
         let hosted = find(&committed, HOSTED_SCRIPT_UNIT_TESTS_TAG);
-        assert_eq!(local.timeout, 1500);
-        assert_eq!(hosted.timeout, 1500);
+        // Literal on purpose: a wall change must trip a test, not restate
+        // the constant under test. The message pins below derive.
+        assert_eq!(local.timeout, 2400);
+        assert_eq!(hosted.timeout, 2400);
         assert_eq!(hosted.cpu_timeout, local.cpu_timeout);
         assert_eq!(hosted.cmd, local.cmd);
         assert_eq!(hosted.deps, local.deps);
@@ -12158,7 +12160,13 @@ the host syscall-table test will fail by name\n"
             .unwrap()
             .timeout = 900;
         let error = materialize_hosted_script_unit_tests(&mut rewalled).unwrap_err();
-        assert!(error.contains("not its authored 1500s"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "not its authored {}s",
+                crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
+            "{error}"
+        );
 
         // The assertion refuses each way of undoing the twin's contract.
         let mutated = |tag: &str, edit: &dyn Fn(&mut Step)| {
@@ -12174,12 +12182,18 @@ the host syscall-table test will fail by name\n"
         };
         let hosted_wall = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
         assert!(
-            hosted_wall.contains("not the hosted 1500s"),
+            hosted_wall.contains(&format!(
+                "not the hosted {}s",
+                crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
             "{hosted_wall}"
         );
         let local_wall = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
         assert!(
-            local_wall.contains("not its authored 1500s"),
+            local_wall.contains(&format!(
+                "not its authored {}s",
+                crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
             "{local_wall}"
         );
         for (what, edit) in [
@@ -12256,6 +12270,12 @@ the host syscall-table test will fail by name\n"
             .timeout = 900;
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let error = assert_invariants(&changed, &cells).unwrap_err();
-        assert!(error.contains("not the hosted 1500s"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "not the hosted {}s",
+                crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
+            "{error}"
+        );
     }
 }
