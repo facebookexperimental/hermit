@@ -290,18 +290,21 @@ mod tests {
                 7200,
                 Some(13_958_643_712),
             ),
-            // 6 GiB hard cap since 2026-11-05 (#5165): retained runs sat
+            // 6 GiB hard cap from 2026-11-05 (#5165): retained runs sat
             // at the former 4-GiB cap (set 2026-09-30 from a 2.53-GiB cold
             // 8-core peak), and fresh uncapped cold builds peaked at
             // 5.00 GiB, so the baseline is that worst peak and the hard
-            // cap is 6 GiB. 600 s wall and 2100 CPU-s since 2026-11-02
-            // (ci/manifest-plan/src/step_limits.rs): 679 runs peaked at
-            // 625.7 CPU-s and 210.3 s of wall.
+            // cap was 6 GiB. 9 GiB since 2026-11-25: the look-back over the
+            // retained dagrun profiles found real-build peaks to
+            // 6,258,323,456 B, and the cap is at least 1.5x that worst (see
+            // the node description). 600 s wall and 2100 CPU-s since
+            // 2026-11-02 (ci/manifest-plan/src/step_limits.rs): 679 runs
+            // peaked at 625.7 CPU-s and 210.3 s of wall.
             (
                 "setup.manifest_plan".to_string(),
                 600,
                 2100,
-                Some(6_442_450_944),
+                Some(9_663_676_416),
             ),
             ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
         ];

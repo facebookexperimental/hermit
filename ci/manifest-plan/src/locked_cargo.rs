@@ -1215,7 +1215,7 @@ mod tests {
         (
             "ci/check-musl-detcore.sh",
             include_str!("../../check-musl-detcore.sh"),
-            "check.lint_checks runs it through `make lint-checks`",
+            "check.musl_detcore runs it, as does `make lint` through lint-musl-detcore",
         ),
         (
             "ci/stage-detcore-liteinst.sh",

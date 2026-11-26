@@ -42,7 +42,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests fmt \
+	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-musl-detcore lint-script-tests fmt \
 	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with first-party backends
@@ -166,7 +166,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # a checker added to lint-checks is exercised by local validation automatically, whereas the previous
 # arrangement required someone to also hand-write a DAG node and six of the ten
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
-lint: lint-checks lint-script-tests lint-cargo lint-parent-checks ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, rust-script unit tests, Reverie pin policy, nested lockfiles, record-version floor)
+lint: lint-checks lint-script-tests lint-cargo lint-parent-checks lint-musl-detcore ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, rust-script unit tests, Reverie pin policy, nested lockfiles, record-version floor, musl Detcore compile)
 
 # The one checker that needs the dev-hermit PARENT repository: the accept arm of the
 # canonical ledger adapter contract drives the parent's real ci-hub/ledger/validate_rows.py.
@@ -179,6 +179,15 @@ lint: lint-checks lint-script-tests lint-cargo lint-parent-checks ## Run the ful
 # not evaluated, which is neither a pass nor a lint failure.
 lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI node check.canonical_adapter_accept, full lane only)
 	python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only
+
+# The musl compile check (cargo check -p hermit-detcore for x86_64-unknown-linux-musl)
+# is a Cargo build, not a lint checker, so it is its own DAG node, check.musl_detcore,
+# sized from its own measurement, and not part of lint-checks. `lint` still runs it,
+# so a local `make lint` covers what CI runs. Without the musl std component the
+# script exits 75 (NO RESULT) and make reports that as `Error 75`: the check was not
+# evaluated, which is neither a pass nor a lint failure.
+lint-musl-detcore: ## The musl hermit-detcore compile check (CI node check.musl_detcore)
+	./ci/check-musl-detcore.sh
 
 # The full stop-path checker is safe to run inside validation: it clears the outer
 # HERMIT_VALIDATE_ACTIVE marker before launching fixtures, and every full-validate
@@ -247,7 +256,6 @@ LINT_CHECK_TARGETS := \
     lint-check-reverie-pin \
     lint-check-private-static-owned \
     lint-check-private-static-pipeline \
-    lint-check-musl-detcore \
     lint-check-nested-lockfiles \
     lint-check-cargo-proxy \
     lint-check-cargo-lock-freshness \
@@ -423,9 +431,6 @@ lint-check-private-static-owned:
 
 lint-check-private-static-pipeline:
 	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p 'test_*.py'
-
-lint-check-musl-detcore:
-	./ci/check-musl-detcore.sh
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs

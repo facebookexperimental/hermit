@@ -8561,11 +8561,14 @@ the host syscall-table test will fail by name\n"
         // memory.events `max` to 15032), so the true peak was censored; an
         // Fresh uncapped cold builds at this head (j8, fresh target,
         // cache-inclusive memory.peak): 5.00, 4.54 and 4.28 GiB, anonymous
-        // at most 1.46 GiB polled. Baseline 5 GiB (worst observed), hard
-        // cap 6 GiB, on the host step and its
-        // pinned-root twin alike. setup.manifest_plan_on_host is excluded:
-        // its spec records that the local twin's measurements do not apply
-        // on the hosted-privileged runner.
+        // at most 1.46 GiB polled. Baseline 5 GiB (worst observed). The
+        // 2026-11-25 look-back over retained dagrun profiles then found
+        // real-build peaks to 6.26 GB in this family (setup.manifest_plan
+        // worst 6,258,323,456 B), so the shared hard cap is now 9 GiB (at
+        // least 1.5x each node's worst uncensored peak), on the host step
+        // and its pinned-root twin alike. setup.manifest_plan_on_host is
+        // excluded: its spec records that the local twin's measurements do
+        // not apply on the hosted-privileged runner.
         let cfg = generated_dag();
         let mut saw = false;
         for step in &cfg.steps {
@@ -8582,7 +8585,7 @@ the host syscall-table test will fail by name\n"
                 );
                 assert_eq!(
                     step.hint.hard_mem_max_bytes,
-                    Some(6 * 1024 * 1024 * 1024),
+                    Some(9 * 1024 * 1024 * 1024),
                     "{}",
                     step.tag()
                 );

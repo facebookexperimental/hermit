@@ -74,6 +74,12 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         populations: &[],
     },
     ExtensionNode {
+        tag: "check.musl_detcore",
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &["build.rust_scripts"],
+        populations: &[],
+    },
+    ExtensionNode {
         tag: "check.gvisor_vendoring",
         labels: &["full", "hosted-portable", "portable"],
         deps: &[],
