@@ -115,7 +115,9 @@ use crate::syscalls::helpers::RestartBlock;
 use crate::syscalls::helpers::get_fd;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::nofile_limit;
 use crate::syscalls::helpers::poll_nfds;
+use crate::syscalls::helpers::poll_nfds_exceeds_nofile;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::woken_poll_errno;
 use crate::syscalls::scm_rights::received_descriptors;
@@ -1925,14 +1927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         nfds: u32,
     ) -> Option<(Vec<libc::pollfd>, Vec<Option<PolledChannel>>)> {
         let address = address?;
-        let open_file_limit = guest
-            .thread_state()
-            .resource_limits
-            .lock()
-            .expect("resource limits mutex poisoned")
-            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
-            .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
-        if u64::from(nfds) > open_file_limit {
+        if poll_nfds_exceeds_nofile(nfds, nofile_limit(guest)) {
             return None;
         }
         let mut pollfds = vec![

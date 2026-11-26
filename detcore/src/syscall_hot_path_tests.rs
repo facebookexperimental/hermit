@@ -53,6 +53,7 @@ pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
     refusal: Option<reverie::UnsupportedRefusal>,
     injected: Mutex<Vec<(Sysno, SyscallArgs)>>,
     memory_map: Option<reverie::MemoryMap>,
+    runtime_fd: Option<i32>,
     _tool: std::marker::PhantomData<T>,
 }
 
@@ -68,6 +69,7 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
             refusal: None,
             injected: Mutex::new(Vec::new()),
             memory_map: None,
+            runtime_fd: None,
             _tool: std::marker::PhantomData,
         }
     }
@@ -87,6 +89,13 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
     /// Report `refusal` as the backend's record of the last injection, once.
     pub(crate) fn with_refusal(mut self, refusal: reverie::UnsupportedRefusal) -> Self {
         self.refusal = Some(refusal);
+        self
+    }
+
+    /// Report `fd` as the backend runtime's own descriptor
+    /// (`Guest::is_runtime_owned_fd`), as a shared-table backend would.
+    pub(crate) fn with_runtime_fd(mut self, fd: i32) -> Self {
+        self.runtime_fd = Some(fd);
         self
     }
 
@@ -147,6 +156,9 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     }
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
+    }
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        self.runtime_fd == Some(fd)
     }
     fn thread_state(&self) -> &ThreadState<()> {
         &self.thread

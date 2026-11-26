@@ -116,6 +116,46 @@ fn bounded_command(program: &Path, arguments: &[&OsStr], seconds: u64) -> Output
         .unwrap_or_else(|error| panic!("failed to launch bounded command {program:?}: {error}"))
 }
 
+/// Hermit's guest-visible `RLIMIT_NOFILE`, Detcore's virtual default. The
+/// fixture's select client checks that a poll count above the limit it
+/// reads is `EINVAL`, at one entry over this value, so the native leg of
+/// the exact contract must run at this limit rather than the host's.
+const NATIVE_CLIENT_NOFILE: u64 = 1_048_576;
+
+/// `bounded_command` for the native contract's client child, with its
+/// soft `RLIMIT_NOFILE` lowered to `NATIVE_CLIENT_NOFILE` first (the hard
+/// limit is never the binding one for a lowering, so it is left alone).
+/// On a host already at or below the value the child runs unchanged.
+fn bounded_native_client(program: &Path, arguments: &[&OsStr], seconds: u64) -> Output {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=1s", &format!("{seconds}s")])
+        .arg(program)
+        .args(arguments);
+    // SAFETY: the closure runs between fork and exec and only calls
+    // getrlimit/setrlimit on its own stack value.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0
+                && limit.rlim_cur > NATIVE_CLIENT_NOFILE
+            {
+                limit.rlim_cur = NATIVE_CLIENT_NOFILE;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+            Ok(())
+        });
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to launch bounded command {program:?}: {error}"))
+}
+
 /// The fixture's loopback TCP server, which checks the exact outbound stream.
 struct Controller {
     child: Option<Child>,
@@ -409,7 +449,7 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
     let evidence = tempfile::tempdir().expect("create native network bracket directory");
     let (controller, port) = Controller::start(fixture, evidence.path());
-    let output = bounded_command(
+    let output = bounded_native_client(
         fixture,
         &[OsStr::new("client"), OsStr::new(&port), OsStr::new("match")],
         NATIVE_CLIENT_WALL_SECONDS,
@@ -421,7 +461,7 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     let directory = evidence.path().join("select");
     fs::create_dir(&directory).expect("create native select directory");
     let (controller, port) = Controller::start(fixture, &directory);
-    let output = bounded_command(
+    let output = bounded_native_client(
         fixture,
         &[
             OsStr::new("client"),
@@ -443,7 +483,7 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
         fs::create_dir(&directory).expect("create native backpressure directory");
         let (controller, port) =
             Controller::start_mode(fixture, &directory, "backpressure-controller");
-        let output = bounded_command(
+        let output = bounded_native_client(
             fixture,
             &[OsStr::new("client"), OsStr::new(&port), OsStr::new(mode)],
             NATIVE_CLIENT_WALL_SECONDS,

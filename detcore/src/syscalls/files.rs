@@ -15033,7 +15033,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.publish_pipe_status(guest, fd).await;
                 Ok(result)
             }
-            F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
+            F_DUPFD(arg) | F_DUPFD_CLOEXEC(arg) => {
+                // An argument at or above RLIMIT_NOFILE is EINVAL
+                // (`f_dupfd`, fs/file.c, reached from `do_fcntl`), after
+                // the descriptor itself: `check_fcntl_cmd` (fs/fcntl.c)
+                // admits both commands on an O_PATH descriptor, so one
+                // the guest holds gets the argument's EINVAL, and one it
+                // does not hold is EBADF first, as `fdget` precedes the
+                // argument check. The guest's virtual limit decides, not
+                // the host's (`nofile_limit`). A descriptor the model
+                // lists decides the EINVAL from the model; one it does
+                // not list is settled by an F_GETFD recorded in the
+                // dup's place, on every backend: on a shared-table
+                // backend the model names only descriptors it has
+                // discovered, so an inherited or just-received one can
+                // be missing from it while the guest holds it, and
+                // missing alone never proves unheld (replay re-derives
+                // the same substitution, keying by sequential event).
+                // The backend runtime's own descriptors are not the
+                // guest's and read as absent without that probe.
+                if crate::syscalls::helpers::fd_at_or_above_nofile(
+                    arg,
+                    crate::syscalls::helpers::nofile_limit(guest),
+                ) {
+                    let (numbers, _, _) = guest.thread_state().descriptor_table();
+                    if numbers.contains(&fd) {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    if guest.is_runtime_owned_fd(fd) {
+                        return Err(Errno::EBADF.into());
+                    }
+                    return match self.record_or_replay(guest, call.with_cmd(F_GETFD)).await {
+                        Ok(_) => Err(Errno::EINVAL.into()),
+                        Err(errno) => Err(errno.into()),
+                    };
+                }
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
                 let lock_tracked = self.lock_tracked_descriptions(guest, newfd..=newfd);
                 let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
@@ -17706,6 +17740,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
+        // Linux refuses a new descriptor at or above RLIMIT_NOFILE
+        // before the table grows or anything closes (`ksys_dup3`,
+        // fs/file.c); the guest's virtual limit decides, not the host's
+        // (`nofile_limit`). The same descriptor twice takes the lookup-
+        // only path and is never refused this way.
+        if old_fd != new_fd
+            && crate::syscalls::helpers::fd_at_or_above_nofile(
+                new_fd,
+                crate::syscalls::helpers::nofile_limit(guest),
+            )
+        {
+            return Err(Errno::EBADF.into());
+        }
         if let Some(refusal) = self
             .refuse_dup_over_waited_listener(guest, Sysno::dup2, old_fd, new_fd)
             .await
@@ -17826,6 +17873,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let flags = call.flags();
+        // As in `handle_dup2`, at or above the guest's virtual
+        // RLIMIT_NOFILE, in `ksys_dup3`'s order (fs/file.c): flags other
+        // than O_CLOEXEC are EINVAL first (the raw argument, whose
+        // refused bits the typed flags truncate away), then old and new
+        // the same descriptor, then the limit's EBADF. Below the limit
+        // the call is forwarded exactly as written.
+        if crate::syscalls::helpers::fd_at_or_above_nofile(
+            new_fd,
+            crate::syscalls::helpers::nofile_limit(guest),
+        ) {
+            let raw_flags = call.into_parts().1.arg2 as libc::c_int;
+            if raw_flags & !libc::O_CLOEXEC != 0 || old_fd == new_fd {
+                return Err(Errno::EINVAL.into());
+            }
+            return Err(Errno::EBADF.into());
+        }
         if let Some(refusal) = self
             .refuse_dup_over_waited_listener(guest, Sysno::dup3, old_fd, new_fd)
             .await
@@ -28690,6 +28753,275 @@ mod serving_kernel_protection_key_tests {
                     (0xffff_8000_0000_0000, page, libc::PROT_NONE as usize, 0),
                     "{reply:?}"
                 );
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod nofile_tests {
+    use reverie::Guest;
+    use reverie::syscalls::Errno;
+
+    use crate::record_or_replay::NoopTool;
+    use crate::syscall_hot_path_tests::InjectGuest;
+
+    /// The guest's virtual `RLIMIT_NOFILE` current value in these tests:
+    /// small, so the boundary is a descriptor number a test can name, and
+    /// below every host limit, so only the virtual limit can refuse.
+    const LIMIT: u64 = 16;
+
+    fn limited(reply: Result<i64, Errno>) -> InjectGuest<NoopTool> {
+        let mut guest = InjectGuest::<NoopTool>::new(reply);
+        guest
+            .thread_state_mut()
+            .resource_limits
+            .lock()
+            .unwrap()
+            .set(
+                reverie::syscalls::linux_abi::RLIMIT_NOFILE,
+                crate::tool_local::ResourceLimit {
+                    current: LIMIT,
+                    maximum: 1_048_576,
+                },
+            );
+        guest
+    }
+
+    fn errno(result: &Result<i64, reverie::Error>) -> Result<i64, Errno> {
+        match result {
+            Ok(value) => Ok(*value),
+            Err(reverie::Error::Errno(errno)) => Err(*errno),
+            Err(other) => panic!("not an errno: {other:?}"),
+        }
+    }
+
+    /// `dup2` to a descriptor at the guest's virtual `RLIMIT_NOFILE` is
+    /// `EBADF` from the virtual limit alone (fs/file.c `ksys_dup3`: the
+    /// `newfd >= rlimit(RLIMIT_NOFILE)` refusal, before the table grows or
+    /// the old descriptor is looked up), so nothing is injected. One below
+    /// the limit still goes to the kernel: the scripted answer is the
+    /// guest's. The scripted host answer above the limit is the `EBADF` a
+    /// host whose real limit happens to bind gives, so at the tip the
+    /// errno matches and only the injected call gives the defect away.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nofile_dup2_at_the_virtual_limit_is_ebadf_without_the_kernel() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            let mut guest = limited(Err(Errno::EBADF));
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EBADF));
+            assert!(
+                guest.injected().is_empty(),
+                "the virtual limit refuses before the kernel: {:?}",
+                guest.injected()
+            );
+
+            let mut guest = limited(Err(Errno::EINVAL));
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32 - 1);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EINVAL), "the kernel's answer");
+            assert_eq!(guest.injected().len(), 1, "below the limit it is forwarded");
+
+            // The same descriptor twice at the limit takes the kernel's
+            // lookup-only path: forwarded, never the limit's EBADF.
+            let mut guest = limited(Ok(LIMIT as i64));
+            guest
+                .thread_state_mut()
+                .add_fd(
+                    LIMIT as i32,
+                    nix::fcntl::OFlag::O_RDONLY,
+                    crate::fd::FdType::Pipe,
+                    None,
+                )
+                .unwrap();
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(LIMIT as i32)
+                .with_newfd(LIMIT as i32);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Ok(LIMIT as i64), "the same descriptor");
+            assert_eq!(guest.injected().len(), 1, "the lookup is forwarded");
+        })
+    }
+
+    /// `dup3` as `dup2`, with Linux's order in `ksys_dup3` preserved where
+    /// the virtual limit binds: flags other than `O_CLOEXEC` are `EINVAL`
+    /// first, then old and new the same descriptor, then the limit's
+    /// `EBADF`. Each is answered without the kernel.
+    #[test]
+    fn nofile_dup3_at_the_virtual_limit_keeps_linux_order() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            for (name, oldfd, flags, expected) in [
+                ("at the limit", 3, nix::fcntl::OFlag::empty(), Errno::EBADF),
+                (
+                    "the same descriptor at the limit",
+                    LIMIT as i32,
+                    nix::fcntl::OFlag::empty(),
+                    Errno::EINVAL,
+                ),
+                (
+                    "flags Linux refuses, at the limit",
+                    3,
+                    nix::fcntl::OFlag::O_RDWR,
+                    Errno::EINVAL,
+                ),
+            ] {
+                let mut guest = limited(Err(Errno::EBADF));
+                let call = reverie::syscalls::Dup3::new()
+                    .with_oldfd(oldfd)
+                    .with_newfd(LIMIT as i32)
+                    .with_flags(flags);
+                let result = tool.handle_dup3(&mut guest, call).await;
+                assert_eq!(errno(&result), Err(expected), "{name}");
+                assert!(
+                    guest.injected().is_empty(),
+                    "{name}: answered without the kernel: {:?}",
+                    guest.injected()
+                );
+            }
+
+            let mut guest = limited(Err(Errno::ENOMEM));
+            let call = reverie::syscalls::Dup3::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32 - 1)
+                .with_flags(nix::fcntl::OFlag::O_CLOEXEC);
+            let result = tool.handle_dup3(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::ENOMEM), "the kernel's answer");
+            assert_eq!(guest.injected().len(), 1, "below the limit it is forwarded");
+
+            // A flag bit the typed flags truncate away still counts: the
+            // raw register is read, so this is EINVAL, not the limit's
+            // EBADF, and nothing is forwarded.
+            let mut guest = limited(Err(Errno::EBADF));
+            let raw = reverie::syscalls::Syscall::from_raw(
+                reverie::syscalls::Sysno::dup3,
+                reverie::syscalls::SyscallArgs::new(3, LIMIT as usize, 0x8000_0000, 0, 0, 0),
+            );
+            let reverie::syscalls::Syscall::Dup3(call) = raw else {
+                panic!("dup3 raw call did not decode: {raw:?}");
+            };
+            let result = tool.handle_dup3(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EINVAL), "a truncated flag bit");
+            assert!(
+                guest.injected().is_empty(),
+                "a truncated flag bit: answered without the kernel: {:?}",
+                guest.injected()
+            );
+        })
+    }
+
+    /// `F_DUPFD` and `F_DUPFD_CLOEXEC` with their argument at the guest's
+    /// virtual `RLIMIT_NOFILE` are `EINVAL` (`f_dupfd`, fs/file.c:
+    /// `from >= rlimit(RLIMIT_NOFILE)`), after the descriptor itself:
+    /// `check_fcntl_cmd` admits both commands on an `O_PATH` descriptor,
+    /// so a held descriptor gets the argument's `EINVAL`; one the guest
+    /// does not hold is `EBADF` first, as `fdget` precedes the argument
+    /// check. A descriptor the model lists decides from the model; one
+    /// it does not list is settled by an `F_GETFD` recorded in the dup's
+    /// place, because on a shared-table backend an inherited or
+    /// just-received descriptor can be held while missing from the
+    /// model: its `EBADF` stays, its success becomes `EINVAL`. The
+    /// backend runtime's own descriptor reads as absent with no probe.
+    /// One below the limit still goes to the kernel as written.
+    #[test]
+    fn nofile_fcntl_dupfd_at_the_virtual_limit_is_einval_after_ebadf() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            // (name, cmd, fd, runtime-owned, kernel answer, expected, the
+            // one forwarded command, if any)
+            for (name, cmd, fd, runtime, reply, expected, forwarded) in [
+                (
+                    "F_DUPFD at the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    3,
+                    false,
+                    Err(Errno::EINVAL),
+                    Errno::EINVAL,
+                    None,
+                ),
+                (
+                    "F_DUPFD_CLOEXEC at the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD_CLOEXEC(LIMIT as i32),
+                    3,
+                    false,
+                    Err(Errno::EINVAL),
+                    Errno::EINVAL,
+                    None,
+                ),
+                (
+                    "a descriptor missing from the model the kernel lacks",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    false,
+                    Err(Errno::EBADF),
+                    Errno::EBADF,
+                    Some(libc::F_GETFD as usize),
+                ),
+                (
+                    "a descriptor missing from the model the kernel holds",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    false,
+                    Ok(0),
+                    Errno::EINVAL,
+                    Some(libc::F_GETFD as usize),
+                ),
+                (
+                    "the runtime's own descriptor",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    true,
+                    Ok(0),
+                    Errno::EBADF,
+                    None,
+                ),
+                (
+                    "one below the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32 - 1),
+                    3,
+                    false,
+                    Err(Errno::ENOMEM),
+                    Errno::ENOMEM,
+                    Some(libc::F_DUPFD as usize),
+                ),
+            ] {
+                let mut guest = limited(reply);
+                if runtime {
+                    guest = guest.with_runtime_fd(9);
+                }
+                guest
+                    .thread_state_mut()
+                    .add_fd(
+                        3,
+                        nix::fcntl::OFlag::O_RDONLY,
+                        crate::fd::FdType::Pipe,
+                        None,
+                    )
+                    .unwrap();
+                let call = reverie::syscalls::Fcntl::new().with_fd(fd).with_cmd(cmd);
+                let result = tool.handle_fcntl(&mut guest, call).await;
+                assert_eq!(errno(&result), Err(expected), "{name}");
+                let injected = guest.injected();
+                match forwarded {
+                    None => assert!(
+                        injected.is_empty(),
+                        "{name}: answered without the kernel: {injected:?}"
+                    ),
+                    Some(command) => {
+                        assert_eq!(injected.len(), 1, "{name}: one forwarded call");
+                        let (sysno, args) = injected[0];
+                        assert_eq!(sysno, reverie::syscalls::Sysno::fcntl, "{name}");
+                        assert_eq!(args.arg0, fd as usize, "{name}: descriptor");
+                        assert_eq!(args.arg1, command, "{name}: forwarded command");
+                    }
+                }
             }
         })
     }

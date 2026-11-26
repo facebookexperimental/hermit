@@ -8217,6 +8217,40 @@ pub fn poll_nfds(nfds: libc::nfds_t) -> u32 {
     nfds as u32
 }
 
+/// The guest process's virtual `RLIMIT_NOFILE` current value, as Detcore
+/// keeps it (`ThreadState::resource_limits`), never the host's real limit.
+/// Linux checks descriptor numbers and counts against this value in
+/// `do_sys_poll` (fs/select.c), `ksys_dup3` and `f_dupfd` (fs/file.c); a
+/// forwarded call would be checked against the host's limit instead, so
+/// those handlers compare first and answer from the virtual one. The
+/// comparison is a pure function of virtual state, the same at record
+/// and replay, so a refusal it produces consumes no recording. Every
+/// reader of the limit goes through `ResourceLimits::nofile`, here or
+/// directly.
+pub(crate) fn nofile_limit<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) -> u64 {
+    guest
+        .thread_state()
+        .resource_limits
+        .lock()
+        .expect("resource limits mutex poisoned")
+        .nofile()
+}
+
+/// Whether a `poll` or `ppoll` entry count (`poll_nfds`) exceeds `limit`,
+/// as `do_sys_poll` refuses it with `EINVAL`: strictly above, so a count
+/// at the limit still polls.
+pub(crate) fn poll_nfds_exceeds_nofile(nfds: u32, limit: u64) -> bool {
+    u64::from(nfds) > limit
+}
+
+/// Whether descriptor number `fd` is at or above `limit`, as `ksys_dup3`
+/// refuses such a `newfd` with `EBADF` and `f_dupfd` such an `F_DUPFD`
+/// argument with `EINVAL`. The kernel's parameters are unsigned, so a
+/// negative number is a huge one and also at or above.
+pub(crate) fn fd_at_or_above_nofile(fd: i32, limit: u64) -> bool {
+    u64::from(fd as u32) >= limit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8230,6 +8264,41 @@ mod tests {
             guest_mask: Some(0),
         });
         drop(IgnoredSignalShield::none());
+    }
+
+    /// The virtual `RLIMIT_NOFILE` comparisons Linux makes: a poll count
+    /// binds only strictly above the limit (`do_sys_poll`), a descriptor
+    /// number at it as well (`ksys_dup3`, `do_fcntl`), the kernel's
+    /// unsigned parameters make a negative number huge, and the limit the
+    /// guest set for itself is the one read, not the host's.
+    #[test]
+    fn nofile_comparisons_bind_at_the_kernel_boundaries() {
+        assert!(!poll_nfds_exceeds_nofile(0, 0));
+        assert!(!poll_nfds_exceeds_nofile(16, 16));
+        assert!(poll_nfds_exceeds_nofile(17, 16));
+        assert!(!poll_nfds_exceeds_nofile(u32::MAX, libc::RLIM64_INFINITY));
+        assert!(poll_nfds_exceeds_nofile(1_048_577, 1_048_576));
+
+        assert!(!fd_at_or_above_nofile(15, 16));
+        assert!(fd_at_or_above_nofile(16, 16));
+        assert!(fd_at_or_above_nofile(0, 0));
+        assert!(fd_at_or_above_nofile(-1, 16));
+        assert!(!fd_at_or_above_nofile(-1, libc::RLIM64_INFINITY));
+        assert!(fd_at_or_above_nofile(1_048_576, 1_048_576));
+
+        let guest =
+            crate::syscall_hot_path_tests::InjectGuest::<crate::record_or_replay::NoopTool>::new(
+                Ok(0),
+            );
+        assert_eq!(nofile_limit(&guest), 1_048_576, "the virtual default");
+        guest.thread_state().resource_limits.lock().unwrap().set(
+            reverie::syscalls::linux_abi::RLIMIT_NOFILE,
+            crate::tool_local::ResourceLimit {
+                current: 16,
+                maximum: 1_048_576,
+            },
+        );
+        assert_eq!(nofile_limit(&guest), 16, "the guest's lowered limit");
     }
 
     /// The drop log must not assert the thread is gone: Drop runs when

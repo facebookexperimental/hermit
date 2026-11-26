@@ -94,6 +94,9 @@ use crate::syscalls::helpers::GuestHeldPollProof;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::TemporaryMaskCheck;
 use crate::syscalls::helpers::kernel_run_entry_refusal;
+use crate::syscalls::helpers::nofile_limit;
+use crate::syscalls::helpers::poll_nfds;
+use crate::syscalls::helpers::poll_nfds_exceeds_nofile;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::temporary_mask_check;
 use crate::syscalls::signal::kernel_installed_signal_mask;
@@ -1217,9 +1220,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// 0. D41's check under the guest's own mask, as for `pselect6`.
     /// 1. The timeout (`EFAULT`, `EINVAL`, :1108-1114), then the mask's size
     ///    and the mask (`set_user_sigmask`, :1117: `EINVAL`, `EFAULT`).
-    /// 2. Each probe is the call itself on the guest's pollfd array with a
-    ///    private zero timeout and no mask (IR-9), so the kernel makes the
-    ///    `nfds > RLIMIT_NOFILE` check (`EINVAL`, :987-988), reads the array
+    /// 2. The count against the guest's virtual `RLIMIT_NOFILE`
+    ///    (`EINVAL`, :987-988), Detcore's own check, since a probe would
+    ///    be judged by the host's limit. Then each probe is the call
+    ///    itself on the guest's pollfd array with a private zero timeout
+    ///    and no mask (IR-9), so the kernel reads the array
     ///    (`EFAULT`, :997-999), polls it, and always copies `revents` back
     ///    (:1018-1030), a fault there giving `EFAULT`. A count or an error is
     ///    returned.
@@ -1265,6 +1270,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mask_address = call.sigmask().map_or(0, |mask| mask.as_raw());
         let mask = read_temporary_mask(guest, "ppoll", mask_address, true).await?;
+        // The count against the guest's virtual limit, in Linux's place:
+        // after the timeout and the mask, before any probe reads the
+        // array (`do_sys_poll`, fs/select.c). A probe would be checked
+        // against the host's limit instead. As on the ungated path, the
+        // time left is written back first (`poll_select_finish`).
+        if poll_nfds_exceeds_nofile(poll_nfds(call.nfds()), nofile_limit(guest)) {
+            if let (Some(timeout_address), Some(timeout)) = (call.timeout(), timeout)
+                && timeout != Duration::ZERO
+            {
+                let started_at = thread_observe_time(guest).await;
+                self.write_ppoll_remaining(guest, timeout_address, timeout, started_at)
+                    .await?;
+            }
+            return Err(Errno::EINVAL.into());
+        }
         let zero = timeout == Some(Duration::ZERO);
         // The clock is observed only after the first probe and its check
         // (`observe_deadline`, round-3 ruling 1), or at the entry with an armed
@@ -1276,9 +1296,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // No room for the private zero timeout (round-2 ruling 2): the
             // kernel's answer comes first, from a stage-free probe, `poll`
             // with an immediate zero timeout and no mask on the guest's own
-            // array, which makes `do_sys_poll`'s checks (fs/select.c:973-1044
-            // at v6.12: `nfds > RLIMIT_NOFILE` EINVAL, the copy-in EFAULT,
-            // the poll, `revents` always copied back) as the ppoll would.
+            // array, which makes `do_sys_poll`'s remaining checks
+            // (fs/select.c:973-1044 at v6.12: the copy-in EFAULT, the poll,
+            // `revents` always copied back; the count was refused above
+            // against the virtual limit) as the ppoll would.
             // A count or an error is returned, as the ppoll returns it.
             // Nothing ready (or a restart code, which only SIGKILL can give
             // under the runtime mask) would go on to the check and the wait,

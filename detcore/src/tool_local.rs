@@ -821,6 +821,13 @@ impl ResourceLimits {
         self.limits.get(resource as usize).copied()
     }
 
+    /// The current `RLIMIT_NOFILE`, the one descriptor limit Detcore
+    /// itself enforces where Linux checks it. The entry always exists:
+    /// it is seeded for every Linux resource number at construction.
+    pub(crate) fn nofile(&self) -> u64 {
+        self.limits[reverie::syscalls::linux_abi::RLIMIT_NOFILE as usize].current
+    }
+
     /// Replace a previously validated resource limit.
     pub(crate) fn set(&mut self, resource: u32, limit: ResourceLimit) {
         self.limits[resource as usize] = limit;
@@ -8749,12 +8756,7 @@ impl<T> ThreadState<T> {
     /// (`FileMetadata::grow_to_hold`): `newfd` below `RLIMIT_NOFILE`, as
     /// Detcore keeps it for the process.
     pub(crate) fn note_failed_dup_target(&self, fd: RawFd) {
-        let limit = self
-            .resource_limits
-            .lock()
-            .unwrap()
-            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
-            .map_or(0, |limit| limit.current);
+        let limit = self.resource_limits.lock().unwrap().nofile();
         if u64::try_from(fd).is_ok_and(|fd| fd < limit) {
             self.metadata().grow_to_hold(fd);
         }

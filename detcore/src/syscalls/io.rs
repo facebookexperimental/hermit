@@ -67,9 +67,12 @@ use crate::syscalls::helpers::is_accepted_connection;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::nofile_limit;
 use crate::syscalls::helpers::observe_under_mask;
 use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::poll_deadline_for;
+use crate::syscalls::helpers::poll_nfds;
+use crate::syscalls::helpers::poll_nfds_exceeds_nofile;
 use crate::syscalls::helpers::poll_targets_guest_held;
 use crate::syscalls::helpers::publish_wait_mask;
 use crate::syscalls::helpers::record_retry_event;
@@ -1463,6 +1466,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Poll,
         restart: Option<crate::syscalls::helpers::RestartBlock>,
     ) -> Result<i64, Error> {
+        // Linux refuses a count above RLIMIT_NOFILE before it reads the
+        // array (`do_sys_poll`, fs/select.c); the guest's virtual limit
+        // decides, not the host's (`nofile_limit`). A rerun of a woken
+        // poll is checked as Linux's restart rechecks it.
+        if poll_nfds_exceeds_nofile(poll_nfds(call.nfds()), nofile_limit(guest)) {
+            return Err(Errno::EINVAL.into());
+        }
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
@@ -2929,6 +2939,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(timeout) => Some(ppoll_timeout_duration(guest.memory().read_value(timeout)?)?),
             None => None,
         };
+        // Linux refuses a count above RLIMIT_NOFILE in `do_sys_poll`
+        // (fs/select.c), in the wrapper's order: the timeout, then the
+        // mask's size and the mask itself (`set_user_sigmask`), then the
+        // count, before the array is read; the guest's virtual limit
+        // decides, not the host's (`nofile_limit`). The size's `EINVAL`
+        // and a faulting mask copy precede any time written back; the
+        // count's `EINVAL` is after `poll_select_finish`, which writes
+        // the time left back even for it, computed here from virtual
+        // time at the call's entry. The mask is read with the kernel-
+        // access probe the other branches use (`read_kernel_sigset`): a
+        // tracer memory read can succeed where the kernel's copy faults
+        // (a `PROT_NONE` page under ptrace), which would answer this
+        // refusal where Linux faults. The value read is not kept: the
+        // branch the call takes below reads the mask it waits under.
+        if poll_nfds_exceeds_nofile(poll_nfds(call.nfds()), nofile_limit(guest)) {
+            if let Some(mask) = call.sigmask() {
+                if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+                    return Err(Errno::EINVAL.into());
+                }
+                crate::syscalls::signal::restart_if_first_probe_not_run(
+                    read_kernel_sigset(guest, mask).await,
+                )?;
+            }
+            if let (Some(timeout_address), Some(timeout)) = (timeout_address, timeout)
+                && timeout != Duration::ZERO
+            {
+                let started_at = thread_observe_time(guest).await;
+                self.write_ppoll_remaining(guest, timeout_address, timeout, started_at)
+                    .await?;
+            }
+            return Err(Errno::EINVAL.into());
+        }
 
         let result: Result<i64, Error> = if timeout == Some(Duration::ZERO) {
             // In run mode the mask's read below is the call's first injection
@@ -3776,6 +3818,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Poll,
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
+        // A restart names this path without `handle_poll`'s entry, and
+        // Linux's restart rechecks the count against the limit then in
+        // force (`do_restart_poll` re-enters `do_sys_poll`, fs/select.c):
+        // the same virtual-limit refusal (`nofile_limit`).
+        if poll_nfds_exceeds_nofile(poll_nfds(call.nfds()), nofile_limit(guest)) {
+            return Err(Errno::EINVAL.into());
+        }
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("poll");
@@ -3959,6 +4008,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         deadline: KernelPollDeadline,
         restart: Syscall,
     ) -> Result<i64, Error> {
+        // As in `handle_internal_poll_until`: the kernel's restart
+        // rechecks the count against the limit then in force
+        // (`do_restart_poll`), the guest's virtual one here.
+        if poll_nfds_exceeds_nofile(poll_nfds(call.nfds()), nofile_limit(guest)) {
+            return Err(Errno::EINVAL.into());
+        }
         if restart_names_poll(&restart, &call) {
             return self
                 .run_kernel_poll_as(guest, call, Some(deadline), restart)

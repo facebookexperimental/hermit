@@ -1043,6 +1043,360 @@ fn ppoll(memory: &FormMemory, pollfd: usize) -> reverie::syscalls::Ppoll {
         .with_sigsetsize(8)
 }
 
+/// Lower the guest's virtual `RLIMIT_NOFILE` current value to `current`,
+/// as its own `setrlimit` would (`ThreadState::resource_limits`).
+fn set_nofile_limit(guest: &mut TurnGuest, current: u64) {
+    guest.thread.resource_limits.lock().unwrap().set(
+        reverie::syscalls::linux_abi::RLIMIT_NOFILE,
+        crate::tool_local::ResourceLimit {
+            current,
+            maximum: 1_048_576,
+        },
+    );
+}
+
+/// `poll` and `ppoll` with `nfds` above the guest's virtual
+/// `RLIMIT_NOFILE` are `EINVAL` from the virtual limit alone (fs/select.c
+/// `do_sys_poll`: `nfds > rlimit(RLIMIT_NOFILE)`, before the array is
+/// copied in), so no probe is injected and no turn is filed. At the limit
+/// the call still goes to the kernel. The host's real limit is far above
+/// the virtual one here, so a forwarded call at the tip answers from the
+/// scripted probe instead: that is the defect.
+#[tokio::test]
+async fn nofile_poll_and_ppoll_above_the_virtual_limit_are_einval() {
+    const LIMIT: u64 = 16;
+    let memory = FormMemory::new(Some(1_000_000_000), 0);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut guest = turn_guest(false, Some(0));
+        set_nofile_limit(&mut guest, LIMIT);
+        let tool = super::tool(&guest);
+        let call = reverie::syscalls::Poll::new()
+            .with_fds(AddrMut::from_raw(memory.at(FormMemory::SET)))
+            .with_nfds(LIMIT + 1)
+            .with_timeout(0);
+        let result = tool.handle_poll(&mut guest, call, None).await;
+        assert_eq!(errno_result(&result), Err(Errno::EINVAL), "poll above");
+        assert!(
+            guest.injected.is_empty(),
+            "poll above: no probe: {:?}",
+            guest.injected
+        );
+        assert!(
+            guest.requests().is_empty(),
+            "poll above: no turn filed: {:?}",
+            guest.requests()
+        );
+
+        let mut guest = turn_guest(false, Some(0));
+        set_nofile_limit(&mut guest, LIMIT);
+        let call = reverie::syscalls::Poll::new()
+            .with_fds(AddrMut::from_raw(memory.at(FormMemory::SET)))
+            .with_nfds(LIMIT)
+            .with_timeout(0);
+        let result = tool.handle_poll(&mut guest, call, None).await;
+        assert_eq!(errno_result(&result), Ok(0), "poll at the limit");
+        assert_eq!(guest.injected, [Sysno::poll], "poll at: the probe ran");
+    }
+
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    let tool = super::tool(&guest);
+    let call = ppoll(&memory, FormMemory::SET)
+        .with_nfds(LIMIT + 1)
+        .with_sigmask(None);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(errno_result(&result), Err(Errno::EINVAL), "ppoll above");
+    assert!(
+        guest.injected.is_empty(),
+        "ppoll above: no probe: {:?}",
+        guest.injected
+    );
+
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    guest.probe_results.push_back(Ok(1));
+    let call = ppoll(&memory, FormMemory::SET)
+        .with_nfds(LIMIT)
+        .with_sigmask(None);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(
+        errno_result(&result),
+        Ok(1),
+        "ppoll at the limit: the count"
+    );
+    assert!(
+        guest.injected.contains(&Sysno::ppoll),
+        "ppoll at: the probe ran: {:?}",
+        guest.injected
+    );
+
+    // Masked, above the limit, in Linux's order (`ppoll`'s timeout, mask
+    // size, mask copy, then `do_sys_poll`'s count): a readable mask gets
+    // the count's EINVAL with the time left written back, exactly the
+    // timeout less the virtual time between the handler's two clock
+    // observations; a mask the kernel could not copy gets EFAULT first
+    // and no write-back. The harness clock answers each observation one
+    // step past the last, so the elapsed virtual time is the step times
+    // the intervals between the call's first and last clock requests,
+    // however many observations the machinery makes in between.
+    let remaining = |memory: &FormMemory| {
+        LocalMemory::new()
+            .read_value::<_, [i64; 2]>(
+                Addr::<[i64; 2]>::from_raw(memory.at(FormMemory::TIMEOUT)).unwrap(),
+            )
+            .unwrap()
+    };
+    // A fresh timeout buffer: the rows above wrote their remaining time
+    // into the shared one, and this row's timeout must be the full second.
+    let memory = FormMemory::new(Some(1_000_000_000), 0);
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    guest.clock_step = 250_000_000;
+    let entry_clock = *guest.clock.lock().unwrap();
+    let rpcs_before = guest.rpcs().len();
+    let call = ppoll(&memory, FormMemory::SET).with_nfds(LIMIT + 1);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(
+        errno_result(&result),
+        Err(Errno::EINVAL),
+        "masked ppoll above"
+    );
+    assert_eq!(
+        guest.injected,
+        [Sysno::rt_sigprocmask],
+        "masked ppoll above: only the mask copy's kernel-access probe"
+    );
+    let exit_clock = *guest.clock.lock().unwrap();
+    let observations = guest.rpcs()[rpcs_before..]
+        .iter()
+        .filter(|request| matches!(request, GlobalRequest::GlobalTimeLowerBound))
+        .count() as u64;
+    assert!(
+        observations >= 2,
+        "masked ppoll above: entry and write-back observations: {:?}",
+        guest.rpcs()
+    );
+    assert_eq!(
+        exit_clock - entry_clock,
+        observations * guest.clock_step,
+        "masked ppoll above: harness clock answers are consecutive steps"
+    );
+    let elapsed = (observations - 1) * guest.clock_step;
+    let expected = 1_000_000_000_u64 - elapsed;
+    assert_eq!(
+        remaining(&memory),
+        [
+            (expected / 1_000_000_000) as i64,
+            (expected % 1_000_000_000) as i64
+        ],
+        "masked ppoll above: the time left is the timeout less the elapsed virtual time"
+    );
+
+    let memory = FormMemory::new(Some(1_000_000_000), 0);
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    let call = ppoll(&memory, FormMemory::SET)
+        .with_nfds(LIMIT + 1)
+        .with_sigmask(Addr::from_raw(memory.at(FormMemory::unreadable())));
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(
+        errno_result(&result),
+        Err(Errno::EFAULT),
+        "masked ppoll above, unreadable mask"
+    );
+    assert_eq!(
+        guest.injected,
+        [Sysno::rt_sigprocmask],
+        "masked ppoll above, unreadable mask: only the mask copy's probe"
+    );
+    assert_eq!(
+        remaining(&memory),
+        [1, 0],
+        "masked ppoll above, unreadable mask: no write-back"
+    );
+
+    // A mask of a size Linux refuses is EINVAL before the copy, the
+    // count, and any write-back.
+    let memory = FormMemory::new(Some(1_000_000_000), 0);
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    let call = ppoll(&memory, FormMemory::SET)
+        .with_nfds(LIMIT + 1)
+        .with_sigsetsize(4);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(
+        errno_result(&result),
+        Err(Errno::EINVAL),
+        "masked ppoll above, bad sigsetsize"
+    );
+    assert!(
+        guest.injected.is_empty(),
+        "masked ppoll above, bad sigsetsize: no probe: {:?}",
+        guest.injected
+    );
+    assert_eq!(
+        remaining(&memory),
+        [1, 0],
+        "masked ppoll above, bad sigsetsize: no write-back"
+    );
+}
+
+/// The restart routes recheck the count against the virtual limit then
+/// in force, as `do_restart_poll` re-enters `do_sys_poll`: both resume
+/// entries an interrupted poll can take (`handle_internal_poll_until`
+/// for an emulated poll, `resume_kernel_poll` for a kernel one) refuse
+/// an above-limit count with EINVAL before any probe, turn, or recorded
+/// call. The scripted ready probe is what an unguarded resume would
+/// answer with instead.
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn nofile_poll_restart_entries_recheck_the_virtual_limit() {
+    const LIMIT: u64 = 16;
+    let memory = FormMemory::new(None, 0);
+    let call = || {
+        reverie::syscalls::Poll::new()
+            .with_fds(AddrMut::from_raw(memory.at(FormMemory::SET)))
+            .with_nfds(LIMIT + 1)
+            .with_timeout(-1)
+    };
+
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    guest.probe_results.push_back(Ok(1));
+    let tool = super::tool(&guest);
+    let result = tool
+        .handle_internal_poll_until(&mut guest, call(), None)
+        .await;
+    assert_eq!(
+        errno_result(&result),
+        Err(Errno::EINVAL),
+        "internal restart above"
+    );
+    assert!(
+        guest.injected.is_empty() && guest.requests().is_empty(),
+        "internal restart above: no probe, no turn: {:?} {:?}",
+        guest.injected,
+        guest.requests()
+    );
+
+    let mut guest = turn_guest(false, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    guest.probe_results.push_back(Ok(1));
+    let restart = reverie::syscalls::Syscall::from_raw(
+        Sysno::restart_syscall,
+        reverie::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
+    );
+    let result = tool
+        .resume_kernel_poll(
+            &mut guest,
+            call(),
+            crate::syscalls::helpers::KernelPollDeadline(None),
+            restart,
+        )
+        .await;
+    assert_eq!(
+        errno_result(&result),
+        Err(Errno::EINVAL),
+        "kernel restart above"
+    );
+    assert!(
+        guest.injected.is_empty(),
+        "kernel restart above: no probe: {:?}",
+        guest.injected
+    );
+}
+
+/// The same refusal on the in-guest gate's masked `ppoll`
+/// (`gated_masked_ppoll`), after Linux's timeout and mask checks
+/// (fs/select.c `ppoll`, then `do_sys_poll`) and before its first probe:
+/// the gate's probes relied on the host kernel's `nfds` check, which the
+/// host's real limit answers instead of the guest's.
+#[tokio::test]
+async fn nofile_gated_masked_ppoll_above_the_virtual_limit_is_einval() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::nofile_gated_masked_ppoll_above_the_virtual_limit_is_einval",
+    ) {
+        return;
+    }
+    const LIMIT: u64 = 16;
+    let _seam = script(proc_state(0, 0, 0));
+    let memory = FormMemory::new(Some(0), 0);
+    let mut guest = turn_guest(true, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    let tool = super::tool(&guest);
+    let call = ppoll(&memory, FormMemory::SET).with_nfds(LIMIT + 1);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(errno_result(&result), Err(Errno::EINVAL));
+    assert!(
+        !guest.injected.contains(&Sysno::ppoll),
+        "no poll probe: {:?}",
+        guest.injected
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert!(
+        !guest.injected.contains(&Sysno::poll),
+        "no stage-free poll probe either: {:?}",
+        guest.injected
+    );
+
+    // With a nonzero timeout the gated refusal writes the time left
+    // back first, exactly the timeout less the elapsed virtual time
+    // between its first and last clock observations (the ungated row's
+    // arithmetic: consecutive step answers from the RPC log).
+    let memory = FormMemory::new(Some(1_000_000_000), 0);
+    let mut guest = turn_guest(true, Some(0));
+    set_nofile_limit(&mut guest, LIMIT);
+    guest.clock_step = 250_000_000;
+    let entry_clock = *guest.clock.lock().unwrap();
+    let rpcs_before = guest.rpcs().len();
+    let tool = super::tool(&guest);
+    let call = ppoll(&memory, FormMemory::SET).with_nfds(LIMIT + 1);
+    let result = tool.handle_ppoll(&mut guest, call).await;
+    assert_eq!(errno_result(&result), Err(Errno::EINVAL), "gated nonzero");
+    assert!(
+        !guest.injected.contains(&Sysno::ppoll),
+        "gated nonzero: no poll probe: {:?}",
+        guest.injected
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert!(
+        !guest.injected.contains(&Sysno::poll),
+        "gated nonzero: no stage-free poll probe either: {:?}",
+        guest.injected
+    );
+    let exit_clock = *guest.clock.lock().unwrap();
+    let observations = guest.rpcs()[rpcs_before..]
+        .iter()
+        .filter(|request| matches!(request, GlobalRequest::GlobalTimeLowerBound))
+        .count() as u64;
+    assert!(
+        observations >= 2,
+        "gated nonzero: entry and write-back observations: {:?}",
+        guest.rpcs()
+    );
+    assert_eq!(
+        exit_clock - entry_clock,
+        observations * guest.clock_step,
+        "gated nonzero: harness clock answers are consecutive steps"
+    );
+    let expected = 1_000_000_000_u64 - (observations - 1) * guest.clock_step;
+    let left = LocalMemory::new()
+        .read_value::<_, [i64; 2]>(
+            Addr::<[i64; 2]>::from_raw(memory.at(FormMemory::TIMEOUT)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        left,
+        [
+            (expected / 1_000_000_000) as i64,
+            (expected % 1_000_000_000) as i64
+        ],
+        "gated nonzero: the time left is the timeout less the elapsed virtual time"
+    );
+}
+
 /// Each real poll handler refreshes the modeled description after a sibling
 /// replaces the same numeric descriptor during its parked retry. The first
 /// stale queued request is deliberately retained; scheduler freshness must
