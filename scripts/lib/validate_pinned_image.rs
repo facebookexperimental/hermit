@@ -438,6 +438,41 @@ exit 91
     }
 
     #[test]
+    fn missing_podman_is_named_with_the_install_line() {
+        // A host with no podman at all must be told that, with the fix,
+        // never left with timeout's raw "failed to run command" line or a
+        // claim about the image. The PATH below holds only the tools the
+        // wrapper itself needs before the probe, found on the ambient
+        // PATH, and deliberately no podman (fake or real).
+        let f = Fixture::new();
+        let clean_bin = f.dir.path().join("clean-bin");
+        std::fs::create_dir(&clean_bin).unwrap();
+        for tool in ["bash", "cat", "dirname", "timeout"] {
+            let found = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|dir| dir.join(tool))
+                .find(|candidate| candidate.exists())
+                .unwrap_or_else(|| panic!("ambient PATH has no {tool} for the clean bin"));
+            std::os::unix::fs::symlink(&found, clean_bin.join(tool)).unwrap();
+        }
+        let output = f
+            .command()
+            .arg("--check-image")
+            .env("PATH", &clean_bin)
+            .output()
+            .unwrap();
+        let output = observed("no-podman", output);
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            text.contains("podman is required to run the pinned validation image"),
+            "{text}"
+        );
+        assert!(text.contains("apt-get install -y podman"), "{text}");
+        assert!(!text.contains("not present locally"), "{text}");
+        assert!(f.calls().is_empty());
+    }
+
+    #[test]
     fn missing_or_malformed_pin_never_reaches_podman() {
         let f = Fixture::new();
         let pin = f.dir.path().join("ci/hermetic/image.digest");

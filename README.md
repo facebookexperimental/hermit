@@ -34,6 +34,9 @@ Hermit currently supports x86-64 Linux. Building and running it requires:
 - Linux user, PID, and mount namespaces.
 - Parent-child ptrace and seccomp filter support.
 - libunwind and LZMA development packages.
+- Podman, for local validation: it builds and tests inside a pinned
+  container image and refuses by name without it (there is no host
+  fallback).
 - User-space performance counters for precise scheduler preemption. Hermit can
   run without them, but CPU-bound workloads receive fewer preemption points.
 
@@ -44,13 +47,13 @@ On Debian or Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev podman
 ```
 
 On Fedora or CentOS:
 
 ```bash
-sudo dnf install -y libunwind-devel xz-devel
+sudo dnf install -y libunwind-devel xz-devel podman
 ```
 
 Install Rust with rustup, then load Cargo into the current shell:

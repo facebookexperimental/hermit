@@ -34,8 +34,9 @@ supplemental evidence; local validation (below) is what a reviewer looks for.
 
 ## Local Validation Protocol
 
-Every change must be **locally validated before it is pushed**. The single
-entry point is:
+Every change must be **locally validated before it is pushed**. Local
+validation needs Podman for its pinned-root steps and refuses by name
+without it (there is no host fallback). The single entry point is:
 
 ```bash
 ./scripts/validate.rs

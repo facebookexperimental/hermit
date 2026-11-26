@@ -142,6 +142,16 @@ check_pinned_image() {
     # attempts in seconds. The default applies only when it is unset: an empty
     # value is refused, not read as 120.
     local bound=${HERMIT_PINNED_IMAGE_PROBE_BOUND_S-120} status attempt
+    # A missing podman is a missing prerequisite, not an image verdict:
+    # name it (and the fix) instead of letting it surface as timeout's raw
+    # "failed to run command" line under a generic inspection failure.
+    # The status stays 127, the tool-failure status timeout itself
+    # reports for a command it cannot run.
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "run-in-pinned-root: podman is required to run the pinned validation image, but no podman was found on PATH." >&2
+        echo "  Install it (Debian/Ubuntu: sudo apt-get install -y podman; Fedora: sudo dnf install -y podman), make sure 'podman --version' works, then rerun. Validation does not fall back to the host toolchain." >&2
+        return 127
+    fi
     if [[ ! "$bound" =~ ^[1-9][0-9]*$ ]]; then
         echo "run-in-pinned-root: HERMIT_PINNED_IMAGE_PROBE_BOUND_S must be a positive integer number of seconds, got '$bound'." >&2
         echo "  Unset it for the default 120 s probe bound, or set a whole number of seconds such as 30." >&2
