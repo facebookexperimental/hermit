@@ -6,20 +6,71 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! This explicitly checks that many schedules are explored. It only fails
-//! if a specific interleaving occurs via a CAS handoff.
+//! Explicitly checks that schedules are explored over four joined
+//! CAS handoff phases in one execution.
+//!
+//! Each phase is the same three-CAS handoff: the early thread CASes
+//! 1 -> 2, spins, then CASes 3 -> 4; the late thread spins, then
+//! CASes 2 -> 3. A phase reaches the antagonistic final value 4
+//! only when the late thread's CAS lands inside the early thread's
+//! middle spin. One execution fails iff any phase reaches 4, so both
+//! passing and failing executions remain possible across seeds.
+//!
+//! The last phase uses the original test's 60,000 / 20,000 spin
+//! amounts and is reported separately. It is an original-amounts
+//! phase, not the original execution: three phases precede it and it
+//! spawns early-then-late.
 
 use std::ptr::read_volatile;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 
-const WORK_AMT: f64 = 20000.0;
 const FINAL_VALUE: usize = 4;
+/// The middle CAS's expected predecessor. The planted control changes
+/// only this constant (to a value the atomic never holds), leaving
+/// every spin, spawn, join and print in the same order.
+const MIDDLE_FROM: usize = 2;
+
+#[derive(Clone, Copy)]
+struct Phase {
+    late_spin: usize,
+    early_mid_spin: usize,
+    late_first: bool,
+}
+
+/// Deterministic phases retained from the measured 24-round sweep.
+/// In that sweep's numbering these were rounds 8, 11, 16 and 23.
+/// Phase identity includes spawn order, so it is part of the table
+/// rather than a consequence of a phase's position here.
+const PHASES: [Phase; 4] = [
+    Phase {
+        late_spin: 0,
+        early_mid_spin: 10_000,
+        late_first: true,
+    },
+    Phase {
+        late_spin: 15_000,
+        early_mid_spin: 10_000,
+        late_first: false,
+    },
+    Phase {
+        late_spin: 0,
+        early_mid_spin: 20_000,
+        late_first: true,
+    },
+    Phase {
+        late_spin: 60_000,
+        early_mid_spin: 20_000,
+        late_first: false,
+    },
+];
+/// Index of the phase using the original 60,000 / 20,000 amounts.
+const ORIGINAL_AMOUNTS_ROUND: usize = 3;
 
 #[inline(never)]
-fn do_work(iters: f64) {
-    let mut x = iters as usize;
+fn do_work(iters: usize) {
+    let mut x = iters;
     while unsafe { read_volatile(&x as *const _) } > 0usize {
         x -= 1;
     }
@@ -31,35 +82,61 @@ fn take_from(a: &AtomicUsize, from: usize, to: usize) {
 }
 
 #[inline(never)]
-fn thread1(var: Arc<AtomicUsize>) {
-    do_work(WORK_AMT * 3.0);
-    take_from(&var, 2, 3);
+fn late_thread(var: Arc<AtomicUsize>, spin: usize) {
+    do_work(spin);
+    take_from(&var, MIDDLE_FROM, 3);
 }
 
 #[inline(never)]
-fn thread2(var: Arc<AtomicUsize>) {
+fn early_thread(var: Arc<AtomicUsize>, mid_spin: usize) {
     take_from(&var, 1, 2);
-    do_work(WORK_AMT); // <- preemption must occur here, not just starvation
+    do_work(mid_spin); // <- the middle CAS must land in this window
     take_from(&var, 3, FINAL_VALUE);
 }
 
+fn one_round(phase: Phase) -> usize {
+    let value = Arc::new(AtomicUsize::new(1));
+    let late_value = Arc::clone(&value);
+    let early_value = Arc::clone(&value);
+    let (late, early) = if phase.late_first {
+        let late = std::thread::spawn(move || late_thread(late_value, phase.late_spin));
+        let early = std::thread::spawn(move || early_thread(early_value, phase.early_mid_spin));
+        (late, early)
+    } else {
+        let early = std::thread::spawn(move || early_thread(early_value, phase.early_mid_spin));
+        let late = std::thread::spawn(move || late_thread(late_value, phase.late_spin));
+        (late, early)
+    };
+    late.join().unwrap();
+    early.join().unwrap();
+    Arc::try_unwrap(value).unwrap().into_inner()
+}
+
 fn main() {
-    let d = Arc::new(AtomicUsize::new(1));
+    let mut hits = Vec::new();
+    let mut final_counts = [0usize; FINAL_VALUE + 1];
+    let mut original_amounts_final = 0usize;
+    for (round, phase) in PHASES.into_iter().enumerate() {
+        let final_value = one_round(phase);
+        if final_value <= FINAL_VALUE {
+            final_counts[final_value] += 1;
+        }
+        if round == ORIGINAL_AMOUNTS_ROUND {
+            original_amounts_final = final_value;
+        }
+        if final_value == FINAL_VALUE {
+            hits.push(round);
+        }
+    }
 
-    let d1 = Arc::clone(&d);
-    let d2 = Arc::clone(&d);
-
-    const FINAL_VALUE: usize = 4;
-
-    let h1 = std::thread::spawn(move || thread1(d1));
-    let h2 = std::thread::spawn(move || thread2(d2));
-
-    h1.join().unwrap();
-    h2.join().unwrap();
-
-    let val = Arc::try_unwrap(d).unwrap().into_inner();
-    println!("Final value: {}", val);
-    if val == FINAL_VALUE {
+    println!(
+        "Handoff rounds: {}; finals {{2: {}, 3: {}, 4: {}}}; original-amounts round {ORIGINAL_AMOUNTS_ROUND} final: {original_amounts_final}; antagonistic rounds: {hits:?}",
+        PHASES.len(),
+        final_counts[2],
+        final_counts[3],
+        final_counts[4]
+    );
+    if !hits.is_empty() {
         println!("Antagonistic schedule reached, failing.");
         std::process::exit(1);
     }

@@ -3925,6 +3925,12 @@
       "why": "tests/chaos/cas_sequence.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `cas_sequence` is built from `tests/chaos/cas_sequence.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/chaos/cas_sequence_sweep_control.rs",
+      "runner": "Meta Buck test targets",
+      "why": "tests/chaos/cas_sequence_sweep_control.rs is owned by Meta Buck test targets: Planted no-race control counterpart to cas_sequence.rs, built only by the internal Buck target chaos_cas_sequence_sweep_control_bin. It is paired validation evidence for hermit_chaos_fail_cas_sequence rather than a standalone test: its middle CAS cannot succeed, so a correct execution must find no antagonistic round, while a generic manifest run without that revised-guest comparison would omit its negative-control contract."
+    },
+    {
       "disposition": "cargo-binary",
       "path": "tests/chaos/hello_chaos.rs",
       "runner": "tests/Cargo.toml and Hermit integration targets",

@@ -546,6 +546,20 @@ hermit_chaos_stress_test(
     preempt_interval = 120000,
 )
 
+# Planted no-race control for cas_sequence: byte-identical to the
+# guest above except its middle CAS expects a predecessor the atomic
+# never holds, so no handoff round can reach the antagonistic value.
+# Not a chaos target — it exists so validation can build it in each
+# pairing and show the revised guest's hits require the handoff.
+rust_binary(
+    name = "chaos_cas_sequence_sweep_control_bin",
+    srcs = ["chaos/cas_sequence_sweep_control.rs"],
+    allocator = "malloc",
+    crate_root = "chaos/cas_sequence_sweep_control.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+)
+
 rust_binary(
     name = "chaos_keyvalue_bin",
     srcs = ["chaos/keyvalue.rs"],
