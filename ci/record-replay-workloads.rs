@@ -1068,6 +1068,59 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             path
         }
+        /// A stand-in C compiler, for tests of how a population is shared,
+        /// rebuilt and pruned rather than of compiling, as `executable`
+        /// stands in for the Cargo-built guests. It answers exactly
+        /// `--version`, which the population key reads, with a fixed line,
+        /// and for exactly `C_FLAGS... SOURCE -o OUTPUT` it installs SOURCE as
+        /// an executable OUTPUT, so each workload costs one small process
+        /// instead of a compiler pipeline. Any other invocation fails and
+        /// names all of its arguments.
+        ///
+        /// The test executes this file, so this process never holds it open
+        /// for writing: a sibling test's spawn would inherit that descriptor
+        /// and the exec would fail with ETXTBSY (see
+        /// ci/manifest-plan/src/exec_safe_fs.rs, which the other test target
+        /// that includes this module does not have). The script is written
+        /// under a staging name, and an `install` child creates the
+        /// executable.
+        fn compiler(&self) -> PathBuf {
+            let flags = C_FLAGS
+                .iter()
+                .enumerate()
+                .map(|(index, flag)| format!("[ \"${{{}}}\" = '{flag}' ]", index + 1))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ $# -eq 1 ] && [ \"$1\" = --version ]; then echo 'stand-in cc 1'; exit 0; fi\n\
+                 if [ $# -eq {total} ] && {flags} && [ \"${{{minus_o}}}\" = -o ]; then\n\
+                 exec install -m 755 -- \"${{{source}}}\" \"${{{output}}}\"\n\
+                 fi\n\
+                 echo \"stand-in cc: expected --version or {expected} SOURCE -o OUTPUT, got: $*\" >&2\n\
+                 exit 2\n",
+                total = C_FLAGS.len() + 3,
+                source = C_FLAGS.len() + 1,
+                minus_o = C_FLAGS.len() + 2,
+                output = C_FLAGS.len() + 3,
+                expected = C_FLAGS.join(" "),
+            );
+            let path = self.0.join("stand-in-cc");
+            let staging = self.0.join("stand-in-cc.staging");
+            fs::write(&staging, script).unwrap();
+            let status = Command::new("install")
+                .args(["-m", "755", "-T", "--"])
+                .arg(&staging)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "install of the stand-in compiler: {status}"
+            );
+            fs::remove_file(&staging).unwrap();
+            path
+        }
         fn paths(&self) -> BTreeMap<String, PathBuf> {
             names()
                 .map(|name| (name.into(), self.executable(name)))
@@ -1567,6 +1620,27 @@ mod tests {
         names
     }
 
+    /// How many threads of this process wait in flock(2) for the lock file
+    /// `path`: the "->" lines of /proc/locks with this process's pid and the
+    /// file's inode. The device field is not compared: on btrfs /proc/locks
+    /// names the filesystem's device while stat(2) names the subvolume's, as
+    /// `flock_waiter_on` in ci/manifest-plan/src/nextest_binaries.rs records.
+    fn flock_waiters_on(path: &Path) -> usize {
+        let inode = format!(":{}", fs::metadata(path).unwrap().ino());
+        let pid = std::process::id().to_string();
+        fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(1) == Some(&"->")
+                    && fields.get(2) == Some(&"FLOCK")
+                    && fields.get(5) == Some(&pid.as_str())
+                    && fields.get(6).is_some_and(|file| file.ends_with(&inode))
+            })
+            .count()
+    }
+
     fn age(path: &Path, by: Duration) {
         let then = std::time::SystemTime::now() - by;
         for path in [path.to_owned(), path.join(ENVELOPE)] {
@@ -1580,6 +1654,13 @@ mod tests {
     /// test processes have, leave one population, built once; a source change
     /// makes a second; populations and legacy generations unused for
     /// `PRUNE_AFTER` are pruned (<https://github.com/rrnewton/hermit/issues/3946>).
+    /// Every build makes the whole population with the stand-in compiler
+    /// (`Fixture::compiler`), which installs each source as its executable.
+    /// The test holds the lock until both preparations wait for it, so they
+    /// always contend, however short a build is. The real compiler's failure
+    /// path is covered by
+    /// `real_c_compiler_failure_preserves_diagnostics_and_does_not_accept_stale_output`,
+    /// and a successful compile of all 50 real sources by every producer run.
     #[test]
     fn standalone_population_is_shared_across_processes_and_pruned() {
         let fixture = Fixture::new();
@@ -1599,7 +1680,9 @@ mod tests {
         fs::create_dir(&legacy_old).unwrap();
         fs::create_dir(&legacy_new).unwrap();
         age(&legacy_old, PRUNE_AFTER * 2);
-        let compiler = c_compiler().unwrap();
+        // The stand-in makes every C workload of the population at a small
+        // fraction of the real compiler's kernel and CPU cost.
+        let compiler = fixture.compiler();
         let inode = |path: &Path| fs::metadata(path).unwrap().ino();
         // Each workload's path and the inode it had when its preparation
         // returned: a rebuild replaces the files.
@@ -1614,9 +1697,28 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        // Hold the preparation lock while both preparations start, and
+        // release it only once /proc/locks shows both of them waiting for it.
+        let lock_path = build_root.join("lock");
         let both = std::thread::scope(|scope| {
+            let held = fs::File::create(&lock_path).unwrap();
+            held.lock().unwrap();
             let first = scope.spawn(prepare);
             let second = scope.spawn(prepare);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while flock_waiters_on(&lock_path) < 2 {
+                assert!(
+                    !first.is_finished() && !second.is_finished(),
+                    "a preparation finished while the test held the lock"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the two preparations did not both wait for the lock within 60 s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Closing the descriptor releases the lock.
+            drop(held);
             [first.join().unwrap(), second.join().unwrap()]
         });
         let populations = directories(&build_root)
