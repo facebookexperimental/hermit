@@ -941,6 +941,11 @@ fn cores_stay_within_the_per_core_and_total_caps() {
         ),
         // The file-backed private mappings but not the anonymous ones: a full
         // core holds the child's libc, loader and binary, never its buffer.
+        // This stays a bound, not the full core's size: those bytes depend on
+        // the host's libc, loader and binary, and with no anonymous memory
+        // stored a core carries no mark of its tier, while a full core that
+        // runs out of time rightly falls to the stack tier. What this filter
+        // rules out is any child's buffer.
         (false, true) => assert!(
             stored.iter().all(|&bytes| bytes < 8 * MIB),
             "coredump_filter {filter:#x} selects no anonymous private memory, yet a \
@@ -1002,6 +1007,21 @@ fn a_cores_libc_code_follows_the_file_backed_filter_bit() {
         stderr(&output)
     );
     let core = decode_core(&cores.join(&kept[0].0));
+    if filter & COREDUMP_FILE_BACKED_PRIVATE != 0 && filter & COREDUMP_ANONYMOUS_PRIVATE != 0 {
+        // Only a full core stores libc's code whole, and with bit 0 only a
+        // full core holds the guest's heap (the stack tier keeps stacks): the
+        // tier is checked first, so a capture that fell back to a smaller
+        // tier, as a full core that runs out of time does, fails by name
+        // rather than as a libc size mismatch. With bit 0 clear no stored
+        // anonymous memory marks the tier.
+        assert!(
+            core.windows(MARKER.len()).any(|window| window == MARKER),
+            "coredump_filter {filter:#x}: the core does not hold the guest's heap, so it \
+             is not a full core (the capture fell back to a smaller tier) and cannot \
+             show libc's code:\n{}",
+            stderr(&output)
+        );
+    }
     let notes = notes(&core);
     let libc_code = code_ranges(b"libc.so.6", &core, &notes);
     assert!(!libc_code.is_empty(), "the core maps no libc code");
