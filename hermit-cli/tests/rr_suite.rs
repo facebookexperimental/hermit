@@ -196,6 +196,44 @@ fn rr_scratch_directories_are_fresh_and_cleaned() {
     assert!(!second_path.exists());
 }
 
+/// Keeps the host's core dumps out of a test's guests: the child sets its real
+/// RLIMIT_CORE to 1 (or a lower hard limit) before exec, and timeout, Hermit
+/// and every guest inherit it. A guest that dies by a core-dumping signal
+/// (an rr test's failed test_assert aborts) otherwise waits, before its exit
+/// stop, for the kernel to dump it to the host's core_pattern; where that is a
+/// pipe to a helper (devbig hosts: /usr/local/bin/coredumper) the wait is the
+/// helper's, outside the test's control, and Hermit waits on the guest. A limit
+/// of 1, not 0, because a core_pattern pipe ignores every other limit
+/// (fs/coredump.c do_coredump: 1 aborts the dump). Guests do not see it:
+/// Detcore keeps RLIMIT_CORE as virtual state (detcore/src/syscalls/sysinfo.rs).
+/// Hermit's --fatal-core-dir is the capture path for a test that wants a core.
+fn no_host_core_dumps(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: getrlimit and setrlimit on a stack value allocate nothing and are
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_CORE, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let one = limit.rlim_max.min(1);
+            let limit = libc::rlimit {
+                rlim_cur: one,
+                rlim_max: one,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
 fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker: Option<&str>) {
     let binary = compile_test(basename);
@@ -211,6 +249,7 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
         let scratch = fresh_scratch_dir(basename);
         // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
         let mut command = Command::new("timeout");
+        no_host_core_dumps(&mut command);
         command
             .current_dir(scratch.path())
             .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
