@@ -106,6 +106,8 @@ use crate::timeouts::FLIP_2026_10_30_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::KVM_2026_11_08_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::KVM_2026_11_26_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
@@ -19823,6 +19825,7 @@ fi
             .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
             .chain(&FLIP_2026_10_30_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_2026_11_08_TIMEOUT_CALIBRATIONS)
+            .chain(&KVM_2026_11_26_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),

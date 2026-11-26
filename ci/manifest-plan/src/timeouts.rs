@@ -437,6 +437,33 @@ pub const KVM_2026_11_08_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [Timeou
     configured_wall_seconds: 328,
 }];
 
+/// The KVM verify cell of node-v8-jit, re-based from the look-back over 83
+/// validate-profile post-land validations (2026-11-22 to 2026-11-26): 38
+/// final PASS rows, max 21.622 CPU s, earliest-10 PASS median 19.204 and
+/// latest-10 median 17.235 (flat, ratio 0.897), while identical hermit
+/// bytes span 10.636..20.584 CPU s under load and 7 runs were killed at
+/// the default 22. The p90 fields are the nearest-rank p90 over those 38
+/// final PASS rows' `cpu_usage_usec` and `duration_ms` in each run's
+/// `e2e/portable/manifest_language_runtimes/results.jsonl` under
+/// `ignored/validate/artifacts/` on the validation host; the look-back record
+/// (table.md/data.json, cited in the commit) carries those exact fields
+/// per row, so both p90s recompute from it alone. The configured CPU
+/// bound is ceil(1.5 x 21.622) = 33, the 1.5x measured-max rule; the
+/// configured wall is 8 x 33 = 264, which covers the p90 wall formula's
+/// 90 s.
+pub const KVM_2026_11_26_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "language-runtimes/node-v8-jit",
+    mode: "verify",
+    backend: "kvm",
+    samples: 38,
+    p90_cpu_usec: 20_889_544,
+    p90_wall_millis: 22_430,
+    required_cpu_seconds: 32,
+    required_wall_seconds: 90,
+    configured_cpu_seconds: 33,
+    configured_wall_seconds: 264,
+}];
+
 /// The DBT verify cell of the Python random example, from its 249 passing
 /// result rows in coordinator-launched full validations of 2026-10-11 to
 /// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the
@@ -2290,6 +2317,7 @@ mod tests {
         assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
+            .chain(&KVM_2026_11_26_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS)

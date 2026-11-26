@@ -30794,7 +30794,7 @@
       "backend": "kvm",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -30808,7 +30808,7 @@
         "kvm"
       ],
       "test": "language-runtimes/node-v8-jit",
-      "timeout_seconds": 180
+      "timeout_seconds": 264
     },
     {
       "backend": "kvm",
