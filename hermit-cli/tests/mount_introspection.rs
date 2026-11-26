@@ -528,13 +528,21 @@ fn sudo_fixture_runs_no_sudo_command_without_the_opt_in() {
     let this_binary = std::env::current_exe().expect("failed to locate this test binary");
     // Run the fixture with HERMIT_TEST_ALLOW_SUDO as `opt_in` (removed when
     // None); answer its output, the stand-in's call log and its skip sidecar.
+    // The fixture is #[ignore]d as host-limited, so the child passes
+    // --ignored or libtest filters it out and records nothing.
     let run_leg = |leg: &str, opt_in: Option<&str>| {
         let log = root.join(format!("{leg}.sudo-calls"));
         let sidecar = root.join(format!("{leg}.skips"));
         fs::write(&sidecar, "").expect("failed to create the skip sidecar");
         let mut child = Command::new(&this_binary);
         child
-            .args(["--exact", fixture, "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                fixture,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env("PATH", &bin)
             .env("SUDO_STAND_IN_LOG", &log)
             .env("HERMIT_TEST_SKIP_FILE", &sidecar)
