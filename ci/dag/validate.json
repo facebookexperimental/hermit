@@ -27371,6 +27371,57 @@
     },
     {
       "group": "privileged-test",
+      "job": "autofs_cases",
+      "desc": "Run the two host-limited autofs mount-introspection cases",
+      "description": "autofs_missing_name_is_enoent_under_hermit needs an autofs mount outside /proc and /sys whose missing names answer ENOENT natively, to use as the native oracle beside the same lookup under Hermit; autofs_privileged_fixture_measures_triggers_and_eloop_notice needs the sudo synthetic-autofs fixture (HERMIT_TEST_ALLOW_SUDO=1 plus passwordless sudo). The pinned-root validate environment exposes neither condition (its mount namespace carries no host autofs root, and validate never forwards the sudo opt-in), so both cases are #[ignore]d as host-limited; as ignored identities they are outside the executed hermit_integration shard populations, and this node is their only automatic validation destination. It carries only the privileged label, like the privileged-only KVM nodes: the privileged lane is the lane for kernel-capability cases. No scheduled host runs this node yet: its execution waits for a privileged host whose execution environment carries both conditions (tracked as P1 dh-b1go3k); no execution is claimed meanwhile. The command first proves both conditions in the environment that runs the tests (an autofs root in /proc/self/mountinfo outside /proc and /sys whose missing leaf stats ENOENT, and `sudo -n true`) and refuses loudly, naming the missing condition, when either is absent, rather than reporting a green that measured nothing or a runtime skip. It then runs exactly the two ignored identities with an exact-name filterset and `-- --ignored`, with HERMIT_TEST_ALLOW_SUDO=1 and both HERMIT_REQUIRE_* variables set by the node, so the counted population is 2 executed and 0 skipped and any later miss fails by name instead of recording a skip. It runs the shared mount_introspection binary privileged-only-build.privileged_tests verifies and, like privileged-test.binder_cli_cases, holds no integration_test_binaries token: nothing relinks that binary while it runs.",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_CENSUS_BASE_COMMIT --env HERMIT_CENSUS_BASE_DIR --env HERMIT_CENSUS_BASE_LISTED_IDS --env HERMIT_CENSUS_DROPPED_FILE --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_E2E_FAIL_FAST --env HERMIT_EPOCH --env HERMIT_NEXTEST_FAIL_FAST --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_NEXTEST_RESULTS_SCHEMA --env HERMIT_NEXTEST_SELECTED_CASES --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK2 --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_BUILD_MODE --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; autofs_root=; for root in $(awk -F'\\'' - '\\'' '\\''$2 ~ /^autofs / {print $1}'\\'' /proc/self/mountinfo | awk '\\''{print $5}'\\''); do case \"$root\" in /proc|/proc/*|/sys|/sys/*) continue;; esac; if err=$(stat \"$root/hermit-autofs-missing-name-that-cannot-exist\" 2>&1 >/dev/null); then continue; fi; case \"$err\" in *\"No such file or directory\"*) autofs_root=$root; break;; esac; done; if [ -z \"$autofs_root\" ] || ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then printf '\\''privileged-test.autofs_cases: this execution environment has no autofs mount outside /proc and /sys whose missing names answer ENOENT natively, and/or no passwordless sudo for the synthetic-autofs fixture, so the two selected autofs cases would not run. Refusing rather than recording a runtime skip or a green that measured nothing; run this node on an autofs-capable privileged host (dh-b1go3k; docs/TESTING_ENVIRONMENTS.md).\\n'\\'' >&2; exit 1; fi; HERMIT_TEST_ALLOW_SUDO=1 HERMIT_REQUIRE_AUTOFS=1 HERMIT_REQUIRE_AUTOFS_FIXTURE=1 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test mount_introspection -j 1 -E '\\''test(=autofs_missing_name_is_enoent_under_hermit) | test(=autofs_privileged_fixture_measures_triggers_and_eloop_notice)'\\'' -- --ignored'",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 5,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-test.autofs_cases"
+        }
+      ],
+      "integration_test_binaries": [
+        "mount_introspection"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"mount_introspection\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 60.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-test.autofs_cases"
+    },
+    {
+      "group": "privileged-test",
       "job": "binder_cli_cases",
       "desc": "Run the six host-limited Binder CLI cases on a Binderfs-capable host",
       "description": "a_descriptor_received_in_a_binder_transaction_is_usable, a_blocking_binder_read_does_not_hold_the_guests_turn (PR 4742), a_fresh_strict_run_refuses_binder, a_strict_replay_refuses_binder, a_strict_run_started_with_a_binder_descriptor_is_refused and a_strict_run_refuses_a_binder_device_a_thread_opens_in_a_table_of_its_own (PR 4761: the first two are the renamed forms of the two strict cases that executed on main before it, so this node is also their validation destination) need a binder filesystem (CONFIG_ANDROID_BINDERFS) that an unprivileged user and mount namespace may mount, plus a C compiler for their guest. The full-profile hosts' kernels do not carry that filesystem (docs/TESTING_ENVIRONMENTS.md, the binder CLI tests row), so the six cases are #[ignore]d as host-limited; as ignored identities they are outside the executed test.cli/test.cli_on_host populations, and this node is their only automatic validation destination. It carries only the privileged label, like the privileged-only KVM nodes: the privileged lane is the lane for kernel-capability cases. No scheduled host runs this node yet: every current validate host's kernel lacks the filesystem, so the node is wired and counted here and its execution waits for a Binderfs-capable privileged host (tracked as P1 dh-ggdbj); the first execution was one run of the original two tests inside a QEMU Binderfs guest on the measurement host recorded for this node in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\", at that head. The command first proves the capability (binder in /proc/filesystems and a trial mount inside an unshared user/mount namespace) and refuses loudly, naming the missing filesystem, when it is absent, rather than reporting a green that measured nothing; the cli_kvm node refuses the same way without /dev/kvm. It then runs exactly the six ignored identities with an exact-name filterset and `-- --ignored`, so the counted population is 6 executed and 0 skipped, enforced by the count pin above. The tests themselves also fail, naming the missing filesystem, when explicitly selected on an incapable host (binder_guest_output_on_a_capable_host), so no route counts a vacuous pass. It runs the shared cli binary privileged-only-build.privileged_tests verifies and, like privileged-test.pmu_cli_cases, holds no integration_test_binaries.cli token: nothing relinks that binary while it runs. No execution is claimed on a host without Binderfs, and no scheduled host runs this node yet.",

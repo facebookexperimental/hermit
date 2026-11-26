@@ -649,6 +649,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "liteinst_stacks",
         ]),
+        "privileged-test.autofs_cases" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst",
+            "--test",
+            "mount_introspection",
+        ]),
         "test.cli"
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"

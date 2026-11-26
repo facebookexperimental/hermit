@@ -708,6 +708,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.autofs_cases",
     "privileged-test.binder_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
@@ -915,9 +916,12 @@ const PROFILES: [Profile; 11] = [
         // read only its pinned-root twin's guests, and hosted-privileged
         // keeps its own privileged-build.manifest_guests_on_host
         // (dh-63c2n3): 12/20 before.
+        // 12/20 since privileged-test.autofs_cases joined the privileged
+        // lane for the two host-limited autofs cases (dh-b1go3k): 11/19
+        // before.
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 20,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -4507,9 +4511,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // consumer (dh-10l17).
     // 156 with test.hermit_exec_stop_launcher, the exec-stop-launcher
     // cohort's counted consumer.
-    if expected.len() != 156 {
+    // 157 with privileged-test.autofs_cases, the autofs-capable
+    // privileged node for the two host-limited autofs cases (dh-b1go3k).
+    if expected.len() != 157 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 156",
+            "structured result producer registry has {} entries, expected 157",
             expected.len()
         ));
     }
@@ -6957,10 +6963,15 @@ mod tests {
         "test.hermit_exec_stop_launcher",
     ];
 
+    /// The pinned-root step the privileged autofs cases add: their counted
+    /// node proves its host conditions, then runs inside the pinned root.
+    const PINNED_AUTOFS_TAGS: [&str; 1] = ["privileged-test.autofs_cases"];
+
     fn expected_pinned_len(pinned: &[&Step]) -> usize {
         for tag in PINNED_NATIVE_EXEC_TAGS
             .iter()
             .chain(&PINNED_EXEC_STOP_LAUNCHER_TAGS)
+            .chain(&PINNED_AUTOFS_TAGS)
         {
             assert!(
                 pinned.iter().any(|step| step.tag() == *tag),
@@ -6969,7 +6980,9 @@ mod tests {
         }
         // Main's pinned-root inventory was 87 through the 5286 census
         // landing; the named cohort steps above are the only delta.
-        87 + PINNED_NATIVE_EXEC_TAGS.len() + PINNED_EXEC_STOP_LAUNCHER_TAGS.len()
+        87 + PINNED_NATIVE_EXEC_TAGS.len()
+            + PINNED_EXEC_STOP_LAUNCHER_TAGS.len()
+            + PINNED_AUTOFS_TAGS.len()
     }
 
     /// The `pre` nodes that no manifest gate waits for, directly or through

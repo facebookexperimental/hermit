@@ -38658,7 +38658,9 @@ printf finalized >target/finalized
                 .unwrap();
         // 4 since privileged-test.binder_cli_cases (PR 4742) added the
         // plain liteinst cli selection to the privileged lane: 3 before.
-        assert_eq!(privileged_selections.len(), 4);
+        // 5 since privileged-test.autofs_cases added the liteinst
+        // mount_introspection selection (dh-b1go3k): 4 before.
+        assert_eq!(privileged_selections.len(), 5);
         assert!(
             privileged_selections
                 .values()

@@ -313,6 +313,7 @@ fn host_autofs_root(missing_leaf: &str) -> Option<PathBuf> {
 /// autofs mounts unbindable, Linux 6.19's `autofs_d_automount` refused
 /// the lookup from Hermit's recursively private container with EPERM.
 #[test]
+#[ignore = "host-limited: needs an autofs root outside /proc and /sys whose missing names answer ENOENT; run with --run-ignored only in privileged-test.autofs_cases (docs/TESTING_ENVIRONMENTS.md)"]
 fn autofs_missing_name_is_enoent_under_hermit() {
     let leaf = format!("hermit-nonexistent-{}-7f3a", std::process::id());
     let Some(root) = host_autofs_root(&leaf) else {
@@ -367,6 +368,7 @@ fn autofs_missing_name_is_enoent_under_hermit() {
 /// it), and runs only where `HERMIT_TEST_ALLOW_SUDO=1` opts in to that;
 /// everywhere else it runs no sudo command and records a named skip.
 #[test]
+#[ignore = "host-limited: needs the sudo synthetic-autofs fixture (HERMIT_TEST_ALLOW_SUDO=1 and passwordless sudo); run with --run-ignored only in privileged-test.autofs_cases (docs/TESTING_ENVIRONMENTS.md)"]
 fn autofs_privileged_fixture_measures_triggers_and_eloop_notice() {
     let test = "autofs_privileged_fixture_measures_triggers_and_eloop_notice";
     if !sudo_fixture_opted_in(test, "HERMIT_REQUIRE_AUTOFS_FIXTURE") {
