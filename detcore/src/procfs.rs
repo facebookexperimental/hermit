@@ -3614,13 +3614,19 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
-            ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
+            ProcfsKind::NetlinkSockets => checked_or_refusal(
+                sanitize_netlink_sockets_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::Locks => {
                 sanitize_locks(&locks::keep_lock_rows(&contents, lock_rows_kept.as_deref()))
             }
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
-            ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
+            ProcfsKind::UnixSockets => checked_or_refusal(
+                sanitize_unix_sockets_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::InetSockets => sanitize_inet_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
@@ -4744,7 +4750,9 @@ fn is_hwmon_input_file(path: &str) -> bool {
 /// `--allow-unsupported-syscalls`): the file was already opened
 /// through the kernel, and the alternatives are republishing host
 /// bytes or fabricating a partial file.
-static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 6] = [
+static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -4769,7 +4777,9 @@ fn record_status_unknown_dropped(count: usize) {
 }
 
 /// The formats [`sanitize_refusal_counts`] reports, in counter order.
-const SANITIZE_FORMATS: [&str; 6] = ["stat", "status", "statm", "io", "sched", "fdinfo"];
+const SANITIZE_FORMATS: [&str; 8] = [
+    "stat", "status", "statm", "io", "sched", "fdinfo", "netlink", "unix",
+];
 
 fn sanitize_refusal_index(format: &str) -> usize {
     match format {
@@ -4779,6 +4789,8 @@ fn sanitize_refusal_index(format: &str) -> usize {
         "io" => 3,
         "sched" => 4,
         "fdinfo" => 5,
+        "netlink" => 6,
+        "unix" => 7,
         _ => {
             debug_assert!(false, "unknown sanitize format {format}");
             0
@@ -5906,89 +5918,156 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+/// The header every `/proc/net/unix` table is served under: the v7.1.3
+/// kernel's (`unix_seq_show`, net/unix/af_unix.c), whose header 7.4-rc3 keeps.
+const UNIX_SOCKETS_HEADER: &str = "Num       RefCount Protocol Flags    Type St Inode Path";
+
+#[cfg(test)]
+fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+    match sanitize_unix_sockets_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
-fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+/// Zero the host identities in `/proc/net/unix`, or refuse the table by name.
+///
+/// Every row is accepted exactly as `unix_seq_show` prints it, in either
+/// kernel layout, or the whole table is refused (counted, named, no bytes
+/// served): host bytes of an unknown shape never reach the guest.
+///
+/// - `Num` is the socket's address printed `%pK:` (v7.1.3: 16 lower-hex
+///   digits), or the constant 0 printed `%08u:` (7.4-rc3: exactly `00000000:`).
+///   Either way it is served as 16 zero digits, so the guest's table is the
+///   same on both kernels.
+/// - `RefCount`, `Protocol` and `Flags` are `%08X`, `Type` is `%04X` and `St`
+///   is `%02X`: upper-case hex, served as printed.
+/// - `Inode` is `%5llu`, a host-global counter, served as 0.
+/// - A bound socket's path follows `Inode` after exactly one space and is
+///   every byte after it, raw (every byte but NUL is printed as it is),
+///   served as printed. It is never empty (an abstract name prints at least
+///   `@`), so an empty path, like any other separator, is refused. A newline
+///   in a path
+///   splits its row: the rest is refused unless it is itself a valid row,
+///   which no reader of the kernel's format can tell apart from one, and
+///   whose identities are then zeroed like any row's.
+///
+/// The header is accepted by its words and served as [`UNIX_SOCKETS_HEADER`];
+/// rows are single-spaced and sorted.
+fn sanitize_unix_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
     const HEADER: [&str; 8] = [
         "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
     ];
+    /// `Num` as 7.4-rc3 prints it: the constant 0, `%08u:`.
+    const V7_4_RC3_NUM: &str = "00000000:";
     const ZERO_NUM: &str = "0000000000000000:";
+    /// The upper-case hex fields after `Num`: index, name and width.
+    const HEX_FIELDS: [(usize, &str, usize); 5] = [
+        (1, "RefCount", 8),
+        (2, "Protocol", 8),
+        (3, "Flags", 8),
+        (4, "Type", 4),
+        (5, "St", 2),
+    ];
+    let refuse = |reason: String| counted_refusal_reason("unix", reason);
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+    let Some(body) = contents.strip_suffix(b"\n") else {
+        return Err(refuse("no trailing newline".to_owned()));
     };
-    let Some(body) = text.strip_suffix('\n') else {
-        return contents.to_vec();
-    };
-    let mut lines = body.split('\n');
-    let Some(header) = lines.next() else {
-        return contents.to_vec();
-    };
-    if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
+    let mut lines = body.split(|byte| *byte == b'\n');
+    // `split` yields at least one item, so a header line is always present.
+    let header = lines.next().unwrap_or_default();
+    if !std::str::from_utf8(header).is_ok_and(|header| header.split_whitespace().eq(HEADER)) {
+        return Err(refuse("header".to_owned()));
     }
 
     let mut rows = Vec::new();
-    for line in lines {
-        let Some((mut fields, path)) = unix_socket_fields(line) else {
-            return contents.to_vec();
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
+        let Some((mut fields, rest)) = unix_socket_fields(line) else {
+            return Err(refuse(format!("line {number}: seven text fields")));
         };
-        let Some(num) = fields[0].strip_suffix(':') else {
-            return contents.to_vec();
-        };
-        if !is_fixed_lower_hex(num, 16)
-            || !is_fixed_lower_hex(fields[1], 8)
-            || !is_fixed_lower_hex(fields[2], 8)
-            || !is_fixed_lower_hex(fields[3], 8)
-            || !is_fixed_lower_hex(fields[4], 4)
-            || !is_fixed_lower_hex(fields[5], 2)
-            || !is_decimal(fields[6])
-        {
-            return contents.to_vec();
+        let num_known = fields[0] == V7_4_RC3_NUM
+            || fields[0]
+                .strip_suffix(':')
+                .is_some_and(|num| is_fixed_lower_hex(num, 16));
+        if !num_known {
+            return Err(refuse(format!("line {number}: Num")));
         }
+        for (field, name, width) in HEX_FIELDS {
+            if !is_fixed_upper_hex(fields[field], width) {
+                return Err(refuse(format!("line {number}: {name}")));
+            }
+        }
+        if !is_decimal(fields[6]) {
+            return Err(refuse(format!("line {number}: Inode")));
+        }
+        // An unbound socket's row ends at `Inode`; a bound socket's path
+        // follows it after exactly one space (`seq_putc(seq, ' ')`) and is
+        // never empty (an abstract name prints at least `@`).
+        let path = match rest {
+            [] => None,
+            [b' '] => return Err(refuse(format!("line {number}: empty path"))),
+            [b' ', path @ ..] => Some(path),
+            _ => return Err(refuse(format!("line {number}: path separator"))),
+        };
 
         fields[0] = ZERO_NUM;
         fields[6] = "0";
-        let mut row = fields.join(" ");
-        if !path.is_empty() {
-            row.push(' ');
-            row.push_str(path);
+        let mut row = fields.join(" ").into_bytes();
+        if let Some(path) = path {
+            row.push(b' ');
+            row.extend_from_slice(path);
         }
         rows.push(row);
     }
     rows.sort_unstable();
 
-    let mut normalized = String::with_capacity(text.len());
-    normalized.push_str(header);
-    normalized.push('\n');
+    let mut normalized = Vec::with_capacity(contents.len());
+    normalized.extend_from_slice(UNIX_SOCKETS_HEADER.as_bytes());
+    normalized.push(b'\n');
     for row in rows {
-        normalized.push_str(&row);
-        normalized.push('\n');
+        normalized.extend_from_slice(&row);
+        normalized.push(b'\n');
     }
-    normalized.into_bytes()
+    Ok(normalized)
 }
 
-fn unix_socket_fields(line: &str) -> Option<(Vec<&str>, &str)> {
+/// The seven fixed fields of a `/proc/net/unix` row, which must be text, and
+/// the rest of the row after them, untrimmed: empty for an unbound socket,
+/// else the separator and the path, raw bytes.
+fn unix_socket_fields(line: &[u8]) -> Option<(Vec<&str>, &[u8])> {
     const FIELD_COUNT: usize = 7;
 
     let mut fields = Vec::with_capacity(FIELD_COUNT);
     let mut remainder = line;
     while fields.len() < FIELD_COUNT {
-        remainder = remainder.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        remainder = trim_ascii_whitespace_start(remainder);
         if remainder.is_empty() {
             return None;
         }
         let end = remainder
-            .find(|character: char| character.is_ascii_whitespace())
+            .iter()
+            .position(u8::is_ascii_whitespace)
             .unwrap_or(remainder.len());
-        fields.push(&remainder[..end]);
+        fields.push(std::str::from_utf8(&remainder[..end]).ok()?);
         remainder = &remainder[end..];
     }
 
-    Some((
-        fields,
-        remainder.trim_start_matches(|character: char| character.is_ascii_whitespace()),
-    ))
+    Some((fields, remainder))
+}
+
+fn trim_ascii_whitespace_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
 }
 
 fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
@@ -5998,61 +6077,112 @@ fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// `%X` digits: exactly `width` of `0-9` and `A-F`.
+fn is_fixed_upper_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
 fn is_decimal(field: &str) -> bool {
     !field.is_empty()
         && field.bytes().all(|byte| byte.is_ascii_digit())
         && field.parse::<u64>().is_ok()
 }
 
+/// The header every `/proc/net/netlink` table is served under: the v7.1.3
+/// kernel's (`netlink_native_seq_show`, net/netlink/af_netlink.c). 7.4-rc3
+/// prints a narrower `sk` column, which no longer carries an address.
+const NETLINK_SOCKETS_HEADER: &str =
+    "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode";
+
+#[cfg(test)]
+fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+    match sanitize_netlink_sockets_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-961): Review proc netlink identity normalization.
-fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+/// Zero the host identities in `/proc/net/netlink`, or refuse the table by
+/// name.
+///
+/// Every row is accepted exactly as `netlink_native_seq_show` prints it, in
+/// either kernel layout, or the whole table is refused (counted, named, no
+/// bytes served): host bytes of an unknown shape never reach the guest.
+///
+/// - `sk` is the socket's address printed `%pK` (v7.1.3: 16 lower-hex
+///   digits), or the literal `0` (7.4-rc3). Either way it is served as 16 zero
+///   digits, so the guest's table is the same on both kernels.
+/// - `Groups` is `%08x`: exactly 8 lower-hex digits.
+/// - `Eth`, `Pid`, `Rmem`, `Wmem`, `Dump`, `Locks` and `Drops` are decimal.
+/// - `Inode` is `%-8llu`, a host-global counter, served as 0.
+///
+/// The header is accepted by its words and served as
+/// [`NETLINK_SOCKETS_HEADER`]; rows are single-spaced and sorted on their
+/// numbers.
+fn sanitize_netlink_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
     const HEADER: [&str; 10] = [
         "sk", "Eth", "Pid", "Groups", "Rmem", "Wmem", "Dump", "Locks", "Drops", "Inode",
     ];
+    /// `sk` as 7.4-rc3 prints it: the literal `0`.
+    const V7_4_RC3_SK: &str = "0";
     const ZERO_POINTER: &str = "0000000000000000";
+    let refuse = |reason: String| counted_refusal_reason("netlink", reason);
 
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Err(refuse("not UTF-8".to_owned()));
     };
     let Some(body) = text.strip_suffix('\n') else {
-        return contents.to_vec();
+        return Err(refuse("no trailing newline".to_owned()));
     };
     let mut lines = body.split('\n');
-    let Some(header) = lines.next() else {
-        return contents.to_vec();
-    };
+    // `split` yields at least one item, so a header line is always present.
+    let header = lines.next().unwrap_or_default();
     if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
+        return Err(refuse("header".to_owned()));
     }
 
     let mut rows = Vec::new();
-    for line in lines {
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
         let mut fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != HEADER.len()
-            || !is_lower_hex(fields[0], 16)
-            || !is_lower_hex(fields[3], 8)
-        {
-            return contents.to_vec();
+        if fields.len() != HEADER.len() {
+            return Err(refuse(format!(
+                "line {number}: {} fields, not {}",
+                fields.len(),
+                HEADER.len()
+            )));
         }
-
-        let Some(key) = [
-            parse_decimal(fields[1]),
-            parse_decimal(fields[2]),
-            parse_lower_hex(fields[3]),
-            parse_decimal(fields[4]),
-            parse_decimal(fields[5]),
-            parse_decimal(fields[6]),
-            parse_decimal(fields[7]),
-            parse_decimal(fields[8]),
-        ]
-        .into_iter()
-        .collect::<Option<Vec<_>>>() else {
-            return contents.to_vec();
+        if !(is_lower_hex(fields[0], 16) || fields[0] == V7_4_RC3_SK) {
+            return Err(refuse(format!("line {number}: sk")));
+        }
+        let groups = match parse_lower_hex(fields[3]) {
+            Some(groups) if is_lower_hex(fields[3], 8) => groups,
+            _ => return Err(refuse(format!("line {number}: Groups"))),
         };
-        if parse_decimal(fields[9]).is_none() {
-            return contents.to_vec();
-        }
+        let decimal = |field: usize| {
+            parse_decimal(fields[field])
+                .ok_or_else(|| refuse(format!("line {number}: {}", HEADER[field])))
+        };
+        // The sort key: every field but the two identities, as numbers.
+        let key = [
+            decimal(1)?,
+            decimal(2)?,
+            groups,
+            decimal(4)?,
+            decimal(5)?,
+            decimal(6)?,
+            decimal(7)?,
+            decimal(8)?,
+        ];
+        decimal(9)?;
 
         fields[0] = ZERO_POINTER;
         fields[9] = "0";
@@ -6061,13 +6191,13 @@ fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
     rows.sort_unstable();
 
     let mut normalized = String::with_capacity(text.len());
-    normalized.push_str(header);
+    normalized.push_str(NETLINK_SOCKETS_HEADER);
     normalized.push('\n');
     for (_, row) in rows {
         normalized.push_str(&row);
         normalized.push('\n');
     }
-    normalized.into_bytes()
+    Ok(normalized.into_bytes())
 }
 
 /// Zero the host-assigned identities in `/proc/net/tcp{,6}` and
@@ -11725,16 +11855,90 @@ nr_switches : -1\n";
 00000000fedcba98: 00000003 00000000 00010000 0002 01 12346 /run/socket two\n\
 000000001234abcd: 00000002 00000000 00000000 0001 03 12345\n";
 
+        // The header served is the canonical one, whatever the input's
+        // padding. Only the expected header changed, from the echoed input
+        // header to that constant: the assertion stays byte-exact, and the
+        // input and the expected rows are unchanged.
         assert_eq!(
             sanitize_unix_sockets(contents),
-            b"Num RefCount Protocol Flags Type St Inode Path\n\
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
 0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
 0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n"
         );
     }
 
+    /// The v7.1.3 row (`%pK:`, `unix_seq_show` in net/unix/af_unix.c) and the
+    /// 7.4-rc3 row (the constant 0 printed `%08u:`) serve the same bytes, so
+    /// the guest's table does not depend on the host kernel.
     #[test]
-    fn unix_sockets_fail_open_on_unknown_schemas() {
+    fn unix_sockets_render_the_v7_1_3_and_v7_4_rc3_layouts_identically() {
+        // Each row as `unix_seq_show` prints it: the identity, then
+        // "%08X %08X %08X %04X %02X %5llu" and, for a bound socket, the path.
+        let table = |identities: [String; 2]| {
+            let rows = [
+                (
+                    3_u32,
+                    0x10000_u32,
+                    2_u32,
+                    1_u32,
+                    12346_u64,
+                    " /run/socket two",
+                ),
+                (2, 0, 1, 3, 12345, ""),
+            ];
+            let mut table =
+                String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
+            for (identity, (refcount, flags, kind, state, inode, path)) in
+                identities.iter().zip(rows)
+            {
+                table.push_str(&format!(
+                    "{identity}: {refcount:08X} {:08X} {flags:08X} {kind:04X} {state:02X} {inode:>5}{path}\n",
+                    0
+                ));
+            }
+            table
+        };
+        let v7_1_3 = table([
+            format!("{:016x}", 0xfedcba98_u64),
+            format!("{:016x}", 0x1234abcd_u64),
+        ]);
+        let v7_4_rc3 = table([format!("{:08}", 0), format!("{:08}", 0)]);
+        let canonical = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
+0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n";
+
+        assert_eq!(sanitize_unix_sockets(v7_1_3.as_bytes()), canonical);
+        assert_eq!(sanitize_unix_sockets(v7_4_rc3.as_bytes()), canonical);
+    }
+
+    /// Initialize the kernel-opened `path` with `contents`, and require a
+    /// named refusal of `format`, counted under that format, with no
+    /// servable byte. The counter is process-global and monotonic, so the
+    /// count is checked by delta.
+    fn assert_refused_without_bytes(path: &str, format: &str, contents: &[u8]) {
+        // `sanitize_refusal_counts` omits a format with no refusal yet.
+        let count = || sanitize_refusal_counts().get(format).copied().unwrap_or(0);
+        let before = count();
+        let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+        file.initialize(contents.to_vec(), ProcfsSnapshotContext::default());
+        assert!(
+            count() > before,
+            "{path}: the refusal must be counted as {format}"
+        );
+        let prefix = format!("procfs sanitize refused {format}: ");
+        assert!(
+            file.sanitize_refusal()
+                .is_some_and(|reason| reason.starts_with(&prefix)),
+            "{path}: {:?}",
+            file.sanitize_refusal()
+        );
+        assert_eq!(file.take(usize::MAX), None, "{path}: no byte is servable");
+    }
+
+    /// A table of unknown shape is refused by name and counted, and no byte
+    /// of it is servable: the host's table never reaches the guest.
+    #[test]
+    fn unix_sockets_refuse_unknown_schemas_by_name() {
         for malformed in [
             b"".as_slice(),
             b"Num RefCount Protocol Flags Type St Inode Path",
@@ -11745,8 +11949,84 @@ nr_switches : -1\n";
             b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 18446744073709551616\n",
             b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001\n",
         ] {
-            assert_eq!(sanitize_unix_sockets(malformed), malformed);
+            assert!(sanitize_unix_sockets(malformed).is_empty());
+            assert_refused_without_bytes("/proc/net/unix", "unix", malformed);
         }
+    }
+
+    /// `unix_seq_show` prints RefCount, Protocol, Flags, Type and St with
+    /// `%X`: upper-case hex is the kernel's own alphabet, served as printed.
+    #[test]
+    fn unix_sockets_accept_uppercase_hex_as_the_kernel_prints_it() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 0000000A 00000000 00000000 0001 03 12345\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 0000000A 00000000 00000000 0001 03 0\n"
+        );
+    }
+
+    /// A bound socket's path is raw bytes (`unix_seq_show` prints every byte
+    /// but NUL as it is): a name that is not UTF-8 is served as printed.
+    #[test]
+    fn unix_sockets_keep_a_non_utf8_path_as_raw_bytes() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345 /tmp/\xff\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 01 0 /tmp/\xff\n"
+        );
+    }
+
+    /// A newline in a path splits its row. When the rest is not a row, the
+    /// table is refused by name, and no byte of it is servable.
+    #[test]
+    fn unix_sockets_refuse_a_path_split_by_a_newline() {
+        let split = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345 /tmp/a\nb\n";
+
+        assert!(sanitize_unix_sockets(split).is_empty());
+        assert_refused_without_bytes("/proc/net/unix", "unix", split);
+    }
+
+    /// Rows one step from an accepted shape are refused by name, so no
+    /// acceptance is wider than the kernel's format: a nonzero or short
+    /// 7.4-rc3 `Num`, a `Num` without its colon, a lower-case `%X` field, a path
+    /// separated from `Inode` by anything but one space, and an empty path
+    /// after that space (a bound socket prints at least `@`).
+    #[test]
+    fn unix_sockets_refuse_near_miss_rows_by_name() {
+        for row in [
+            "00000001: 00000002 00000000 00000000 0001 01 12345",
+            "0000000: 00000002 00000000 00000000 0001 01 12345",
+            "00000000 00000002 00000000 00000000 0001 01 12345",
+            "000000001234abcd: 0000000a 00000000 00000000 0001 01 12345",
+            "000000001234abcd: 00000002 00000000 00000000 0001 01 12345\t/tmp/x",
+            "000000001234abcd: 00000002 00000000 00000000 0001 01 12345 ",
+        ] {
+            let table = format!("Num       RefCount Protocol Flags    Type St Inode Path\n{row}\n");
+            assert!(sanitize_unix_sockets(table.as_bytes()).is_empty(), "{row}");
+            assert_refused_without_bytes("/proc/net/unix", "unix", table.as_bytes());
+        }
+    }
+
+    /// `unix_seq_show` separates a bound path from `Inode` by one space, and
+    /// the path is every byte after it: a name that begins with a space keeps
+    /// that space.
+    #[test]
+    fn unix_sockets_keep_a_path_that_begins_with_a_space() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345  lead\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 01 0  lead\n"
+        );
     }
 
     #[test]
@@ -11784,12 +12064,61 @@ total_commit_ms 0\n"
 00000000fedcba98 10 20 00000002 3 4 5 6 7 12346\n\
 000000001234abcd 4 10 00000001 0 0 0 2 0 12345\n";
 
+        // The header served is the canonical one, whatever the input's
+        // padding. Only the expected header changed, from the echoed input
+        // header to that constant: the assertion stays byte-exact, and the
+        // input and the expected rows are unchanged.
         assert_eq!(
             sanitize_netlink_sockets(contents),
-            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+            b"sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n\
 0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
 0000000000000000 10 20 00000002 3 4 5 6 7 0\n"
         );
+    }
+
+    /// The v7.1.3 table (`%pK` under a header padded for it,
+    /// `netlink_native_seq_show` in net/netlink/af_netlink.c) and the 7.4-rc3
+    /// table (the literal `0` under a narrower header) serve the same bytes,
+    /// so the guest's table does not depend on the host kernel.
+    #[test]
+    fn netlink_sockets_render_the_v7_1_3_and_v7_4_rc3_layouts_identically() {
+        // Each row as `netlink_native_seq_show` prints it: the identity, then
+        // "%-3d %-10u %08x %-8d %-8d %-5d %-8d %-8u %-8llu".
+        let table = |header: &str, identities: [String; 2]| {
+            let rows = [
+                (
+                    10_u32, 20_u32, 2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 12346_u64,
+                ),
+                (4, 10, 1, 0, 0, 0, 2, 0, 12345),
+            ];
+            let mut table = format!("{header}\n");
+            for (identity, (eth, pid, groups, rmem, wmem, dump, locks, drops, inode)) in
+                identities.iter().zip(rows)
+            {
+                table.push_str(&format!(
+                    "{identity} {eth:<3} {pid:<10} {groups:08x} {rmem:<8} {wmem:<8} {dump:<5} {locks:<8} {drops:<8} {inode:<8}\n"
+                ));
+            }
+            table
+        };
+        let v7_1_3 = table(
+            "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode",
+            [
+                format!("{:016x}", 0xfedcba98_u64),
+                format!("{:016x}", 0x1234abcd_u64),
+            ],
+        );
+        // 7.4-rc3 prints "0  %-3d ...": the literal 0, then two spaces.
+        let v7_4_rc3 = table(
+            "sk Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode",
+            [String::from("0 "), String::from("0 ")],
+        );
+        let canonical = b"sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n\
+0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
+0000000000000000 10 20 00000002 3 4 5 6 7 0\n";
+
+        assert_eq!(sanitize_netlink_sockets(v7_1_3.as_bytes()), canonical);
+        assert_eq!(sanitize_netlink_sockets(v7_4_rc3.as_bytes()), canonical);
     }
 
     #[test]
@@ -11847,8 +12176,10 @@ total_commit_ms 0\n"
         }
     }
 
+    /// A table of unknown shape is refused by name and counted, and no byte
+    /// of it is servable: the host's table never reaches the guest.
     #[test]
-    fn netlink_sockets_fail_open_on_unknown_schemas() {
+    fn netlink_sockets_refuse_unknown_schemas_by_name() {
         for malformed in [
             b"".as_slice(),
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode",
@@ -11857,7 +12188,25 @@ total_commit_ms 0\n"
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 zero 12345\n",
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 0 12345 extra\n",
         ] {
-            assert_eq!(sanitize_netlink_sockets(malformed), malformed);
+            assert!(sanitize_netlink_sockets(malformed).is_empty());
+            assert_refused_without_bytes("/proc/net/netlink", "netlink", malformed);
+        }
+    }
+
+    /// Rows one step from an accepted `sk` are refused by name: the 7.4-rc3
+    /// literal is exactly `0`, and the v7.1.3 address exactly 16 digits.
+    #[test]
+    fn netlink_sockets_refuse_near_miss_rows_by_name() {
+        for row in [
+            "1 4 10 00000001 0 0 0 2 0 12345",
+            "00 4 10 00000001 0 0 0 2 0 12345",
+        ] {
+            let table = format!("sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n{row}\n");
+            assert!(
+                sanitize_netlink_sockets(table.as_bytes()).is_empty(),
+                "{row}"
+            );
+            assert_refused_without_bytes("/proc/net/netlink", "netlink", table.as_bytes());
         }
     }
 
