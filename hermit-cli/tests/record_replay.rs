@@ -4143,6 +4143,66 @@ fn record_sendfile_into_its_own_file_meets_the_file_size_limit() {
     }
 }
 
+/// Host evidence for a sendfile-overlap failure: the mount source and
+/// filesystem type under each labelled directory, plus the kernel and
+/// CPU, read from /proc. Overlapping sendfile semantics depend on
+/// which splice_read the filesystem provides, so a failure on an
+/// unseen host must name its filesystem to be diagnosable.
+fn sendfile_host_evidence(build: &Path, recording: &Path) -> String {
+    fn f_type_of(dir: &Path) -> String {
+        let Ok(cpath) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+            return "f_type unknown".to_owned();
+        };
+        let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(cpath.as_ptr(), &mut sfs as *mut libc::statfs) } == 0 {
+            format!("f_type {:#x}", sfs.f_type)
+        } else {
+            "f_type unknown".to_owned()
+        }
+    }
+    fn mount_of(dir: &Path) -> String {
+        let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let mut best: Option<(usize, String, String)> = None;
+        if let Ok(mounts) = fs::read_to_string("/proc/self/mounts") {
+            for line in mounts.lines() {
+                let mut fields = line.split_whitespace();
+                let (Some(source), Some(point), Some(fstype)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                if target.starts_with(point)
+                    && best.as_ref().is_none_or(|(len, _, _)| point.len() > *len)
+                {
+                    best = Some((point.len(), source.to_owned(), fstype.to_owned()));
+                }
+            }
+        }
+        match best {
+            Some((_, source, fstype)) => format!("{fstype} on {source}"),
+            None => "mount unknown".to_owned(),
+        }
+    }
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_else(|_| "kernel unknown".to_owned());
+    let cpu = fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .map(|rest| rest.trim_start_matches([' ', '\t', ':']).to_owned())
+        })
+        .unwrap_or_else(|| "cpu unknown".to_owned());
+    format!(
+        " [host: kernel {kernel}; cpu {cpu}; build dir {} ({}) ; recording dir {} ({})]",
+        mount_of(build),
+        f_type_of(build),
+        mount_of(recording),
+        f_type_of(recording)
+    )
+}
+
 /// Every byte of every file under `dir`, concatenated.
 fn recording_bytes(dir: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -4227,12 +4287,13 @@ fn record_sendfile_overlapping_its_input_keeps_the_bytes_it_wrote() {
         let holds = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
         assert!(
             holds(wrote) && !wrong.iter().any(|wrong| holds(wrong)),
-            "sendfile {mode}: the recording must hold {:?} and none of {:?}",
+            "sendfile {mode}: the recording must hold {:?} and none of {:?}{}",
             String::from_utf8_lossy(wrote),
             wrong
                 .iter()
                 .map(|wrong| String::from_utf8_lossy(wrong))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            sendfile_host_evidence(build.path(), recording.path())
         );
     }
 }
