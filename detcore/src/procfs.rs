@@ -207,7 +207,11 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
     UnixSockets,
     /// `/proc/net/tcp`, `tcp6`, `udp`, `udp6`. The binary view of this same
-    /// table is normalized in `crate::sock_diag`; the two must agree.
+    /// table is normalized in `crate::sock_diag`. Both views zero the socket
+    /// inode; this text view also zeroes the kernel pointer; the binary view
+    /// leaves `AF_INET` and `AF_INET6` cookies untouched; and they differ in
+    /// failure policy: this text view refuses an unknown shape, while the
+    /// binary view (fail-open) passes it through.
     InetSockets,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-966): Review Btrfs commit telemetry normalization.
@@ -3627,7 +3631,10 @@ impl ProcfsFile {
                 sanitize_unix_sockets_checked(&contents),
                 &mut sanitize_refusal,
             ),
-            ProcfsKind::InetSockets => sanitize_inet_sockets(&contents),
+            ProcfsKind::InetSockets => checked_or_refusal(
+                sanitize_inet_sockets_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind.clone(), virtual_realtime_seconds)
@@ -4750,7 +4757,8 @@ fn is_hwmon_input_file(path: &str) -> bool {
 /// `--allow-unsupported-syscalls`): the file was already opened
 /// through the kernel, and the alternatives are republishing host
 /// bytes or fabricating a partial file.
-static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 8] = [
+static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -4777,8 +4785,8 @@ fn record_status_unknown_dropped(count: usize) {
 }
 
 /// The formats [`sanitize_refusal_counts`] reports, in counter order.
-const SANITIZE_FORMATS: [&str; 8] = [
-    "stat", "status", "statm", "io", "sched", "fdinfo", "netlink", "unix",
+const SANITIZE_FORMATS: [&str; 9] = [
+    "stat", "status", "statm", "io", "sched", "fdinfo", "netlink", "unix", "inet",
 ];
 
 fn sanitize_refusal_index(format: &str) -> usize {
@@ -4791,6 +4799,7 @@ fn sanitize_refusal_index(format: &str) -> usize {
         "fdinfo" => 5,
         "netlink" => 6,
         "unix" => 7,
+        "inet" => 8,
         _ => {
             debug_assert!(false, "unknown sanitize format {format}");
             0
@@ -6200,6 +6209,17 @@ fn sanitize_netlink_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> 
     Ok(normalized.into_bytes())
 }
 
+#[cfg(test)]
+fn sanitize_inet_sockets(contents: &[u8]) -> Vec<u8> {
+    match sanitize_inet_sockets_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
 /// Zero the host-assigned identities in `/proc/net/tcp{,6}` and
 /// `/proc/net/udp{,6}`.
 ///
@@ -6214,8 +6234,10 @@ fn sanitize_netlink_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> 
 /// `inode` is a host-global counter and `pointer` is the kernel socket address.
 /// This mirrors `sanitize_netlink_sockets`, which zeroes the same two kinds of
 /// field, and it is the text half of the `AF_INET`/`AF_INET6` work in
-/// `crate::sock_diag`: the binary and text views of this table agreed before
-/// (both leaking) and must still agree after.
+/// `crate::sock_diag`. Both views zero the socket inode; this text view also
+/// zeroes the kernel pointer; the binary view leaves `AF_INET` and `AF_INET6`
+/// cookies untouched; and they differ in failure policy: this text view refuses
+/// an unknown shape, while the binary view (fail-open) passes it through.
 ///
 /// Zero is in range for `inode` rather than a substitute chosen here. The
 /// kernel emits it itself for sockets with no owning file -- on the host that
@@ -6231,46 +6253,39 @@ fn sanitize_netlink_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> 
 /// sorting without renumbering would leave a positional index contradicting its
 /// own position.
 ///
-/// Fail-open on any unexpected shape, like the other sanitizers.
-fn sanitize_inet_sockets(contents: &[u8]) -> Vec<u8> {
-    /// `inode`, counting from zero.
-    const INODE_FIELD: usize = 9;
-    /// The kernel socket pointer, printed `%pK` as 16 lower-hex digits.
-    const POINTER_FIELD: usize = 11;
-    /// `udp`/`udp6` rows are 13 fields, `tcp`/`tcp6` 17. Both put the two
-    /// host-state columns at the same index, so only the shorter is required.
-    const MIN_FIELDS: usize = 13;
-    const ZERO_POINTER: &str = "0000000000000000";
+/// Every row is accepted exactly as the kernel prints it for its table's
+/// class (v7.1.3 or v7.4-rc3), or the whole table is refused: counted, named,
+/// no byte served.
+fn sanitize_inet_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
+    let refuse = |reason: String| counted_refusal_reason("inet", reason);
 
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Err(refuse("not UTF-8".to_owned()));
     };
     let Some(body) = text.strip_suffix('\n') else {
-        return contents.to_vec();
+        return Err(refuse("no trailing newline".to_owned()));
     };
     let mut lines = body.split('\n');
-    let Some(header) = lines.next() else {
-        return contents.to_vec();
+    // `split` yields at least one item, so a header line is always present.
+    let header = lines.next().unwrap_or_default();
+    let Some(class) = InetClass::of_header(header) else {
+        return Err(refuse("header".to_owned()));
     };
-    // The four files have four different headers, so this checks the shape
-    // rather than an exact string: first column `sl`, and an `inode` column.
-    let header_fields = header.split_whitespace().collect::<Vec<_>>();
-    if header_fields.first() != Some(&"sl") || !header_fields.contains(&"inode") {
-        return contents.to_vec();
-    }
 
     let mut rows = Vec::new();
-    for line in lines {
-        let mut fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < MIN_FIELDS {
-            return contents.to_vec();
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
+        // The kernel separates and pads these columns with spaces only, so any
+        // other byte stays inside a field and fails that field's rule.
+        let mut fields = line
+            .split(' ')
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        if let Err(name) = check_inet_row(class, &fields) {
+            return Err(refuse(format!("line {number}: {name}")));
         }
-        if parse_decimal(fields[INODE_FIELD]).is_none() || !is_lower_hex(fields[POINTER_FIELD], 16)
-        {
-            return contents.to_vec();
-        }
-        fields[INODE_FIELD] = "0";
-        fields[POINTER_FIELD] = ZERO_POINTER;
+        fields[INET_INODE_FIELD] = "0";
+        fields[INET_POINTER_FIELD] = "0000000000000000";
         // Sort on everything but the index, then reassign the index, so the
         // ordering key cannot be perturbed by the very column it decides.
         rows.push(fields[1..].join(" "));
@@ -6283,7 +6298,254 @@ fn sanitize_inet_sockets(contents: &[u8]) -> Vec<u8> {
     for (index, row) in rows.iter().enumerate() {
         normalized.push_str(&format!("{index}: {row}\n"));
     }
-    normalized.into_bytes()
+    Ok(normalized.into_bytes())
+}
+
+/// The field `/proc/net/{tcp,udp}{,6}` print the socket inode in.
+const INET_INODE_FIELD: usize = 9;
+/// The field they print the socket pointer in: `%pK` (16 lower-hex digits)
+/// in v7.1.3, the literal `0` in v7.4-rc3.
+const INET_POINTER_FIELD: usize = 11;
+
+/// `/proc/net/tcp`'s header text (`tcp4_seq_show`), which `seq_pad` pads with
+/// spaces to `TMPSZ - 1` = 149 bytes.
+const INET_TCP4_HEADER_TEXT: &str = concat!(
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  ",
+    "timeout inode",
+);
+const INET_TCP4_HEADER_WIDTH: usize = 149;
+/// `/proc/net/udp`'s header text (`udp4_seq_show`), padded to 127 bytes.
+const INET_UDP4_HEADER_TEXT: &str = concat!(
+    "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  ",
+    "timeout inode ref pointer drops",
+);
+const INET_UDP4_HEADER_WIDTH: usize = 127;
+/// `/proc/net/tcp6`'s header (`tcp6_seq_show`), unpadded.
+const INET_TCP6_HEADER: &str = concat!(
+    "  sl  local_address                         remote_address                        ",
+    "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+);
+/// `/proc/net/udp6`'s header (`IPV6_SEQ_DGRAM_HEADER`), unpadded.
+const INET_UDP6_HEADER: &str = concat!(
+    "  sl  local_address                         remote_address                        ",
+    "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops",
+);
+const _: () = assert!(INET_TCP4_HEADER_TEXT.len() == 96);
+const _: () = assert!(INET_UDP4_HEADER_TEXT.len() == 115);
+const _: () = assert!(INET_TCP6_HEADER.len() == 144);
+const _: () = assert!(INET_UDP6_HEADER.len() == 162);
+
+/// The TCP states a full row may carry: `TCP_ESTABLISHED` (1) to `TCP_CLOSING`
+/// (11) in `include/net/tcp_states.h`. A request socket prints as `03` in a
+/// 12-field row, and `TCP_BOUND_INACTIVE` is never listed.
+const INET_TCP_FULL_STATES: [&str; 11] = [
+    "01", "02", "03", "04", "05", "06", "07", "08", "09", "0A", "0B",
+];
+
+/// A `/proc/net` socket table's class, which its header alone decides.
+#[derive(Clone, Copy)]
+enum InetClass {
+    Tcp4,
+    Tcp6,
+    Udp4,
+    Udp6,
+}
+
+impl InetClass {
+    /// The class whose header `header` is, byte for byte, padding included.
+    fn of_header(header: &str) -> Option<Self> {
+        let padded = |text: &str, width: usize| {
+            header.len() == width
+                && header.starts_with(text)
+                && header[text.len()..].bytes().all(|byte| byte == b' ')
+        };
+        if padded(INET_TCP4_HEADER_TEXT, INET_TCP4_HEADER_WIDTH) {
+            Some(Self::Tcp4)
+        } else if header == INET_TCP6_HEADER {
+            Some(Self::Tcp6)
+        } else if padded(INET_UDP4_HEADER_TEXT, INET_UDP4_HEADER_WIDTH) {
+            Some(Self::Udp4)
+        } else if header == INET_UDP6_HEADER {
+            Some(Self::Udp6)
+        } else {
+            None
+        }
+    }
+
+    fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp4 | Self::Tcp6)
+    }
+
+    /// The hex digits of an address: `%08X` for IPv4, four of them for IPv6.
+    fn address_digits(self) -> usize {
+        match self {
+            Self::Tcp4 | Self::Udp4 => 8,
+            Self::Tcp6 | Self::Udp6 => 32,
+        }
+    }
+}
+
+/// Check one row's fields against its class, in the kernel's format strings'
+/// terms, and name the first field that is not as the kernel prints it.
+fn check_inet_row(class: InetClass, fields: &[&str]) -> Result<(), &'static str> {
+    let count_fits = if class.is_tcp() {
+        fields.len() == 12 || fields.len() == 17
+    } else {
+        fields.len() == 13
+    };
+    inet_field(count_fits, "field count")?;
+    let digits = class.address_digits();
+    inet_field(is_inet_sl(fields[0]), "sl")?;
+    inet_field(is_inet_address(fields[1], digits), "local_address")?;
+    inet_field(is_inet_address(fields[2], digits), "rem_address")?;
+    inet_field(is_inet_upper_hex(fields[3], 2), "st")?;
+    if !class.is_tcp() {
+        return check_inet_udp_row(fields);
+    }
+    if fields.len() == 17 {
+        inet_field(INET_TCP_FULL_STATES.contains(&fields[3]), "state")?;
+        return check_inet_full_row(fields);
+    }
+    match fields[3] {
+        "03" => check_inet_request_row(fields),
+        "05" | "06" => check_inet_timewait_row(fields),
+        _ => Err("state"),
+    }
+}
+
+/// `Ok` if `ok`, else the field `name` as the refusal's reason.
+fn inet_field(ok: bool, name: &'static str) -> Result<(), &'static str> {
+    if ok { Ok(()) } else { Err(name) }
+}
+
+/// A full row (`get_tcp4_sock`, `get_tcp6_sock`): 17 fields.
+fn check_inet_full_row(fields: &[&str]) -> Result<(), &'static str> {
+    inet_field(is_inet_queues(fields[4]), "tx_queue")?;
+    inet_field(is_inet_timer(fields[5]), "tr")?;
+    inet_field(is_inet_upper_hex(fields[6], 8), "retrnsmt")?;
+    inet_field(is_inet_decimal(fields[7]), "uid")?;
+    inet_field(is_inet_signed(fields[8]), "timeout")?;
+    inet_field(is_inet_decimal(fields[9]), "inode")?;
+    inet_field(is_inet_signed(fields[10]), "ref")?;
+    inet_field(is_inet_pointer(fields[11]), "pointer")?;
+    inet_field(is_inet_decimal(fields[12]), "rto")?;
+    inet_field(is_inet_decimal(fields[13]), "ato")?;
+    inet_field(is_inet_decimal(fields[14]), "quick")?;
+    inet_field(is_inet_decimal(fields[15]), "cwnd")?;
+    inet_field(is_inet_signed(fields[16]), "ssthresh")
+}
+
+/// A timewait row (`get_timewait4_sock`, `get_timewait6_sock`): 12 fields, with
+/// the timer flag 3 and constant zeros where the kernel prints them.
+fn check_inet_timewait_row(fields: &[&str]) -> Result<(), &'static str> {
+    inet_field(fields[4] == "00000000:00000000", "tx_queue")?;
+    inet_field(
+        fields[5]
+            .strip_prefix("03:")
+            .is_some_and(is_inet_timer_tail),
+        "tr",
+    )?;
+    inet_field(fields[6] == "00000000", "retrnsmt")?;
+    inet_field(fields[7] == "0", "uid")?;
+    inet_field(fields[8] == "0", "timeout")?;
+    inet_field(fields[9] == "0", "inode")?;
+    inet_field(is_inet_signed(fields[10]), "ref")?;
+    inet_field(is_inet_pointer(fields[11]), "pointer")
+}
+
+/// A request row (`get_openreq4`, `get_openreq6`): 12 fields, with the timer
+/// flag 1 and constant zeros where the kernel prints them.
+fn check_inet_request_row(fields: &[&str]) -> Result<(), &'static str> {
+    inet_field(fields[4] == "00000000:00000000", "tx_queue")?;
+    inet_field(
+        fields[5]
+            .strip_prefix("01:")
+            .is_some_and(is_inet_timer_tail),
+        "tr",
+    )?;
+    inet_field(is_inet_upper_hex(fields[6], 8), "retrnsmt")?;
+    inet_field(is_inet_decimal(fields[7]), "uid")?;
+    inet_field(fields[8] == "0", "timeout")?;
+    inet_field(fields[9] == "0", "inode")?;
+    inet_field(fields[10] == "0", "ref")?;
+    inet_field(is_inet_pointer(fields[11]), "pointer")
+}
+
+/// A UDP row (`udp4_format_sock`, `__ip6_dgram_sock_seq_show`): 13 fields.
+fn check_inet_udp_row(fields: &[&str]) -> Result<(), &'static str> {
+    inet_field(is_inet_queues(fields[4]), "tx_queue")?;
+    inet_field(fields[5] == "00:00000000", "tr")?;
+    inet_field(fields[6] == "00000000", "retrnsmt")?;
+    inet_field(is_inet_decimal(fields[7]), "uid")?;
+    inet_field(fields[8] == "0", "timeout")?;
+    inet_field(is_inet_decimal(fields[9]), "inode")?;
+    inet_field(is_inet_signed(fields[10]), "ref")?;
+    inet_field(is_inet_pointer(fields[11]), "pointer")?;
+    inet_field(is_inet_decimal(fields[12]), "drops")
+}
+
+/// Exactly `width` uppercase hex digits: `%0NX` where the type bounds the width.
+fn is_inet_upper_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
+/// `0`, or a digit 1-9 and more digits: `%u`, `%lu` and `%llu` never pad with
+/// zeros.
+fn is_inet_decimal(field: &str) -> bool {
+    field == "0"
+        || (field.starts_with(|c: char| ('1'..='9').contains(&c))
+            && field.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// A decimal, or `-` and a digit 1-9 and more digits: `%d`.
+fn is_inet_signed(field: &str) -> bool {
+    is_inet_decimal(field)
+        || field
+            .strip_prefix('-')
+            .is_some_and(|digits| digits != "0" && is_inet_decimal(digits))
+}
+
+/// `sl`: `%4d:` or `%5d:`, space-padded, never zero-padded.
+fn is_inet_sl(field: &str) -> bool {
+    field.strip_suffix(':').is_some_and(is_inet_decimal)
+}
+
+/// An address and port: `%08X:%04X`, or `%08X%08X%08X%08X:%04X` for IPv6.
+fn is_inet_address(field: &str, digits: usize) -> bool {
+    field
+        .split_once(':')
+        .is_some_and(|(host, port)| is_inet_upper_hex(host, digits) && is_inet_upper_hex(port, 4))
+}
+
+/// `tx_queue:rx_queue`: `%08X:%08X`.
+fn is_inet_queues(field: &str) -> bool {
+    field
+        .split_once(':')
+        .is_some_and(|(tx, rx)| is_inet_upper_hex(tx, 8) && is_inet_upper_hex(rx, 8))
+}
+
+/// `tr:tm->when`: `%02X:%08lX`.
+fn is_inet_timer(field: &str) -> bool {
+    field
+        .split_once(':')
+        .is_some_and(|(active, tail)| is_inet_upper_hex(active, 2) && is_inet_timer_tail(tail))
+}
+
+/// `%08lX` of a long: 8 digits, or 9 to 16 with no leading zero.
+fn is_inet_timer_tail(tail: &str) -> bool {
+    is_inet_upper_hex(tail, 8)
+        || ((9..=16).contains(&tail.len())
+            && !tail.starts_with('0')
+            && is_inet_upper_hex(tail, tail.len()))
+}
+
+/// The socket pointer: `%pK` as 16 lower-hex digits (v7.1.3), or the literal
+/// `0` (v7.4-rc3). A 32-bit kernel's 8 digits and `(____ptrval____)` are refused.
+fn is_inet_pointer(field: &str) -> bool {
+    is_lower_hex(field, 16) || field == "0"
 }
 
 fn is_lower_hex(field: &str, width: usize) -> bool {
@@ -12125,12 +12387,18 @@ total_commit_ms 0\n"
     fn inet_sockets_zero_both_host_identities_and_canonicalize_row_order() {
         // Two rows deliberately given in the order the kernel happened to
         // produce on one run; a later run produced them the other way round.
-        let contents = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787053 1 00000000703938cf 100 0 0 10 0\n   1: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787052 1 0000000042a27170 100 0 0 10 0\n"
-            .as_slice();
+        let contents = format!(
+            "{}\n   0: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787053 1 00000000703938cf 100 0 0 10 0\n   1: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787052 1 0000000042a27170 100 0 0 10 0\n",
+            fx_tcp4_header()
+        );
+        let contents = contents.as_bytes();
         // Same rows, opposite order, different host inodes and pointers: a
         // second run of the same guest. Both must normalize to one answer.
-        let swapped = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433840 1 000000005b1c887b 100 0 0 10 0\n   1: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433841 1 00000000ab7b588a 100 0 0 10 0\n"
-            .as_slice();
+        let swapped = format!(
+            "{}\n   0: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433840 1 000000005b1c887b 100 0 0 10 0\n   1: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433841 1 00000000ab7b588a 100 0 0 10 0\n",
+            fx_tcp4_header()
+        );
+        let swapped = swapped.as_bytes();
 
         let first = sanitize_inet_sockets(contents);
         assert_eq!(
@@ -12159,21 +12427,592 @@ total_commit_ms 0\n"
         assert!(text.lines().nth(1).unwrap().contains(":8000"));
     }
 
-    #[test]
-    fn inet_sockets_fail_open_on_unknown_schemas() {
-        for malformed in [
-            b"".as_slice(),
-            // No trailing newline.
-            b"  sl  local_address rem_address st inode",
-            // Header is not this table.
-            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n",
-            // Too few columns for the two host-state fields to exist.
-            b"  sl  local_address inode\n   0: 0100007F:8000 12345\n",
-            // Inode column not decimal.
-            b"  sl  a b c d e f g h inode j pointer\n   0: 1 2 3 4 5 6 7 8 zero 1 0000000042a27170\n",
-        ] {
-            assert_eq!(sanitize_inet_sockets(malformed), malformed);
+    /// `/proc/net/tcp`'s header text as v7.1.3 and v7.4-rc3 print it
+    /// (`tcp4_seq_show`), before `seq_pad` pads it with spaces to 149 bytes.
+    const FX_TCP4_TEXT: &str = concat!(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  ",
+        "timeout inode",
+    );
+    /// `/proc/net/udp`'s header text (`udp4_seq_show`, three leading spaces),
+    /// before `seq_pad` pads it with spaces to 127 bytes.
+    const FX_UDP4_TEXT: &str = concat!(
+        "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  ",
+        "timeout inode ref pointer drops",
+    );
+
+    fn fx_tcp4_header() -> String {
+        format!("{FX_TCP4_TEXT:<149}")
+    }
+
+    fn fx_udp4_header() -> String {
+        format!("{FX_UDP4_TEXT:<127}")
+    }
+
+    /// `/proc/net/tcp6`'s header (`tcp6_seq_show`): its two address columns
+    /// are 38 wide, as the kernel's string spells them, and it is unpadded.
+    fn fx_tcp6_header() -> String {
+        format!(
+            "  sl  {:<38}{:<38}st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+            "local_address", "remote_address"
+        )
+    }
+
+    /// `/proc/net/udp6`'s header (`IPV6_SEQ_DGRAM_HEADER`), unpadded.
+    fn fx_udp6_header() -> String {
+        format!("{} ref pointer drops", fx_tcp6_header())
+    }
+
+    /// A table: `header`, then each row, every line ending in `\n`.
+    fn fx_table(header: &str, rows: &[&str]) -> String {
+        let mut table = format!("{header}\n");
+        for row in rows {
+            table.push_str(row);
+            table.push('\n');
         }
+        table
+    }
+
+    /// The served table: `header`, then each canonical row, numbered in order.
+    fn fx_served(header: &str, rows: &[&str]) -> String {
+        let mut served = format!("{header}\n");
+        for (index, row) in rows.iter().enumerate() {
+            served.push_str(&format!("{index}: {row}\n"));
+        }
+        served
+    }
+
+    /// `row`, single-spaced, with its field `index` replaced by `field`.
+    fn fx_with(row: &str, index: usize, field: &str) -> String {
+        let mut fields = row.split(' ').collect::<Vec<_>>();
+        fields[index] = field;
+        fields.join(" ")
+    }
+
+    /// `row` padded with spaces to `width`, as `seq_pad` pads tcp4 and udp4 rows.
+    fn fx_pad(row: &str, width: usize) -> String {
+        format!("{row:<width$}")
+    }
+
+    // Rows as v7.1.3 prints them, single-spaced (`FX_B*`), and as they are
+    // served (`FX_C*`): `sl` dropped, inode 0 and the pointer 16 zeros.
+    const FX_B4F: &str = "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 4242 1 ffff8881234a5600 100 40 0 10 -1";
+    const FX_C4F: &str = "0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 100 40 0 10 -1";
+    const FX_C4F2: &str = "0100007F:1F91 00000000:0000 0A 00000000:00000000 01:100000000 00000000 1000 0 0 1 0000000000000000 100 40 0 10 -1";
+    const FX_B4W: &str = "0: 0100007F:1F90 0100007F:A3B4 06 00000000:00000000 03:00001770 00000000 0 0 0 1 ffff8881234a5700";
+    const FX_C4W: &str = "0100007F:1F90 0100007F:A3B4 06 00000000:00000000 03:00001770 00000000 0 0 0 1 0000000000000000";
+    const FX_B4W2: &str = "1: 0100007F:1F90 0100007F:A3B6 05 00000000:00000000 03:00001770 00000000 0 0 0 1 ffff8881234a5e00";
+    const FX_C4W2: &str = "0100007F:1F90 0100007F:A3B6 05 00000000:00000000 03:00001770 00000000 0 0 0 1 0000000000000000";
+    const FX_B4R: &str = "0: 0100007F:1F90 0100007F:A3B5 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 ffff8881234a5800";
+    const FX_C4R: &str = "0100007F:1F90 0100007F:A3B5 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 0000000000000000";
+    const FX_B6F: &str = "0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 4343 1 ffff8881234a5900 100 40 0 10 -1";
+    const FX_C6F: &str = "00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 100 40 0 10 -1";
+    const FX_C6F2: &str = "00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 100 40 0 10 -1";
+    const FX_B6W: &str = "0: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B4 05 00000000:00000000 03:00001770 00000000 0 0 0 1 ffff8881234a5a00";
+    const FX_C6W: &str = "00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B4 05 00000000:00000000 03:00001770 00000000 0 0 0 1 0000000000000000";
+    const FX_B6W2: &str = "1: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B6 06 00000000:00000000 03:00001770 00000000 0 0 0 1 ffff8881234a5f00";
+    const FX_C6W2: &str = "00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B6 06 00000000:00000000 03:00001770 00000000 0 0 0 1 0000000000000000";
+    const FX_B6R: &str = "0: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B5 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 ffff8881234a5b00";
+    const FX_C6R: &str = "00000000000000000000000001000000:1F90 00000000000000000000000001000000:A3B5 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 0000000000000000";
+    const FX_BU4: &str = "0: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 4444 1 ffff8881234a5c00 0";
+    const FX_CU4: &str = "00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 0";
+    const FX_CU4B: &str = "00000000:0045 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 0";
+    const FX_BU6: &str = "0: 00000000000000000000000000000000:0223 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 4545 1 ffff8881234a5d00 0";
+    const FX_CU6: &str = "00000000000000000000000000000000:0223 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 0";
+    const FX_CU6B: &str = "00000000000000000000000000000000:0224 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 0";
+
+    /// Read `contents` through the kernel-opened `path`, as a guest read does:
+    /// the refusal reason, if the table is refused, and the servable bytes.
+    fn inet_read(path: &str, contents: &[u8]) -> (Option<String>, Option<Vec<u8>>) {
+        let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+        file.initialize(contents.to_vec(), ProcfsSnapshotContext::default());
+        let refusal = file.sanitize_refusal().map(str::to_owned);
+        (refusal, file.take(usize::MAX))
+    }
+
+    /// `contents`, read through `path`, is served as exactly `expected`.
+    fn assert_inet_served(path: &str, contents: &str, expected: &str) {
+        let (refusal, served) = inet_read(path, contents.as_bytes());
+        assert_eq!(refusal, None, "{path}: must not be refused");
+        assert_eq!(
+            served.as_deref(),
+            Some(expected.as_bytes()),
+            "{path}: served bytes"
+        );
+    }
+
+    /// Whether `contents`, read through `path`, is refused with exactly
+    /// `reason`: counted under `inet`, named in full, no servable byte. The
+    /// counter is process-global and shared with parallel tests, so only its
+    /// rise is required; the full reason and `take` carry each case's proof.
+    fn inet_refused_as(path: &str, contents: &str, reason: &str) -> bool {
+        let count = || sanitize_refusal_counts().get("inet").copied().unwrap_or(0);
+        let before = count();
+        let (refusal, served) = inet_read(path, contents.as_bytes());
+        let expected = format!("procfs sanitize refused inet: {reason}");
+        count() > before && refusal.as_deref() == Some(expected.as_str()) && served.is_none()
+    }
+
+    /// Run every case, then fail once, listing each label not refused exactly
+    /// as expected. Labels are constants; no table byte is printed.
+    fn assert_inet_cases_refused(test: &str, cases: &[(&str, &str, String, &str)]) {
+        let mut labels = cases.iter().map(|case| case.0).collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            cases.len(),
+            "{test}: case labels must be unique"
+        );
+        let outcomes = cases
+            .iter()
+            .map(|(label, path, table, reason)| (*label, inet_refused_as(path, table, reason)))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), cases.len(), "{test}: every case must run");
+        let missed = outcomes
+            .iter()
+            .filter(|(_, refused)| !refused)
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>();
+        assert!(
+            missed.is_empty(),
+            "{test} not refused as expected: {}",
+            missed.join(" ")
+        );
+    }
+
+    /// TIME_WAIT rows (12 fields, states 06 and 05) are served with their
+    /// identities zeroed and sorted, not passed through as the host's bytes.
+    #[test]
+    fn inet_sockets_zero_identities_in_time_wait_rows() {
+        assert_inet_served(
+            "/proc/net/tcp",
+            &fx_table(&fx_tcp4_header(), &[FX_B4W2, FX_B4W]),
+            &fx_served(&fx_tcp4_header(), &[FX_C4W, FX_C4W2]),
+        );
+        assert_inet_served(
+            "/proc/net/tcp6",
+            &fx_table(&fx_tcp6_header(), &[FX_B6W2, FX_B6W]),
+            &fx_served(&fx_tcp6_header(), &[FX_C6W, FX_C6W2]),
+        );
+    }
+
+    /// SYN_RECV request rows (12 fields, state 03) are served with their
+    /// identities zeroed, not passed through.
+    #[test]
+    fn inet_sockets_zero_identities_in_syn_recv_rows() {
+        assert_inet_served(
+            "/proc/net/tcp",
+            &fx_table(&fx_tcp4_header(), &[FX_B4R]),
+            &fx_served(&fx_tcp4_header(), &[FX_C4R]),
+        );
+        assert_inet_served(
+            "/proc/net/tcp6",
+            &fx_table(&fx_tcp6_header(), &[FX_B6R]),
+            &fx_served(&fx_tcp6_header(), &[FX_C6R]),
+        );
+    }
+
+    /// v7.4-rc3 prints the socket pointer as the literal `0`; a table in that
+    /// layout is served exactly as its v7.1.3 twin is, in every class.
+    #[test]
+    fn inet_sockets_render_the_v7_1_3_and_v7_4_rc3_layouts_identically() {
+        for (path, header, rows, served) in [
+            (
+                "/proc/net/tcp",
+                fx_tcp4_header(),
+                vec![FX_B4R, FX_B4W, FX_B4F],
+                vec![FX_C4F, FX_C4W, FX_C4R],
+            ),
+            (
+                "/proc/net/tcp6",
+                fx_tcp6_header(),
+                vec![FX_B6R, FX_B6W, FX_B6F],
+                vec![FX_C6F, FX_C6W, FX_C6R],
+            ),
+            (
+                "/proc/net/udp",
+                fx_udp4_header(),
+                vec![FX_BU4],
+                vec![FX_CU4],
+            ),
+            (
+                "/proc/net/udp6",
+                fx_udp6_header(),
+                vec![FX_BU6],
+                vec![FX_CU6],
+            ),
+        ] {
+            let expected = fx_served(&header, &served);
+            let v7_4_rc3 = rows
+                .iter()
+                .map(|row| fx_with(row, 11, "0"))
+                .collect::<Vec<_>>();
+            let v7_4_rc3 = v7_4_rc3.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_inet_served(path, &fx_table(&header, &rows), &expected);
+            assert_inet_served(path, &fx_table(&header, &v7_4_rc3), &expected);
+        }
+    }
+
+    /// A table of unknown shape is refused by name, counted, and serves no
+    /// byte. It replaces the fail-open test and keeps its five inputs.
+    #[test]
+    fn inet_sockets_refuse_unknown_schemas_by_name() {
+        let tcp4_unpadded = format!("{FX_TCP4_TEXT}\n");
+        let tcp4_short = format!("{FX_TCP4_TEXT:<148}\n");
+        let udp4_two_spaces = format!("{:<127}\n", &FX_UDP4_TEXT[1..]);
+        let cases: [(&[u8], &str); 9] = [
+            (b"", "no trailing newline"),
+            (b"  sl  local_address rem_address st inode", "no trailing newline"),
+            (b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n", "header"),
+            (b"  sl  local_address inode\n   0: 0100007F:8000 12345\n", "header"),
+            (
+                b"  sl  a b c d e f g h inode j pointer\n   0: 1 2 3 4 5 6 7 8 zero 1 0000000042a27170\n",
+                "header",
+            ),
+            (b"\xff\n", "not UTF-8"),
+            (tcp4_unpadded.as_bytes(), "header"),
+            (tcp4_short.as_bytes(), "header"),
+            (udp4_two_spaces.as_bytes(), "header"),
+        ];
+        for (contents, reason) in cases {
+            assert_refused_without_bytes("/proc/net/tcp", "inet", contents);
+            let (refusal, served) = inet_read("/proc/net/tcp", contents);
+            let expected = format!("procfs sanitize refused inet: {reason}");
+            assert_eq!(refusal.as_deref(), Some(expected.as_str()), "{reason}");
+            assert_eq!(served, None, "{reason}");
+            assert_eq!(
+                sanitize_inet_sockets(contents),
+                Vec::<u8>::new(),
+                "{reason}"
+            );
+        }
+    }
+
+    /// Rows one rule away from a kernel row are refused by the rule's field:
+    /// counts no class has, inode and pointer spellings, and one case per other
+    /// field rule. Every case is otherwise valid for its own class.
+    #[test]
+    fn inet_sockets_refuse_near_miss_fields_by_name() {
+        let tcp4 = |row: &str| fx_table(&fx_tcp4_header(), &[row]);
+        let tcp6 = |row: &str| fx_table(&fx_tcp6_header(), &[row]);
+        let udp4 = |row: &str| fx_table(&fx_udp4_header(), &[row]);
+        let (t4, t6, u4) = ("/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp");
+        let b4w_short = FX_B4W.rsplit_once(' ').unwrap().0;
+        let b4f_line_3 = fx_with(
+            &fx_with(&fx_with(FX_B4F, 0, "1:"), 1, "0100007F:1F91"),
+            9,
+            "4242a",
+        );
+        let cases = [
+            ("[T5a-01]", t4, tcp4(b4w_short), "line 2: field count"),
+            (
+                "[T5a-02]",
+                t4,
+                tcp4(&format!("{FX_B4W} 0 0")),
+                "line 2: field count",
+            ),
+            (
+                "[T5a-03]",
+                t4,
+                tcp4(&format!("{FX_B4F} 0")),
+                "line 2: field count",
+            ),
+            (
+                "[T5a-04]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 9, "4242a")),
+                "line 2: inode",
+            ),
+            (
+                "[T5a-05]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 11, "fff8881234a5600")),
+                "line 2: pointer",
+            ),
+            (
+                "[T5a-06]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 11, "FFFF8881234A5600")),
+                "line 2: pointer",
+            ),
+            (
+                "[T5a-07]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 11, "00")),
+                "line 2: pointer",
+            ),
+            ("[T5a-08]", t4, tcp4(&fx_with(FX_B4F, 0, "0")), "line 2: sl"),
+            (
+                "[T5a-09]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 1, "0100007:1F90")),
+                "line 2: local_address",
+            ),
+            (
+                "[T5a-10]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 2, "0000000G:0000")),
+                "line 2: rem_address",
+            ),
+            (
+                "[T5a-11]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 7, "-1000")),
+                "line 2: uid",
+            ),
+            (
+                "[T5a-12]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 16, "-")),
+                "line 2: ssthresh",
+            ),
+            (
+                "[T5a-13]",
+                t4,
+                tcp4(&fx_with(FX_B4W, 9, "7")),
+                "line 2: inode",
+            ),
+            ("[T5a-14]", t4, tcp4(&fx_with(FX_B4F, 3, "A")), "line 2: st"),
+            (
+                "[T5a-15]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 5, "00:00000000000000000")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-16]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 4, "00000000:0000000a")),
+                "line 2: tx_queue",
+            ),
+            (
+                "[T5a-17]",
+                u4,
+                udp4(&fx_with(FX_BU4, 12, "-1")),
+                "line 2: drops",
+            ),
+            (
+                "[T5a-18]",
+                t6,
+                tcp6(&fx_with(FX_B6F, 1, "0000000000000000000000001000000:1F90")),
+                "line 2: local_address",
+            ),
+            (
+                "[T5a-19]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 7, "01000")),
+                "line 2: uid",
+            ),
+            (
+                "[T5a-20]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 16, "-0")),
+                "line 2: ssthresh",
+            ),
+            (
+                "[T5a-21]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 5, "00:000000000")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-22]",
+                t4,
+                tcp4(&FX_B4F.replacen("1000 0", "1000\t0", 1)),
+                "line 2: field count",
+            ),
+            (
+                "[T5a-23]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 0, "00:")),
+                "line 2: sl",
+            ),
+            (
+                "[T5a-24]",
+                t4,
+                fx_table(&fx_tcp4_header(), &[FX_B4F, b4f_line_3.as_str()]),
+                "line 3: inode",
+            ),
+            (
+                "[T5a-25]",
+                t4,
+                tcp4(&fx_with(FX_B4W, 5, "01:00001770")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-26]",
+                t4,
+                tcp4(&fx_with(FX_B4R, 5, "03:00000064")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-27]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 5, "00:0000000")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-28]",
+                t4,
+                tcp4(&fx_with(FX_B4F, 6, "0000000")),
+                "line 2: retrnsmt",
+            ),
+            (
+                "[T5a-29]",
+                u4,
+                udp4(&fx_with(FX_BU4, 5, "00:00000001")),
+                "line 2: tr",
+            ),
+            (
+                "[T5a-30]",
+                t4,
+                tcp4(&fx_with(FX_B4W, 6, "00000001")),
+                "line 2: retrnsmt",
+            ),
+            (
+                "[T5a-31]",
+                t4,
+                tcp4(&fx_with(FX_B4W, 4, "00000000:00000001")),
+                "line 2: tx_queue",
+            ),
+        ];
+        assert_inet_cases_refused("T5a", &cases);
+    }
+
+    /// Rows valid in every field except their class or state are refused by
+    /// that check alone: another class's field count, or a state outside the
+    /// row's set. UDP state is unconstrained, so it gives no case here.
+    #[test]
+    fn inet_sockets_refuse_near_miss_classes_and_states_by_name() {
+        let (t4, t6, u4) = ("/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp");
+        let (b4f_00, b4f_0c) = (fx_with(FX_B4F, 3, "00"), fx_with(FX_B4F, 3, "0C"));
+        let (b4w_01, b6w_04) = (fx_with(FX_B4W, 3, "01"), fx_with(FX_B6W, 3, "04"));
+        let cases = [
+            (
+                "[T5b-01]",
+                t4,
+                fx_table(&fx_tcp4_header(), &[FX_BU4]),
+                "line 2: field count",
+            ),
+            (
+                "[T5b-02]",
+                u4,
+                fx_table(&fx_udp4_header(), &[FX_B4W]),
+                "line 2: field count",
+            ),
+            (
+                "[T5b-03]",
+                u4,
+                fx_table(&fx_udp4_header(), &[FX_B4F]),
+                "line 2: field count",
+            ),
+            (
+                "[T5b-04]",
+                t4,
+                fx_table(&fx_tcp4_header(), &[b4f_00.as_str()]),
+                "line 2: state",
+            ),
+            (
+                "[T5b-05]",
+                t4,
+                fx_table(&fx_tcp4_header(), &[b4f_0c.as_str()]),
+                "line 2: state",
+            ),
+            (
+                "[T5b-06]",
+                t4,
+                fx_table(&fx_tcp4_header(), &[b4w_01.as_str()]),
+                "line 2: state",
+            ),
+            (
+                "[T5b-07]",
+                t6,
+                fx_table(&fx_tcp6_header(), &[FX_BU6]),
+                "line 2: field count",
+            ),
+            (
+                "[T5b-08]",
+                t6,
+                fx_table(&fx_tcp6_header(), &[b6w_04.as_str()]),
+                "line 2: state",
+            ),
+        ];
+        assert_inet_cases_refused("T5b", &cases);
+    }
+
+    /// Each class's header alone is a valid table, served as exactly itself.
+    #[test]
+    fn inet_sockets_render_header_only_tables_exactly() {
+        assert_eq!(FX_TCP4_TEXT.len(), 96);
+        assert_eq!(fx_tcp4_header().len(), 149);
+        assert_eq!(FX_UDP4_TEXT.len(), 115);
+        assert_eq!(fx_udp4_header().len(), 127);
+        assert_eq!(fx_tcp6_header().len(), 144);
+        assert_eq!(fx_udp6_header().len(), 162);
+        for (path, header) in [
+            ("/proc/net/tcp", fx_tcp4_header()),
+            ("/proc/net/tcp6", fx_tcp6_header()),
+            ("/proc/net/udp", fx_udp4_header()),
+            ("/proc/net/udp6", fx_udp6_header()),
+        ] {
+            let table = format!("{header}\n");
+            assert_inet_served(path, &table, &table);
+        }
+    }
+
+    /// Full rows of every class, in the kernel's widths and padding and out of
+    /// order, are served zeroed, single-spaced and sorted. One timer tail has 9
+    /// digits, as `%08lX` prints a value above 32 bits.
+    #[test]
+    fn inet_sockets_render_full_rows_canonically() {
+        let tcp4 = [
+            fx_pad(
+                "   1: 0100007F:1F91 00000000:0000 0A 00000000:00000000 01:100000000 00000000  1000        0 4243 1 ffff8881234a6600 100 40 0 10 -1",
+                149,
+            ),
+            fx_pad(
+                "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 ffff8881234a5600 100 40 0 10 -1",
+                149,
+            ),
+        ];
+        let udp4 = [
+            fx_pad(
+                "   69: 00000000:0045 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4445 1 ffff8881234a6800 0",
+                127,
+            ),
+            fx_pad(
+                "   68: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4444 1 ffff8881234a5c00 0",
+                127,
+            ),
+        ];
+        let tcp6 = [
+            "   1: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4344 1 ffff8881234a6700 100 40 0 10 -1",
+            "   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4343 1 ffff8881234a5900 100 40 0 10 -1",
+        ];
+        let udp6 = [
+            "   36: 00000000000000000000000000000000:0224 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4546 1 ffff8881234a6900 0",
+            "   35: 00000000000000000000000000000000:0223 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4545 1 ffff8881234a5d00 0",
+        ];
+        assert_inet_served(
+            "/proc/net/tcp",
+            &fx_table(&fx_tcp4_header(), &[tcp4[0].as_str(), tcp4[1].as_str()]),
+            &fx_served(&fx_tcp4_header(), &[FX_C4F, FX_C4F2]),
+        );
+        assert_inet_served(
+            "/proc/net/udp",
+            &fx_table(&fx_udp4_header(), &[udp4[0].as_str(), udp4[1].as_str()]),
+            &fx_served(&fx_udp4_header(), &[FX_CU4, FX_CU4B]),
+        );
+        assert_inet_served(
+            "/proc/net/tcp6",
+            &fx_table(&fx_tcp6_header(), &tcp6),
+            &fx_served(&fx_tcp6_header(), &[FX_C6F, FX_C6F2]),
+        );
+        assert_inet_served(
+            "/proc/net/udp6",
+            &fx_table(&fx_udp6_header(), &udp6),
+            &fx_served(&fx_udp6_header(), &[FX_CU6, FX_CU6B]),
+        );
     }
 
     /// A table of unknown shape is refused by name and counted, and no byte
