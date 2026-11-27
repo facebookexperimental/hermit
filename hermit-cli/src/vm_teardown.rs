@@ -96,6 +96,7 @@ pub const READY_BYTE: u8 = b'R';
 /// expect hundreds of MiB, not the 240 GiB a fully touched set of
 /// windows would pin. Saturation needs fork/exec churn far faster
 /// than the destroy drain.
+#[cfg(target_arch = "x86_64")]
 const MAX_IN_FLIGHT_BUNDLES: usize = 64;
 
 /// Sends one descriptor pair (`vcpu` first, mirroring the close order)
@@ -433,6 +434,7 @@ impl HelperTeardownSink {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl HelperTeardownSink {
     fn adopt(&self, vcpu: OwnedFd, vm: OwnedFd, hold: Option<Box<dyn std::any::Any + Send>>) {
         // Claim an in-flight slot, draining acknowledgements (and
@@ -492,6 +494,7 @@ impl HelperTeardownSink {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl reverie_kvm::VmTeardownSink for HelperTeardownSink {
     fn adopt_vm(&self, vcpu: OwnedFd, vm: OwnedFd) {
         self.adopt(vcpu, vm, None);
@@ -519,6 +522,7 @@ pub fn vm_teardown_sink_installed() -> bool {
 }
 
 /// The installed teardown sink, for `run_kvm` to hand to each backend.
+#[cfg(target_arch = "x86_64")]
 pub fn vm_teardown_sink() -> Option<Arc<dyn reverie_kvm::VmTeardownSink>> {
     match SINK.get() {
         Some(sink) => Some(sink.clone()),
@@ -528,9 +532,12 @@ pub fn vm_teardown_sink() -> Option<Arc<dyn reverie_kvm::VmTeardownSink>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
     use std::io::Write;
+    #[cfg(target_arch = "x86_64")]
     use std::sync::mpsc;
 
+    #[cfg(target_arch = "x86_64")]
     use reverie_kvm::VmTeardownSink as _;
 
     use super::*;
@@ -573,6 +580,7 @@ mod tests {
 
     /// A stand-in helper: announces ready, receives bundles, closes
     /// them (vcpu first), and acknowledges each. Stops at EOF.
+    #[cfg(target_arch = "x86_64")]
     fn fake_helper(mut stream: UnixStream, hold_acks: Option<mpsc::Receiver<()>>) {
         let _ = stream.write_all(&[READY_BYTE]);
         let mut held = hold_acks;
@@ -590,6 +598,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn adopted_bundles_close_in_the_helper_and_drain() {
         let (sender, helper) = UnixStream::pair().unwrap();
@@ -605,6 +614,7 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn adoption_blocks_at_the_in_flight_bound_until_an_ack() {
         let (sender, helper) = UnixStream::pair().unwrap();
@@ -660,6 +670,7 @@ mod tests {
     /// A hold survives until its bundle's acknowledgement is drained:
     /// while the helper withholds the ack, the hold is not dropped,
     /// so a guest-memory clone in it cannot unmap against a live VM.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn hold_drops_only_after_acknowledgement() {
         struct Flag(Arc<std::sync::atomic::AtomicBool>);
@@ -688,6 +699,7 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn dead_helper_falls_back_to_local_close() {
         let (sender, helper) = UnixStream::pair().unwrap();
