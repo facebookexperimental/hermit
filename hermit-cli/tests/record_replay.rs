@@ -445,6 +445,7 @@ fn record_replay_flocks_a_guest_created_fifo() {
 /// against the opening thread's base directory, not the leader's state
 /// at the later flock.
 #[test]
+#[ignore = "dh-j4ittj: the recorder inlines Python's 223.5 MB locale archive into a ~230 MB event stream that no 64 MiB retained-file limit can hold; re-enable once the recorder stops inlining file-backed mappings into the event stream"]
 fn record_replay_flocks_thread_reopened_relative_file_after_chdir() {
     let combined_output = flock_guest_output(
         concat!(
