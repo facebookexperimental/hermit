@@ -108,6 +108,8 @@ use crate::timeouts::KVM_2026_11_08_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::KVM_2026_11_26_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::KVM_2026_11_27_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
@@ -19809,7 +19811,23 @@ fi
             assert_eq!(*mode, "verify", "{test}");
             assert_eq!(*bounds, (33, 57), "{test}");
         }
-        let observed: BTreeMap<_, _> = observed.into_iter().chain(compat_dbt_slow).collect();
+        // The one compat KVM cell with a `slow` budget (rustc at 59/177,
+        // the sibling replay class as a point fix) is likewise not a
+        // ptrace corpus cell; assert it apart the same way.
+        let (compat_kvm_slow, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
+            .into_iter()
+            .partition(|((_, _, backend), _)| *backend == "kvm");
+        assert_eq!(compat_kvm_slow.len(), 1);
+        for ((test, mode, _), bounds) in &compat_kvm_slow {
+            assert_eq!(*test, "compat/rustc");
+            assert_eq!(*mode, "verify", "{test}");
+            assert_eq!(*bounds, (59, 177), "{test}");
+        }
+        let observed: BTreeMap<_, _> = observed
+            .into_iter()
+            .chain(compat_dbt_slow)
+            .chain(compat_kvm_slow)
+            .collect();
         assert_eq!(
             compat.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
@@ -19826,6 +19844,7 @@ fi
             .chain(&FLIP_2026_10_30_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_2026_11_08_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_2026_11_26_TIMEOUT_CALIBRATIONS)
+            .chain(&KVM_2026_11_27_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),

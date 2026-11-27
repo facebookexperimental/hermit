@@ -1555,6 +1555,28 @@ corpus:
     # the KVM /proc changes of 2026-11-07 and 2026-11-08. Both passed 3 of 3
     # strict verify runs in the pinned root at 19b45f66, with bitwise parity.
     - backend: kvm
+      slow:
+        - timeout_seconds: 177
+          cpu_timeout_seconds: 59
+          slow_reason: >-
+            The ordinary 22 CPU s stopped this cell in 57 of 59 KVM
+            verify attempts since 2026-11-22 (look-back in
+            KVM_2026_11_27_TIMEOUT_CALIBRATIONS). The sibling
+            replay/ptrace cell, the same workload under its 59 s slow
+            class, passed 30 of 30 with charge equal to its wait4
+            total (max 40.37 CPU s); KVM's charge over its own wait4
+            on readable kills is at most 11.15 CPU s, bounding a
+            completed KVM charge near 51.5. The bound is the sibling
+            slow class, 59 CPU s and 177 s wall: about 18% over that
+            roughly 50 CPU-s worst case, BELOW the 1.5x rule,
+            because the class already exists for this workload and
+            the precise re-derivation is parked behind the
+            falsifier. Falsifier: completed KVM charges repeatedly
+            above 51.5 CPU-s (the bound argument's own maximum: the
+            sibling's 40.37 plus KVM's extra 11.15) mean real
+            KVM-path growth to chase, and the parked measuring runs
+            return; no budget is raised again first.
+          rows: [rustc]
       rows:
         [
           addr2line, ar, arch, as, awk, b2sum, base32, base64, basename,

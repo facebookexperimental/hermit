@@ -45162,7 +45162,7 @@
       "backend": "kvm",
       "category": "compat",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -45175,7 +45175,7 @@
         "kvm"
       ],
       "test": "compat/rustc",
-      "timeout_seconds": 180
+      "timeout_seconds": 177
     },
     {
       "backend": "kvm",

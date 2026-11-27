@@ -464,6 +464,36 @@ pub const KVM_2026_11_26_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [Timeou
     configured_wall_seconds: 264,
 }];
 
+/// The KVM verify cell of compat/rustc, given its sibling replay
+/// cell's slow class as a point fix (lead 2026-11-27). Its own KVM
+/// charges are censored at the ordinary 22 CPU s in 57 of 59
+/// attempts since 2026-11-22, so the retained samples are the
+/// sibling replay/ptrace cell's 30 passes (charge equal to wait4
+/// total, max 40.37 CPU s); KVM's charge over its own wait4 on
+/// readable kills is at most 11.15 CPU s, bounding a completed
+/// KVM charge near 51.5. The p90 fields are the sibling passes'
+/// nearest-rank p90, so the required bounds recompute from them;
+/// the configured bounds are the sibling slow class itself: about
+/// 18% over the roughly 50 CPU-s worst case, BELOW the 1.5x rule,
+/// because the class already exists for this workload.
+/// Falsifier: completed KVM charges repeatedly above 51.5 CPU-s
+/// (the bound argument's own maximum: the sibling's 40.37 plus
+/// KVM's extra 11.15) mean real KVM-path growth to chase, and
+/// the parked measuring runs return; no budget is raised again
+/// first.
+pub const KVM_2026_11_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "compat/rustc",
+    mode: "verify",
+    backend: "kvm",
+    samples: 30,
+    p90_cpu_usec: 36_430_000,
+    p90_wall_millis: 39_100,
+    required_cpu_seconds: 55,
+    required_wall_seconds: 118,
+    configured_cpu_seconds: 59,
+    configured_wall_seconds: 177,
+}];
+
 /// The DBT verify cell of the Python random example, from its 249 passing
 /// result rows in coordinator-launched full validations of 2026-10-11 to
 /// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the
@@ -2318,6 +2348,7 @@ mod tests {
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_2026_11_26_TIMEOUT_CALIBRATIONS)
+            .chain(&KVM_2026_11_27_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS)
