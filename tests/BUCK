@@ -815,6 +815,17 @@ buck_filegroup(
     ],
 )
 
+# The standalone and util shell scripts (util through its
+# guest-sources, as integration-tree maps it), for gated_tests'
+# exit-122 guard: only the literal `exit 122` in .sh files is
+# checked. Guests (tests/shell) and flaky-tests scripts are not
+# covered; the glob covers a new standalone script automatically.
+buck_filegroup(
+    name = "shell-test-scripts",
+    srcs = {"util": "//hermetic_infra/hermit/tests/util:guest-sources"} | {src: src for src in glob(["standalone/*.sh"])},
+    visibility = ["//hermetic_infra/hermit/fb-only/gated_tests/tests:"],
+)
+
 # tests/ exactly as upstream has it, for the e2e cells' source snapshot
 # (//hermetic_infra/hermit:e2e-source-snapshot): the manifest planner's
 # --source-snapshot check requires every file under tests/ to have a disposition
