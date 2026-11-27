@@ -8940,6 +8940,246 @@ mod tests {
         assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
     }
 
+    /// Where the backend's whole memory map fails, a read of a rendered
+    /// `smaps` is refused before anything reads the address space's marks
+    /// (`MemoryMetadata::mapping_flags_changed`, which a rendering reads only
+    /// in `Detcore::smaps_facts`, from a map `Guest::memory_map` returned).
+    /// So the read is the same refusal, naming the map that gave no answer,
+    /// whether a madvise before it set the marks, as an answer read from the
+    /// failed map does (the default of `Guest::memory_map_overlaps`), or
+    /// left them unset, as a backend that answers from its own address space
+    /// may (`Detcore::range_reaches_listed_mapping`). `smaps_facts` asks the
+    /// kernel serving the process about protection keys, with an injected
+    /// `pkey_mprotect`, before it reads a mark: where the map fails no call
+    /// is injected after the madvise. Where the backend gives the map, that
+    /// call is, which shows the descriptor and the process table's answer let
+    /// the read reach the map. With the map given, advice on its mapping marks
+    /// the space. Advice past the mapping leaves it unmarked, as the backend's
+    /// own answer does where its map fails. Then, the kernel enabling no keys,
+    /// the read renders the file a whole list renders: once a failed map is
+    /// whole again, the space the backend's own answer left unmarked reads as
+    /// this one. That case reads the host's transparent huge page settings
+    /// and mount table, as every rendering does.
+    #[test]
+    fn a_failed_memory_map_refuses_smaps_before_the_marks_are_read() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+        use crate::tool_global::GlobalRequest;
+
+        /// The message of every event logged while it is the default.
+        struct Logged(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Logged {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Message<'a>(&'a mut String);
+                impl tracing::field::Visit for Message<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push_str(&format!("{value:?}"));
+                        }
+                    }
+                }
+                let mut text = String::new();
+                event.record(&mut Message(&mut text));
+                self.0.lock().unwrap().push(text);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        /// What a read gives: a refusal whose logged reason holds the text,
+        /// with the calls injected after the madvise; or Linux's file.
+        enum Expected {
+            Refused(&'static str, Vec<Sysno>),
+            Rendered,
+        }
+
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            let stack = reverie::MappingFact::new(
+                0x7000_0000,
+                0x7002_0000,
+                (libc::PROT_READ | libc::PROT_WRITE) as u32,
+                false,
+                0,
+                reverie::MappingBacking::Stack,
+            )
+            .unwrap();
+            let map = reverie::MemoryMap::new(vec![stack], false).unwrap();
+            let no_answer = "which gave no answer";
+            for (given, overlap, at, marked, expected) in [
+                // The answer read from the failed map marks the space.
+                (
+                    None,
+                    None,
+                    0x7000_0000,
+                    true,
+                    Expected::Refused(no_answer, Vec::new()),
+                ),
+                // An answer the backend gives where its map fails need not.
+                (
+                    None,
+                    Some(Ok(false)),
+                    0x7000_0000,
+                    false,
+                    Expected::Refused(no_answer, Vec::new()),
+                ),
+                // The map given, the advice on its mapping: the read goes on
+                // to `smaps_facts`, whose key probe this kernel answers 0,
+                // which says nothing.
+                (
+                    Some(map.clone()),
+                    None,
+                    0x7000_0000,
+                    true,
+                    Expected::Refused("asked whether it does", vec![Sysno::pkey_mprotect]),
+                ),
+                // The map given, the advice a page past its mapping: no mark,
+                // and the file a whole list renders.
+                (Some(map), None, 0x7002_0000, false, Expected::Rendered),
+            ] {
+                let what = format!(
+                    "map given {} overlap {overlap:?} at {at:#x}",
+                    given.is_some()
+                );
+                let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                tool.cfg.recordreplay_modes = false;
+                tool.cfg.backend = reverie::BackendCapabilities::KVM;
+                let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+                if let Some(map) = given.clone() {
+                    guest = guest.with_memory_map(map);
+                }
+                if let Some(overlap) = overlap {
+                    guest = guest.with_overlap_answer(overlap);
+                }
+                if let Expected::Rendered = expected {
+                    // A kernel that enables no protection keys
+                    // (`Detcore::serving_kernel_enables_protection_keys`).
+                    guest = guest.with_reply_to(Sysno::pkey_mprotect, Err(Errno::EINVAL));
+                }
+                let opener = guest.thread_state().mm_id;
+                let answer = crate::procfs::listing::ProcfsTaskAnswer {
+                    exists: true,
+                    without_mm: false,
+                    process_incarnation: 1,
+                    thread_incarnation: None,
+                    mm: Some(opener),
+                    runtime_private_memory: None,
+                };
+                let task = crate::procfs::BoundTask {
+                    process: guest.pid().as_raw(),
+                    thread: None,
+                };
+                let binding = crate::procfs::memory_map::Binding::at_open(task, &answer, opener)
+                    .expect("the opener's own task holds its address space");
+                let mut guest = guest.with_procfs_task_answer(answer);
+
+                // Advice that both changes flags and discards pages.
+                let call = syscalls::Madvise::new()
+                    .with_addr(AddrMut::from_raw(at))
+                    .with_len(page)
+                    .with_advice(libc::MADV_WIPEONFORK);
+                assert_eq!(
+                    tool.handle_madvise(&mut guest, call).await.ok(),
+                    Some(0),
+                    "{what}"
+                );
+                let state = guest.thread_state();
+                assert_eq!(state.mapping_flags_may_have_changed(), marked, "{what}");
+                assert_eq!(state.pages_may_have_been_discarded(), marked, "{what}");
+
+                let fd = 9;
+                guest
+                    .thread_state()
+                    .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                    .unwrap();
+                let mut file = ProcfsFile::from_path(Path::new("/proc/self/smaps")).unwrap();
+                file.bind_memory_map(binding);
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_procfs(file.clone()))
+                    .unwrap();
+                let advised = guest.injected().len();
+                let logged = Arc::new(Mutex::new(Vec::new()));
+                let logging = tracing::subscriber::set_default(Logged(logged.clone()));
+                let read = tool
+                    .render_address_space_file(&mut guest, fd, AddressSpaceFile::Smaps)
+                    .await;
+                drop(logging);
+                let refusals: Vec<String> = logged
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message.contains("read refused:"))
+                    .cloned()
+                    .collect();
+                let after: Vec<Sysno> = guest.injected()[advised..]
+                    .iter()
+                    .map(|(number, _)| *number)
+                    .collect();
+                let rpcs = guest.rpcs();
+                match expected {
+                    Expected::Refused(reason, injected) => {
+                        assert!(
+                            matches!(read, Err(Error::Errno(Errno::EOPNOTSUPP))),
+                            "{what}: {read:?}"
+                        );
+                        assert!(
+                            matches!(refusals.as_slice(), [refusal] if refusal.contains(reason)),
+                            "{what}: {refusals:?}"
+                        );
+                        assert_eq!(after, injected, "{what}");
+                        assert!(
+                            matches!(
+                                rpcs.as_slice(),
+                                [
+                                    GlobalRequest::ProcfsTask(..),
+                                    GlobalRequest::ReportUnsupportedSyscall(_)
+                                ]
+                            ),
+                            "{what}: {rpcs:?}"
+                        );
+                    }
+                    Expected::Rendered => {
+                        // This case renders through the host's readers: its
+                        // transparent huge page settings and its mount table
+                        // (`smaps::host_thp`, `smaps::host_filesystems`). A
+                        // refusal names which one Detcore could not read.
+                        let bytes = read.unwrap_or_else(|error| {
+                            panic!("{what}: {error:?}, refused: {refusals:?}")
+                        });
+                        let text = String::from_utf8(bytes).unwrap();
+                        assert!(
+                            text.starts_with("70000000-70020000 rw-p 00000000 00:00 0 "),
+                            "{what}: {text}"
+                        );
+                        assert!(text.contains("[stack]"), "{what}: {text}");
+                        assert!(refusals.is_empty(), "{what}: {refusals:?}");
+                        assert_eq!(after.first(), Some(&Sysno::pkey_mprotect), "{what}");
+                        assert!(
+                            matches!(rpcs.as_slice(), [GlobalRequest::ProcfsTask(..)]),
+                            "{what}: {rpcs:?}"
+                        );
+                    }
+                }
+            }
+        })
+    }
+
     /// A guest for [`Detcore::bind_task_identity`]: its registers name the
     /// call being answered (`openat`), and nothing else is used.
     struct RefusalGuest<'a> {

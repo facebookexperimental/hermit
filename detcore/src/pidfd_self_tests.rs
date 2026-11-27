@@ -429,6 +429,38 @@ fn the_adapter_respells_every_injection_route_of_the_guest_call() {
     })
 }
 
+/// The adapter forwards `memory_map_overlaps` to the thread it wraps, so it
+/// gives that thread's own answer and not the trait default's, which reads
+/// the adapter's whole `memory_map`. The wrapped thread here gives no list
+/// but answers the overlap itself, as a backend that keeps the address space
+/// may where its whole list fails (`Guest::memory_map_overlaps`): only the
+/// forward gives its answer. The adapter wraps a thread only for a respelled
+/// pidfd call today, which asks no such question; the forward keeps it a
+/// complete wrapper, so a question through it never reads the backend's whole
+/// list (`Detcore::range_reaches_listed_mapping`).
+#[test]
+fn the_adapter_forwards_the_overlap_question_to_the_wrapped_thread() {
+    use crate::syscall_hot_path_tests::InjectGuest;
+
+    let respelled = respelling(pidfd_send_signal(register(GROUP), 0, 0, 0));
+    let mut inner = InjectGuest::<NoopTool>::new(Ok(0)).with_overlap_answer(Ok(false));
+    let tid = inner.tid();
+    assert_eq!(
+        inner.memory_map(tid).err(),
+        Some(reverie::FactError::NotProvided)
+    );
+    let adapter = PhysicalSpelling::<_, Detcore>::new(&mut inner, respelled);
+    assert_eq!(
+        adapter.memory_map(tid).err(),
+        Some(reverie::FactError::NotProvided)
+    );
+    assert_eq!(
+        adapter.memory_map_overlaps(tid, 0x7000_0000, 0x7000_1000),
+        Ok(false),
+        "the adapter must give the wrapped thread's own overlap answer"
+    );
+}
+
 /// Through Detcore's forwarding, with the slot armed: the record tool
 /// records the guest's canonical call and the kernel is given the physical
 /// one; with no tool the injection is respelled the same way; and with the

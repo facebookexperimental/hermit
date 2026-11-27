@@ -1128,6 +1128,156 @@ VmFlags: rd wr mr mw me gd ac
         })
     }
 
+    /// The discard mark (`MemoryMetadata::pages_discarded`) is set only where
+    /// Detcore renders address-space files, from `Guest::memory_map_overlaps`,
+    /// which may answer where the backend's whole memory map fails
+    /// (`Detcore::range_reaches_listed_mapping`). Its one reader is
+    /// native-exec freshness (`MemoryMetadata::is_fresh_for_native_exec`),
+    /// which only LiteInst's in-guest native exec reaches. That backend must
+    /// therefore never render the files: this pins it, and fails if its
+    /// capabilities ever move.
+    #[test]
+    fn the_native_exec_backend_never_renders_address_space_files() {
+        use crate::record_or_replay::NoopTool;
+
+        let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+        tool.cfg.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+        assert!(!tool.renders_address_space_files());
+        tool.cfg.backend = reverie::BackendCapabilities::KVM;
+        assert!(tool.renders_address_space_files());
+    }
+
+    /// Where the backend's whole memory map fails, as it does when a mapping
+    /// elsewhere cannot be stated, a backend may still answer whether a range
+    /// reaches a listed mapping, counting that mapping as listed
+    /// (`Guest::memory_map_overlaps`). Then advice that changes flags and
+    /// discards pages, over a range that reaches no mapping, leaves both
+    /// marks unset, as a whole map's own answer does for the same range;
+    /// the answer read from the failed map set them. The madvise result is
+    /// the same every way. While the map fails, so is every file the guest
+    /// can read: `smaps` is rendered only from a map `memory_map` gives, so
+    /// it is refused either way before a mark is read
+    /// (`a_failed_memory_map_refuses_smaps_before_the_marks_are_read`). Once
+    /// the map is whole again, the unmarked space renders as the whole map's
+    /// own does, where the marked one is refused. Native-exec freshness is
+    /// never reached where the marks are set
+    /// (`the_native_exec_backend_never_renders_address_space_files`).
+    #[test]
+    fn an_answer_where_the_map_fails_leaves_the_madvise_result_alone() {
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            for (map, answer, marked) in [
+                // The answer read from the failed map.
+                (None, None, true),
+                // The backend's own answer where its map fails.
+                (None, Some(Ok(false)), false),
+                // A whole map's own answer: the range is past its one mapping.
+                (Some(stack_window()), None, false),
+            ] {
+                let what = format!("map given {} answer {answer:?}", map.is_some());
+                let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                tool.cfg.recordreplay_modes = false;
+                tool.cfg.backend = reverie::BackendCapabilities::KVM;
+                let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+                let map_given = map.is_some();
+                if let Some(map) = map {
+                    guest = guest.with_memory_map(map);
+                }
+                if let Some(answer) = answer {
+                    guest = guest.with_overlap_answer(answer);
+                }
+                let call = syscalls::Madvise::new()
+                    .with_addr(AddrMut::from_raw(0x7002_0000))
+                    .with_len(page)
+                    .with_advice(libc::MADV_WIPEONFORK);
+                let result = tool.handle_madvise(&mut guest, call).await;
+                assert_eq!(result.ok(), Some(0), "{what}");
+                let state = guest.thread_state();
+                assert_eq!(state.mapping_flags_may_have_changed(), marked, "{what}");
+                assert_eq!(state.pages_may_have_been_discarded(), marked, "{what}");
+                // What a rendered `smaps` reads first fails where no map is
+                // given.
+                assert_eq!(guest.memory_map(guest.tid()).is_err(), !map_given, "{what}");
+            }
+        })
+    }
+
+    /// Once the backend answers whether a range reaches a listed mapping
+    /// (`Guest::memory_map_overlaps`), neither a marking madvise nor a memory
+    /// lock asks for the whole memory map: the cost of listing every mapping,
+    /// once per call, is what the question exists to avoid. The marks follow
+    /// the answer: set where it says the range reaches a listed mapping, and
+    /// where it is an error, which cannot show that the call reached none;
+    /// unset where it says the range reaches none. Here the backend gives no
+    /// list at all. Without an answer the call reads the list once, which the
+    /// last case shows, so the count would catch a call that did.
+    #[test]
+    fn once_the_backend_answers_the_overlap_no_call_reads_the_whole_list() {
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            for (answer, marked, reads) in [
+                (Some(Ok(true)), true, 0),
+                (Some(Ok(false)), false, 0),
+                (Some(Err(reverie::FactError::Errno(Errno::EIO))), true, 0),
+                // No answer: the trait's default reads the list, which fails.
+                (None, true, 1),
+            ] {
+                for lock in [false, true] {
+                    let what = format!("answer {answer:?} lock {lock}");
+                    let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                    tool.cfg.recordreplay_modes = false;
+                    tool.cfg.backend = reverie::BackendCapabilities::KVM;
+                    let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+                    if let Some(answer) = answer {
+                        guest = guest.with_overlap_answer(answer);
+                    }
+                    if lock {
+                        let call = Syscall::from_raw(
+                            Sysno::mlock,
+                            SyscallArgs::new(0x7000_0000, page, 0, 0, 0, 0),
+                        );
+                        assert_eq!(
+                            tool.handle_memory_lock_call(&mut guest, call).await.ok(),
+                            Some(0),
+                            "{what}"
+                        );
+                    } else {
+                        let call = syscalls::Madvise::new()
+                            .with_addr(AddrMut::from_raw(0x7000_0000))
+                            .with_len(page)
+                            .with_advice(libc::MADV_WIPEONFORK);
+                        assert_eq!(
+                            tool.handle_madvise(&mut guest, call).await.ok(),
+                            Some(0),
+                            "{what}"
+                        );
+                        assert_eq!(
+                            guest.thread_state().pages_may_have_been_discarded(),
+                            marked,
+                            "{what}"
+                        );
+                    }
+                    assert_eq!(
+                        guest.thread_state().mapping_flags_may_have_changed(),
+                        marked,
+                        "{what}"
+                    );
+                    assert_eq!(guest.memory_map_calls(), reads, "{what}");
+                }
+            }
+        })
+    }
+
     /// A memory lock marks the address space once the backend may have run
     /// it, a part-way failure too; not ENOSYS, the answer of a backend that
     /// runs none (KVM's LinuxEmu). Only where Detcore renders the files from

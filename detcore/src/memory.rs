@@ -154,6 +154,13 @@ impl MemoryMetadata {
             && self.brk_model.is_none()
             && self.brk_unmodeled.is_none()
             && !self.protection_keys
+            // These two marks may be set from an answer given where the
+            // backend's whole memory map fails
+            // (`Detcore::range_reaches_listed_mapping`), only in a session
+            // that renders address-space files, which LiteInst's in-guest
+            // native exec, the only path here, never does; the test
+            // `the_native_exec_backend_never_renders_address_space_files`
+            // pins that.
             && !self.mapping_flags_changed
             && !self.pages_discarded
             && !self.unresolved_shared_mapping

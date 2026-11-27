@@ -2148,8 +2148,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Whether the pages that hold `[start, start + len)`, the range a call
     /// acted on, overlap a mapping the backend's memory map lists, the only
     /// mappings a rendered `smaps` shows
-    /// (`procfs::memory_map::smaps`). True where the backend gives no map,
-    /// which cannot show that the call reached none.
+    /// (`procfs::memory_map::smaps`), asked with
+    /// `Guest::memory_map_overlaps` rather than by reading the whole list:
+    /// a backend that keeps the address space can answer without listing
+    /// every mapping. True where the backend gives no answer, which cannot
+    /// show that the call reached none.
+    ///
+    /// A backend may answer where its whole list fails because a mapping
+    /// elsewhere cannot be stated, counting that mapping as listed
+    /// (`Guest::memory_map_overlaps`). The answer then marks the address
+    /// space as a list that could state every mapping would. It differs from
+    /// no answer only for a range that reaches no listed mapping, where the
+    /// call changed nothing a rendered `smaps` shows. While the list still
+    /// fails, a `smaps` read is refused before it reads a mark
+    /// (`Detcore::smaps_facts` takes a list `memory_map` returned). Once the
+    /// list is whole again, such a read renders what a whole list renders,
+    /// where no answer would have marked the space and refused it. The
+    /// marks' other reader, native-exec
+    /// freshness (`MemoryMetadata::is_fresh_for_native_exec`), is reached by
+    /// no session that renders these files.
     ///
     /// A zero length reaches no page, as for madvise, which returns before
     /// any when `start + PAGE_ALIGN(len)` is `start` (`madvise_should_skip`,
@@ -2172,13 +2189,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let page = crate::page::page_size();
         let first = start & !(page - 1);
         let end = start.saturating_add(len).saturating_add(page - 1) & !(page - 1);
-        match guest.memory_map(guest.tid()) {
-            Ok(map) => map
-                .mappings
-                .iter()
-                .any(|mapping| mapping.start < end && first < mapping.end),
-            Err(_) => true,
-        }
+        guest
+            .memory_map_overlaps(guest.tid(), first, end)
+            .unwrap_or(true)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -44,3 +44,4 @@ thiserror
 tokio-stream
 typed-arena
 unwind
+zerocopy

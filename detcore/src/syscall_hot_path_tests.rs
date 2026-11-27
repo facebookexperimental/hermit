@@ -37,22 +37,32 @@ use crate::GlobalState;
 use crate::ThreadState;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
+use crate::tool_global::GlobalRequest;
+use crate::tool_global::GlobalResponse;
 use crate::types::DetPid;
 
 const TID: i32 = 4242;
 
 /// A thread that records every syscall injected through it and answers each
-/// with `reply`. Nothing else it offers is expected to be used, but for its
-/// registers where a test supplies them (`with_registers`), and a backend's
-/// typed refusal where a test supplies one (`with_refusal`).
+/// with `reply`, or with the reply a test gives that syscall
+/// (`with_reply_to`). Nothing else it offers is expected to be used, but for
+/// its registers where a test supplies them (`with_registers`), a backend's
+/// typed refusal where a test supplies one (`with_refusal`), and the two
+/// requests a read of a rendered procfs file sends where a test supplies the
+/// process table's answer (`with_procfs_task_answer`).
 pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
     pub(crate) config: Config,
     thread: ThreadState<()>,
     reply: Result<i64, Errno>,
+    replies_to: Vec<(Sysno, Result<i64, Errno>)>,
     registers: Option<libc::user_regs_struct>,
     refusal: Option<reverie::UnsupportedRefusal>,
     injected: Mutex<Vec<(Sysno, SyscallArgs)>>,
     memory_map: Option<reverie::MemoryMap>,
+    memory_map_calls: std::sync::atomic::AtomicUsize,
+    overlap_answer: Option<Result<bool, reverie::FactError>>,
+    procfs_task: Option<crate::procfs::listing::ProcfsTaskAnswer>,
+    rpcs: Mutex<Vec<GlobalRequest>>,
     runtime_fd: Option<i32>,
     _tool: std::marker::PhantomData<T>,
 }
@@ -65,18 +75,38 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
             config,
             thread,
             reply,
+            replies_to: Vec::new(),
             registers: None,
             refusal: None,
             injected: Mutex::new(Vec::new()),
             memory_map: None,
+            memory_map_calls: std::sync::atomic::AtomicUsize::new(0),
+            overlap_answer: None,
+            procfs_task: None,
+            rpcs: Mutex::new(Vec::new()),
             runtime_fd: None,
             _tool: std::marker::PhantomData,
         }
     }
 
+    /// Answer every injection of `sysno` with `reply` rather than with the
+    /// reply every other syscall gets.
+    pub(crate) fn with_reply_to(mut self, sysno: Sysno, reply: Result<i64, Errno>) -> Self {
+        self.replies_to.push((sysno, reply));
+        self
+    }
+
     /// Answer the `memory_map` fact with `map` rather than not providing it.
     pub(crate) fn with_memory_map(mut self, map: reverie::MemoryMap) -> Self {
         self.memory_map = Some(map);
+        self
+    }
+
+    /// Answer `memory_map_overlaps` with `answer` whatever the range, as a
+    /// backend that answers it from its own address space may where its
+    /// whole memory map fails, rather than reading it from `memory_map`.
+    pub(crate) fn with_overlap_answer(mut self, answer: Result<bool, reverie::FactError>) -> Self {
+        self.overlap_answer = Some(answer);
         self
     }
 
@@ -99,8 +129,34 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
         self
     }
 
+    /// Answer the global tool's two requests a read of a rendered procfs file
+    /// sends, rather than panicking at them: the process table's question
+    /// about the task the file names (`tool_global::procfs_task`) with
+    /// `answer`, and the report of an unsupported operation
+    /// (`tool_global::report_unsupported_syscall`) with its acknowledgement.
+    /// Every other request still panics.
+    pub(crate) fn with_procfs_task_answer(
+        mut self,
+        answer: crate::procfs::listing::ProcfsTaskAnswer,
+    ) -> Self {
+        self.procfs_task = Some(answer);
+        self
+    }
+
     pub(crate) fn injected(&self) -> Vec<(Sysno, SyscallArgs)> {
         self.injected.lock().unwrap().clone()
+    }
+
+    /// The global requests answered (`with_procfs_task_answer`), in order.
+    pub(crate) fn rpcs(&self) -> Vec<GlobalRequest> {
+        self.rpcs.lock().unwrap().clone()
+    }
+
+    /// How many times the whole memory map was asked for, by anyone: the
+    /// cost `Guest::memory_map_overlaps` exists to avoid.
+    pub(crate) fn memory_map_calls(&self) -> usize {
+        self.memory_map_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -134,7 +190,21 @@ impl<T: RecordOrReplay<ThreadState = ()>> GlobalRPC<GlobalState> for InjectGuest
         &self,
         message: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
-        panic!("forwarding a syscall sent an RPC: {:?}", message.2)
+        let request = match message.2 {
+            GlobalRequest::WithForwardedCount(_, request) => *request,
+            request => request,
+        };
+        let response = match (&request, &self.procfs_task) {
+            (GlobalRequest::ProcfsTask(..), Some(answer)) => {
+                GlobalResponse::ProcfsTask(answer.clone())
+            }
+            (GlobalRequest::ReportUnsupportedSyscall(_), Some(_)) => {
+                GlobalResponse::ReportUnsupportedSyscall(())
+            }
+            _ => panic!("forwarding a syscall sent an RPC: {request:?}"),
+        };
+        self.rpcs.lock().unwrap().push(request);
+        (None, response)
     }
     fn config(&self) -> &Config {
         &self.config
@@ -179,7 +249,10 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
         let (number, args) = call.into_parts();
         self.injected.lock().unwrap().push((number, args));
-        self.reply
+        self.replies_to
+            .iter()
+            .find(|(sysno, _)| *sysno == number)
+            .map_or(self.reply, |(_, reply)| *reply)
     }
     async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
         panic!("forwarding a syscall must not tail-inject")
@@ -197,9 +270,26 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
         self.refusal.take()
     }
     fn memory_map(&self, _tid: Pid) -> Result<reverie::MemoryMap, reverie::FactError> {
+        self.memory_map_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.memory_map
             .clone()
             .ok_or(reverie::FactError::NotProvided)
+    }
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, reverie::FactError> {
+        match self.overlap_answer {
+            Some(answer) => answer,
+            // The trait's default, from `memory_map`, restated: an override
+            // cannot call the default it replaces. It must stay the same as
+            // `reverie::Guest::memory_map_overlaps`'s default.
+            None if end <= start => Ok(false),
+            None => Ok(self.memory_map(tid)?.overlaps(start, end)),
+        }
     }
 }
 
