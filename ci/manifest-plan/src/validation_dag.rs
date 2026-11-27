@@ -3718,8 +3718,16 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             }
             step.cmd = step.cmd.replace(previous, "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test'");
         }
-        step.env
-            .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+        // test.record_replay never reads HERMIT_E2E_EMPTY_WORKDIR and
+        // never calls the harness's guest-workdir injection, and
+        // run_node.py gives each of its cases an isolated cwd of its
+        // own. Naming /test for it only makes the runner's workdir
+        // probe skip the whole node on hosts without /test. Every
+        // other pinned-root step keeps the variable.
+        if step.tag() != "test.record_replay" {
+            step.env
+                .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+        }
         step.deps = step
             .deps
             .iter()

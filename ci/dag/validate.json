@@ -26468,7 +26468,6 @@
         "setup.pinned_root_fetch"
       ],
       "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"record_replay\"]"
