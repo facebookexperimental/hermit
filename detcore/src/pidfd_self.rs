@@ -623,6 +623,15 @@ where
         self.inner.memory_map(tid)
     }
 
+    fn memory_map_overlaps(
+        &self,
+        tid: Pid,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, reverie::FactError> {
+        self.inner.memory_map_overlaps(tid, start, end)
+    }
+
     fn pidfd_self_spelling(&self) -> PidfdSelfSpelling {
         self.inner.pidfd_self_spelling()
     }

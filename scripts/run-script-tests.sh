@@ -85,7 +85,7 @@ declare -A relocated_prefixes=(
     [ci/build-liteinst-allocator-fixtures.rs]='m1_artifact::'
 )
 declare -A relocated_counts=(
-    [ci/build-liteinst-allocator-fixtures.rs]=319
+    [ci/build-liteinst-allocator-fixtures.rs]=329
 )
 declare -A relocated_homes=(
     [ci/build-liteinst-allocator-fixtures.rs]="reverie-liteinst-artifact's own test binary"

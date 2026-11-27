@@ -339,7 +339,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
                     .as_array()
                     .unwrap()
                     .len(),
-                507,
+                508,
             );
         }
         CompiledSourceLayout::GitlinkCheckout => {
@@ -361,13 +361,15 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
     }
     // The path inventory is the reviewed catalog plus every
     // source-shaped file in the compiled closure, not the git arm's
-    // catalog alone: 507 entries on this tree (506 measured
+    // catalog alone: 508 entries on this tree (506 measured
     // 2026-11-16, plus reverie-liteinst/tests/aarch64_trap_install.rs
-    // from the landed aarch64 trap-install change).
+    // from the landed aarch64 trap-install change, plus
+    // reverie/tests/memory_map_overlaps_forwarding.rs from the
+    // landed memory-map change).
     let reverie_inventory = observed["authority"]["reverie_inventory"]
         .as_array()
         .unwrap();
-    assert_eq!(reverie_inventory.len(), 507);
+    assert_eq!(reverie_inventory.len(), 508);
     let mut inventory_paths: Vec<&str> = reverie_inventory
         .iter()
         .map(|entry| entry["relative"].as_str().unwrap())
@@ -384,7 +386,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
     // constant deliberately, like the count above.
     assert_eq!(
         crate::artifact::sha256(format!("{}\n", inventory_paths.join("\n")).as_bytes()),
-        "12925ab51846415091a7e663f27445afb0e53e3f7a60aac85d782051781399ba",
+        "6e2acffb8b838dd84975886ced92f1e1147ad4633be7c89cc21d342faa6cfe7f",
     );
     assert_eq!(
         context.compiler_manifest_path()?.as_os_str(),
