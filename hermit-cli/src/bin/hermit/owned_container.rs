@@ -84,6 +84,27 @@ const FINALIZE_BUDGET_ENV: &str = "HERMIT_FINALIZE_BUDGET_MS";
 /// guest's; an unset or unparsable value means no stall.
 const STALL_AFTER_PUBLICATION_ENV: &str = "HERMIT_INTERNAL_STALL_AFTER_PUBLICATION_MS";
 
+/// Temporary dual-pin shim: `StartupOwnedFailure::AfterClone.run` is a
+/// plain `OwnedFinalization` at the currently pinned Reverie and a
+/// `Box<OwnedFinalization>` after the mount-failure change, while
+/// `OwnedFinalize::Failed.cleanup` is unboxed in both. The repin
+/// follow-up deletes this trait and restores the explicit `*run`.
+trait IntoOwnedFinalization<T> {
+    fn into_owned_finalization(self) -> OwnedFinalization<T>;
+}
+
+impl<T> IntoOwnedFinalization<T> for OwnedFinalization<T> {
+    fn into_owned_finalization(self) -> OwnedFinalization<T> {
+        self
+    }
+}
+
+impl<T> IntoOwnedFinalization<T> for Box<OwnedFinalization<T>> {
+    fn into_owned_finalization(self) -> OwnedFinalization<T> {
+        *self
+    }
+}
+
 /// The finalize budget for this invocation, refusing a malformed override
 /// rather than silently falling back to the default.
 fn finalize_budget() -> Result<Duration, Error> {
@@ -325,7 +346,7 @@ where
             (
                 OwnedFinalize::Failed {
                     cause,
-                    cleanup: run,
+                    cleanup: run.into_owned_finalization(),
                 },
                 pid,
             )
