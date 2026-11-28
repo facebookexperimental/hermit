@@ -16,6 +16,7 @@ use super::RetainedJson;
 
 pub const ADMISSION_CONTEXT_CONTRACT: &str = "ci-hub-admission-floor/v1";
 pub const ADMISSION_CONTEXT_V2_CONTRACT: &str = "ci-hub-admission-floor/v2";
+pub const ADMISSION_CONTEXT_V3_CONTRACT: &str = "ci-hub-admission-floor/v3";
 pub const ADMISSION_CONTEXT_MAX_BYTES: usize = 1024 * 1024;
 
 /// The most first-parent main commits a `disjoint-main` floor may lag the main
@@ -174,6 +175,33 @@ pub struct AdmissionContextV2 {
     pub pin_bindings: Vec<AdmissionPinBindingV1>,
 }
 
+/// V3 is V2 plus the required selected floor-bound pin-node set. The
+/// contract itself says when that set is mandatory: a V3 record without it
+/// is not a V3 record. V1 and V2 remain readable for history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionContextV3 {
+    pub contract: String,
+    /// The driver's timestamp when it wrote the raw lock response ("...Z").
+    pub observed_at: String,
+    pub target_sha: String,
+    pub target_tree: String,
+    pub host: String,
+    pub run_id: String,
+    pub started_at: String,
+    pub log_identity: WorkspaceLocatorV2,
+    pub authority: AdmissionAuthorityV1,
+    pub floor: AdmissionFloorV1,
+    pub canonical_plan_sha256: String,
+    pub execution_plan_sha256: String,
+    pub pin_bindings: Vec<AdmissionPinBindingV1>,
+    /// Sorted unique floor-bound pin nodes selected in the bound plans.
+    /// The reader requires exactly one binding for each, no extra binding.
+    pub selected_pin_nodes: Vec<String>,
+}
+
+pub type AdmissionContextArtifactV3 = AdmissionContextArtifactV2;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionContextArtifactV2 {
@@ -190,12 +218,20 @@ pub struct AdmissionFloorEvidenceV2 {
 }
 
 /// Wire serialization has no enum tag; the required context contract selects
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionFloorEvidenceV3 {
+    pub context: AdmissionContextV3,
+    pub artifact: AdmissionContextArtifactV3,
+}
+
 /// exactly one strict schema. V1 is never normalized into V2.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AdmissionEvidence {
     V1(AdmissionFloorEvidenceV1),
     V2(AdmissionFloorEvidenceV2),
+    V3(AdmissionFloorEvidenceV3),
 }
 
 fn transport_safe_string(value: &str) -> bool {
@@ -472,6 +508,9 @@ impl<'de> Deserialize<'de> for AdmissionEvidence {
                 .map_err(serde::de::Error::custom),
             Some(ADMISSION_CONTEXT_V2_CONTRACT) => serde_json::from_value(captured.value)
                 .map(Self::V2)
+                .map_err(serde::de::Error::custom),
+            Some(ADMISSION_CONTEXT_V3_CONTRACT) => serde_json::from_value(captured.value)
+                .map(Self::V3)
                 .map_err(serde::de::Error::custom),
             _ => Err(serde::de::Error::custom(
                 "unknown admission context contract",
@@ -785,6 +824,7 @@ struct AdmissionIdentity<'a> {
     canonical_plan_sha256: &'a str,
     execution_plan_sha256: &'a str,
     pin_bindings: &'a [AdmissionPinBindingV1],
+    selected_pin_nodes: Option<&'a [String]>,
 }
 
 impl AdmissionIdentity<'_> {
@@ -938,6 +978,33 @@ impl AdmissionIdentity<'_> {
                 return Err("admission context has an invalid or duplicate pin binding".into());
             }
         }
+        if let Some(selected_pin_nodes) = self.selected_pin_nodes {
+            if let Some(pair) = selected_pin_nodes.windows(2).find(|w| w[0] >= w[1]) {
+                return Err(format!(
+                    "admission context selected pin nodes are not sorted unique: \
+                     first out-of-order pair {:?} >= {:?}",
+                    pair[0], pair[1]
+                ));
+            }
+            let mut selected = BTreeSet::new();
+            for node in selected_pin_nodes {
+                if !ADMISSION_PIN_NODES.contains(&node.as_str()) || !selected.insert(node) {
+                    return Err(format!(
+                        "admission context has an invalid or duplicate selected pin node {node:?}"
+                    ));
+                }
+            }
+            if let Some(node) = selected.iter().find(|node| !nodes.contains(*node)) {
+                return Err(format!(
+                    "admission context is missing a pin binding for selected floor-bound pin node {node:?}"
+                ));
+            }
+            if let Some(node) = nodes.iter().find(|node| !selected.contains(*node)) {
+                return Err(format!(
+                    "admission context has an extra pin binding for unselected floor-bound pin node {node:?}"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -959,6 +1026,7 @@ impl AdmissionContextV1 {
             canonical_plan_sha256: &self.canonical_plan_sha256,
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
+            selected_pin_nodes: None,
             log_valid: self.log_file.starts_with('/') && !self.log_file.contains('\0'),
             v2_contract: false,
         }
@@ -989,6 +1057,7 @@ impl AdmissionContextV2 {
             canonical_plan_sha256: &self.canonical_plan_sha256,
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
+            selected_pin_nodes: None,
             log_valid: true,
             v2_contract: true,
         }
@@ -1021,6 +1090,37 @@ impl AdmissionFloorEvidenceV1 {
             &c.started_at,
             Some(&c.log_file),
         )
+    }
+}
+
+impl AdmissionContextV3 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.contract != ADMISSION_CONTEXT_V3_CONTRACT {
+            return Err("unknown admission context contract".into());
+        }
+        self.log_identity.validate()?;
+        if !transport_safe_value(&serde_json::to_value(self).map_err(|e| e.to_string())?) {
+            return Err(
+                "V3 context contains a nonportable substitution token or owner path".into(),
+            );
+        }
+        AdmissionIdentity {
+            observed_at: &self.observed_at,
+            target_sha: &self.target_sha,
+            target_tree: &self.target_tree,
+            host: &self.host,
+            run_id: &self.run_id,
+            started_at: &self.started_at,
+            authority: &self.authority,
+            floor: &self.floor,
+            canonical_plan_sha256: &self.canonical_plan_sha256,
+            execution_plan_sha256: &self.execution_plan_sha256,
+            pin_bindings: &self.pin_bindings,
+            selected_pin_nodes: Some(&self.selected_pin_nodes),
+            log_valid: true,
+            v2_contract: true,
+        }
+        .validate()
     }
 }
 
@@ -1090,6 +1190,22 @@ pub fn admission_context_v2_from_bytes(bytes: &[u8]) -> Result<AdmissionContextV
     Ok(context)
 }
 
+pub fn admission_context_v3_bytes(context: &AdmissionContextV3) -> Result<Vec<u8>, String> {
+    context.validate()?;
+    canonical_context_bytes(&serde_json::to_value(context).map_err(|e| e.to_string())?)
+}
+
+pub fn admission_context_v3_from_bytes(bytes: &[u8]) -> Result<AdmissionContextV3, String> {
+    if bytes.len() > ADMISSION_CONTEXT_MAX_BYTES {
+        return Err("admission context exceeds its 1 MiB wire bound".into());
+    }
+    let context: AdmissionContextV3 = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if admission_context_v3_bytes(&context)? != bytes {
+        return Err("admission context is not canonical v3 JSON".into());
+    }
+    Ok(context)
+}
+
 pub fn admission_evidence_receipt_echo(bytes: &[u8]) -> Result<AdmissionEvidence, String> {
     #[derive(Deserialize)]
     struct Echo {
@@ -1139,35 +1255,77 @@ impl AdmissionFloorEvidenceV2 {
     }
 }
 
+impl AdmissionFloorEvidenceV3 {
+    pub fn validate(&self) -> Result<(), String> {
+        let bytes = admission_context_v3_bytes(&self.context)?;
+        self.artifact.locator.validate()?;
+        if self.artifact.bytes != bytes.len() as u64
+            || self.artifact.sha256 != admission_sha256(&bytes)
+        {
+            return Err("admission artifact does not match the inline context bytes".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
+        self.validate()?;
+        let c = &self.context;
+        validate_original_row(
+            row,
+            &c.target_sha,
+            &c.target_tree,
+            &c.host,
+            &c.run_id,
+            &c.started_at,
+            None,
+        )?;
+        let identity: WorkspaceLocatorV2 = serde_json::from_value(
+            row.admission_log_identity()
+                .ok_or("V3 selected row has no log_identity")?,
+        )
+        .map_err(|e| format!("invalid original row log_identity: {e}"))?;
+        identity.validate()?;
+        if identity != c.log_identity {
+            return Err("admission context disagrees with original row log_identity".into());
+        }
+        Ok(())
+    }
+}
+
 impl AdmissionEvidence {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::V1(e) => e.validate(),
             Self::V2(e) => e.validate(),
+            Self::V3(e) => e.validate(),
         }
     }
     pub fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
         match self {
             Self::V1(e) => e.validate_for_row(row),
             Self::V2(e) => e.validate_for_row(row),
+            Self::V3(e) => e.validate_for_row(row),
         }
     }
     pub fn context_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
             Self::V1(e) => admission_context_bytes(&e.context),
             Self::V2(e) => admission_context_v2_bytes(&e.context),
+            Self::V3(e) => admission_context_v3_bytes(&e.context),
         }
     }
     pub fn floor(&self) -> &AdmissionFloorV1 {
         match self {
             Self::V1(e) => &e.context.floor,
             Self::V2(e) => &e.context.floor,
+            Self::V3(e) => &e.context.floor,
         }
     }
     pub fn authority(&self) -> &AdmissionAuthorityV1 {
         match self {
             Self::V1(e) => &e.context.authority,
             Self::V2(e) => &e.context.authority,
+            Self::V3(e) => &e.context.authority,
         }
     }
     /// Ordinary validation authority is canonical from the record alone when
@@ -1200,24 +1358,28 @@ impl AdmissionEvidence {
         match self {
             Self::V1(_) => None,
             Self::V2(e) => Some(&e.context.log_identity),
+            Self::V3(e) => Some(&e.context.log_identity),
         }
     }
     pub fn artifact_locator(&self) -> Option<&WorkspaceLocatorV2> {
         match self {
             Self::V1(_) => None,
             Self::V2(e) => Some(&e.artifact.locator),
+            Self::V3(e) => Some(&e.artifact.locator),
         }
     }
     pub fn artifact_sha256(&self) -> &str {
         match self {
             Self::V1(e) => &e.artifact.sha256,
             Self::V2(e) => &e.artifact.sha256,
+            Self::V3(e) => &e.artifact.sha256,
         }
     }
     pub fn artifact_bytes(&self) -> u64 {
         match self {
             Self::V1(e) => e.artifact.bytes,
             Self::V2(e) => e.artifact.bytes,
+            Self::V3(e) => e.artifact.bytes,
         }
     }
 }
@@ -1328,6 +1490,61 @@ mod tests {
         AdmissionFloorEvidenceV2 {
             context: c,
             artifact: AdmissionContextArtifactV2 {
+                locator: WorkspaceLocatorV2 {
+                    scope: "workspace".into(),
+                    path: "ignored/validate/admission/exact-run/context.json".into(),
+                },
+                sha256: admission_sha256(&bytes),
+                bytes: bytes.len() as u64,
+            },
+        }
+    }
+
+    fn context_v3() -> AdmissionContextV3 {
+        let c = context_v2();
+        let selected_pin_nodes = vec![
+            "check.lint_checks".to_owned(),
+            "check.reverie_pin_bindings".to_owned(),
+        ];
+        let pin_bindings = selected_pin_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| AdmissionPinBindingV1 {
+                node: node.clone(),
+                base_sha: c.floor.sha.clone(),
+                canonical_command_sha256: char::from_digit(8 + index as u32, 16)
+                    .unwrap()
+                    .to_string()
+                    .repeat(64),
+                execution_command_sha256: char::from_digit(10 + index as u32, 16)
+                    .unwrap()
+                    .to_string()
+                    .repeat(64),
+            })
+            .collect();
+        AdmissionContextV3 {
+            contract: ADMISSION_CONTEXT_V3_CONTRACT.into(),
+            observed_at: c.observed_at,
+            target_sha: c.target_sha,
+            target_tree: c.target_tree,
+            host: c.host,
+            run_id: c.run_id,
+            started_at: c.started_at,
+            log_identity: c.log_identity,
+            authority: c.authority,
+            floor: c.floor,
+            canonical_plan_sha256: c.canonical_plan_sha256,
+            execution_plan_sha256: c.execution_plan_sha256,
+            pin_bindings,
+            selected_pin_nodes,
+        }
+    }
+
+    fn evidence_v3(c: AdmissionContextV3) -> AdmissionFloorEvidenceV3 {
+        let bytes = admission_context_v3_bytes(&c).unwrap();
+        AdmissionFloorEvidenceV3 {
+            context: c,
+            artifact: AdmissionContextArtifactV3 {
                 locator: WorkspaceLocatorV2 {
                     scope: "workspace".into(),
                     path: "ignored/validate/admission/exact-run/context.json".into(),
@@ -2825,5 +3042,62 @@ mod tests {
             }))
             .unwrap()
         );
+    }
+    #[test]
+    fn v3_selected_pin_nodes_require_exactly_one_binding_each() {
+        let valid = context_v3();
+        valid.validate().unwrap();
+        evidence_v3(valid.clone()).validate().unwrap();
+        assert_eq!(
+            admission_context_v3_from_bytes(&admission_context_v3_bytes(&valid).unwrap()).unwrap(),
+            valid
+        );
+
+        let mut missing = valid.clone();
+        missing.pin_bindings.clear();
+        let error = missing.validate().unwrap_err();
+        assert!(error.contains("missing a pin binding"), "{error}");
+        assert!(error.contains("check.lint_checks"), "{error}");
+
+        let mut extra = valid.clone();
+        extra.pin_bindings.push(AdmissionPinBindingV1 {
+            node: "pre.reverie_pin_on_host".into(),
+            base_sha: extra.floor.sha.clone(),
+            canonical_command_sha256: "c".repeat(64),
+            execution_command_sha256: "d".repeat(64),
+        });
+        let error = extra.validate().unwrap_err();
+        assert!(error.contains("extra pin binding"), "{error}");
+        assert!(error.contains("pre.reverie_pin_on_host"), "{error}");
+
+        let mut unsorted = valid.clone();
+        unsorted.selected_pin_nodes.reverse();
+        let error = unsorted.validate().unwrap_err();
+        assert!(error.contains("not sorted unique"), "{error}");
+
+        let mut duplicate = valid.clone();
+        duplicate.selected_pin_nodes[1] = duplicate.selected_pin_nodes[0].clone();
+        let error = duplicate.validate().unwrap_err();
+        assert!(error.contains("not sorted unique"), "{error}");
+
+        let mut unknown = valid.clone();
+        unknown.selected_pin_nodes[1] = "check.unknown_pin_node".into();
+        let error = unknown.validate().unwrap_err();
+        assert!(
+            error.contains("invalid or duplicate selected pin node"),
+            "{error}"
+        );
+        assert!(error.contains("check.unknown_pin_node"), "{error}");
+
+        let mut missing_field = serde_json::to_value(&valid).unwrap();
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("selected_pin_nodes");
+        assert!(serde_json::from_value::<AdmissionContextV3>(missing_field).is_err());
+
+        // Historical contexts remain decodable; V3 totality is not retroactive.
+        assert!(context().validate().is_ok());
+        assert!(context_v2().validate().is_ok());
     }
 }
