@@ -309,23 +309,27 @@ pub struct PreemptionRecord {
     /// switch on, so a replay can tell "no switch was taken" from a record
     /// derived from another, which holds none (`None`).
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
-    /// Set when the run that produced this record ended its slices without
-    /// the `--max-timeslice` bound: a run that replayed a preemption record
-    /// (`--replay-preemptions-from`) some of whose slices ran past where
-    /// the bound would have ended them (the writer's noted past-bound
-    /// slice; a slice that merely ends past the bound, on the costs and
-    /// sync jumps landing at its ending check-in, does not count), or that
-    /// followed a record that was itself marked, or a schedule replay of a
-    /// record that says so. A replay whose slices all fit under the bound
-    /// writes no mark, so a capped record round-trips byte-identically. It holds the latest logical time, in
-    /// nanoseconds, any of the run's recorded events reached, which no slice
-    /// of the run outlasts. A schedule replay of such a record installs no
-    /// `--max-timeslice` slice end while the record lasts
+    /// Set when the run that produced this record ended its slices without the
+    /// `--max-timeslice` bound, and its record says so. A run that replayed a
+    /// preemption record (`--replay-preemptions-from`) is eligible, not marked:
+    /// it is marked when it has no bound, or when some of its own slices ran
+    /// past where the bound would have ended them (the writer's noted
+    /// past-bound slice; a slice that merely ends past the bound, on the costs
+    /// and sync jumps landing at its ending check-in, does not count), so a
+    /// capped record round-trips byte-identically. A run that followed a record
+    /// that was itself marked, a schedule replay of a record that says so,
+    /// keeps the mark. A missing mark proves nothing about the run's slices: a
+    /// record a failed run flushed (`GlobalState::clean_up_failed_run`) can
+    /// lack completed-slice evidence a thread never reported, and a record
+    /// written before the mark existed never has it. It holds the latest
+    /// logical time, in nanoseconds, any of the run's recorded events reached,
+    /// which no slice of the run outlasts. A schedule replay of such a record
+    /// installs no `--max-timeslice` slice end while the record lasts
     /// (`Scheduler::uncapped_backstop`); one that did would end a recorded
-    /// slice early and leave the record. The value survives where event
-    /// times do not (analyze writes its trial schedules without them).
-    /// `None`, which writes nothing, for every other run and for records
-    /// written before the field existed.
+    /// slice early and leave the record. The value survives where event times
+    /// do not (analyze writes its trial schedules without them). `None`, which
+    /// writes nothing, for every other run and for records written before the
+    /// field existed.
     ///
     /// Reader contract: the mark is honoured by Hermit from the change that
     /// added it. It is an optional setting outside the format counter
@@ -5127,6 +5131,49 @@ mod tests {
         assert!(past.into_string().contains("\"uncapped_slices\":9400000"));
     }
 
+    /// The bounded summary a run without a destination file logs, and that
+    /// `--verify-strict` compares, describes the record the write paths
+    /// would write, an earned uncapped-slices mark included: the same
+    /// eligible writer with and without a completed slice past its bound
+    /// summarizes differently, and the earned summary is exactly that of
+    /// the record carrying the mark.
+    #[test]
+    fn the_bounded_summary_carries_an_earned_uncapped_slices_mark() {
+        let writer = |past_bound: bool| {
+            let mut writer = PreemptionWriter::new(None)
+                .with_uncapped_slices(true)
+                .with_max_timeslice(std::num::NonZeroU64::new(1_000_000));
+            for end in [250_000, 9_400_000] {
+                writer.inner.global.push(SchedEvent {
+                    dettid: DetTid::from_raw(3),
+                    op: detcore_model::schedule::Op::Branch,
+                    count: 1,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: Some(LogicalTime::from_nanos(end)),
+                    stopless: false,
+                    instruction_offset: None,
+                });
+            }
+            if past_bound {
+                writer.note_slice_past_bound();
+            }
+            writer
+        };
+        let capped = writer(false).summary().unwrap();
+        let earned = writer(true).summary().unwrap();
+        assert_ne!(capped, earned, "an earned mark must reach the summary");
+        let mut marked = writer(false);
+        marked.inner.uncapped_slices = Some(9_400_000);
+        assert_eq!(earned, marked.summary().unwrap());
+        assert!(!writer(false).into_string().contains("uncapped_slices"));
+        assert!(
+            writer(true)
+                .into_string()
+                .contains("\"uncapped_slices\":9400000")
+        );
+    }
+
     #[test]
     fn the_in_memory_exclusive_rewrite_round_trips_and_is_compared() {
         let off = PreemptionWriter::new(None).into_string();
@@ -8119,6 +8166,9 @@ impl PreemptionWriter {
         // to write. Lowering drops only marks, never rows, so the counts
         // below are the record's either way.
         self.flushed = true;
+        // The record this summary describes is the one the write paths
+        // would write, the uncapped-slices mark included.
+        self.mark_uncapped_slices();
         self.finalize()?;
         let digest = if let Some(records) = &self.boundary_records {
             let output = boundary_recording::BorrowedInfoEnvelope::new(&self.inner, records)
