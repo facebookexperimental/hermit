@@ -18,12 +18,82 @@ use dagrun::cgroup::CgroupManager;
 use dagrun::cgroup::Cgroups;
 use dagrun::cgroup::ContainmentProof;
 use dagrun::cgroup::attempt_scope_reexec;
+use dagrun::cgroup::delegated_cgroup_root;
 use dagrun::cgroup::expected_outer_memory_max_bytes;
 use dagrun::cgroup::expected_scope_runtime_max_s;
 use dagrun::cgroup::install_scope_teardown;
 use dagrun::cgroup::is_in_scope;
 use dagrun::cgroup::verify_scope_runtime_max;
 use dagrun::scheduler::BoxedCgroups;
+
+/// The declared driver capabilities validate-run reads before offering
+/// this driver a delegated cgroup. The JSON is the declaration; these
+/// constants are the versions this code implements, and
+/// `declared_delegated_cgroup_version` refuses when they disagree, so
+/// the declaration cannot silently outrun (or lag) the adoption below.
+const DRIVER_CAPABILITIES_JSON: &str = include_str!("safe_ci_scope_capabilities.json");
+const DRIVER_CAPABILITY_SCHEMA_VERSION: u64 = 1;
+const DELEGATED_CGROUP_CAPABILITY_VERSION: u64 = 1;
+
+/// The declared `dagrun_delegated_cgroup` capability version, parsed
+/// from the machine-readable declaration shipped beside this module.
+pub fn declared_delegated_cgroup_version() -> Result<u64, String> {
+    declared_delegated_cgroup_version_from(DRIVER_CAPABILITIES_JSON)
+}
+
+/// One parsed capability declaration, before the supported-version
+/// cross-check. Splitting parse from cross-check lets the self-test
+/// compare the shipped declaration against the implemented constants
+/// through a path that can actually fail on drift.
+struct DriverCapabilityDeclaration {
+    schema_version: u64,
+    delegated_cgroup_version: u64,
+}
+
+fn parse_driver_capability_declaration(text: &str) -> Result<DriverCapabilityDeclaration, String> {
+    let declaration: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("driver capability declaration is not JSON: {error}"))?;
+    let schema_version = declaration
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "driver capability declaration has no integer schema_version".to_string())?;
+    let delegated_cgroup_version = declaration
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("dagrun_delegated_cgroup"))
+        .and_then(|capability| capability.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            "driver capability declaration has no integer \
+             capabilities.dagrun_delegated_cgroup.version"
+                .to_string()
+        })?;
+    Ok(DriverCapabilityDeclaration {
+        schema_version,
+        delegated_cgroup_version,
+    })
+}
+
+/// The supported-version cross-check over JSON text, split out so the
+/// self-test can plant drifted and malformed declarations without
+/// rewriting the shipped file.
+fn declared_delegated_cgroup_version_from(text: &str) -> Result<u64, String> {
+    let declaration = parse_driver_capability_declaration(text)?;
+    if declaration.schema_version != DRIVER_CAPABILITY_SCHEMA_VERSION {
+        return Err(format!(
+            "driver capability declaration schema {} != implemented \
+             {DRIVER_CAPABILITY_SCHEMA_VERSION}",
+            declaration.schema_version
+        ));
+    }
+    if declaration.delegated_cgroup_version != DELEGATED_CGROUP_CAPABILITY_VERSION {
+        return Err(format!(
+            "declared dagrun_delegated_cgroup version {} != implemented \
+             {DELEGATED_CGROUP_CAPABILITY_VERSION}",
+            declaration.delegated_cgroup_version
+        ));
+    }
+    Ok(declaration.delegated_cgroup_version)
+}
 
 /// True while a check that is EXPECTED to refuse is running.
 ///
@@ -57,6 +127,7 @@ fn expecting_refusal<T>(check: impl FnOnce() -> T) -> T {
 enum ScopeRequirement {
     LiveContainment,
     OuterMemorySwapAndOomGroup,
+    DelegatedOuterMemoryAndSwap,
     RuntimeMax,
     PerStepCgroups,
 }
@@ -68,6 +139,9 @@ fn requirement_message(requirement: ScopeRequirement) -> &'static str {
         }
         ScopeRequirement::OuterMemorySwapAndOomGroup => {
             "outer MemoryMax/MemorySwapMax/memory.oom.group readback failed"
+        }
+        ScopeRequirement::DelegatedOuterMemoryAndSwap => {
+            "delegated outer MemoryMax/MemorySwapMax readback failed"
         }
         ScopeRequirement::RuntimeMax => "this invocation's outer RuntimeMaxSec readback failed",
         ScopeRequirement::PerStepCgroups => {
@@ -110,6 +184,34 @@ fn require_scope_observations(
     )?;
     require_observed(
         ScopeRequirement::OuterMemorySwapAndOomGroup,
+        observations.outer_memory_swap_and_oom_group,
+    )?;
+    require_observed(
+        ScopeRequirement::RuntimeMax,
+        runtime_readback_satisfies(verify_runtime, observations.runtime_max),
+    )?;
+    require_observed(
+        ScopeRequirement::PerStepCgroups,
+        observations.per_step_cgroups,
+    )?;
+    Ok(())
+}
+
+/// The delegated topology's ordered refusal decision. It reuses the
+/// same typed observations, but the outer-limit requirement names
+/// only what the delegated audit actually reads (finite service
+/// MemoryMax and swap off); no `memory.oom.group` readback on the
+/// parent-owned service root is claimed.
+fn require_delegated_scope_observations(
+    observations: ScopeObservations,
+    verify_runtime: bool,
+) -> Result<(), &'static str> {
+    require_observed(
+        ScopeRequirement::LiveContainment,
+        observations.live_containment,
+    )?;
+    require_observed(
+        ScopeRequirement::DelegatedOuterMemoryAndSwap,
         observations.outer_memory_swap_and_oom_group,
     )?;
     require_observed(
@@ -260,6 +362,78 @@ fn outer_scope_limits_observed(proof: Option<&ContainmentProof>, expected_memory
         return false;
     };
     verify_outer_scope_limits_at(&scope, expected_memory_max)
+}
+
+/// Outer-limit observation for a PARENT-OWNED delegated root (a validate
+/// service cgroup), the delegated counterpart of
+/// `outer_scope_limits_observed`. The root is the enclosing unit, not a
+/// scope this invocation owns: its `memory.max` is the service's rendered
+/// MemoryMax and must read back FINITE (a nested run root created under it
+/// is then bounded whatever tighter cap was requested), and swap must be
+/// disabled. Unlike the scope audit this writes nothing: the service's
+/// controls belong to the launcher that rendered the unit.
+fn delegated_outer_limits_observed(root: &Path) -> bool {
+    let memory_max = read_trim(root, "memory.max");
+    let memory_swap_max = read_trim(root, "memory.swap.max");
+    let memory_ok = memory_max
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|actual| actual > 0);
+    let swap_ok = memory_swap_max.as_deref() == Some("0");
+    eprintln!(
+        "[safe-ci]{} delegated outer cgroup audit at {}: memory.max={} ({}), \
+         memory.swap.max={} ({})",
+        if EXPECTED_REFUSAL.load(Ordering::Relaxed) {
+            " expected-refusal:"
+        } else {
+            ""
+        },
+        root.display(),
+        memory_max.as_deref().unwrap_or("UNREADABLE"),
+        if memory_ok { "bound" } else { "MISMATCH" },
+        memory_swap_max.as_deref().unwrap_or("UNREADABLE"),
+        if swap_ok { "disabled" } else { "MISMATCH" },
+    );
+    memory_ok && swap_ok
+}
+
+/// Whether the enclosing service carries a finite RuntimeMaxSec, the
+/// delegated counterpart of the sibling scope's RuntimeMaxSec rung. The
+/// launcher renders RuntimeMaxSec strictly outside the child deadline;
+/// this only observes that a finite value is in force on the unit whose
+/// cgroup is the delegated root. An unobservable unit is NOT observed.
+fn delegated_service_runtime_observed(root: &Path) -> bool {
+    let Some(unit) = root.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property=RuntimeMaxUSec",
+            "--no-pager",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    delegated_runtime_value_observed(&text)
+}
+
+/// The accept rule over one `systemctl show` stdout, split out so the
+/// self-test can plant each refused shape without a live unit: the
+/// exact RuntimeMaxUSec property must be present and name a finite,
+/// nonzero span.
+fn delegated_runtime_value_observed(stdout: &str) -> bool {
+    let Some(value) = stdout.trim().strip_prefix("RuntimeMaxUSec=") else {
+        return false;
+    };
+    !value.is_empty() && value != "infinity" && value != "0"
 }
 
 // --------------------------------------------------------------- CPU placement
@@ -753,6 +927,86 @@ pub fn resolve_cgroups(
     scope_runtime_s: Option<i64>,
     verify_runtime: bool,
 ) -> Result<BoxedCgroups, u8> {
+    // PARENT-OWNED DELEGATION, checked before the sibling-scope paths:
+    // a validate service that drained itself into its supervisor leaf
+    // offers its own cgroup as the run root (DAGRUN_DELEGATED_CGROUP).
+    // Adopt it exactly as the dagrun CLI does — validate live
+    // membership, create the private nested run root under it with the
+    // launcher's expected outer-memory cap made physical — instead of
+    // re-execing into a sibling scope that escapes the service. With
+    // the env present, Cgroups::new() deliberately returns a disabled
+    // manager, so without this branch a delegated Hermit run could
+    // only refuse. An invalid (forged, stale, or non-ancestor)
+    // delegation refuses by name; it never falls back to a sibling
+    // scope. The scope RuntimeMaxSec rung does not exist here: the
+    // enclosing service's RuntimeMaxSec is that rung, observed below.
+    let delegated = match delegated_cgroup_root() {
+        Ok(root) => root,
+        Err(error) => {
+            return unavailable(
+                label,
+                false,
+                &format!("invalid delegated cgroup: {error}; resource boxing is required"),
+            );
+        }
+    };
+    if let Some(root) = delegated {
+        if let Err(error) = declared_delegated_cgroup_version() {
+            return unavailable(
+                label,
+                false,
+                &format!("{error}; resource boxing is required"),
+            );
+        }
+        let manager = Cgroups::from_delegated_root_with_limits(
+            root.clone(),
+            None,
+            expected_outer_memory_max_bytes(),
+        );
+        if !manager.enabled() {
+            // Weaker than the dagrun CLI's restore, stated plainly:
+            // dropping the manager asks its nested-coordinator guard
+            // to restore this process to the delegated supervisor
+            // leaf, but dagrun's explicit restore (and its failure
+            // count) is pub(crate), so a failed Drop restore only
+            // logs where this process cannot read it. A direct caller
+            // that explicitly allows cgroup failure therefore accepts
+            // that placement is unproven on this path. Under
+            // validate-run that weaker path cannot occur: the
+            // launcher refuses --allow-cgroup-failure in validate_args
+            // by name (dev-hermit ci-hub/validate/start_unit.py,
+            // pinned by test_allow_cgroup_failure_in_validate_args_
+            // refuses_by_name in ci-hub/validate/tests/
+            // test_start_unit.py), so allow_failure is never set for
+            // this branch there.
+            return unavailable(
+                label,
+                allow_failure,
+                &format!(
+                    "delegated root {} could not establish inner per-step cgroups; \
+                     resource boxing is required",
+                    root.display()
+                ),
+            );
+        }
+        let observations = ScopeObservations {
+            live_containment: true,
+            outer_memory_swap_and_oom_group: delegated_outer_limits_observed(&root),
+            runtime_max: delegated_service_runtime_observed(&root),
+            per_step_cgroups: manager.enabled(),
+        };
+        if let Err(message) = require_delegated_scope_observations(observations, verify_runtime) {
+            return unavailable(label, allow_failure, message);
+        }
+        let placement = establish_cpu_placement(label, None, false);
+        let _ = CPU_PLACEMENT.set(placement);
+        eprintln!(
+            "{label}: cgroup boxing ACTIVE in parent-owned delegated step root {}; \
+             the enclosing service retains subtree teardown ownership.",
+            root.display()
+        );
+        return Ok(Some(Arc::new(manager) as Arc<dyn CgroupManager>));
+    }
     if !is_in_scope() {
         if allow_failure {
             return unavailable(
@@ -854,6 +1108,103 @@ pub fn self_test() -> Result<String, String> {
         per_step_cgroups: true,
     };
     require_scope_observations(all, true).map_err(str::to_owned)?;
+    // The shipped declaration must parse and name exactly the versions
+    // this code implements. This goes through the raw parser, not the
+    // cross-checking entry point, so a drifted shipped declaration
+    // fails HERE by comparison instead of being pre-refused upstream.
+    let shipped = parse_driver_capability_declaration(DRIVER_CAPABILITIES_JSON)?;
+    if shipped.schema_version != DRIVER_CAPABILITY_SCHEMA_VERSION
+        || shipped.delegated_cgroup_version != DELEGATED_CGROUP_CAPABILITY_VERSION
+    {
+        return Err(format!(
+            "shipped capability declaration (schema {}, delegated {}) does not match \
+             the implementation (schema {DRIVER_CAPABILITY_SCHEMA_VERSION}, \
+             delegated {DELEGATED_CGROUP_CAPABILITY_VERSION})",
+            shipped.schema_version, shipped.delegated_cgroup_version
+        ));
+    }
+    // Drift brackets for the same parser over planted JSON text: every
+    // unsupported or malformed shape must refuse; only the exact
+    // supported integer pair is accepted.
+    let declaration = |schema: &str, version: &str| {
+        format!(
+            r#"{{"schema_version": {schema}, "capabilities": {{"dagrun_delegated_cgroup": {{"version": {version}}}}}}}"#
+        )
+    };
+    if declared_delegated_cgroup_version_from(&declaration("1", "1"))
+        != Ok(DELEGATED_CGROUP_CAPABILITY_VERSION)
+    {
+        return Err("the exact supported capability declaration was refused".into());
+    }
+    for text in [
+        declaration("0", "1"),
+        declaration("2", "1"),
+        declaration("1", "0"),
+        declaration("1", "2"),
+        declaration("1.0", "1"),
+        declaration("\"1\"", "1"),
+        declaration("true", "1"),
+        declaration("-1", "1"),
+        declaration("1", "1.0"),
+        declaration("1", "\"1\""),
+        declaration("1", "true"),
+        declaration("1", "-1"),
+        r#"{"schema_version": 1, "capabilities": {}}"#.to_string(),
+        "not json".to_string(),
+    ] {
+        if declared_delegated_cgroup_version_from(&text).is_ok() {
+            return Err(format!(
+                "an unsupported or malformed capability declaration was accepted: {text}"
+            ));
+        }
+    }
+    // The RuntimeMax accept rule over planted systemctl stdout: the
+    // exact property must name a finite, nonzero span.
+    if !delegated_runtime_value_observed("RuntimeMaxUSec=5520s\n") {
+        return Err("a finite delegated RuntimeMaxUSec was refused".into());
+    }
+    for text in [
+        "RuntimeMaxUSec=infinity\n",
+        "RuntimeMaxUSec=0\n",
+        "RuntimeMaxUSec=\n",
+        "ActiveState=active\n",
+        "",
+    ] {
+        if delegated_runtime_value_observed(text) {
+            return Err(format!(
+                "an unusable delegated RuntimeMaxUSec was accepted: {text:?}"
+            ));
+        }
+    }
+    // The delegated requirement names only the delegated audit.
+    if require_delegated_scope_observations(all, true).is_err() {
+        return Err("complete delegated observations were refused".into());
+    }
+    let delegated_missing = ScopeObservations {
+        outer_memory_swap_and_oom_group: false,
+        ..all
+    };
+    if require_delegated_scope_observations(delegated_missing, true)
+        != Err(requirement_message(
+            ScopeRequirement::DelegatedOuterMemoryAndSwap,
+        ))
+    {
+        return Err("a missing delegated outer observation refused with the wrong reason".into());
+    }
+    // Wiring bracket: an invalid delegated root refuses in
+    // resolve_cgroups itself, never falling through to a sibling
+    // scope, even when the caller allows cgroup failure.
+    let prior_delegated = std::env::var_os("DAGRUN_DELEGATED_CGROUP");
+    std::env::set_var("DAGRUN_DELEGATED_CGROUP", "/definitely/not/a/cgroup");
+    let invalid_delegation =
+        expecting_refusal(|| resolve_cgroups("safe-ci scope self-test", true, None, false));
+    match prior_delegated {
+        Some(value) => std::env::set_var("DAGRUN_DELEGATED_CGROUP", value),
+        None => std::env::remove_var("DAGRUN_DELEGATED_CGROUP"),
+    }
+    if !matches!(invalid_delegation, Err(3)) {
+        return Err("an invalid delegated cgroup did not refuse as fail-closed exit 3".into());
+    }
     for (requirement, observations) in [
         (
             ScopeRequirement::LiveContainment,
@@ -1053,6 +1404,41 @@ pub fn self_test() -> Result<String, String> {
         if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("an unwritable outer OOM-group control was accepted".into());
         }
+        // Delegated outer-limit brackets over a planted service root:
+        // finite MemoryMax + swap off accepted; the kernel's "max",
+        // an unreadable control, and any nonzero swap refused. This
+        // audit intentionally writes nothing on the parent-owned root.
+        let delegated = tmp.join("delegated.service");
+        fs::create_dir_all(&delegated)
+            .map_err(|error| format!("cannot create delegated fixture: {error}"))?;
+        fs::write(delegated.join("memory.max"), "104857600\n")
+            .map_err(|error| format!("cannot write delegated memory.max fixture: {error}"))?;
+        fs::write(delegated.join("memory.swap.max"), "0\n")
+            .map_err(|error| format!("cannot write delegated memory.swap.max fixture: {error}"))?;
+        if !delegated_outer_limits_observed(&delegated) {
+            return Err("finite delegated outer limits were refused".into());
+        }
+        fs::write(delegated.join("memory.max"), "max\n")
+            .map_err(|error| format!("cannot mutate delegated memory.max fixture: {error}"))?;
+        if expecting_refusal(|| delegated_outer_limits_observed(&delegated)) {
+            return Err("an unbounded delegated memory.max was accepted".into());
+        }
+        fs::remove_file(delegated.join("memory.max"))
+            .map_err(|error| format!("cannot remove delegated memory.max fixture: {error}"))?;
+        fs::create_dir(delegated.join("memory.max"))
+            .map_err(|error| format!("cannot make delegated memory.max unreadable: {error}"))?;
+        if expecting_refusal(|| delegated_outer_limits_observed(&delegated)) {
+            return Err("an unreadable delegated memory.max was accepted".into());
+        }
+        fs::remove_dir(delegated.join("memory.max"))
+            .map_err(|error| format!("cannot remove unreadable delegated memory.max: {error}"))?;
+        fs::write(delegated.join("memory.max"), "104857600\n")
+            .map_err(|error| format!("cannot restore delegated memory.max fixture: {error}"))?;
+        fs::write(delegated.join("memory.swap.max"), "1\n")
+            .map_err(|error| format!("cannot mutate delegated memory.swap.max fixture: {error}"))?;
+        if expecting_refusal(|| delegated_outer_limits_observed(&delegated)) {
+            return Err("a nonzero delegated swap limit was accepted".into());
+        }
         Ok(())
     })();
     let cleanup_result = fs::remove_dir_all(&tmp)
@@ -1060,7 +1446,7 @@ pub fn self_test() -> Result<String, String> {
     fixture_result?;
     cleanup_result?;
     Ok(
-        "safe-ci scope: containment, promised-scope ancestor, outer memory/swap/OOM-group, optional RuntimeMax, per-step cgroups, and CPU placement verdict bracketed"
+        "safe-ci scope: containment, promised-scope ancestor, outer memory/swap/OOM-group, optional RuntimeMax, per-step cgroups, CPU placement verdict bracketed, delegated declaration drift, delegated outer memory/swap, delegated RuntimeMax, and invalid-delegation refusal bracketed"
             .into(),
     )
 }

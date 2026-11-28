@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "capabilities": {
+    "dagrun_delegated_cgroup": {
+      "version": 1
+    }
+  }
+}
