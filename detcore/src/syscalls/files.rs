@@ -664,6 +664,832 @@ fn fcntl_host_timed_signals(cmd: syscalls::FcntlCmd<'_>) -> u64 {
     }
 }
 
+/// The `ioctl` numbers that read or set a file's inode generation
+/// (`inode->i_generation`) in Linux 7.1.3, the same on x86_64 and aarch64,
+/// which both encode ioctls as `include/uapi/asm-generic/ioctl.h` does.
+/// `FS_IOC_GETVERSION`, `_IOR('v', 1, long)` (`include/uapi/linux/fs.h`), is
+/// also `EXT2_IOC_GETVERSION`, `EXT4_IOC_GETVERSION_OLD` and
+/// `XFS_IOC_GETVERSION`.
+const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+/// `EXT4_IOC_GETVERSION`, `_IOR('f', 3, long)` (`include/uapi/linux/ext4.h`),
+/// which only ext4 answers.
+const EXT4_IOC_GETVERSION: u32 = 0x8008_6603;
+/// `FS_IOC32_GETVERSION`, `_IOR('v', 1, int)`, also `EXT4_IOC32_GETVERSION_OLD`
+/// and `XFS_IOC_GETVERSION_32`, and `EXT4_IOC32_GETVERSION`,
+/// `_IOR('f', 3, int)`: the 4-byte encodings, which file systems answer only
+/// for compat tasks (in their `compat_ioctl`). Hermit runs only 64-bit guests
+/// (Reverie's filter kills an IA-32 `int 0x80`), so a guest's call with one
+/// gets the host's ENOTTY.
+const FS_IOC32_GETVERSION: u32 = 0x8004_7601;
+const EXT4_IOC32_GETVERSION: u32 = 0x8004_6603;
+/// `FS_IOC_SETVERSION`, `_IOW('v', 2, long)` (also `EXT2_IOC_SETVERSION` and
+/// `EXT4_IOC_SETVERSION_OLD`), `EXT4_IOC_SETVERSION`, `_IOW('f', 4, long)`, and
+/// their 4-byte encodings `FS_IOC32_SETVERSION` and `EXT4_IOC32_SETVERSION`.
+const FS_IOC_SETVERSION: u32 = 0x4008_7602;
+const EXT4_IOC_SETVERSION: u32 = 0x4008_6604;
+const FS_IOC32_SETVERSION: u32 = 0x4004_7602;
+const EXT4_IOC32_SETVERSION: u32 = 0x4004_6604;
+
+/// Whether an `ioctl` reads or sets a file's inode generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationRequest {
+    Get,
+    Set,
+}
+
+/// The [`GenerationRequest`] `command` is, matched by its full number.
+fn generation_request(command: u32) -> Option<GenerationRequest> {
+    match command {
+        FS_IOC_GETVERSION | EXT4_IOC_GETVERSION | FS_IOC32_GETVERSION | EXT4_IOC32_GETVERSION => {
+            Some(GenerationRequest::Get)
+        }
+        FS_IOC_SETVERSION | EXT4_IOC_SETVERSION | FS_IOC32_SETVERSION | EXT4_IOC32_SETVERSION => {
+            Some(GenerationRequest::Set)
+        }
+        _ => None,
+    }
+}
+
+/// The command an `ioctl` with `arg1` in its second register carries:
+/// Linux's `ioctl` takes `unsigned int cmd`, so the register's high 32 bits
+/// never reach a file system.
+fn kernel_ioctl_command(arg1: usize) -> u32 {
+    arg1 as u32
+}
+
+/// What Detcore knows of how a file system answers a generation read, for a
+/// regular file or directory on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationFs {
+    /// The read is answered from `inode->i_generation` with a 4-byte
+    /// `put_user` and no other effect (Linux 7.4-rc3): `FS_IOC_GETVERSION` by
+    /// ext2, ext3 and ext4 (which share `EXT4_SUPER_MAGIC`), btrfs and XFS
+    /// (`fs/ext2/ioctl.c:63-65`, `fs/ext4/ioctl.c:1539-1552`,
+    /// `fs/btrfs/ioctl.c:470-473, 5553-5563`, `fs/xfs/xfs_ioctl.c:1449-1461,
+    /// 1502-1503`; XFS's `trace_xfs_file_ioctl` is a tracepoint), and
+    /// `EXT4_IOC_GETVERSION` by ext4, which ext2 does not know.
+    Int,
+    /// A file system whose handler does nothing for this number but answer
+    /// ENOTTY: the other numbers on ext2/ext4, btrfs and XFS, which their
+    /// ioctl switches do not name, so they end in `return -ENOTTY`
+    /// (`fs/ext4/ioctl.c:1926`, `fs/btrfs/ioctl.c:5718`,
+    /// `fs/xfs/xfs_ioctl.c:1579`, `fs/ext2/ioctl.c:139`), and every number on
+    /// tmpfs, whose file and directory operations have no `unlocked_ioctl`
+    /// (`mm/shmem.c:5447-5461`, `fs/libfs.c:538-544`), so that `vfs_ioctl`
+    /// answers ENOTTY (`fs/ioctl.c:45-57`). `do_vfs_ioctl` and `file_ioctl`
+    /// name none of these numbers (`fs/ioctl.c:323-338, 575-581`).
+    NoHandler,
+    /// FUSE: its daemon decides what the call does and how much it writes
+    /// (`fuse_do_ioctl` copies `_IOC_SIZE` bytes, 8 here).
+    Fuse,
+    /// pidfs, for a kernel whose pidfds are regular files (those of fbsource's
+    /// 6.16 and 7.1.3 workers have no file type, so they never get here):
+    /// `FS_IOC_GETVERSION` stores the pidfd inode's `i_generation`, the upper
+    /// half of its inode number, always 0 on a 64-bit kernel, and is EINVAL
+    /// for a null argument; every other number is ENOTTY (`pidfd_ioctl`,
+    /// `fs/pidfs.c:533-580`; `pidfs_gen`).
+    Pidfs,
+    /// Any other file system, which Detcore has not audited to do nothing but
+    /// answer, so the call is refused by name before it runs: a stacked file
+    /// system forwards it to another, eCryptfs to the file system below it,
+    /// copying attributes back even on an error (`fs/ecryptfs/file.c:365-382`),
+    /// and an unknown one may do anything.
+    Unaudited,
+}
+
+/// [`GenerationFs`] for a generation read `command` on a file system whose
+/// `fstatfs` reports `f_type` (`include/uapi/linux/magic.h`): the allowlist.
+fn generation_fs(command: u32, f_type: libc::__fsword_t) -> GenerationFs {
+    const EXT4_SUPER_MAGIC: libc::__fsword_t = 0xEF53;
+    const BTRFS_SUPER_MAGIC: libc::__fsword_t = 0x9123_683E;
+    const XFS_SUPER_MAGIC: libc::__fsword_t = 0x5846_5342;
+    const TMPFS_MAGIC: libc::__fsword_t = 0x0102_1994;
+    const FUSE_SUPER_MAGIC: libc::__fsword_t = 0x6573_5546;
+    const PID_FS_MAGIC: libc::__fsword_t = 0x5049_4446;
+    match (command, f_type) {
+        (_, FUSE_SUPER_MAGIC) => GenerationFs::Fuse,
+        (_, PID_FS_MAGIC) => GenerationFs::Pidfs,
+        (FS_IOC_GETVERSION, EXT4_SUPER_MAGIC | BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC)
+        | (EXT4_IOC_GETVERSION, EXT4_SUPER_MAGIC) => GenerationFs::Int,
+        (_, EXT4_SUPER_MAGIC | BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC | TMPFS_MAGIC) => {
+            GenerationFs::NoHandler
+        }
+        _ => GenerationFs::Unaudited,
+    }
+}
+
+/// The bytes of Detcore's staging page: an `fstat` result, an `fstatfs`
+/// result, then room for the eight bytes a generation read's encoding names.
+const STAGING_LEN: usize = std::mem::size_of::<libc::stat>()
+    + std::mem::size_of::<libc::statfs>()
+    + std::mem::size_of::<u64>();
+
+/// Why Detcore does not answer generation calls on the backend `backend`,
+/// if it does not. This route (an injected `fstat`, `fstatfs` and ioctl on a
+/// page Detcore maps in the guest, and a store with the guest's access rights)
+/// has been run end to end only on a backend whose tool reaches a guest
+/// thread through its host task (`host_task_reads_reach_guest_threads`, which
+/// ptrace sets). It is not proven on the KVM backend, whose guest memory is
+/// the backend's own, nor on the in-guest backends, where no such access has
+/// been validated: there the calls are refused by name, before any call.
+fn generation_route_refusal(backend: &reverie::BackendCapabilities) -> Option<&'static str> {
+    (!backend.host_task_reads_reach_guest_threads).then_some(
+        "this backend's guest memory access is not proven end to end for this call (Detcore \
+         answers it only on a backend whose tool reaches a guest thread through its host task, \
+         as ptrace's does)",
+    )
+}
+
+/// How [`publish_int`] left the guest's `int`.
+#[derive(Debug, PartialEq, Eq)]
+enum Published {
+    /// All four bytes hold the value.
+    Whole,
+    /// No byte changed: the guest's answer is EFAULT, as `put_user`'s.
+    Untouched,
+    /// No byte changed, but the backend's memory interface cannot store the
+    /// `int` whole or not at all here, saying why: the call is refused by name.
+    Unpublishable(String),
+    /// The `int` may hold part of the value, saying why: no answer is right.
+    Unrestored(String),
+}
+
+/// Store `bytes` at `address` in `memory` with the guest's access rights,
+/// through as many [`MemoryAccess::write_with_user_access`] calls as the
+/// backend's short counts take: how many bytes it stored, and the error that
+/// stopped it, if one did. By that method's contract, which every backend's
+/// memory implements (`process_vm_writev` on ptrace and the in-guest
+/// backends, a copy through the guest's page tables on KVM), each call is one
+/// increasing-address copy whose count is exactly the bytes it copied; EFAULT
+/// means its first byte faulted and nothing was copied; ENOSYS means the
+/// backend has no such copy; and any other error (KVM's EIO for a terminal
+/// failure, say) may come after effects. A count of zero, or more than was
+/// asked, breaks that contract and is EPROTO.
+fn store_with_user_access<M: MemoryAccess>(
+    memory: &mut M,
+    address: usize,
+    bytes: &[u8],
+) -> (usize, Option<Errno>) {
+    let mut stored = 0;
+    while stored < bytes.len() {
+        let Some(at) = address
+            .checked_add(stored)
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            return (stored, Some(Errno::EFAULT));
+        };
+        match memory.write_with_user_access(at, &bytes[stored..]) {
+            Ok(copied) if copied > 0 && copied <= bytes.len() - stored => stored += copied,
+            Ok(_) => return (stored, Some(Errno::EPROTO)),
+            Err(errno) => return (stored, Some(errno)),
+        }
+    }
+    (stored, None)
+}
+
+/// Store `value` as the `int` at `address` in `memory` whole or not at all,
+/// as the kernel's `put_user` publishes it, for pages of `page` bytes, relying
+/// only on the [`MemoryAccess`] contracts every backend implements
+/// ([`store_with_user_access`], and `read_value`, which reads the guest's
+/// memory as a debugger does). The range is checked first, as `access_ok`
+/// checks it, against the host kernel's user-address limit
+/// ([`super::chosen_ids::within_user_memory`]): a range past it is EFAULT
+/// before any byte. That covers the top of the address space and, on arm64,
+/// every pointer with a nonzero top byte, a tag `access_ok` refuses because no
+/// guest thread enables the tagged-address ABI (Detcore's prctl allowlist does
+/// not admit `PR_SET_TAGGED_ADDR_CTRL`), while a copy from another process
+/// strips the tag (`untagged_addr` in `get_user_pages`) and would reach the
+/// page. That is the rule for a thread without arm64's tagged-address ABI or
+/// x86's linear address masking, which no guest can enable through the calls
+/// Detcore admits; it is not an implementation of tagged addressing. An
+/// `int` within one page is one store, and its only outcomes are all of it
+/// or, with EFAULT, none of it. For an `int` that straddles a page boundary, the
+/// aligned word that ends its first page is read first: if the second page
+/// then refuses the store after the first took its part, those bytes are
+/// written back and read back. Where that word cannot be read, the store
+/// still runs, so that a first page the guest cannot write is EFAULT with
+/// nothing stored, as on Linux (ptrace's `PTRACE_PEEKDATA` reads every page
+/// that is mapped and backed, so there the guest cannot write it either);
+/// only if that page then takes part of the store and the second refuses the
+/// rest is the `int` left in part (a write-only first page, to the in-guest
+/// backends' `process_vm_readv`). A backend that cannot store with the
+/// guest's rights at all leaves the `int` untouched and the call refused by
+/// name. Anything short of a store that is whole, or untouched, or put back
+/// and read back as it was, is [`Published::Unrestored`].
+///
+/// This is a guarantee about the bytes the `int` holds once the call
+/// returns, not atomic visibility: a prefix stored before it is put back is
+/// in the page in between. No guest thread runs then (threads are
+/// sequentialized), but another mapping of shared backing (a `MAP_SHARED`
+/// file mapped by a process outside the run) could read it.
+fn publish_int<M: MemoryAccess>(
+    memory: &mut M,
+    address: usize,
+    value: libc::c_int,
+    page: usize,
+) -> Published {
+    let new = value.to_ne_bytes();
+    if address == 0 || !super::chosen_ids::within_user_memory(address, new.len()) {
+        return Published::Untouched;
+    }
+    let first_page_len = (page - address % page).min(new.len());
+    let old_first_page = if first_page_len < new.len() {
+        let word = address
+            .checked_add(first_page_len)
+            .and_then(|page_end| page_end.checked_sub(std::mem::size_of::<u64>()))
+            .and_then(Addr::<u64>::from_raw)
+            .expect("a page ends above its last word");
+        Some((word, memory.read_value(word)))
+    } else {
+        None
+    };
+    let (stored, error) = store_with_user_access(memory, address, &new);
+    let error = match (stored, error) {
+        (_, None) => return Published::Whole,
+        (0, Some(Errno::EFAULT)) => return Published::Untouched,
+        (0, Some(Errno::ENOSYS)) => {
+            return Published::Unpublishable(
+                "the backend cannot store into guest memory with the guest's access rights"
+                    .to_owned(),
+            );
+        }
+        (_, Some(error)) => error,
+    };
+    let Some((word, old)) =
+        old_first_page.filter(|_| error == Errno::EFAULT && stored <= first_page_len)
+    else {
+        return Published::Unrestored(format!(
+            "the backend stored {stored} of its {} bytes and then failed with {error}",
+            new.len()
+        ));
+    };
+    let Ok(old) = old else {
+        return Published::Unrestored(format!(
+            "its second page refused the store after its first page took {stored} bytes, whose \
+             old values the backend could not read to put back"
+        ));
+    };
+    // The bytes on the first page are the last `first_page_len` of the word.
+    let old_bytes = &old.to_ne_bytes()[8 - first_page_len..][..stored];
+    match store_with_user_access(memory, address, old_bytes) {
+        (put_back, None) if put_back == stored => {}
+        (put_back, error) => {
+            return Published::Unrestored(format!(
+                "its second page refused the store after its first page took {stored} bytes, \
+                 and putting them back stopped after {put_back} ({error:?})"
+            ));
+        }
+    }
+    match memory.read_value(word) {
+        Ok(read_back) if read_back.to_ne_bytes()[8 - first_page_len..][..stored] == *old_bytes => {
+            Published::Untouched
+        }
+        Ok(_) => Published::Unrestored(
+            "its second page refused the store after its first page took it, and the first \
+             page did not read back its old bytes after they were put back"
+                .to_owned(),
+        ),
+        Err(errno) => Published::Unrestored(format!(
+            "its second page refused the store after its first page took it, and the first \
+             page's restored bytes could not be read back ({errno})"
+        )),
+    }
+}
+
+/// What the guest's generation read gets once [`publish_int`] has run.
+#[derive(Debug, PartialEq, Eq)]
+enum GenerationAnswer {
+    /// The call's result, or EFAULT.
+    Linux(Result<i64, Errno>),
+    /// Nothing was stored, but the store was not possible: a refusal by name.
+    Refused(String),
+    /// The `int` may hold part of the value: the run ends, saying why.
+    RunEnds(String),
+}
+
+/// [`GenerationAnswer`] for a read whose call answered `result` and whose
+/// value [`publish_int`] left as `published`.
+fn generation_answer(published: Published, result: i64) -> GenerationAnswer {
+    match published {
+        Published::Whole => GenerationAnswer::Linux(Ok(result)),
+        Published::Untouched => GenerationAnswer::Linux(Err(Errno::EFAULT)),
+        Published::Unpublishable(why) => GenerationAnswer::Refused(why),
+        Published::Unrestored(why) => GenerationAnswer::RunEnds(why),
+    }
+}
+
+/// How many times Detcore runs one of its own calls around a generation call
+/// again after a signal interrupts it, before it gives up by name.
+const INTERRUPTED_CALL_ATTEMPTS: usize = 64;
+
+/// What Detcore does with one result of the guest's staged generation read
+/// ([`staged_read_decision`]).
+#[derive(Debug, PartialEq, Eq)]
+enum StagedRead {
+    /// The guest's answer.
+    Answer(Result<i64, Errno>),
+    /// Refuse the call by name, saying why.
+    Refuse(String),
+}
+
+/// Whether `errno` is one of the kernel's restart codes (`ERESTARTSYS`,
+/// `ERESTARTNOINTR`, `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`), which Linux
+/// turns into a restart or EINTR as a signal is delivered and which no guest
+/// call returns.
+fn is_restart_code(errno: Errno) -> bool {
+    matches!(errno.into_raw(), 512 | 513 | 514 | 516)
+}
+
+/// What Detcore does with `result`, the result of the guest's generation
+/// read run into its staging page. A restart code is never the guest's
+/// answer, and Detcore never runs the read again: `Guest::inject` answers
+/// ERESTARTSYS for a call a signal stopped before it ran, but the errno alone
+/// does not say whether the call ran, and some of it may have: Linux runs the
+/// security hook first and returns its error unchanged (fs/ioctl.c, the
+/// `security_file_ioctl` call), and a host BPF LSM may return a restart code
+/// there, on any file system. So every restart code is refused by name.
+/// Every other result is the guest's answer, an EINTR from a read that ran
+/// included. (Running the read again on proof that it did not run needs that
+/// proof from the backend: a follow-up.)
+fn staged_read_decision(result: Result<i64, Errno>) -> StagedRead {
+    match result {
+        Err(errno) if is_restart_code(errno) => StagedRead::Refuse(format!(
+            "the read answered {errno}, a restart code, which does not say whether the call ran \
+             (a security hook may return one before the handler), so Detcore neither runs it \
+             again nor answers it"
+        )),
+        result => StagedRead::Answer(result),
+    }
+}
+
+/// `errno`, the failure of one of Detcore's own calls around a generation
+/// call, saying so where it is an interruption that every one of
+/// [`INTERRUPTED_CALL_ATTEMPTS`] attempts met.
+fn interruption_note(errno: Errno) -> String {
+    match errno {
+        Errno::EINTR | Errno::ERESTARTSYS => {
+            format!("{errno}: a signal interrupted it {INTERRUPTED_CALL_ATTEMPTS} times")
+        }
+        errno => errno.to_string(),
+    }
+}
+
+/// The system's page size.
+fn system_page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .expect("the page size should be positive")
+}
+
+/// What Detcore's calls on its staging page decided about a generation call
+/// (`Detcore::generation_outcome`).
+enum GenerationOutcome {
+    /// Send the guest's call on to the kernel unchanged.
+    PassThrough,
+    /// Answer this errno.
+    Errno(Errno),
+    /// Refuse the call by name, saying why.
+    Refuse(String),
+    /// A read the kernel answered `result` to, in Detcore's page, for the file
+    /// whose `fstat` is `stat`.
+    Read { result: i64, stat: libc::stat },
+}
+
+#[cfg(test)]
+mod inode_generation_tests {
+    use super::*;
+
+    #[test]
+    fn every_generation_number_is_matched_by_its_full_number() {
+        for get in [
+            FS_IOC_GETVERSION,
+            EXT4_IOC_GETVERSION,
+            FS_IOC32_GETVERSION,
+            EXT4_IOC32_GETVERSION,
+        ] {
+            assert_eq!(
+                generation_request(get),
+                Some(GenerationRequest::Get),
+                "{get:#x}"
+            );
+        }
+        for set in [
+            FS_IOC_SETVERSION,
+            EXT4_IOC_SETVERSION,
+            FS_IOC32_SETVERSION,
+            EXT4_IOC32_SETVERSION,
+        ] {
+            assert_eq!(
+                generation_request(set),
+                Some(GenerationRequest::Set),
+                "{set:#x}"
+            );
+        }
+        // FS_IOC_GETFLAGS ('f' 1) and other sizes of the same request are not.
+        for other in [0x8008_6601, 0x8010_7601, 0x0000_7601] {
+            assert_eq!(generation_request(other), None, "{other:#x}");
+        }
+    }
+
+    /// The allowlist: the read runs only where Detcore has audited the
+    /// handler to do nothing but answer.
+    #[test]
+    fn only_file_systems_known_to_write_an_int_generation_are_answered() {
+        // ext2, ext3 and ext4 share 0xEF53; then btrfs and XFS.
+        for answered in [0xEF53, 0x9123_683E, 0x5846_5342] {
+            assert_eq!(
+                generation_fs(FS_IOC_GETVERSION, answered),
+                GenerationFs::Int,
+                "{answered:#x}"
+            );
+        }
+        assert_eq!(
+            generation_fs(EXT4_IOC_GETVERSION, 0xEF53),
+            GenerationFs::Int
+        );
+        // Only ext4 knows its own number, no file system answers a 4-byte
+        // encoding for a 64-bit task, and tmpfs has no handler at all.
+        for (command, f_type) in [
+            (EXT4_IOC_GETVERSION, 0x9123_683E),
+            (EXT4_IOC_GETVERSION, 0x5846_5342),
+            (FS_IOC32_GETVERSION, 0xEF53),
+            (EXT4_IOC32_GETVERSION, 0xEF53),
+            (FS_IOC32_GETVERSION, 0x9123_683E),
+            (FS_IOC_GETVERSION, 0x0102_1994),
+            (EXT4_IOC_GETVERSION, 0x0102_1994),
+        ] {
+            assert_eq!(
+                generation_fs(command, f_type),
+                GenerationFs::NoHandler,
+                "{command:#x} {f_type:#x}"
+            );
+        }
+        for command in [FS_IOC_GETVERSION, EXT4_IOC_GETVERSION, FS_IOC32_GETVERSION] {
+            assert_eq!(generation_fs(command, 0x6573_5546), GenerationFs::Fuse);
+            assert_eq!(generation_fs(command, 0x5049_4446), GenerationFs::Pidfs);
+            // eCryptfs and overlayfs, which stack on other file systems,
+            // procfs, f2fs and nilfs2 (which write an int too, but no run has
+            // measured them), and an unknown magic: refused before the read.
+            for unaudited in [0xF15F, 0x794C_7630, 0x9FA0, 0xF2F5_2010, 0x3434, 0] {
+                assert_eq!(
+                    generation_fs(command, unaudited),
+                    GenerationFs::Unaudited,
+                    "{command:#x} {unaudited:#x}"
+                );
+            }
+        }
+    }
+
+    /// Two pages of [`PAGE`] bytes at [`BASE`], each readable and writable or
+    /// not, whose reads and user-access stores copy in increasing address
+    /// order and stop at the first byte they may not touch, as
+    /// `process_vm_readv` and `process_vm_writev` do, with the counts and
+    /// EFAULT of `MemoryAccess::write_with_user_access`'s contract. After
+    /// `writes_left` stores, the first page stops taking them. With
+    /// `no_user_copy`, stores are ENOSYS, as on a backend without them; with
+    /// `fails_after`, each store fails with that error after its copy; with
+    /// `strips_tags`, a copy drops an address's top byte, as arm64's
+    /// `get_user_pages` does for a copy from another process.
+    struct FakePages {
+        bytes: [u8; 2 * PAGE],
+        readable: [bool; 2],
+        writable: [bool; 2],
+        writes_left: Option<usize>,
+        no_user_copy: bool,
+        fails_after: Option<Errno>,
+        strips_tags: bool,
+    }
+
+    const PAGE: usize = 16;
+    const BASE: usize = 0x1000;
+    /// The bits below an address's top byte.
+    const TAG_MASK: usize = (1 << 56) - 1;
+
+    impl FakePages {
+        fn new(writable: [bool; 2]) -> Self {
+            Self {
+                bytes: [0x5a; 2 * PAGE],
+                readable: [true, true],
+                writable,
+                writes_left: None,
+                no_user_copy: false,
+                fails_after: None,
+                strips_tags: false,
+            }
+        }
+
+        fn untagged(&self, address: usize) -> usize {
+            if self.strips_tags {
+                address & TAG_MASK
+            } else {
+                address
+            }
+        }
+
+        fn copy(&self, address: usize, len: usize, allowed: [bool; 2]) -> Result<usize, Errno> {
+            let offset = self
+                .untagged(address)
+                .checked_sub(BASE)
+                .ok_or(Errno::EFAULT)?;
+            let copied = (offset..offset.saturating_add(len))
+                .take_while(|byte| *byte < 2 * PAGE && allowed[*byte / PAGE])
+                .count();
+            if copied == 0 && len > 0 {
+                return Err(Errno::EFAULT);
+            }
+            Ok(copied)
+        }
+    }
+
+    impl MemoryAccess for FakePages {
+        fn read_vectored(
+            &self,
+            read_from: &[std::io::IoSlice],
+            write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            let (remote, local) = (&read_from[0], &mut write_to[0]);
+            let address = remote.as_ptr() as usize;
+            let copied = self.copy(address, remote.len().min(local.len()), self.readable)?;
+            let offset = self.untagged(address) - BASE;
+            local[..copied].copy_from_slice(&self.bytes[offset..offset + copied]);
+            Ok(copied)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[std::io::IoSlice],
+            _write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("publication must store with the guest's access rights")
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            buf: &[u8],
+        ) -> Result<usize, Errno> {
+            if self.no_user_copy {
+                return Err(Errno::ENOSYS);
+            }
+            if let Some(left) = &mut self.writes_left {
+                if *left == 0 {
+                    self.writable[0] = false;
+                } else {
+                    *left -= 1;
+                }
+            }
+            let address = addr.as_raw();
+            let copied = match (
+                self.copy(address, buf.len(), self.writable),
+                self.fails_after,
+            ) {
+                (Ok(copied), _) => copied,
+                (Err(_), Some(_)) => 0,
+                (Err(errno), None) => return Err(errno),
+            };
+            let offset = self.untagged(address) - BASE;
+            self.bytes[offset..offset + copied].copy_from_slice(&buf[..copied]);
+            match self.fails_after {
+                Some(errno) => Err(errno),
+                None => Ok(copied),
+            }
+        }
+    }
+
+    const VALUE: libc::c_int = 0x0403_0201;
+    /// The `int` straddling the two pages, two bytes in each.
+    const STRADDLING: usize = BASE + PAGE - 2;
+
+    fn int_at(memory: &FakePages, address: usize) -> [u8; 4] {
+        memory.bytes[address - BASE..address - BASE + 4]
+            .try_into()
+            .unwrap()
+    }
+
+    /// The stores and reads of every backend follow `FakePages` in kind: a
+    /// copy stops at the first byte it may not touch. A reader that reads any
+    /// mapped page, as ptrace's `PTRACE_PEEKDATA` does, is `readable` on
+    /// both pages.
+    #[test]
+    fn an_int_is_published_whole_or_not_at_all() {
+        let mut memory = FakePages::new([true, true]);
+        assert_eq!(
+            publish_int(&mut memory, BASE + 4, VALUE, PAGE),
+            Published::Whole
+        );
+        assert_eq!(int_at(&memory, BASE + 4), VALUE.to_ne_bytes());
+        let mut memory = FakePages::new([true, true]);
+        assert_eq!(
+            publish_int(&mut memory, STRADDLING, VALUE, PAGE),
+            Published::Whole
+        );
+        assert_eq!(int_at(&memory, STRADDLING), VALUE.to_ne_bytes());
+        // A second page that refuses the store: the first page's bytes are
+        // put back.
+        let mut memory = FakePages::new([true, false]);
+        assert_eq!(
+            publish_int(&mut memory, STRADDLING, VALUE, PAGE),
+            Published::Untouched
+        );
+        assert_eq!(int_at(&memory, STRADDLING), [0x5a; 4]);
+        // The second page need not be readable: only the first page's bytes
+        // are read.
+        let mut memory = FakePages::new([true, true]);
+        memory.readable[1] = false;
+        assert_eq!(
+            publish_int(&mut memory, STRADDLING, VALUE, PAGE),
+            Published::Whole
+        );
+        // An unwritable first page takes nothing: EFAULT, as on Linux, also
+        // where it cannot be read either (a page that is not mapped) or only
+        // the reader cannot read it.
+        for readable in [true, false] {
+            let mut memory = FakePages::new([false, true]);
+            memory.readable[0] = readable;
+            assert_eq!(
+                publish_int(&mut memory, STRADDLING, VALUE, PAGE),
+                Published::Untouched,
+                "first page readable: {readable}"
+            );
+            assert_eq!(int_at(&memory, STRADDLING), [0x5a; 4]);
+        }
+        // A first page only the reader cannot read, whose store succeeds.
+        let mut memory = FakePages::new([true, true]);
+        memory.readable[0] = false;
+        assert_eq!(
+            publish_int(&mut memory, STRADDLING, VALUE, PAGE),
+            Published::Whole
+        );
+    }
+
+    /// A backend that cannot store with the guest's access rights at all
+    /// stores nothing, and the call is refused. An `int` within one page needs
+    /// no read.
+    #[test]
+    fn an_int_the_backend_cannot_publish_whole_is_refused_untouched() {
+        let mut memory = FakePages::new([true, true]);
+        memory.readable[0] = false;
+        assert_eq!(
+            publish_int(&mut memory, BASE + 4, VALUE, PAGE),
+            Published::Whole
+        );
+        let mut memory = FakePages::new([true, true]);
+        memory.no_user_copy = true;
+        let published = publish_int(&mut memory, BASE + 4, VALUE, PAGE);
+        assert!(
+            matches!(&published, Published::Unpublishable(why) if why.contains("access rights")),
+            "{published:?}"
+        );
+        assert_eq!(memory.bytes, [0x5a; 2 * PAGE]);
+        assert!(matches!(
+            generation_answer(published, 0),
+            GenerationAnswer::Refused(_)
+        ));
+    }
+
+    /// An `int` past the end of user memory is EFAULT with nothing written,
+    /// as `access_ok` answers, never an overflow: at the top of the address
+    /// space (its last three bytes or its last page), and a pointer with a
+    /// nonzero top byte, which the copy here would untag and store through,
+    /// as arm64's `get_user_pages` does.
+    #[test]
+    fn an_int_past_user_memory_is_efault() {
+        for address in [
+            usize::MAX - 2,
+            usize::MAX - 3,
+            usize::MAX - 10,
+            usize::MAX,
+            (0x2a << 56) | (BASE + 4),
+            (0x2a << 56) | STRADDLING,
+        ] {
+            let mut memory = FakePages::new([true, true]);
+            memory.strips_tags = true;
+            assert_eq!(
+                publish_int(&mut memory, address, VALUE, PAGE),
+                Published::Untouched,
+                "{address:#x}"
+            );
+            assert_eq!(memory.bytes, [0x5a; 2 * PAGE]);
+        }
+    }
+
+    /// An `int` that may be left in part is never EFAULT, and the run ends: a
+    /// first page that takes the store but then refuses the store that puts
+    /// its bytes back, or whose old bytes could not be read; and a store that
+    /// fails with anything but EFAULT (which may come after effects, as KVM's
+    /// EIO for a terminal failure does), even one that copied nothing.
+    #[test]
+    fn an_int_left_in_part_ends_the_run() {
+        let mut memory = FakePages::new([true, false]);
+        memory.writes_left = Some(1);
+        let published = publish_int(&mut memory, STRADDLING, VALUE, PAGE);
+        assert!(
+            matches!(&published, Published::Unrestored(why) if why.contains("putting them back")),
+            "{published:?}"
+        );
+        assert_eq!(int_at(&memory, STRADDLING)[..2], VALUE.to_ne_bytes()[..2]);
+        assert!(matches!(
+            generation_answer(published, 0),
+            GenerationAnswer::RunEnds(_)
+        ));
+        // A first page that takes the store but whose old bytes the reader
+        // could not read, and a second page that refuses it.
+        let mut memory = FakePages::new([true, false]);
+        memory.readable[0] = false;
+        let published = publish_int(&mut memory, STRADDLING, VALUE, PAGE);
+        assert!(
+            matches!(&published, Published::Unrestored(why) if why.contains("could not read")),
+            "{published:?}"
+        );
+        for address in [BASE + 4, STRADDLING] {
+            let mut memory = FakePages::new([true, true]);
+            memory.fails_after = Some(Errno::EIO);
+            let published = publish_int(&mut memory, address, VALUE, PAGE);
+            assert!(
+                matches!(&published, Published::Unrestored(why) if why.contains("EIO")),
+                "{address:#x}: {published:?}"
+            );
+        }
+        let mut memory = FakePages::new([false, false]);
+        memory.fails_after = Some(Errno::EIO);
+        let published = publish_int(&mut memory, BASE + 4, VALUE, PAGE);
+        assert!(
+            matches!(&published, Published::Unrestored(_)),
+            "{published:?}"
+        );
+        // Through the store itself: an `int` stored whole answers the call's
+        // result, and one whose first page refuses the store answers EFAULT.
+        let mut memory = FakePages::new([true, true]);
+        assert_eq!(
+            generation_answer(publish_int(&mut memory, BASE + 4, VALUE, PAGE), 0),
+            GenerationAnswer::Linux(Ok(0))
+        );
+        assert_eq!(int_at(&memory, BASE + 4), VALUE.to_ne_bytes());
+        let mut memory = FakePages::new([false, true]);
+        assert_eq!(
+            generation_answer(publish_int(&mut memory, STRADDLING, VALUE, PAGE), 0),
+            GenerationAnswer::Linux(Err(Errno::EFAULT))
+        );
+        assert_eq!(int_at(&memory, STRADDLING), [0x5a; 4]);
+    }
+
+    /// Only ptrace's tool reaches a guest thread through its host task: on
+    /// every other backend, KVM first, the generation calls are refused.
+    #[test]
+    fn generation_calls_are_answered_only_where_the_route_is_proven() {
+        use reverie::BackendCapabilities;
+        assert_eq!(generation_route_refusal(&BackendCapabilities::PTRACE), None);
+        for (name, backend) in [
+            ("kvm", BackendCapabilities::KVM),
+            ("liteinst", BackendCapabilities::LITEINST_IN_GUEST),
+            ("dbt", BackendCapabilities::DBT),
+            ("sabre", BackendCapabilities::SABRE),
+        ] {
+            assert!(
+                generation_route_refusal(&backend).is_some_and(|why| why.contains("not proven")),
+                "{name}"
+            );
+        }
+    }
+
+    /// A restart code is never the guest's answer, and nothing runs the read
+    /// again: every one is refused. EINTR, other errors and successes are
+    /// answers.
+    #[test]
+    fn every_restart_code_from_the_read_is_refused() {
+        for raw in [512, 513, 514, 516] {
+            assert!(
+                matches!(
+                    staged_read_decision(Err(Errno::new(raw))),
+                    StagedRead::Refuse(_)
+                ),
+                "{raw}"
+            );
+        }
+        for result in [
+            Ok(0),
+            Err(Errno::EINTR),
+            Err(Errno::ENOTTY),
+            Err(Errno::new(515)),
+        ] {
+            assert_eq!(
+                staged_read_decision(result),
+                StagedRead::Answer(result),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_command_is_the_32_bits_the_kernel_reads() {
+        assert_eq!(
+            kernel_ioctl_command(0xdead_beef_8008_7601),
+            FS_IOC_GETVERSION
+        );
+        assert_eq!(kernel_ioctl_command(0x1_4008_6604), EXT4_IOC_SETVERSION);
+    }
+}
+
 /// The signals an `ioctl` request lets Linux send at a moment set by host
 /// timing, as a kernel sigset; 0 for every other request. `FIOASYNC` enables
 /// SIGIO, and `FIOSETOWN` and `SIOCSPGRP` name the owner. `TIOCSCTTY` makes
@@ -16478,6 +17304,491 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((call.with_request(request), Some(guard)))
     }
 
+    /// A read or set of a file's inode generation, `command`
+    /// ([`generation_request`]), on descriptor `fd` with argument `argument`,
+    /// where the run virtualizes file metadata (`Config::virtualize_metadata`,
+    /// which stat and statx follow; record and replay run without it). `None`
+    /// sends the guest's call on to the kernel unchanged, where threads are
+    /// sequentialized, for a descriptor Detcore's `fstat` shows is neither a
+    /// regular file nor a directory, whose driver may give the number another
+    /// meaning, and for a pidfd ([`GenerationFs::Pidfs`]).
+    ///
+    /// A file's inode generation is the host's choice when it makes the inode
+    /// (a random number on ext4, the transaction ID on btrfs), so it differs
+    /// between runs for a file the run creates, and between hosts for every
+    /// file. A read answers instead the low 32 bits of the number the
+    /// descriptor's `fstat` shows at that point of the run
+    /// (`Self::inode_generation_number`), written as the 4-byte `int` the file
+    /// systems write for every one of these numbers. Detcore numbers files in
+    /// the order the run first sees them and never gives a number twice (each
+    /// numbering request takes the next value of a counter,
+    /// `InodePool::add_sighted_inode`), so a file gets the same generation in
+    /// every run that sees the same files in the same order, and a file
+    /// deleted and made again gets a new one, as Linux gives it; the low 32
+    /// bits repeat only after 2^32 numbering requests.
+    ///
+    /// The answer is bound to the file the kernel answered for, and the host's
+    /// value never reaches guest memory:
+    /// - Only on a backend where this route is proven: on any other, every
+    ///   generation call is refused by name before any call
+    ///   ([`generation_route_refusal`]).
+    /// - Detcore looks at the descriptor (`fstat`, `F_GETFL`, `fstatfs`) and
+    ///   runs the call as separate injections writing into the guest's memory,
+    ///   so it answers only where threads are sequentialized: then no other
+    ///   guest thread runs until this call returns (Hermit traces every
+    ///   thread, `CLONE_UNTRACED` included), and a call already blocked in the
+    ///   kernel can fill a free descriptor but not replace one in use. Without
+    ///   sequentialization every generation call is refused by name before
+    ///   any of these calls.
+    /// - Detcore answers only a descriptor it classified: an `fstat` or
+    ///   `F_GETFL` that fails is refused by name (one that says there is no
+    ///   such descriptor is that EBADF), never sent on.
+    /// - Every call Detcore makes, the `fstat` that classifies the descriptor
+    ///   included, writes into one page Detcore maps for the guest's call and
+    ///   whose address the guest never learns; it zeroes and unmaps the page
+    ///   before the guest resumes, and if either fails, the run ends
+    ///   (`Self::release_staging_page`). Only the virtual value is written to
+    ///   the guest's argument, whole or not at all with EFAULT, as `put_user`
+    ///   publishes it ([`publish_int`]); an `int` that cannot be put back after
+    ///   a partial store ends the run. Detcore's store does not check
+    ///   protection keys, so in an address space that has used them (its
+    ///   `pkey_alloc` and `pkey_mprotect` calls, `may_use_protection_keys`) a
+    ///   read is refused by name before it. That is a record of the calls, not
+    ///   a check of the thread's PKRU register: a thread that changes PKRU with
+    ///   `WRPKRU` alone, denying itself key 0 say, is not seen.
+    /// - The read runs only on a file system whose handler for that number
+    ///   Detcore has audited to do nothing but answer ([`generation_fs`]):
+    ///   one that writes a 4-byte `int` from `inode->i_generation`
+    ///   ([`GenerationFs::Int`]), or one that answers ENOTTY
+    ///   ([`GenerationFs::NoHandler`], tmpfs and the other numbers there),
+    ///   whose error is the guest's answer and whose success is refused by
+    ///   name. On any other file system, FUSE, eCryptfs, overlayfs and any
+    ///   unknown one included, the call is refused by name and the generation
+    ///   ioctl is never sent; Detcore's `fstat` and `fstatfs` probes still
+    ///   reach the file system. The read runs once: an EINTR from it is the
+    ///   guest's answer too, and a restart code is refused by name
+    ///   ([`staged_read_decision`]).
+    ///   Detcore's own calls around the read, which the guest did not make and
+    ///   which are safe to repeat, run again after an interruption, a bounded
+    ///   number of times (`Self::record_or_replay_uninterrupted`), after which
+    ///   the call is refused by name, or, for the staging page's `munmap`, the
+    ///   run ends. A cleanup failure ends the run whatever the
+    ///   read answered: the page may still hold the host's output.
+    ///
+    /// Linux's order of errors is kept: EBADF for an `O_PATH` descriptor,
+    /// which `ioctl` refuses before any file system sees the call, then the
+    /// file system's own answer, then EFAULT for an argument it cannot write.
+    ///
+    /// Design decision: a set on a descriptor Detcore's `fstat` classified as a
+    /// regular file or directory fails with ENOTTY, after the EBADF of an
+    /// `O_PATH` one, as btrfs, XFS, f2fs and an ext4 with `metadata_csum`
+    /// answer `FS_IOC_SETVERSION`, in every run that virtualizes metadata,
+    /// without a call on the descriptor. Where ext2 or an ext4 without
+    /// `metadata_csum` would set the host's generation, a later read would
+    /// still answer the virtual value, which Linux never returns after a
+    /// successful set. A set on any other descriptor goes to its driver
+    /// unchanged.
+    async fn inode_generation_ioctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        command: u32,
+        request: GenerationRequest,
+        argument: usize,
+    ) -> Result<Option<i64>, Error> {
+        if let Some(why) = generation_route_refusal(&self.cfg.backend) {
+            return self
+                .refuse_inode_generation(guest, fd, command, why)
+                .await
+                .map(Some);
+        }
+        if !self.cfg.sequentialize_threads {
+            return self
+                .refuse_inode_generation(
+                    guest,
+                    fd,
+                    command,
+                    "threads are not sequentialized (--no-sequentialize-threads), so another \
+                     thread could read or change what Detcore's calls write in the guest's \
+                     memory, or replace the descriptor before the call",
+                )
+                .await
+                .map(Some);
+        }
+        let page = match self.map_staging_page(guest).await {
+            Ok(page) => page,
+            Err(why) => {
+                return self
+                    .refuse_inode_generation(guest, fd, command, &why)
+                    .await
+                    .map(Some);
+            }
+        };
+        let outcome = self
+            .generation_outcome(guest, fd, command, request, page)
+            .await;
+        if let Err(why) = self.release_staging_page(guest, page).await {
+            return self
+                .end_run_for_inode_generation(guest, fd, command, &why)
+                .await;
+        }
+        let (result, stat) = match outcome {
+            GenerationOutcome::PassThrough => return Ok(None),
+            GenerationOutcome::Errno(errno) => return Err(errno.into()),
+            GenerationOutcome::Refuse(why) => {
+                return self
+                    .refuse_inode_generation(guest, fd, command, &why)
+                    .await
+                    .map(Some);
+            }
+            GenerationOutcome::Read { result, stat } => (result, stat),
+        };
+        if guest.thread_state().may_use_protection_keys() {
+            return self
+                .refuse_inode_generation(
+                    guest,
+                    fd,
+                    command,
+                    "the address space has used protection keys, whose write rights Detcore's \
+                     store does not check, so it could write where the guest cannot",
+                )
+                .await
+                .map(Some);
+        }
+        let generation = self
+            .inode_generation_number(guest, fd, &stat)
+            .await
+            .as_raw() as u32 as libc::c_int;
+        let published = publish_int(
+            &mut guest.memory(),
+            argument,
+            generation,
+            system_page_size(),
+        );
+        match generation_answer(published, result) {
+            GenerationAnswer::Linux(answer) => Ok(Some(answer?)),
+            GenerationAnswer::Refused(why) => self
+                .refuse_inode_generation(
+                    guest,
+                    fd,
+                    command,
+                    &format!("the generation cannot be stored at {argument:#x}: {why}"),
+                )
+                .await
+                .map(Some),
+            GenerationAnswer::RunEnds(why) => {
+                self.end_run_for_inode_generation(
+                    guest,
+                    fd,
+                    command,
+                    &format!("the generation was stored at {argument:#x} only in part: {why}"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Map Detcore's staging page for one generation call: private and
+    /// anonymous, as `Self::inject_stat_in_transient_page`'s is, so that the
+    /// guest never learns its address. An error says why it could not.
+    async fn map_staging_page<G: Guest<Self>>(&self, guest: &mut G) -> Result<usize, String> {
+        let mmap = Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(STAGING_LEN)
+                .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                .with_fd(-1)
+                .with_offset(0),
+        );
+        let mapped = self
+            .record_or_replay_uninterrupted(guest, mmap)
+            .await
+            .map_err(|errno| {
+                format!(
+                    "Detcore could not map a page for the call ({})",
+                    interruption_note(errno)
+                )
+            })?;
+        Ok(usize::try_from(mapped)
+            .ok()
+            .filter(|page| *page != 0)
+            .unwrap_or_else(|| panic!("the staging page mmap returned {mapped}")))
+    }
+
+    /// `call`, one of Detcore's own calls around a generation call (the
+    /// staging page's `mmap` and `munmap`, `fstat`, `F_GETFL`, `fstatfs`),
+    /// through the recording, again where a signal interrupts it: the guest
+    /// made no such call, so its interruption is no answer for the guest. Up to
+    /// [`INTERRUPTED_CALL_ATTEMPTS`] attempts; if a signal interrupts every
+    /// one, the last interruption's errno, which each caller turns into its
+    /// named refusal or end of the run ([`interruption_note`]).
+    async fn record_or_replay_uninterrupted<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Errno> {
+        let mut result = Err(Errno::EINTR);
+        for _ in 0..INTERRUPTED_CALL_ATTEMPTS {
+            result = self.record_or_replay(guest, call).await;
+            if !matches!(result, Err(Errno::EINTR | Errno::ERESTARTSYS)) {
+                break;
+            }
+        }
+        result
+    }
+
+    /// The guest's generation read `call`, run once into the staging page
+    /// through the recording, answered as [`staged_read_decision`] decides:
+    /// the guest's answer (`Ok(result)`), or a refusal by name (`Err(why)`).
+    async fn staged_generation_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<Result<i64, Errno>, String> {
+        match staged_read_decision(self.record_or_replay(guest, call).await) {
+            StagedRead::Answer(result) => Ok(result),
+            StagedRead::Refuse(why) => Err(why),
+        }
+    }
+
+    /// The calls `Self::inode_generation_ioctl` makes for the generation call
+    /// `command` (a `request`) on descriptor `fd`, each writing into Detcore's
+    /// staging page at `page`: `fstat` and `F_GETFL` to classify the
+    /// descriptor, and, for a read on a file, `fstatfs` and the read itself.
+    /// Their failures are values, so that the page is released after any of
+    /// them.
+    async fn generation_outcome<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        command: u32,
+        request: GenerationRequest,
+        page: usize,
+    ) -> GenerationOutcome {
+        let stat_at = page;
+        let offsets = stat_at
+            .checked_add(std::mem::size_of::<libc::stat>())
+            .and_then(|statfs_at| {
+                statfs_at
+                    .checked_add(std::mem::size_of::<libc::statfs>())
+                    .map(|output_at| (statfs_at, output_at))
+            });
+        let Some((statfs_at, output_at)) = offsets else {
+            return GenerationOutcome::Refuse(format!(
+                "Detcore's staging page at {page:#x} ends past the address space"
+            ));
+        };
+        let fstat = Syscall::from_raw(
+            Sysno::fstat,
+            procfs_levels::raw_args([fd as usize, stat_at, 0, 0, 0, 0]),
+        );
+        match self.record_or_replay_uninterrupted(guest, fstat).await {
+            Ok(_) => {}
+            // No descriptor `fd`: Linux's answer, which sequentialized threads
+            // keep true until the guest resumes.
+            Err(Errno::EBADF) => return GenerationOutcome::Errno(Errno::EBADF),
+            Err(errno) => {
+                return GenerationOutcome::Refuse(format!(
+                    "Detcore could not tell what the descriptor is (fstat: {})",
+                    interruption_note(errno)
+                ));
+            }
+        }
+        let Some(Ok(stat)) =
+            Addr::<libc::stat>::from_raw(stat_at).map(|stat| guest.memory().read_value(stat))
+        else {
+            return GenerationOutcome::Refuse("Detcore could not read what fstat wrote".to_owned());
+        };
+        let file_type = stat.st_mode & libc::S_IFMT;
+        if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {
+            return GenerationOutcome::PassThrough;
+        }
+        let status = Syscall::from_raw(
+            Sysno::fcntl,
+            procfs_levels::raw_args([fd as usize, libc::F_GETFL as usize, 0, 0, 0, 0]),
+        );
+        let flags = match self.record_or_replay_uninterrupted(guest, status).await {
+            Ok(flags) => flags as libc::c_int,
+            Err(errno) => {
+                return GenerationOutcome::Refuse(format!(
+                    "Detcore could not read the descriptor's flags (F_GETFL: {})",
+                    interruption_note(errno)
+                ));
+            }
+        };
+        if flags & libc::O_PATH != 0 {
+            return GenerationOutcome::Errno(Errno::EBADF);
+        }
+        if request == GenerationRequest::Set {
+            return GenerationOutcome::Errno(Errno::ENOTTY);
+        }
+        let statfs_call = Syscall::from_raw(
+            Sysno::fstatfs,
+            procfs_levels::raw_args([fd as usize, statfs_at, 0, 0, 0, 0]),
+        );
+        if let Err(errno) = self
+            .record_or_replay_uninterrupted(guest, statfs_call)
+            .await
+        {
+            return GenerationOutcome::Refuse(format!(
+                "Detcore could not tell its file system (fstatfs failed with {})",
+                interruption_note(errno)
+            ));
+        }
+        let Some(Ok(statfs)) =
+            Addr::<libc::statfs>::from_raw(statfs_at).map(|at| guest.memory().read_value(at))
+        else {
+            return GenerationOutcome::Refuse(
+                "Detcore could not read what fstatfs wrote".to_owned(),
+            );
+        };
+        let fs = match generation_fs(command, statfs.f_type) {
+            GenerationFs::Fuse => {
+                return GenerationOutcome::Refuse(
+                    "its file system is FUSE, whose daemon decides what the call does and writes"
+                        .to_owned(),
+                );
+            }
+            GenerationFs::Unaudited => {
+                return GenerationOutcome::Refuse(format!(
+                    "its file system (f_type {:#x}) is not one whose handler for this number \
+                     Detcore has audited to do nothing but answer, so Detcore does not run it",
+                    statfs.f_type
+                ));
+            }
+            GenerationFs::Pidfs => return GenerationOutcome::PassThrough,
+            fs => fs,
+        };
+        let call = Syscall::from_raw(
+            Sysno::ioctl,
+            procfs_levels::raw_args([fd as usize, command as usize, output_at, 0, 0, 0]),
+        );
+        let read = match self.staged_generation_read(guest, call).await {
+            Ok(read) => read,
+            Err(why) => return GenerationOutcome::Refuse(why),
+        };
+        match (fs, read) {
+            (_, Err(errno)) => GenerationOutcome::Errno(errno),
+            (GenerationFs::Int, Ok(result)) => GenerationOutcome::Read { result, stat },
+            (_, Ok(_)) => GenerationOutcome::Refuse(format!(
+                "it succeeded on a file system (f_type {:#x}) whose handler Detcore's audit \
+                 says answers this number only with ENOTTY",
+                statfs.f_type
+            )),
+        }
+    }
+
+    /// Zero Detcore's staging page at `page`, so that no host output stays
+    /// readable, and unmap it. An error says which of the two failed.
+    async fn release_staging_page<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+    ) -> Result<(), String> {
+        let zeroed = AddrMut::<u8>::from_raw(page)
+            .ok_or(Errno::EFAULT)
+            .and_then(|address| guest.memory().write_exact(address, &[0; STAGING_LEN]));
+        let unmap = Syscall::Munmap(
+            syscalls::Munmap::new()
+                .with_addr(AddrMut::<libc::c_void>::from_raw(page).map(Into::into))
+                .with_len(STAGING_LEN),
+        );
+        let unmapped = self.record_or_replay_uninterrupted(guest, unmap).await;
+        match (zeroed, unmapped) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Err(zero), Ok(_)) => Err(format!(
+                "Detcore could not zero the page the call wrote into ({zero}); it unmapped it"
+            )),
+            (Ok(()), Err(unmap)) => Err(format!(
+                "Detcore could not unmap the page the call wrote into ({}); it zeroed it",
+                interruption_note(unmap)
+            )),
+            (Err(zero), Err(unmap)) => Err(format!(
+                "Detcore could neither zero ({zero}) nor unmap ({}) the page the call wrote \
+                 into, so the host's output may stay in the guest's address space",
+                interruption_note(unmap)
+            )),
+        }
+    }
+
+    /// The number descriptor `fd`'s `fstat` shows for the file whose host stat
+    /// is `stat`, numbered as `Self::determinize_stat` numbers it (a standard
+    /// stream's fixed number, else the run's pool, sighted by name when the
+    /// file has a link), without observing its mtime.
+    async fn inode_generation_number<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        stat: &libc::stat,
+    ) -> DetInode {
+        if let Some(inode) = stdio_inode_override(guest, fd) {
+            return inode;
+        }
+        let sighting = if stat.st_nlink > 0 {
+            InodeSighting::Name
+        } else {
+            InodeSighting::Descriptor
+        };
+        determinize_inode_observing_mtime(
+            guest,
+            DetStat::from(stat).raw_inode(),
+            None,
+            ObservedMtime::Unobserved,
+            sighting,
+        )
+        .await
+        .0
+    }
+
+    /// End the run, whatever the unsupported-operation policy, for the
+    /// generation call `command` on descriptor `fd`, saying `why`: what the
+    /// guest would see next cannot be made right, so it does not resume.
+    async fn end_run_for_inode_generation<G: Guest<Self>, R>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        command: u32,
+        why: &str,
+    ) -> R {
+        crate::syscalls::helpers::report_refusal_reason(
+            true,
+            &format!(
+                "[dtid {}] ioctl {command:#x}, an inode generation call, on descriptor {fd} ended \
+                 the run: {why} (https://github.com/facebookexperimental/hermit/issues/117)",
+                guest.thread_state().dettid
+            ),
+        );
+        unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
+    }
+
+    /// Refuse the generation call `command` on descriptor `fd` by name,
+    /// saying `why`, through the unsupported-operation policy: a fail-closed
+    /// run ends, and one that allows unsupported operations gives the guest
+    /// EOPNOTSUPP.
+    async fn refuse_inode_generation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        command: u32,
+        why: &str,
+    ) -> Result<i64, Error> {
+        let reason = format!(
+            "ioctl {command:#x}, an inode generation call, on descriptor {fd} refused: {why}. \
+             Detcore answers these calls only from the file's virtual inode number, never with \
+             the host's generation (https://github.com/facebookexperimental/hermit/issues/117)"
+        );
+        crate::syscalls::helpers::report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {}] ioctl refused: {reason}",
+                guest.thread_state().dettid
+            ),
+        );
+        self.refuse_unserviceable_operation_because(guest, Sysno::ioctl, Errno::EOPNOTSUPP, &reason)
+            .await
+    }
+
     /// ioctl system call
     pub async fn handle_ioctl<G: Guest<Self>>(
         &self,
@@ -16495,6 +17806,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::syscalls::timerfd::refuse(format_args!(
                 "ioctl(TFD_IOC_SET_TICKS) on timerfd {fd} would set the host's tick count"
             ));
+        }
+        let (_, args) = Syscall::Ioctl(call).into_parts();
+        let command = kernel_ioctl_command(args.arg1);
+        if let Some(request) = generation_request(command)
+            && guest.config().virtualize_metadata
+            && let Some(result) = self
+                .inode_generation_ioctl(guest, fd, command, request, args.arg2)
+                .await?
+        {
+            return Ok(result);
         }
         // As in `handle_fcntl`: the one request that would complete a
         // host-timed signal producer, on an in-guest run's default route,

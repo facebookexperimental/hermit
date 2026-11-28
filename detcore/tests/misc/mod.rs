@@ -14,6 +14,7 @@
 )]
 
 mod cpuinfo_sessions;
+mod fs_ioc_getversion;
 mod ignored_signal_waits;
 mod inode_reuse;
 mod notification_fds;
