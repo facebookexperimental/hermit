@@ -2033,7 +2033,7 @@ mod tests {
             );
         }
         let verdict = Error::new(AnalyzeVerdict::reproduced_without_schedule(
-            "no event decides",
+            "reproduced without it",
             None,
         ));
         assert_eq!(failure_exit_code(&verdict), 0);
@@ -2041,8 +2041,10 @@ mod tests {
             classify_failure(&verdict),
             "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
         );
-        // The same words without the type stay an internal failure.
-        let prose = Error::msg("no event of the target schedule decides the outcome");
+        // The same words without the type stay an internal failure. These
+        // are the words the verdict opens with where analyze builds it
+        // (`analyze::phases`, the empty-prefix verdict), and must stay so.
+        let prose = Error::msg("the target is reproduced without the target schedule");
         assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
         assert_eq!(
             classify_failure(&prose),
