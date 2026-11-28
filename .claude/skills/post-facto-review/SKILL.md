@@ -1,6 +1,6 @@
 ---
 name: post-facto-review
-description: "Current Hermit post-facto human-review protocol: exact trigger set and commit trailer, review depth (two models for engine changes, otherwise one reviewer), the close precondition an adversarial reviewer must satisfy before closing a PR, the hand-run protocol lint, and fix-forward human review after landing."
+description: "Current Hermit post-facto human-review protocol: exact trigger set, review depth (two models for engine changes, otherwise one reviewer), the close precondition an adversarial reviewer must satisfy before closing a PR, the hand-run protocol lint, and fix-forward human review after landing."
 ---
 
 # Post-facto human review
@@ -30,19 +30,9 @@ Apply `post-facto-human-review` if and only if the PR has one of these triggers:
    slowdown into virtual-time/epoch scheduling, is the canonical good example.
 
 Routine parity work toward the ptrace reference is not a trigger by itself.
-Every triggered change also carries this trailer in its commit message, because
-a pull-request label does not survive repository export while a trailer travels
-with the commit on every copy of the history:
 
-```text
-Post-facto-human-review: trigger-<n> (<short reason>)
-```
-
-`<n>` is the trigger number above (repeat the line for several triggers) and
-the reason is a few words. Find tagged changes with
-`git log --grep='^Post-facto-human-review:'` in any clone, `git log -1
---format=%B <commit>` inside a bisect script, or
-`gh pr list --label post-facto-human-review` for pull requests.
+Find tagged changes with
+`gh pr list --label post-facto-human-review --state all --limit 1000` for pull requests.
 
 The label routes after-the-fact human review and never waits for human approval
 before landing. Never apply `pre-land-human-review`, alter `human-approved`, or
@@ -66,8 +56,7 @@ labels.
 
 Every PR contains `Plain Language Summary and Project Impact` first, then
 `Determinism`, `Linux Semantics`, and `Validation`.
-KVM changes also contain `Relationship to gVisor`; a triggered PR contains
-`Human Review Required` naming the numbered triggers. A determinism proof
+KVM changes also contain `Relationship to gVisor`. A determinism proof
 explains the model, not only tests. For a change to the Linux behaviour Hermit
 presents (syscall results, errno, restart or interruption, signals, `/proc`),
 `Linux Semantics` cites the kernel source it matches (function and `file:line`

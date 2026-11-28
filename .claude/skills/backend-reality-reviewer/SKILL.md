@@ -35,9 +35,7 @@ stating the substantive outcome and its connection to the product vision or
 owner request. It also requires mandatory `Determinism` (why the
 change is deterministic plus its logic or informal proof), `Linux Semantics`
 (how it matches real Linux kernel behavior, or why a deviation is safe), and
-`Validation`. KVM PRs also require `Relationship to gVisor`. A labeled PR
-additionally requires `Human Review Required`, naming the specific numbered
-trigger rather than vague prose such as "backend change". The syscall tags above
+`Validation`. KVM PRs also require `Relationship to gVisor`. The syscall tags above
 verify trigger 1; they are not blanket backend-change markers. Hermit
 [PR #1151](https://github.com/rrnewton/hermit/pull/1151), which moved slowdown
 into virtual-time/epoch scheduling, is the canonical good example for trigger 4.

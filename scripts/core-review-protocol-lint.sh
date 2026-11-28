@@ -21,7 +21,7 @@
 #       by complexity; two models only for core Reverie types or the Detcore
 #       engine). Mirrors `review_lane_policy` in the reference verifier.
 #   (b) the PR body contains the required sections: Summary, Determinism,
-#       Linux Semantics, Validation, Human Review Required, and — when the PR
+#       Linux Semantics, Validation, and — when the PR
 #       touches KVM — Relationship to gVisor.
 #
 # Numbered round labels (`adversarial-review-<family><n>`) and approval
@@ -1070,7 +1070,7 @@ fi
 if [ -z "${PR_BODY+set}" ]; then
     echo "::error::PR #${pr}: PR_BODY is not set, and this PR is labeled" >&2
     echo "  ${post_facto_label}, so the required-section checks below cannot run." >&2
-    echo "  Refusing rather than reporting five phantom 'missing section' errors for a" >&2
+    echo "  Refusing rather than reporting four phantom 'missing section' errors for a" >&2
     echo "  body that was never supplied. Pass an EMPTY string for a PR with no body." >&2
     exit 2
 fi
@@ -1300,7 +1300,7 @@ fi
 # titled "Summary" is still accepted, as before that rule.
 has_section "Plain Language Summary and Project Impact" || has_section "Summary" \
     || fail "PR body is missing the required \"Plain Language Summary and Project Impact\" (or \"Summary\") section."
-for section in "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
+for section in "Determinism" "Linux Semantics" "Validation"; do
     has_section "$section" \
         || fail "PR body is missing the required \"${section}\" section."
 done

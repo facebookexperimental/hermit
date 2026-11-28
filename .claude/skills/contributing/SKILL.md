@@ -35,10 +35,7 @@ before landing more work.
   after it when the change implements task work.
 - Every PR description also has **Determinism** (why the change is
   deterministic, with a logic or informal proof, not only tests), **Linux
-  Semantics** and **Validation**. KVM changes add **Relationship to gVisor**. A
-  `post-facto-human-review` PR adds **Human Review Required**, naming the
-  numbered trigger, and its commit carries the `Post-facto-human-review:`
-  trailer (`post-facto-review` skill).
+  Semantics** and **Validation**. KVM changes add **Relationship to gVisor**.
 - **Linux Semantics citations** (owner, 2026-10-18): a change to the Linux
   behavior Hermit or Detcore presents (a syscall's result, errno, restart or
   interruption; signal delivery, masks or handler order; `/proc` or `/sys`

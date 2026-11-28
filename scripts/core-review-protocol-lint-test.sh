@@ -464,7 +464,7 @@ run_case "missing Linux Semantics section blocks" 1 \
     "$FULL_LABELS" \
     $'## Summary\nx\n## Determinism\ny\n## Validation\nz\n## Human Review Required\nt'
 
-run_case "missing Human Review Required section blocks" 1 \
+run_case "missing Human Review Required section does not block" 0 \
     "$FULL_LABELS" \
     $'## Summary\nx\n## Determinism\ny\n## Linux Semantics\nl\n## Validation\nz'
 

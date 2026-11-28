@@ -118,19 +118,15 @@ Full guidelines: `development`; code-quality audits: `code-elegance`.
 Review depth: one cold-context reviewer who is not the author by default; two
 reviewers on two different models, neither the author, for engine changes (core
 Reverie types, the Detcore engine and its scheduler).
-Apply the `post-facto-human-review` label, and put this trailer in the commit
-message, exactly for: (1) new syscall support, with both markers above; (2) a
+Apply the `post-facto-human-review` label exactly for: (1) new syscall
+support, with both markers above; (2) a
 Reverie `Tool`, `Guest`, `Backend` or syscall-interception-model change; (3) a
 new determinization strategy; (4) a core Detcore scheduling change affecting how
 programs are scheduled, especially race search. Routine backend-parity work is
 not a trigger by itself.
 
-```text
-Post-facto-human-review: trigger-<n> (<short reason>)
-```
-
 The label routes after-the-fact human review and never waits for approval. Find
-tagged changes with `git log --grep='^Post-facto-human-review:'`. Before landing
+tagged changes with `gh pr list --label post-facto-human-review --state all --limit 1000`. Before landing
 a labeled PR you must run `scripts/core-review-protocol-lint.sh` by hand
 (nothing runs it for you; the gate stays unarmed): `post-facto-review`.
 
@@ -144,8 +140,7 @@ a labeled PR you must run `scripts/core-review-protocol-lint.sh` by hand
   never (owner, 2026-10-09). The first section after it is **Plain Language
   Summary and Project Impact**; PR descriptions also need **Determinism**,
   **Linux Semantics** (citing the kernel source it matches) and **Validation**,
-  plus **Relationship to gVisor** for KVM and **Human Review Required** for a
-  labeled PR.
+  plus **Relationship to gVisor** for KVM.
 - Implemented means a pushed change under review (a PR, or the primary
   repository's code review) carrying the exact tested head and its validation;
   landed means on `main` by freshly fetched ancestry. Never report a weaker
