@@ -867,6 +867,10 @@ fn a_restart_code_on_a_file_system_without_a_handler_is_refused_without_a_second
     assert_eq!(OTHER_RESTART_READS.load(Ordering::SeqCst), 2, "{stdout}");
 }
 
+/// One off-allowlist probe of the test below: its name, its run, and the
+/// count of generation ioctls it sent.
+type MagicProbeRun = (&'static str, fn() -> String, &'static AtomicUsize);
+
 /// A read on a file system off Detcore's allowlist is refused by name, and
 /// the generation ioctl is never sent; Detcore's `fstat` and `fstatfs` probes
 /// still reach the file system. Here eCryptfs (whose handler forwards the call
@@ -875,7 +879,7 @@ fn a_restart_code_on_a_file_system_without_a_handler_is_refused_without_a_second
 /// Detcore's `fstatfs` to its magic and counts generation ioctls sent: none.
 #[test]
 fn a_read_on_a_file_system_off_the_allowlist_is_refused_before_it_runs() {
-    let runs: [(&str, fn() -> String, &AtomicUsize); 3] = [
+    let runs: [MagicProbeRun; 3] = [
         (
             "eCryptfs",
             || run_with::<Detcore<EcryptfsMagicProbe>>(config(true, true), audited_restart_guest).0,

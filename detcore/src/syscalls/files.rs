@@ -757,15 +757,26 @@ enum GenerationFs {
     Unaudited,
 }
 
+/// The type of `libc::statfs`'s `f_type` on this target. glibc names it
+/// `__fsword_t` (libc 0.2.191 `src/unix/linux_like/linux/gnu/b64/x86_64/mod.rs:17`,
+/// an `i64` on 64-bit targets per `gnu/b64/mod.rs:25`); musl's libc has no
+/// `__fsword_t` and declares the field `c_ulong`
+/// (`src/unix/linux_like/linux/musl/mod.rs:353`).
+#[cfg(not(target_env = "musl"))]
+type FsWord = libc::__fsword_t;
+/// The type of `libc::statfs`'s `f_type` on this target (see above).
+#[cfg(target_env = "musl")]
+type FsWord = libc::c_ulong;
+
 /// [`GenerationFs`] for a generation read `command` on a file system whose
 /// `fstatfs` reports `f_type` (`include/uapi/linux/magic.h`): the allowlist.
-fn generation_fs(command: u32, f_type: libc::__fsword_t) -> GenerationFs {
-    const EXT4_SUPER_MAGIC: libc::__fsword_t = 0xEF53;
-    const BTRFS_SUPER_MAGIC: libc::__fsword_t = 0x9123_683E;
-    const XFS_SUPER_MAGIC: libc::__fsword_t = 0x5846_5342;
-    const TMPFS_MAGIC: libc::__fsword_t = 0x0102_1994;
-    const FUSE_SUPER_MAGIC: libc::__fsword_t = 0x6573_5546;
-    const PID_FS_MAGIC: libc::__fsword_t = 0x5049_4446;
+fn generation_fs(command: u32, f_type: FsWord) -> GenerationFs {
+    const EXT4_SUPER_MAGIC: FsWord = 0xEF53;
+    const BTRFS_SUPER_MAGIC: FsWord = 0x9123_683E;
+    const XFS_SUPER_MAGIC: FsWord = 0x5846_5342;
+    const TMPFS_MAGIC: FsWord = 0x0102_1994;
+    const FUSE_SUPER_MAGIC: FsWord = 0x6573_5546;
+    const PID_FS_MAGIC: FsWord = 0x5049_4446;
     match (command, f_type) {
         (_, FUSE_SUPER_MAGIC) => GenerationFs::Fuse,
         (_, PID_FS_MAGIC) => GenerationFs::Pidfs,
