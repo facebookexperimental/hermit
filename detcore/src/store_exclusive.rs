@@ -243,16 +243,16 @@ mod decode {
     pub(crate) type FileRanges = Vec<(u64, u64)>;
 
     /// The file ranges (start, end) of `sections` to scan, and of those the
-    /// ones scanned without proof, each sorted and merged. Only `SHT_PROGBITS`
-    /// sections admit `$x` and `$d` proof, as the default rewrite takes them
-    /// ([`CodeEvidence::classify`]): what a section's mapping symbols mark
-    /// `$x` is code, and what they mark `$d` is data and is not scanned, so a
-    /// constant table in `.text` cannot pass for an exclusive pair. The rest
-    /// is scanned and labelled unverified: bytes before a section's first
-    /// mapping symbol, and the whole of a section that no mapping symbol
-    /// marks (whatever its unwind table says), that has another section type,
-    /// or that holds a mapping symbol of another kind
-    /// ([`CodeEvidence::unsupported_in`]). The rewriter leaves those
+    /// ones scanned without proof, each sorted and merged. What a section's
+    /// mapping symbols mark `$d` is data and is not scanned, so a constant
+    /// table in `.text` cannot pass for an exclusive pair; what they mark `$x`
+    /// is code, verified only in an `SHT_PROGBITS` section, as the default
+    /// rewrite takes them ([`CodeEvidence::classify`]), and scanned but
+    /// labelled unverified in a section of another type. The rest is scanned
+    /// and labelled unverified too: bytes before a section's first mapping
+    /// symbol, and the whole of a section that no mapping symbol marks
+    /// (whatever its unwind table says) or that holds a mapping symbol of
+    /// another kind ([`CodeEvidence::unsupported_in`]). The rewriter leaves those
     /// alone by default, but this census only names where retries may come
     /// from, and dropping them would hide a real loop.
     ///
@@ -275,13 +275,20 @@ mod decode {
         for section in sections {
             let end = section.address.saturating_add(section.size);
             let held = evidence.classify(section.index, section.address, section.size);
-            let (code, unknown) = if section.kind == goblin::elf::section_header::SHT_PROGBITS
-                && held.evidence == Some(mapping::Evidence::MappingSymbols)
-                && evidence.unsupported_in(section.index).is_none()
-            {
+            let marked = held.evidence == Some(mapping::Evidence::MappingSymbols)
+                && evidence.unsupported_in(section.index).is_none();
+            let (code, unknown) = if !marked {
+                (Vec::new(), vec![(section.address, end)])
+            } else if section.kind == goblin::elf::section_header::SHT_PROGBITS {
                 (held.code, held.unknown)
             } else {
-                (Vec::new(), vec![(section.address, end)])
+                // Its mapping symbols still prove which bytes are data, and
+                // `$d` is never scanned; but outside `SHT_PROGBITS` the
+                // rewriter proves no code, so none of the rest is verified.
+                (
+                    Vec::new(),
+                    held.code.into_iter().chain(held.unknown).collect(),
+                )
             };
             // The header's offset, size and address are the file's own: a
             // malformed one saturates rather than overflows, and the caller
@@ -4296,6 +4303,61 @@ mod tests {
             assert_eq!(
                 (found.pairs, found.unverified_pairs),
                 (1, u64::from(unknown))
+            );
+        }
+    }
+
+    /// Outside `SHT_PROGBITS` the mapping symbols still prove which bytes are
+    /// data: a section holding an `$x` loop and a loop-shaped `$d` table
+    /// counts the one loop whatever its type, and only the label moves, to
+    /// unverified when the section is not `SHT_PROGBITS`. The table is never
+    /// scanned as code.
+    #[test]
+    fn data_marked_in_a_non_progbits_section_is_not_scanned() {
+        use goblin::elf::section_header::SHF_ALLOC;
+        use goblin::elf::section_header::SHF_EXECINSTR;
+        use goblin::elf::section_header::SHT_NOTE;
+        use goblin::elf::section_header::SHT_PROGBITS;
+
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        use crate::aarch64_lse::mapping::MappingSymbol;
+
+        let image: Vec<u8> = [LDAXR_X0_X2, ADD_X1_X0_1, STLXR_W3_X1_X2, CBNZ_W3]
+            .iter()
+            .chain(&[LDAXR_X0_X2, ADD_X1_X0_1, STLXR_W3_X1_X2, CBNZ_W3])
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let evidence = CodeEvidence {
+            symbols: vec![
+                MappingSymbol {
+                    section: 0,
+                    address: 0x10400,
+                    code: true,
+                },
+                MappingSymbol {
+                    section: 0,
+                    address: 0x10410,
+                    code: false,
+                },
+            ],
+            unsupported: Vec::new(),
+            unwind: None,
+        };
+        for (kind, unverified_pairs) in [(SHT_PROGBITS, 0), (SHT_NOTE, 1)] {
+            let headers = section(kind, u64::from(SHF_ALLOC | SHF_EXECINSTR), 0x400, 0x20);
+            let sections = executable_sections(&headers);
+            let (ranges, unverified) = code_file_ranges(&sections, &evidence);
+            assert_eq!(ranges, vec![(0x400, 0x410)], "{kind}");
+            let loops = scan_ranges(&ranges, unverified, |start, end, scan| {
+                scan.push_bytes(&image[(start - 0x400) as usize..(end - 0x400) as usize]);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let found = loops.found_in(0, 0x1000);
+            assert_eq!(
+                (found.pairs, found.unverified_pairs),
+                (1, unverified_pairs),
+                "{kind}"
             );
         }
     }
