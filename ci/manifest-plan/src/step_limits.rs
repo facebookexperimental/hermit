@@ -266,7 +266,11 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
     ),
     (
         "build.workspace_compile_in_pinned_root",
-        "WORKSPACE_WALL_SECONDS, checked by assert_pinned_workspace_split; its cold-build overrun is fixed in the warm target cache (dev-hermit f854b82c), not by a bigger cap",
+        "WORKSPACE_WALL_SECONDS (3000 since 2026-11-28), checked by assert_pinned_workspace_split: INTERIM, the bucket above 1.5x its 15600 CPU bound at its worst measured effective width (8.53 cores in the WALL-killed 2cefc176 super validation, a cpu floor of 10257.1 s); re-derive from the first green super validation's retained profiles (the compile node's description)",
+    ),
+    (
+        "build.hermit_native_exec_compile_in_pinned_root",
+        "INTERIM 2026-11-28: its measured critical path uses about 5 effective cores however many jobs it is offered, so consuming its 4800 CPU bound takes about 920-1426 s of wall and no wall at or below the 600 s ceiling can leave the CPU bound binding; 1500 s is the bucket above 1.5x that bound at the worst measured width (5.05 cores; the WALL-killed 2cefc176 super validation is a cpu floor, not a completion). A named exemption beats a formula change because the ceiling exists to refuse unmeasured wall-only bounds graph-wide, and raising it for every node to fit this one measured node would remove that refusal where no measurement justifies it. Removal condition: the re-derivation from the first green super validation's retained profiles either brings the derived wall to 600 or below (remove this entry) or renews it with completed measurements in place of the kill-censored floor",
     ),
     (
         "build.liteinst_allocator_fixtures_in_pinned_root",
