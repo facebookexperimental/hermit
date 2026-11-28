@@ -17,7 +17,7 @@ same way. Regenerate (and commit the result) whenever image.digest changes;
 staging regenerates on digest change and refuses only unresolvable inputs.
 """
 
-PINNED_IMAGE_DIGEST = "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e"
+PINNED_IMAGE_DIGEST = "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f"
 
 PINNED_GCC = "/nix/store/3d1c302vw7kc8a5vknhmn34c0pd7zm6m-gcc-wrapper-15.3.0/bin/gcc"
 
