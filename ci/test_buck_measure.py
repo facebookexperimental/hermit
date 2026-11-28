@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -257,7 +258,9 @@ STUB_BUCK2 = r"""#!/bin/bash
 case $1 in
   --version) echo "buck2 stub 1.0" ;;
   status)
-    sleep "${STUB_STATUS_SLEEP:-0}"
+    sleep "${STUB_STATUS_SLEEP:-0}" & sleeper=$!
+    trap 'kill "$sleeper" 2>/dev/null; exit 143' TERM
+    wait "$sleeper"
     printf '{"process_info": {"pid": %s, "auth_token": "SECRET-TOKEN"}}\n' "$STUB_DAEMON_PID" ;;
   build)
     shift
@@ -349,45 +352,70 @@ class MeasureShellTest(unittest.TestCase):
         self.assertIn("after", process.stdout)
         self.assertIn("writes no sidecar", process.stderr)
 
-    def daemon_read(self, limit: str, status_sleep: str) -> tuple[subprocess.CompletedProcess, list[tuple[Decimal, str]], Decimal]:
+    def daemon_read(self, limit: str, status_sleep: str) -> tuple[subprocess.CompletedProcess, list[tuple[Decimal, str]], Decimal, Decimal]:
         """Run buck_measure_daemon LIMIT against a `buck2 status` that takes STATUS_SLEEP seconds,
         with every `timeout` it runs recorded (its duration and command); return the process, those
-        records and the read's own wall time."""
+        records, the read's own wall time and the child CPU it used. Wall time on a loaded host
+        includes scheduling delays outside the read's control, so budget assertions charge CPU
+        and keep wall only as a wide backstop."""
         bin_dir = self.root / "bin"
         bin_dir.mkdir(exist_ok=True)
         log = self.root / "timeouts.tsv"
         recorder = bin_dir / "timeout"
         recorder.write_text(f'#!/bin/bash\nprintf \'%s\\t%s\\n\' "$4" "${{5##*/}}" >>"{log}"\nexec {shutil.which("timeout")} "$@"\n')
         recorder.chmod(0o755)
+        children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         process = self.run_script(f'buck_measure_start build.example {self.stub} HERMIT_VALIDATE_BUCK2; : >"{log}"; '
                                   f'start=$EPOCHREALTIME; buck_measure_daemon {limit}; end=$EPOCHREALTIME; '
                                   'echo "read $start $end"; echo "reason: $bm_daemon_reason"',
                                   PATH=f"{bin_dir}:{os.environ['PATH']}", STUB_STATUS_SLEEP=status_sleep)
+        children_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        child_cpu = Decimal(str(
+            (children_after.ru_utime + children_after.ru_stime)
+            - (children_before.ru_utime + children_before.ru_stime)))
         records = [(Decimal(duration), command) for duration, command in
                    (line.split("\t") for line in log.read_text().splitlines())]
         start, end = re.search(r"^read (\S+) (\S+)$", process.stdout, re.M).groups()
-        return process, records, Decimal(end) - Decimal(start)
+        return process, records, Decimal(end) - Decimal(start), child_cpu
 
     def test_the_daemon_read_spends_one_budget_for_status_and_the_summarizer(self):
         # A `buck2 status` that takes 2 of the 6 s leaves the summarizer only the rest (at most
-        # 4 s): never the whole 6 s again. The read stays within its 6 s plus one 1 s kill grace.
-        # The margins are wide so a loaded host cannot push status past its budget.
-        process, records, elapsed = self.daemon_read("6", "2")
+        # 4 s): never the whole 6 s again. The split is asserted from the recorded timeout
+        # arguments, so host load cannot move it.
+        process, records, elapsed, child_cpu = self.daemon_read("6", "2")
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual([command for _duration, command in records], ["buck2", "python3"], records)
         self.assertEqual(records[0][0], Decimal(6), records)
         self.assertGreater(records[1][0], 0, records)
         self.assertLessEqual(records[1][0], Decimal(4), f"the summarizer got more than what status left: {records}")
-        self.assertLessEqual(elapsed, 6 + 1, f"the read took {elapsed} s of a 6 s budget")
+        # The budget split is proven by the recorded timeout arguments above. What the read
+        # itself burned is charged as child CPU (load stretches wall, not CPU); wall stays
+        # only as a wide hang backstop.
+        self.assertLessEqual(child_cpu, Decimal(6) + 2,
+                             f"the read burned {child_cpu} CPU-s of a 6 s budget")
+        self.assertLessEqual(elapsed, 6 + 60,
+                             f"the read took {elapsed} s wall (status bounded to 6 s by "
+                             "timeout, recorded above); that is a hang, not load")
 
     def test_a_status_that_uses_the_whole_budget_starts_no_summarizer(self):
         # A `buck2 status` still running at the bound is stopped there; nothing starts after it,
         # and the daemon is unmeasured with the reason.
-        process, records, elapsed = self.daemon_read("1", "5")
+        # The stub status sleeps 90 s: well past the 61 s backstop below, under the
+        # 120 s harness timeout. A read that ends at the stop takes about 1 s; one
+        # that waits outside a recorded timeout takes at least 90 s and fails at the
+        # backstop by name - a margin no host load reaches.
+        process, records, elapsed, child_cpu = self.daemon_read("1", "90")
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(records, [(Decimal(1), "buck2")], records)
         self.assertIn("reason: `buck2 status` exited 124 (124: it ran past 1 s)", process.stdout)
-        self.assertLessEqual(elapsed, 1 + 1, f"the read took {elapsed} s of a 1 s budget")
+        # No summarizer started is proven by the records above (only the buck2 timeout ran),
+        # never by wall time: elapsed past the 1 s timeout is shell/kill overhead, which host
+        # load stretches. The read's own cost is charged as child CPU; wall is a backstop.
+        self.assertLessEqual(child_cpu, Decimal(1) + 2,
+                             f"the read burned {child_cpu} CPU-s of a 1 s budget")
+        self.assertLessEqual(elapsed, 1 + 60,
+                             f"the read took {elapsed} s wall (status bounded to 1 s by "
+                             "timeout, recorded above); that is a hang, not load")
 
     def test_a_discarded_measurement_leaves_no_work_directory_and_no_sidecar(self):
         # validate-node's exit with no time left for the sidecar discards the measurement: its work
