@@ -1041,13 +1041,48 @@ struct WatchLedger {
     due_at: EventIndex,
     /// Whether the threads alive when the watches became due were entered.
     seeded: bool,
+    /// The live threads' ledgers, by id.
     threads: BTreeMap<DetTid, WatchThreadLedger>,
+    /// The ledgers of threads that are gone, in the order the scheduler
+    /// retired them ([`AccessTraceWriter::note_thread_gone`]). A task that
+    /// later reuses one of their ids starts a ledger of its own: it neither
+    /// lands in a gone thread's coverage interval, so its own missing
+    /// coverage is reported, nor shares its hit budget.
+    finished: Vec<(DetTid, WatchThreadLedger)>,
+}
+
+impl WatchLedger {
+    /// Every thread's ledger, gone or live, in id order, and for one id
+    /// in the order its tasks had it: the gone ones as they were retired,
+    /// then the live one. That order follows the deterministic schedule.
+    fn in_order(self) -> Vec<(DetTid, WatchThreadLedger)> {
+        let mut all: Vec<_> = self.finished.into_iter().chain(self.threads).collect();
+        all.sort_by_key(|(tid, _)| *tid);
+        all
+    }
+
+    /// [`Self::in_order`], borrowed.
+    fn iter_in_order(&self) -> Vec<(DetTid, &WatchThreadLedger)> {
+        let mut all: Vec<_> = self
+            .finished
+            .iter()
+            .map(|(tid, thread)| (*tid, thread))
+            .chain(self.threads.iter().map(|(tid, thread)| (*tid, thread)))
+            .collect();
+        all.sort_by_key(|(tid, _)| *tid);
+        all
+    }
 }
 
 /// One thread's watch state: a single hit budget for the thread's whole
 /// life, plus the coverage intervals its images went through. The two
 /// are independent: an exec that cannot re-arm (or a later recovery)
-/// closes a coverage interval, but never resets the budget.
+/// closes a coverage interval, but never resets the budget. A thread's
+/// life ends when the scheduler retires its id, and a task that reuses the
+/// id gets a ledger of its own ([`WatchLedger::finished`]). An exec from a
+/// thread other than its process's leader does not end it: the task goes
+/// on under the leader's id, with its ledger
+/// ([`AccessTraceWriter::rekey_thread`]).
 #[derive(Debug)]
 struct WatchThreadLedger {
     /// Coverage intervals in order; the last is the current one.
@@ -1625,10 +1660,17 @@ impl AccessTraceWriter {
     /// So is its first event while no clone's return has claimed it: a
     /// child can run and be gone before its parent's clone returns (a
     /// forked child that exits at once), and that return still starts its
-    /// creation edge.
+    /// creation edge. Its `--watch` ledger is retired whole, to be
+    /// summarized when the run ends, so a task that reuses its id records
+    /// in a ledger of its own.
     pub fn note_thread_gone(&mut self, tid: DetTid) {
         if let Some(record) = self.open.remove(&tid) {
             self.edges.orphaned.push(record);
+        }
+        if let Some(ledger) = self.watch.as_mut()
+            && let Some(thread) = ledger.threads.remove(&tid)
+        {
+            ledger.finished.push((tid, thread));
         }
         let edges = &mut self.edges;
         if edges.first_unclaimed.remove(&tid)
@@ -1656,13 +1698,24 @@ impl AccessTraceWriter {
     /// would otherwise drop them: a sigqueue send to itself that keeps its
     /// process's deliveries of that signal without an edge
     /// (`SendKind::Queue`), and a tkill whose delivery to the leader it
-    /// causes.
+    /// causes. The task's `--watch` ledger moves to `leader` too, so its
+    /// hit budget and coverage intervals go on across the exec; a ledger
+    /// still live under `leader` is the old leader's, and is retired.
     pub fn rekey_thread(&mut self, former: DetTid, leader: DetTid) {
         let edges = &mut self.edges;
         for signal in edges.signals.iter_mut().chain(edges.evicted.iter_mut()) {
             if signal.target == Task::Thread(former) {
                 signal.target = Task::Thread(leader);
             }
+        }
+        let Some(ledger) = self.watch.as_mut() else {
+            return;
+        };
+        let Some(thread) = ledger.threads.remove(&former) else {
+            return;
+        };
+        if let Some(old_leader) = ledger.threads.insert(leader, thread) {
+            ledger.finished.push((leader, old_leader));
         }
     }
 
@@ -1971,6 +2024,7 @@ impl AccessTraceWriter {
             due_at,
             seeded: false,
             threads: BTreeMap::new(),
+            finished: Vec::new(),
         });
     }
 
@@ -2100,44 +2154,45 @@ impl AccessTraceWriter {
     }
 
     /// `--watch`: how many threads armed in some interval, which
-    /// intervals never did, and every hit.
+    /// intervals never did, and every hit. Two tasks that had one id in
+    /// turn are two threads here.
     pub fn watch_run_summary(&self) -> Option<detcore_model::summary::WatchRunSummary> {
         let ledger = self.watch.as_ref()?;
-        let mut armed_threads = std::collections::BTreeSet::new();
+        let mut armed = 0;
         let mut unarmed = Vec::new();
         let mut hits = 0;
-        for (tid, thread) in &ledger.threads {
+        for (tid, thread) in ledger.iter_in_order() {
+            let mut armed_once = false;
             for interval in &thread.intervals {
-                if interval.armed_before.is_some() {
-                    armed_threads.insert(*tid);
-                }
+                armed_once |= interval.armed_before.is_some();
                 if let Some(why) = interval.unarmed() {
-                    unarmed.push((*tid, why));
+                    unarmed.push((tid, why));
                 }
                 hits += interval.hits;
             }
+            armed += u64::from(armed_once);
         }
-        unarmed.sort_by_key(|(tid, _why)| *tid);
         Some(detcore_model::summary::WatchRunSummary {
-            armed: armed_threads.len() as u64,
+            armed,
             unarmed,
             hits,
         })
     }
 
     /// Write the kept last hits, then one summary per coverage interval,
-    /// in thread order.
+    /// in thread order ([`WatchLedger::in_order`]).
     fn finish_watch(&mut self) {
-        let Some(mut ledger) = self.watch.take() else {
+        let Some(ledger) = self.watch.take() else {
             return;
         };
-        for thread in ledger.threads.values_mut() {
+        let mut threads = ledger.in_order();
+        for (_, thread) in &mut threads {
             for (interval, record) in std::mem::take(&mut thread.last) {
                 thread.intervals[interval].recorded += 1;
                 self.write(TraceRecord::WatchHit(record));
             }
         }
-        for (tid, thread) in &ledger.threads {
+        for (tid, thread) in &threads {
             for interval in &thread.intervals {
                 self.write(TraceRecord::WatchSummary(WatchSummaryRecord {
                     tid: *tid,
@@ -4271,6 +4326,244 @@ mod tests {
         assert_eq!(summaries[0].tid, tid(3));
         assert_eq!(summaries[0].hits, 3);
         assert_eq!(summaries[0].unarmed, None);
+    }
+
+    /// The `WatchSummary` records of a finished in-memory trace.
+    fn watch_summaries(bytes: &Mutex<Vec<u8>>) -> Vec<WatchSummaryRecord> {
+        detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..])
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `--watch`, at the ledger: a thread that armed is gone, and its id
+    /// goes to a new task that records events and never arms. The normal
+    /// producer gives a newborn the due watch order before its first event,
+    /// so this shape is not known to arise there, but the ledger must fail
+    /// closed on it: the new task's events must not land in the gone
+    /// thread's armed interval, and it is reported as never armed. Before,
+    /// the ledger was keyed by id alone and never retired, so the new task
+    /// counted as armed and no warning named it.
+    #[test]
+    fn a_task_that_reuses_an_armed_threads_id_and_never_arms_is_reported_unarmed() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(0);
+        writer.note_watch(tid(5), 0, WatchStatus::Armed);
+        writer.watch_hit(1, tid(5), 0, 0x404010, 0x401000, vec![]);
+        writer.note_thread_gone(tid(5));
+        // The new task with the old id records events and never arms.
+        writer.note_watch(tid(5), 3, WatchStatus::Pending);
+        writer.note_watch(tid(5), 4, WatchStatus::Pending);
+        // Another thread, live at the end, between them in id order.
+        writer.note_watch(tid(6), 2, WatchStatus::Armed);
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 2,
+                unarmed: vec![(tid(5), WatchUnarmed::NoStop)],
+                hits: 1,
+            })
+        );
+        writer.finish(500).unwrap();
+        // By id, and for one id in the order its tasks had it.
+        assert_eq!(
+            watch_summaries(&bytes),
+            vec![
+                WatchSummaryRecord {
+                    tid: tid(5),
+                    armed_before: Some(0),
+                    unarmed: None,
+                    hits: 1,
+                    recorded: 1,
+                },
+                WatchSummaryRecord {
+                    tid: tid(5),
+                    armed_before: None,
+                    unarmed: Some(WatchUnarmed::NoStop),
+                    hits: 0,
+                    recorded: 0,
+                },
+                WatchSummaryRecord {
+                    tid: tid(6),
+                    armed_before: Some(2),
+                    unarmed: None,
+                    hits: 0,
+                    recorded: 0,
+                },
+            ]
+        );
+    }
+
+    /// `--watch`: task A arms, spends its stacked-hit budget and is gone;
+    /// the scheduler gives its id to task B, which arms on its own. They
+    /// are two threads: two summaries, B's arm boundary its own, and B's
+    /// hit budget fresh, so its first hit is written at once with its
+    /// stack. Before, the ledger was keyed by id alone and never retired:
+    /// B landed in A's interval (A's arm boundary, one armed thread) and
+    /// inherited A's spent budget, so its hits lost their stacks.
+    #[test]
+    fn two_tasks_that_have_one_id_in_turn_and_both_arm_are_summarized_apart() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(0);
+        let frame = StackFrame {
+            ip: 0x401000,
+            function: None,
+            file: None,
+            line: None,
+        };
+        // Task A: armed, then one hit past its stacked-hit budget.
+        writer.note_watch(tid(5), 0, WatchStatus::Armed);
+        for n in 0..=WATCH_HITS_WITH_STACKS {
+            writer.watch_hit(1 + n, tid(5), 0, 0x404010, 0x401000, vec![frame.clone()]);
+        }
+        writer.note_thread_gone(tid(5));
+        // Task B, with A's id, arms independently and hits once.
+        let b_armed = WATCH_HITS_WITH_STACKS + 10;
+        writer.note_watch(tid(5), b_armed, WatchStatus::Armed);
+        writer.watch_hit(
+            b_armed + 1,
+            tid(5),
+            0,
+            0x404010,
+            0x402000,
+            vec![frame.clone()],
+        );
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 2,
+                unarmed: vec![],
+                hits: WATCH_HITS_WITH_STACKS + 2,
+            })
+        );
+        writer.finish(500).unwrap();
+        let hits: Vec<WatchHitRecord> =
+            detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..])
+                .unwrap()
+                .records
+                .into_iter()
+                .filter_map(|record| match record {
+                    TraceRecord::WatchHit(hit) => Some(hit),
+                    _ => None,
+                })
+                .collect();
+        let b_hit = hits
+            .iter()
+            .find(|hit| hit.after == b_armed + 1)
+            .expect("B's hit is written");
+        assert_eq!(b_hit.stack, vec![frame]);
+        // A's one hit past its budget is kept for the end without a stack.
+        let a_over_budget = hits
+            .iter()
+            .find(|hit| hit.after == 1 + WATCH_HITS_WITH_STACKS)
+            .expect("A's kept last hit is written");
+        assert!(a_over_budget.stack.is_empty());
+        assert_eq!(
+            watch_summaries(&bytes),
+            vec![
+                WatchSummaryRecord {
+                    tid: tid(5),
+                    armed_before: Some(0),
+                    unarmed: None,
+                    hits: WATCH_HITS_WITH_STACKS + 1,
+                    recorded: WATCH_HITS_WITH_STACKS + 1,
+                },
+                WatchSummaryRecord {
+                    tid: tid(5),
+                    armed_before: Some(b_armed),
+                    unarmed: None,
+                    hits: 1,
+                    recorded: 1,
+                },
+            ]
+        );
+    }
+
+    /// `--watch`: a thread other than its process's leader arms, spends its
+    /// stacked-hit budget and execs. Linux keeps its task and gives it the
+    /// leader's id, so the scheduler retires the old leader, moves the
+    /// caller to the leader's id (`rekey_thread`) and then retires the
+    /// caller's id. The survivor keeps its one ledger: the old leader and
+    /// the survivor are the two armed threads, the survivor's summary keeps
+    /// its first arm boundary under the leader's id, and its budget stays
+    /// spent, so its first hit after the exec is kept without a stack.
+    #[test]
+    fn an_exec_survivor_keeps_its_watch_ledger_and_hit_budget() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(0);
+        let frame = StackFrame {
+            ip: 0x401000,
+            function: None,
+            file: None,
+            line: None,
+        };
+        // The leader (3) arms; the caller (5) arms and spends its budget.
+        writer.note_watch(tid(3), 0, WatchStatus::Armed);
+        writer.note_watch(tid(5), 1, WatchStatus::Armed);
+        for n in 0..WATCH_HITS_WITH_STACKS {
+            writer.watch_hit(2 + n, tid(5), 0, 0x404010, 0x401000, vec![frame.clone()]);
+        }
+        // The caller execs, as the scheduler's exec hand-over sees it.
+        writer.note_thread_gone(tid(3));
+        writer.rekey_thread(tid(5), tid(3));
+        writer.note_thread_gone(tid(5));
+        // The new image arms again and hits once, under the leader's id.
+        let rearmed = WATCH_HITS_WITH_STACKS + 10;
+        writer.note_watch(tid(3), rearmed, WatchStatus::Armed);
+        writer.watch_hit(
+            rearmed + 1,
+            tid(3),
+            0,
+            0x404010,
+            0x402000,
+            vec![frame.clone()],
+        );
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 2,
+                unarmed: vec![],
+                hits: WATCH_HITS_WITH_STACKS + 1,
+            })
+        );
+        writer.finish(500).unwrap();
+        let after_exec = detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..])
+            .unwrap()
+            .records
+            .into_iter()
+            .find_map(|record| match record {
+                TraceRecord::WatchHit(hit) if hit.after == rearmed + 1 => Some(hit),
+                _ => None,
+            })
+            .expect("the survivor's hit after the exec is written");
+        assert!(after_exec.stack.is_empty());
+        assert_eq!(
+            watch_summaries(&bytes),
+            vec![
+                WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: Some(0),
+                    unarmed: None,
+                    hits: 0,
+                    recorded: 0,
+                },
+                WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: Some(1),
+                    unarmed: None,
+                    hits: WATCH_HITS_WITH_STACKS + 1,
+                    recorded: WATCH_HITS_WITH_STACKS + 1,
+                },
+            ]
+        );
     }
 
     /// `--watch`: a thread that armed, then reports a blocked re-arm (its

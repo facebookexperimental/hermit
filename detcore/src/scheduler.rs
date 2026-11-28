@@ -8978,8 +8978,9 @@ impl Scheduler {
             fair.reassign(caller, new_leader);
         }
         self.discarded_at_send.rekey_thread(caller, new_leader);
-        // The access trace's sends waiting on the caller's queue move with
-        // it, before `logically_kill_thread(&caller)` below forgets its id.
+        // The access trace's sends waiting on the caller's queue, and its
+        // `--watch` ledger, move with it, before
+        // `logically_kill_thread(&caller)` below forgets its id.
         if let Some(writer) = self.access_trace.as_mut() {
             writer.rekey_thread(caller, new_leader);
         }
