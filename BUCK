@@ -245,7 +245,7 @@ rust_library(
 # select-gated flags reach targets only through the per-target
 # selects. fbcode pins its
 # x86_64 Linux platform plus its four liteinst-runtime constraints,
-# whose closure-wide flag delivery is still unmeasured (the
+# whose scoped-profile delivery is still unmeasured (the
 # profile file's LITEINST_RUNTIME_FLAGS_APPLIED = False; the finalizer
 # refuses to emit a Buck receipt while that holds). No default target
 # references this alias.

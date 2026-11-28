@@ -26,8 +26,8 @@
 //! mode; the genrule keeps the Cargo `--prebuilt` gate and its by-name
 //! refusal instead. Still PLUMBING ONLY and
 //! unqualified: the D1c-2/D1c-6 machine-code recipes refuse the real
-//! Buck-built ELF by name inside qualification, and the fbcode profile
-//! does not yet deliver its pinned rustc flags to the closure (see
+//! Buck-built ELF by name inside qualification, and the fbcode scoped
+//! profile's per-class delivery is not yet measured (see
 //! `require_profile_flags_applied`), so no Buck receipt has ever been
 //! emitted.
 use std::fs;
@@ -246,19 +246,33 @@ const BUCK_CONSTRAINTS: [&str; 6] = [
 /// tree (never from the `--profile-bzl` argument).
 const BUCK_WORKSPACE_BUCK_FILE: &str = "BUCK";
 const BUCK_PROFILE_RELATIVE: &str = "fb-only/liteinst-runtime-profile.bzl";
-/// The reviewed Buck `liteinst-runtime` flag set: release opt 3 with debug
-/// assertions and overflow checks on, and no `-Clto` at all (matching the
-/// Cargo profile's `lto = false`, which also passes no flag).
-const BUCK_RUSTC_FLAGS: [&str; 8] = [
+/// The scoped Buck `liteinst-runtime` profile the receipt records, by
+/// delivery class. Only the first list reaches every crate (opt and
+/// debug-assertions constraints plus opt toolchain defaults); the
+/// selects reach only their served targets; the vendored remainder is
+/// recorded by description, pinned by the constraint set and the ELF
+/// rustc identity. No `-Clto` appears in any class (matching Cargo's
+/// `lto = false`, which also passes no flag), and no `-Cstrip` is
+/// claimed as delivered: unstripped output is a link-output property
+/// the measurement verifies. Values are expected delivery, pending
+/// per-class ELF measurement.
+const BUCK_RUSTC_FLAGS: [&str; 4] = [
     "-Copt-level=3",
-    "-Cdebuginfo=0",
     "-Cdebug-assertions=yes",
-    "-Coverflow-checks=yes",
-    "-Ccodegen-units=16",
     "-Cembed-bitcode=no",
     "-Cpanic=unwind",
-    "-Cstrip=none",
 ];
+/// Hermit/Reverie own-target select flags (the constraints-package
+/// literal; the packaged-receipt cross-check ties this copy to it).
+const BUCK_OWN_SELECT_RUSTC_FLAGS: [&str; 3] = [
+    "-Coverflow-checks=yes",
+    "-Ccodegen-units=16",
+    "-Cdebuginfo=0",
+];
+/// LiteInst fixup select flags: overflow only.
+const BUCK_LITEINST_SELECT_RUSTC_FLAGS: [&str; 1] = ["-Coverflow-checks=yes"];
+/// Vendored-remainder record: no per-crate flags are claimed.
+const BUCK_VENDORED_DEFAULTS: &str = "fbcode opt toolchain defaults; expected (unmeasured): debuginfo=2, rustc-default codegen-units, overflow-checks follow debug-assertions; iced-x86 1.21.0 overflow-checks=off";
 /// The arguments after the program name: the mode, the target directory, and
 /// the mode's own inputs.
 fn parse_args(args: &[String]) -> proof::Result<Mode> {
@@ -429,40 +443,60 @@ fn validate_buck_args(args: &BuckArgs) -> proof::Result<()> {
     Ok(())
 }
 
-/// The `LITEINST_RUNTIME_RUSTC_FLAGS` string list a profile `.bzl` actually
-/// defines: the quoted literals of its first `[...]` list after that name.
-/// Anything else — no such definition, or a list this cannot read — refuses
-/// by name rather than trusting the file's name alone.
-fn profile_bzl_flags(contents: &str) -> proof::Result<Vec<String>> {
-    let missing = "--profile-bzl does not define LITEINST_RUNTIME_RUSTC_FLAGS";
+/// The string list a profile `.bzl` actually defines for `name`: the
+/// quoted literals of its `name = [...]` list. Anything else — no such
+/// definition, or a list this cannot read — refuses by name rather
+/// than trusting the file's name alone.
+fn profile_bzl_flags(contents: &str, name: &str) -> proof::Result<Vec<String>> {
+    let missing = || format!("--profile-bzl does not define {name}");
     let after_name = contents
-        .split_once("LITEINST_RUNTIME_RUSTC_FLAGS")
-        .ok_or(missing)?
+        .split_once(&format!("{name} = ["))
+        .ok_or_else(missing)?
         .1;
-    let list = after_name
-        .split_once('[')
-        .ok_or(missing)?
-        .1
-        .split_once(']')
-        .ok_or(missing)?
-        .0;
+    let list = after_name.split_once(']').ok_or_else(missing)?.0;
     let mut flags = Vec::new();
     let mut rest = list;
     while let Some((_, after_quote)) = rest.split_once('"') {
-        let (flag, tail) = after_quote.split_once('"').ok_or(missing)?;
+        let (flag, tail) = after_quote.split_once('"').ok_or_else(missing)?;
         flags.push(flag.to_owned());
         rest = tail;
     }
     Ok(flags)
 }
 
-/// The supplied profile must define exactly the pinned flag list, in order.
+/// The string a profile `.bzl` actually defines for `name` as
+/// `name = "..."`. A missing or unreadable definition refuses by name.
+fn profile_bzl_string(contents: &str, name: &str) -> proof::Result<String> {
+    let missing = || format!("--profile-bzl does not define {name}");
+    let after_name = contents
+        .split_once(&format!("{name} = \""))
+        .ok_or_else(missing)?
+        .1;
+    Ok(after_name.split_once('"').ok_or_else(missing)?.0.to_owned())
+}
+
+/// The supplied profile must define exactly the pinned scoped lists
+/// and defaults record, in order. The own-target select literal lives
+/// in the constraints package, not this file, so it is pinned here
+/// and tied to that literal by the packaged-receipt cross-check.
 fn validate_profile_bzl(contents: &str) -> proof::Result<()> {
-    let flags = profile_bzl_flags(contents)?;
+    let closure = profile_bzl_flags(contents, "LITEINST_RUNTIME_RUSTC_FLAGS")?;
     require(
-        flags.iter().map(String::as_str).collect::<Vec<_>>() == BUCK_RUSTC_FLAGS,
-        "--profile-bzl LITEINST_RUNTIME_RUSTC_FLAGS do not match the pinned \
-         liteinst-runtime flags",
+        closure.iter().map(String::as_str).collect::<Vec<_>>() == BUCK_RUSTC_FLAGS,
+        "--profile-bzl LITEINST_RUNTIME_RUSTC_FLAGS does not match the pinned \
+         scoped liteinst-runtime profile",
+    )?;
+    let liteinst = profile_bzl_flags(contents, "LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS")?;
+    require(
+        liteinst.iter().map(String::as_str).collect::<Vec<_>>() == BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+        "--profile-bzl LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS does not \
+         match the pinned scoped liteinst-runtime profile",
+    )?;
+    let defaults = profile_bzl_string(contents, "LITEINST_RUNTIME_VENDORED_DEFAULTS")?;
+    require(
+        defaults == BUCK_VENDORED_DEFAULTS,
+        "--profile-bzl LITEINST_RUNTIME_VENDORED_DEFAULTS does not match the \
+         pinned scoped liteinst-runtime profile",
     )
 }
 
@@ -507,15 +541,14 @@ fn parse_buck_output(stdout: &str) -> proof::Result<PathBuf> {
     Ok(path)
 }
 
-/// A receipt may list `LITEINST_RUNTIME_RUSTC_FLAGS` only when the
-/// supplied profile actually delivers them to the transitive closure.
-/// The profile `.bzl` states this as `LITEINST_RUNTIME_FLAGS_APPLIED`:
-/// the fbcode profile sets it `False` — the alias's toolchain
-/// constraints and the closure's per-target selects are expected to
-/// deliver the list, but no fbsource-built ELF has been measured
-/// against it, and the served-closure drift check
-/// (`fb-only/check-liteinst-runtime-closure.py` against
-/// `fb-only/liteinst-runtime-own-closure.txt`) must also pass before
+/// A receipt may list the scoped profile only when the supplied
+/// profile actually delivers each class. The profile `.bzl` states
+/// this as `LITEINST_RUNTIME_FLAGS_APPLIED`: the fbcode profile sets
+/// it `False` — the alias constraints and per-target selects are
+/// expected to deliver each class, but no fbsource-built ELF has
+/// been measured against the scoped record, and the drift check
+/// (`fb-only/check-liteinst-runtime-closure.py`, for the own
+/// targets and the LiteInst fixups alike) must also pass before
 /// it may become `True`. In fbcode the per-target selects are
 /// the only path for the three select-gated flags; what the
 /// open-source shim's toolchain delivers is as the landed shim
@@ -527,9 +560,9 @@ fn require_profile_flags_applied(contents: &str) -> proof::Result<()> {
         contents
             .lines()
             .any(|line| line.trim() == "LITEINST_RUNTIME_FLAGS_APPLIED = True"),
-        "--profile-bzl does not apply LITEINST_RUNTIME_RUSTC_FLAGS to the Buck \
-         closure (LITEINST_RUNTIME_FLAGS_APPLIED is not True); refusing to \
-         emit a receipt listing unapplied flags",
+        "--profile-bzl does not apply the scoped liteinst-runtime profile \
+         (LITEINST_RUNTIME_FLAGS_APPLIED is not True); refusing to emit a \
+         receipt listing unapplied flags",
     )
 }
 
@@ -624,19 +657,25 @@ fn needed_from_readelf(dump: &str) -> Vec<String> {
 }
 
 fn buck_profile_objects() -> serde_json::Value {
-    json!({"liteinst-runtime": {"rustc_flags": BUCK_RUSTC_FLAGS}})
+    json!({"liteinst-runtime": {"scoped_rustc_flags": {
+        "closure": BUCK_RUSTC_FLAGS,
+        "own_select": BUCK_OWN_SELECT_RUSTC_FLAGS,
+        "liteinst_select": BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+        "vendored_defaults": BUCK_VENDORED_DEFAULTS,
+    }}})
 }
 
 /// The `buck_artifact` mirror of the Cargo receipt's artifact record: the
-/// ordinary (empty) feature mode, the exact compiler profile the Buck flag
-/// set produces, the synthesized leaf package, and the Buck output path the
+/// ordinary (empty) feature mode, the closure-wide compiler-profile
+/// facts only (per-class debuginfo, overflow and codegen-units live in
+/// `buck_profile_objects`; no single value describes the Buck closure),
+/// the synthesized leaf package, and the Buck output path the
 /// qualification proof must name. There is no `fresh`: Buck has no such
 /// notion to report honestly.
 fn buck_artifact(package: serde_json::Value, reported_path: &Path) -> serde_json::Value {
     json!({
         "features": [],
-        "profile": {"opt_level": "3", "debuginfo": 0, "debug_assertions": true,
-                    "overflow_checks": true, "test": false},
+        "profile": {"opt_level": "3", "debug_assertions": true, "test": false},
         "package": package,
         "reported_path": reported_path.to_string_lossy(),
     })
@@ -778,9 +817,9 @@ fn run_buck(args: &BuckArgs) -> proof::Result<()> {
         "Buck input must be a regular non-symlink file",
     )?;
     // The profile is judged by its contents, not its filename: only the
-    // exact pinned flag list may proceed to source resolution. The same
-    // contents are re-judged at publication for whether those flags are
-    // actually applied, before any receipt may list them.
+    // exact pinned scoped profile may proceed to source resolution. The
+    // same contents are re-judged at publication for whether those
+    // flags are actually applied, before any receipt may list them.
     let profile_contents = fs::read_to_string(&args.profile_bzl).map_err(|e| e.to_string())?;
     validate_profile_bzl(&profile_contents)?;
     let resources = target.join("install_pkg/rsrcs");
@@ -1615,13 +1654,30 @@ mod tests {
     }
 
     /// A profile `.bzl` text in the shape `fb-only/liteinst-runtime-profile.bzl`
-    /// defines, over the given flag literals.
-    fn profile_bzl_text(flags: &[&str]) -> String {
-        let list = flags
-            .iter()
-            .map(|flag| format!("    \"{flag}\",\n"))
-            .collect::<String>();
-        format!("LITEINST_RUNTIME_RUSTC_FLAGS = [\n{list}]\n")
+    /// defines, over the given scoped literals.
+    fn profile_bzl_text(closure: &[&str], liteinst: &[&str], defaults: &str) -> String {
+        let list = |flags: &[&str]| {
+            flags
+                .iter()
+                .map(|flag| format!("    \"{flag}\",\n"))
+                .collect::<String>()
+        };
+        format!(
+            "LITEINST_RUNTIME_RUSTC_FLAGS = [\n{}]\n\
+             LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS = [\n{}]\n\
+             LITEINST_RUNTIME_VENDORED_DEFAULTS = \"{defaults}\"\n",
+            list(closure),
+            list(liteinst)
+        )
+    }
+
+    /// The exact scoped profile text over the pinned constants.
+    fn exact_profile_bzl_text() -> String {
+        profile_bzl_text(
+            &BUCK_RUSTC_FLAGS,
+            &BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+            BUCK_VENDORED_DEFAULTS,
+        )
     }
 
     /// Buck arguments over real on-disk inputs, so `run_buck` passes every
@@ -1663,10 +1719,10 @@ mod tests {
         // have no buck2 at all), so the retained run refuses and no
         // staged runtime or receipt appears. This is the honesty gate
         // in action: without a real buck2 run there is nothing to bind.
-        let (root, args) = buck_disk_fixture(&profile_bzl_text(&BUCK_RUSTC_FLAGS));
+        let (root, args) = buck_disk_fixture(&exact_profile_bzl_text());
         let error = run_buck(&args).unwrap_err();
         assert!(
-            !error.contains("LITEINST_RUNTIME_RUSTC_FLAGS do not match"),
+            !error.contains("does not match") && !error.contains("does not define"),
             "profile check must pass before the buck2 run: {error}"
         );
         let resources = args.target.join("install_pkg/rsrcs");
@@ -1770,10 +1826,15 @@ mod tests {
     fn buck_mode_refuses_a_profile_whose_flags_differ() {
         let mut flags = BUCK_RUSTC_FLAGS;
         flags[0] = "-Copt-level=2";
-        let (root, args) = buck_disk_fixture(&profile_bzl_text(&flags));
+        let text = profile_bzl_text(
+            &flags,
+            &BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+            BUCK_VENDORED_DEFAULTS,
+        );
+        let (root, args) = buck_disk_fixture(&text);
         let error = run_buck(&args).unwrap_err();
         assert!(
-            error.contains("LITEINST_RUNTIME_RUSTC_FLAGS do not match"),
+            error.contains("LITEINST_RUNTIME_RUSTC_FLAGS does not match"),
             "profile refusal precedes source resolution: {error}"
         );
         fs::remove_dir_all(root).unwrap();
@@ -1781,7 +1842,24 @@ mod tests {
 
     #[test]
     fn profile_bzl_contents_must_define_the_pinned_flags_exactly() {
-        let exact = profile_bzl_text(&[
+        validate_profile_bzl(&exact_profile_bzl_text()).unwrap();
+        // Missing definition refuses by that name.
+        let error = validate_profile_bzl("# no profile here\n").unwrap_err();
+        assert!(
+            error.contains("does not define LITEINST_RUNTIME_RUSTC_FLAGS"),
+            "{error}"
+        );
+        // Dropped, appended, reordered and respelled closure lists refuse.
+        // The old flat eight-flag list refuses here too.
+        let mut dropped = BUCK_RUSTC_FLAGS.to_vec();
+        dropped.pop();
+        let mut appended = BUCK_RUSTC_FLAGS.to_vec();
+        appended.push("-Coverflow-checks=yes");
+        let mut reordered = BUCK_RUSTC_FLAGS.to_vec();
+        reordered.reverse();
+        let mut respelled = BUCK_RUSTC_FLAGS.to_vec();
+        respelled[1] = "-Cdebug-assertions=no";
+        let old_flat = vec![
             "-Copt-level=3",
             "-Cdebuginfo=0",
             "-Cdebug-assertions=yes",
@@ -1790,30 +1868,43 @@ mod tests {
             "-Cembed-bitcode=no",
             "-Cpanic=unwind",
             "-Cstrip=none",
-        ]);
-        validate_profile_bzl(&exact).unwrap();
-        // Missing definition refuses by that name.
-        let error = validate_profile_bzl("# no profile here\n").unwrap_err();
-        assert!(
-            error.contains("does not define LITEINST_RUNTIME_RUSTC_FLAGS"),
-            "{error}"
-        );
-        // Dropped, appended, reordered and respelled lists all refuse.
-        let mut dropped = BUCK_RUSTC_FLAGS.to_vec();
-        dropped.pop();
-        let mut appended = BUCK_RUSTC_FLAGS.to_vec();
-        appended.push("-Clto=off");
-        let mut reordered = BUCK_RUSTC_FLAGS.to_vec();
-        reordered.reverse();
-        let mut respelled = BUCK_RUSTC_FLAGS.to_vec();
-        respelled[3] = "-Coverflow-checks=no";
-        for flags in [&dropped, &appended, &reordered, &respelled] {
-            let error = validate_profile_bzl(&profile_bzl_text(flags)).unwrap_err();
+        ];
+        for flags in [&dropped, &appended, &reordered, &respelled, &old_flat] {
+            let text = profile_bzl_text(
+                flags,
+                &BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+                BUCK_VENDORED_DEFAULTS,
+            );
+            let error = validate_profile_bzl(&text).unwrap_err();
             assert!(
-                error.contains("LITEINST_RUNTIME_RUSTC_FLAGS do not match"),
+                error.contains("LITEINST_RUNTIME_RUSTC_FLAGS does not match"),
                 "{flags:?}: {error}"
             );
         }
+        // Widened or emptied LiteInst selects refuse by their own name.
+        for liteinst in [
+            vec![],
+            vec!["-Coverflow-checks=yes", "-Ccodegen-units=16"],
+            vec!["-Coverflow-checks=no"],
+        ] {
+            let text = profile_bzl_text(&BUCK_RUSTC_FLAGS, &liteinst, BUCK_VENDORED_DEFAULTS);
+            let error = validate_profile_bzl(&text).unwrap_err();
+            assert!(
+                error.contains("LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS does not match"),
+                "{liteinst:?}: {error}"
+            );
+        }
+        // A respelled defaults record refuses by its own name.
+        let text = profile_bzl_text(
+            &BUCK_RUSTC_FLAGS,
+            &BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+            "toolchain defaults",
+        );
+        let error = validate_profile_bzl(&text).unwrap_err();
+        assert!(
+            error.contains("LITEINST_RUNTIME_VENDORED_DEFAULTS does not match"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1913,15 +2004,15 @@ mod tests {
         ] {
             let error = require_profile_flags_applied(contents).unwrap_err();
             assert!(
-                error.contains("does not apply LITEINST_RUNTIME_RUSTC_FLAGS"),
+                error.contains("does not apply the scoped liteinst-runtime profile"),
                 "{contents:?}: {error}"
             );
         }
     }
 
     /// The receipt body must match the verifier's Buck arm exactly: same
-    /// schema, `builder=buck2`, the flag-dict profile, the Buck literals and
-    /// argv, the artifact mirror, and no `cargo_*` key anywhere.
+    /// schema, `builder=buck2`, the scoped flag profile, the Buck literals
+    /// and argv, the artifact mirror, and no `cargo_*` key anywhere.
     #[test]
     fn buck_receipt_matches_the_verifier_buck_arm() {
         let args = buck_args_fixture();
@@ -1992,10 +2083,13 @@ mod tests {
         assert_eq!(record["profile_name"], "liteinst-runtime");
         assert_eq!(
             record["profile_objects"],
-            json!({"liteinst-runtime": {"rustc_flags": [
-                "-Copt-level=3", "-Cdebuginfo=0", "-Cdebug-assertions=yes",
-                "-Coverflow-checks=yes", "-Ccodegen-units=16",
-                "-Cembed-bitcode=no", "-Cpanic=unwind", "-Cstrip=none"]}})
+            json!({"liteinst-runtime": {"scoped_rustc_flags": {
+                "closure": ["-Copt-level=3", "-Cdebug-assertions=yes",
+                            "-Cembed-bitcode=no", "-Cpanic=unwind"],
+                "own_select": ["-Coverflow-checks=yes", "-Ccodegen-units=16",
+                               "-Cdebuginfo=0"],
+                "liteinst_select": ["-Coverflow-checks=yes"],
+                "vendored_defaults": BUCK_VENDORED_DEFAULTS}}})
         );
         assert_eq!(
             record["buck_argv"],
@@ -2042,8 +2136,7 @@ mod tests {
         assert_eq!(record["buck_artifact"]["features"], json!([]));
         assert_eq!(
             record["buck_artifact"]["profile"],
-            json!({"opt_level": "3", "debuginfo": 0, "debug_assertions": true,
-                   "overflow_checks": true, "test": false})
+            json!({"opt_level": "3", "debug_assertions": true, "test": false})
         );
         assert_eq!(
             record["buck_artifact"]["reported_path"],

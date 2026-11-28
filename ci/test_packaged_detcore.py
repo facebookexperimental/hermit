@@ -190,7 +190,10 @@ def buck_fixture_receipt(install, pin, *, core=False):
     artifact = "/fixture/buck-out/libdetcore_liteinst.so"
     # Fixture literals are the verifier's pins, never a second copy; the
     # cross-check test binds those pins to the finalizer and profile texts.
-    flags = list(verifier.BUCK_RUSTC_FLAGS)
+    scoped = {"closure": list(verifier.BUCK_RUSTC_FLAGS),
+              "own_select": list(verifier.BUCK_OWN_SELECT_RUSTC_FLAGS),
+              "liteinst_select": list(verifier.BUCK_LITEINST_SELECT_RUSTC_FLAGS),
+              "vendored_defaults": verifier.BUCK_VENDORED_DEFAULTS}
     target = verifier.BUCK_TARGET
     platform = verifier.BUCK_PLATFORM
     args = list(verifier.BUCK_ARGV)
@@ -202,11 +205,10 @@ def buck_fixture_receipt(install, pin, *, core=False):
     record = {
         "schema": "hermit-packaged-detcore/v1", "builder": "buck2", "reverie_pin": pin,
         "profile_name": "liteinst-runtime", "profile_inputs": source,
-        "profile_objects": {"liteinst-runtime": {"rustc_flags": flags}},
+        "profile_objects": {"liteinst-runtime": {"scoped_rustc_flags": scoped}},
         "buck_target": target, "buck_platform": platform,
         "buck_constraints": list(verifier.BUCK_CONSTRAINTS),
-        "buck_artifact": {"features": [], "profile": {"opt_level": "3", "debuginfo": 0,
-            "debug_assertions": True, "overflow_checks": True, "test": False},
+        "buck_artifact": {"features": [], "profile": dict(verifier.BUCK_ARTIFACT_PROFILE),
             "package": package, "reported_path": artifact},
         "compiled_sources": {"image_kind": "Detcore", "reverie_pin": pin,
             "manifest": source, "leaf": package, "reverie_root": "/fixture/reverie"},
@@ -296,9 +298,19 @@ def finalizer_literals(case, root):
             r'"([^"]+)"\.into\(\)|(BUCK_TARGET|BUCK_PLATFORM)\.into\(\)', argv_match.group(1)):
         resolved.append(literal or {"BUCK_TARGET": target,
                                      "BUCK_PLATFORM": platform}[constant])
+    # The finalizer's buck_artifact profile literal, independent of
+    # the fixture (which is built from the verifier pin).
+    artifact_match = re.search(
+        r'fn buck_artifact\(.*?"profile": (\{[^{}]*\})', finalizer, re.S)
+    case.assertIsNotNone(artifact_match, "buck_artifact profile")
     return {"target": target, "platform": platform,
             "constraints": rust_list("BUCK_CONSTRAINTS"),
-            "flags": rust_list("BUCK_RUSTC_FLAGS"), "argv": resolved}
+            "flags": rust_list("BUCK_RUSTC_FLAGS"),
+            "own": rust_list("BUCK_OWN_SELECT_RUSTC_FLAGS"),
+            "liteinst": rust_list("BUCK_LITEINST_SELECT_RUSTC_FLAGS"),
+            "defaults": rust_const("BUCK_VENDORED_DEFAULTS"),
+            "artifact_profile": json.loads(artifact_match.group(1)),
+            "argv": resolved}
 
 
 def profile_literals(case, root):
@@ -317,16 +329,31 @@ def profile_literals(case, root):
         r"additional_constraints = \[(.*?)\],?\s*\n\s*platform =", profile, re.S)
     case.assertIsNotNone(additional, PROFILE_NAME)
     additional_text = additional.group(1)
+    liteinst = re.search(
+        r"LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS = \[(.*?)\]", profile, re.S)
+    case.assertIsNotNone(liteinst, PROFILE_NAME)
+    defaults = re.search(
+        r'LITEINST_RUNTIME_VENDORED_DEFAULTS = "([^"]*)"', profile)
+    case.assertIsNotNone(defaults, PROFILE_NAME)
     additional_values = re.findall(r'"([^"]*)"', additional_text)
+    own = None
     if "LITEINST_RUNTIME_FLAGS_CONSTRAINT" in additional_text:
         # The constant's canonical home is the constraints package;
-        # the profile re-exports it without a literal.
+        # the profile re-exports it without a literal. The own-target
+        # select list lives there too, next to the constant it keys on.
         constraints_bzl = (root.parent / REVERIE_CONSTRAINTS_NAME).read_text()
         match = (re.search(r'LITEINST_RUNTIME_FLAGS_CONSTRAINT = "([^"]+)"', constraints_bzl)
                  or re.search(r'LITEINST_RUNTIME_FLAGS_CONSTRAINT = "([^"]+)"', profile))
         case.assertIsNotNone(match, "LITEINST_RUNTIME_FLAGS_CONSTRAINT literal")
         additional_values.append(match.group(1))
+        own_match = re.search(
+            r"LITEINST_RUNTIME_SELECT_RUSTC_FLAGS = \[(.*?)\]", constraints_bzl, re.S)
+        case.assertIsNotNone(own_match, REVERIE_CONSTRAINTS_NAME)
+        own = re.findall(r'"([^"]*)"', own_match.group(1))
     return {"flags": re.findall(r'"([^"]*)"', flags.group(1)),
+            "liteinst": re.findall(r'"([^"]*)"', liteinst.group(1)),
+            "defaults": defaults.group(1),
+            "own": own,
             "platform": platform.group(1),
             "additional": additional_values}
 
@@ -354,10 +381,25 @@ def check_finalizer_literals(case, root):
     case.assertEqual(record["buck_constraints"], rust["constraints"])
     case.assertEqual(record["buck_constraints"], verifier.BUCK_CONSTRAINTS)
     case.assertEqual(record["buck_constraints"], sorted(record["buck_constraints"]))
-    flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
-    case.assertEqual(len(flags), 8)
-    case.assertEqual(flags, rust["flags"])
-    case.assertEqual(flags, verifier.BUCK_RUSTC_FLAGS)
+    scoped = record["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]
+    case.assertEqual(sorted(scoped),
+                     ["closure", "liteinst_select", "own_select", "vendored_defaults"])
+    case.assertEqual(len(scoped["closure"]), 4)
+    case.assertEqual(scoped["closure"], rust["flags"])
+    case.assertEqual(scoped["closure"], verifier.BUCK_RUSTC_FLAGS)
+    case.assertEqual(len(scoped["own_select"]), 3)
+    case.assertEqual(scoped["own_select"], rust["own"])
+    case.assertEqual(scoped["own_select"], verifier.BUCK_OWN_SELECT_RUSTC_FLAGS)
+    case.assertEqual(len(scoped["liteinst_select"]), 1)
+    case.assertEqual(scoped["liteinst_select"], rust["liteinst"])
+    case.assertEqual(scoped["liteinst_select"],
+                     verifier.BUCK_LITEINST_SELECT_RUSTC_FLAGS)
+    case.assertEqual(scoped["vendored_defaults"], rust["defaults"])
+    case.assertEqual(scoped["vendored_defaults"], verifier.BUCK_VENDORED_DEFAULTS)
+    case.assertEqual(record["buck_artifact"]["profile"],
+                     verifier.BUCK_ARTIFACT_PROFILE)
+    case.assertEqual(rust["artifact_profile"], verifier.BUCK_ARTIFACT_PROFILE)
+    case.assertEqual(record["buck_artifact"]["profile"], rust["artifact_profile"])
     case.assertEqual(record["buck_argv"], rust["argv"])
     case.assertEqual(record["buck_argv"], verifier.BUCK_ARGV)
     buck2_entries = [command for command in record["commands"]
@@ -370,8 +412,12 @@ def check_profile_literals(case, root):
     bzl = profile_literals(case, root)
     record = buck_fixture_record()
     case.assertEqual(record["buck_platform"], bzl["platform"])
-    flags = record["profile_objects"]["liteinst-runtime"]["rustc_flags"]
-    case.assertEqual(flags, bzl["flags"])
+    scoped = record["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]
+    case.assertEqual(scoped["closure"], bzl["flags"])
+    case.assertEqual(scoped["liteinst_select"], bzl["liteinst"])
+    case.assertEqual(scoped["vendored_defaults"], bzl["defaults"])
+    if bzl["own"] is not None:
+        case.assertEqual(scoped["own_select"], bzl["own"])
 
 
 def check_buck_literals(case, root):
@@ -522,11 +568,21 @@ class ReceiptControls(unittest.TestCase):
                 else:
                     bad[section][field] = value
                 refused(bad)
-            for field, value in [("opt_level", "2"), ("debuginfo", 2),
-                    ("debug_assertions", False), ("overflow_checks", False),
-                    ("test", True)]:
+            for field, value in [("opt_level", "2"),
+                    ("debug_assertions", False), ("test", True)]:
                 bad = copy.deepcopy(good)
                 bad["buck_artifact"]["profile"][field] = value
+                refused(bad)
+            # Per-class keys must not reappear as closure-wide facts, and
+            # no closure-wide key may drop out either.
+            for field, value in [("debuginfo", 0), ("debuginfo", 2),
+                    ("overflow_checks", True), ("overflow_checks", False)]:
+                bad = copy.deepcopy(good)
+                bad["buck_artifact"]["profile"][field] = value
+                refused(bad)
+            for field in ("opt_level", "debug_assertions", "test"):
+                bad = copy.deepcopy(good)
+                del bad["buck_artifact"]["profile"][field]
                 refused(bad)
             for field, value in [("name", "other"), ("target", "other"),
                     ("source", "registry"), ("kind", ["lib"]),
@@ -534,16 +590,37 @@ class ReceiptControls(unittest.TestCase):
                 bad = copy.deepcopy(good)
                 bad["buck_artifact"]["package"][field] = value
                 refused(bad)
-            flags = good["profile_objects"]["liteinst-runtime"]["rustc_flags"]
-            for index, flag in enumerate(flags):
+            scoped = good["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]
+            for scope in ("closure", "own_select", "liteinst_select"):
+                flags = scoped[scope]
+                for index, flag in enumerate(flags):
+                    bad = copy.deepcopy(good)
+                    bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"][scope][index] = flag + "X"
+                    refused(bad)
+                mutated_lists = [flags + ["-Clto=off"], flags + ["-Clto=thin"], flags[:-1]]
+                if flags[::-1] != flags:
+                    mutated_lists.append(flags[::-1])
+                for mutated in mutated_lists:
+                    bad = copy.deepcopy(good)
+                    bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"][scope] = mutated
+                    refused(bad)
                 bad = copy.deepcopy(good)
-                bad["profile_objects"]["liteinst-runtime"]["rustc_flags"][index] = flag + "X"
+                del bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"][scope]
                 refused(bad)
-            for mutated in [flags + ["-Clto=off"], flags + ["-Clto=thin"],
-                    flags[:-1], flags[::-1]]:
+            for mutated in [scoped["vendored_defaults"] + "X", "", "toolchain defaults"]:
                 bad = copy.deepcopy(good)
-                bad["profile_objects"]["liteinst-runtime"]["rustc_flags"] = mutated
+                bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]["vendored_defaults"] = mutated
                 refused(bad)
+            bad = copy.deepcopy(good)
+            del bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]["vendored_defaults"]
+            refused(bad)
+            bad = copy.deepcopy(good)
+            bad["profile_objects"]["liteinst-runtime"]["scoped_rustc_flags"]["vendored"] = []
+            refused(bad)
+            # The pre-scope flat shape refuses: no closure-wide list remains.
+            bad = copy.deepcopy(good)
+            bad["profile_objects"] = {"liteinst-runtime": {"rustc_flags": scoped["closure"]}}
+            refused(bad)
             bad = copy.deepcopy(good)
             bad["profile_objects"]["liteinst-runtime"]["lto"] = False
             refused(bad)
@@ -873,11 +950,15 @@ class BuckLiteralExportSkipControls(unittest.TestCase):
         if tamper_profile:
             flags[0] += "X"
         quoted = ", ".join(f'"{flag}"' for flag in flags)
+        liteinst_quoted = ", ".join(
+            f'"{flag}"' for flag in verifier.BUCK_LITEINST_SELECT_RUSTC_FLAGS)
         if profile:
             path = root / PROFILE_NAME
             path.parent.mkdir(parents=True)
             path.write_text(
                 f"LITEINST_RUNTIME_RUSTC_FLAGS = [{quoted}]\n"
+                f"LITEINST_RUNTIME_LITEINST_SELECT_RUSTC_FLAGS = [{liteinst_quoted}]\n"
+                f'LITEINST_RUNTIME_VENDORED_DEFAULTS = "{verifier.BUCK_VENDORED_DEFAULTS}"\n'
                 'additional_constraints = ['
                 '"fbcode//hermetic_infra/reverie/constraints:liteinst-runtime-flags[applied]", '
                 '"fbcode_macros//config/constraints:ld-as-needed-default-enabled", '

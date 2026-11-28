@@ -31,17 +31,26 @@ def require(ok, message):
         raise ValueError(message)
 
 
-# Buck liteinst-runtime pins: the reviewed flag set for the Buck closure
-# (release opt 3 with assertions and overflow checks on, and no -Clto at
-# all, matching Cargo's lto=false), the profiled runtime alias requested at
-# its [cdylib] output, the fbcode x86_64 Linux platform that alias pins, and
-# the exact constraint set of that request, sorted: the runtime target's
+# Buck liteinst-runtime pins: the scoped profile by delivery class
+# (only the first list reaches every crate; the selects reach only
+# their served targets; the vendored remainder is recorded by
+# description; no -Clto in any class, matching Cargo's lto=false),
+# the profiled runtime alias requested at its [cdylib] output, the
+# fbcode x86_64 Linux platform that alias pins, and the exact
+# constraint set of that request, sorted: the runtime target's
 # declared cpu/os compatibility plus the alias's four additional
 # constraints (opt, debug-assertions[on], liteinst-runtime-flags[applied]
-# and ld-as-needed-default-enabled).
-BUCK_RUSTC_FLAGS = ["-Copt-level=3", "-Cdebuginfo=0", "-Cdebug-assertions=yes",
-                    "-Coverflow-checks=yes", "-Ccodegen-units=16",
-                    "-Cembed-bitcode=no", "-Cpanic=unwind", "-Cstrip=none"]
+# and ld-as-needed-default-enabled). Per-class values are expected
+# delivery pending ELF measurement.
+BUCK_RUSTC_FLAGS = ["-Copt-level=3", "-Cdebug-assertions=yes",
+                    "-Cembed-bitcode=no", "-Cpanic=unwind"]
+BUCK_OWN_SELECT_RUSTC_FLAGS = ["-Coverflow-checks=yes", "-Ccodegen-units=16",
+                               "-Cdebuginfo=0"]
+BUCK_LITEINST_SELECT_RUSTC_FLAGS = ["-Coverflow-checks=yes"]
+BUCK_VENDORED_DEFAULTS = "fbcode opt toolchain defaults; expected (unmeasured): debuginfo=2, rustc-default codegen-units, overflow-checks follow debug-assertions; iced-x86 1.21.0 overflow-checks=off"
+# Closure-wide compiler-profile facts only; per-class debuginfo,
+# overflow and codegen-units live in the scoped profile above.
+BUCK_ARTIFACT_PROFILE = {"opt_level": "3", "debug_assertions": True, "test": False}
 BUCK_TARGET = "//hermetic_infra/hermit:detcore-liteinst-liteinst-runtime[cdylib]"
 BUCK_PLATFORM = "ovr_config//platform/linux:x86_64-fbcode"
 BUCK_CONSTRAINTS = [
@@ -159,15 +168,22 @@ def _verify(install, *, core=False):
                 "Buck receipt carries Cargo provenance")
     profiles = record["profile_objects"]
     if builder == "buck2":
-        require(profiles == {"liteinst-runtime": {"rustc_flags": BUCK_RUSTC_FLAGS}},
-                "Buck packaging did not retain the reviewed liteinst-runtime flags")
+        require(profiles == {"liteinst-runtime": {"scoped_rustc_flags": {
+                    "closure": BUCK_RUSTC_FLAGS,
+                    "own_select": BUCK_OWN_SELECT_RUSTC_FLAGS,
+                    "liteinst_select": BUCK_LITEINST_SELECT_RUSTC_FLAGS,
+                    "vendored_defaults": BUCK_VENDORED_DEFAULTS}}},
+                "Buck packaging did not retain the scoped liteinst-runtime profile")
     else:
         require(profiles["liteinst-runtime"]["inherits"] == "validate" and profiles["liteinst-runtime"]["lto"] is False,
                 "ordinary packaging did not retain the reviewed LTO profile")
     artifact = record["cargo_artifact" if builder == "cargo" else "buck_artifact"]
     require(artifact["features"] == [], "packaged runtime is not the ordinary feature mode")
-    require(artifact["profile"] == {"opt_level": "3", "debuginfo": 0, "debug_assertions": True,
-                                      "overflow_checks": True, "test": False}, "wrong compiler profile")
+    if builder == "buck2":
+        require(artifact["profile"] == BUCK_ARTIFACT_PROFILE, "wrong compiler profile")
+    else:
+        require(artifact["profile"] == {"opt_level": "3", "debuginfo": 0, "debug_assertions": True,
+                                          "overflow_checks": True, "test": False}, "wrong compiler profile")
     sources = record["compiled_sources"]
     require(sources["image_kind"] == "Detcore" and sources["reverie_pin"] == pin, "source authority differs from packaging inputs")
     # For a HermitPath (content-only) receipt the reverie_pin checked
